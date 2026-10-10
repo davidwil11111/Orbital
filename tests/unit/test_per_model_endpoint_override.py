@@ -473,3 +473,47 @@ def test_go_does_not_default_to_a_region_gated_model(real):
     first contact — which is exactly how this was reported."""
     first = real.suggested_models("opencode-go")[0]
     assert not first.startswith("deepseek-"), first
+
+
+# --- Claude Haiku 5.5 on both OpenCode tiers --------------------------------
+#
+# Reported 2026-10-10: "haiku returns 400 in Test Connection on an OpenCode Go
+# card". The gateway lists claude-haiku-5-5 and serves it ONLY over
+# /messages; without a catalog entry the provider default (/chat/completions)
+# applied and Go answered ModelProtocolUnsupported. Same on Zen.
+
+
+def test_claude_haiku_5_5_uses_the_anthropic_protocol_on_both_tiers(real):
+    go = real.get_model_info("opencode-go", "claude-haiku-5-5")
+    assert go.sdk == "anthropic"
+    assert go.base_url == GO_ROOT
+
+    zen = real.get_model_info("opencode-zen", "claude-haiku-5-5")
+    assert zen.sdk == "anthropic"
+    assert zen.base_url == ZEN_ROOT
+
+
+PROTOCOL_400 = (
+    "Error code: 400 - {'type': 'error', 'error': {'type': "
+    "'ModelProtocolUnsupported', 'message': 'Model does not support this "
+    "protocol.'}}"
+)
+
+
+def test_a_protocol_mismatch_names_the_protocol_and_the_fix(
+    route_client, monkeypatch
+):
+    """Grok / GPT on OpenCode live on the Responses API, which Orbital does
+    not speak. The gateway's "Model does not support this protocol." names
+    neither what was tried nor what to do; the card line must."""
+    _provider_error(monkeypatch, PROTOCOL_400, 400)
+    resp = route_client.post(
+        "/api/v2/providers/test",
+        json={"provider": "router", "model": "grok-4.7", "api_key": "sk-valid"},
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "Error code:" not in detail and "{" not in detail, detail
+    assert "'grok-4.7'" in detail, detail
+    assert "OpenAI chat/completions" in detail, detail
+    assert "Responses API" in detail, detail
