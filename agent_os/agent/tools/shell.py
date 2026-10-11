@@ -182,6 +182,25 @@ class ShellTool(Tool):
     _UNIX_ABS_RE = re.compile(r'/(?:home|Users|etc|var|tmp|root)/[^\s"\';&|>]*')
     _HOME_REL_RE = re.compile(r'~/[^\s"\';&|>]*')
     _ENV_VAR_RE = re.compile(r'(?:\$HOME|\$USERPROFILE|%USERPROFILE%|%APPDATA%|%LOCALAPPDATA%)')
+    # A whole quoted absolute path, spaces included: "C:\a b\c" or '/Users/a b'.
+    _QUOTED_ABS_RE = re.compile(
+        r'(["\'])((?:[A-Za-z]:\\|/(?:home|Users|etc|var|tmp|root)/)[^"\']*)\1')
+    # What may follow the workspace path for it to be the workspace (or a path
+    # under it) rather than a sibling sharing its name as a prefix.
+    _WS_BOUNDARY = r'(?=$|[\\/\s"\';&|>)])'
+
+    def _mask_workspace(self, command: str) -> str:
+        """Blank out the workspace path wherever it appears, so its pieces are
+        never scanned as separate paths. Case-insensitive on Windows."""
+        workspace = os.path.normpath(self._workspace or "")
+        if not workspace or workspace in (os.sep, "."):
+            return command
+        flags = re.IGNORECASE if self._os_type == "windows" else 0
+        variants = {workspace, workspace.replace("\\", "/")}
+        for variant in sorted(variants, key=len, reverse=True):
+            command = re.sub(re.escape(variant) + self._WS_BOUNDARY, "", command,
+                             flags=flags)
+        return command
 
     def __init__(self, workspace: str, os_type: str,
                  platform_provider=None, project_id: str | None = None):
@@ -226,8 +245,21 @@ class ShellTool(Tool):
         return False
 
     def _detect_external_paths(self, command: str) -> list[str]:
-        """Extract path-like strings from command and return those outside the workspace."""
+        """Extract path-like strings from command and return those outside the workspace.
+
+        The unquoted patterns stop at whitespace, so a path with a space was
+        cut at it: for workspace ``...\\My Project`` the command
+        ``dir "...\\My Project"`` read as ``...\\My``, outside, and the
+        ``[focus]`` warning told the agent not to read its own project.
+        Occurrences of the workspace itself are masked first (only at a path
+        boundary, so ``My Project-old`` still counts), and quoted paths are
+        then taken whole.
+        """
+        command = self._mask_workspace(command)
         candidates: list[str] = []
+        for match in self._QUOTED_ABS_RE.finditer(command):
+            candidates.append(match.group(2))
+        command = self._QUOTED_ABS_RE.sub(" ", command)
         candidates.extend(self._WIN_ABS_RE.findall(command))
         candidates.extend(self._UNIX_ABS_RE.findall(command))
         candidates.extend(self._HOME_REL_RE.findall(command))
