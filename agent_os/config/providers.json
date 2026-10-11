@@ -3676,6 +3676,12 @@
         "_default": {
           "input_per_1m": 3.0,
           "output_per_1m": 15.0
+        },
+        "claude-haiku-5-5": {
+          "input_per_1m": 0.1,
+          "output_per_1m": 0.5,
+          "cached_input_per_1m": 0.01,
+          "cache_write_per_1m": 0.125
         }
       },
       "models": {
@@ -4276,6 +4282,26 @@
           "display_name": "Qwen3.7 Plus",
           "sdk": "anthropic",
           "base_url": "https://opencode.ai/zen"
+        },
+        "claude-haiku-5-5": {
+          "tier": "fast",
+          "context_window": 1000000,
+          "max_output": 128000,
+          "capabilities": {
+            "streaming": true,
+            "tool_use": true,
+            "vision": true
+          },
+          "reasoning": {
+            "supported": true,
+            "enable": "param:thinking={type:'adaptive'}",
+            "field": "thinking",
+            "echo_back": "required",
+            "notes": "Adaptive thinking, on by default; manual budget_tokens returns 400. Thinking blocks must be echoed unchanged on tool-use continuations. Priced for prompts up to 100K tokens ($0.50/$2.50 beyond). Served ONLY over /messages on both OpenCode tiers — verified on the wire 2026-10-10 (400 ModelProtocolUnsupported on /chat/completions). https://platform.claude.com/docs/en/about-claude/models"
+          },
+          "display_name": "Claude Haiku 5.5",
+          "sdk": "anthropic",
+          "base_url": "https://opencode.ai/zen"
         }
       },
       "cache": {
@@ -4308,6 +4334,7 @@
       "suggested_models": [
         "glm-5.2",
         "kimi-k3",
+        "claude-haiku-5-5",
         "glm-5.3",
         "minimax-m3",
         "kimi-k2.7-code",
@@ -4315,7 +4342,7 @@
         "deepseek-v4-flash",
         "deepseek-v4-pro"
       ],
-      "notes": "$10/month subscription ($5 first month) with dollar-capped usage: $12 per 5 hours, $30/week, $60/month. The per-token rates below are what meters against those caps — they are not incremental charges, so spend readings show cap burn, not a bill. Enable 'Use balance' in the console to fall back to your Zen credits past a cap. Same API key as Zen. minimax-* and qwen* are served over the Anthropic /messages protocol on this tier, while the same minimax ids are /chat/completions on Zen — Orbital resolves that per model. grok-4.5 and gpt-5.6-luna use the Responses API, which Orbital does not speak. Since 2026-09 the Go gateway rejects any request without a stable per-conversation x-opencode-session header (400 MissingSessionID, both wire protocols) and asks clients to identify with their own User-Agent — hence session_header + extra_headers on this entry. https://opencode.ai/docs/go/ NOTE: deepseek-v4-flash and deepseek-v4-pro answer 403 RegionError on this tier until the workspace explicitly opts into China hosting in the OpenCode console — verified 2026-08-19; every other Go model works without it.",
+      "notes": "$10/month subscription ($5 first month) with dollar-capped usage: $12 per 5 hours, $30/week, $60/month. The per-token rates below are what meters against those caps — they are not incremental charges, so spend readings show cap burn, not a bill. Enable 'Use balance' in the console to fall back to your Zen credits past a cap. Same API key as Zen. minimax-* and qwen* are served over the Anthropic /messages protocol on this tier, while the same minimax ids are /chat/completions on Zen — Orbital resolves that per model. claude-haiku-5-5 is /messages as well. grok-4.6, grok-4.7, gpt-5.6-luna and gpt-6-luna are served ONLY over OpenAI's Responses API, which Orbital does not speak — Test Connection reports the protocol mismatch (verified on the wire 2026-10-10; gpt-5.6-luna additionally answers 403 unsupported_country_region_territory from this region). Live /models also lists longcat-2.0, longcat-2.5-preview-free, step-5-preview-free, space-bunny and omen-alpha (all /chat/completions, reached via the provider default; no vendor specs published, so uncatalogued) and muse-spark-* (403 region-gated). Since 2026-09 the Go gateway rejects any request without a stable per-conversation x-opencode-session header (400 MissingSessionID, both wire protocols) and asks clients to identify with their own User-Agent — hence session_header + extra_headers on this entry. https://opencode.ai/docs/go/ NOTE: deepseek-v4-flash and deepseek-v4-pro answer 403 RegionError on this tier until the workspace explicitly opts into China hosting in the OpenCode console — verified 2026-08-19; every other Go model works without it.",
       "pricing": {
         "deepseek-v4-flash": {
           "input_per_1m": 0.22,
@@ -4416,6 +4443,43 @@
         "_default": {
           "input_per_1m": 1.4,
           "output_per_1m": 4.4
+        },
+        "claude-haiku-5-5": {
+          "input_per_1m": 0.1,
+          "output_per_1m": 0.5,
+          "cached_input_per_1m": 0.01,
+          "cache_write_per_1m": 0.125
+        },
+        "glm-5.3-flash": {
+          "input_per_1m": 0.15,
+          "output_per_1m": 0.5,
+          "cached_input_per_1m": 0.03
+        },
+        "mimo-v2.6-flash": {
+          "input_per_1m": 0.14,
+          "output_per_1m": 0.28,
+          "cached_input_per_1m": 0.0028
+        },
+        "mimo-v2.6-pro": {
+          "input_per_1m": 0.435,
+          "output_per_1m": 0.87,
+          "cached_input_per_1m": 0.003625
+        },
+        "qwen3.8-flash": {
+          "input_per_1m": 0.15,
+          "output_per_1m": 0.47,
+          "cached_input_per_1m": 0.016,
+          "cache_write_per_1m": 0.2
+        },
+        "deepseek-v4.1-flash": {
+          "input_per_1m": 0.15,
+          "output_per_1m": 0.6,
+          "cached_input_per_1m": 0.003
+        },
+        "hy4-preview": {
+          "input_per_1m": 0.834,
+          "output_per_1m": 2.501,
+          "cached_input_per_1m": 0.042
         }
       },
       "models": {
@@ -4746,6 +4810,121 @@
           "display_name": "Qwen3.8 Max",
           "sdk": "anthropic",
           "base_url": "https://opencode.ai/zen/go"
+        },
+        "claude-haiku-5-5": {
+          "tier": "fast",
+          "context_window": 1000000,
+          "max_output": 128000,
+          "capabilities": {
+            "streaming": true,
+            "tool_use": true,
+            "vision": true
+          },
+          "reasoning": {
+            "supported": true,
+            "enable": "param:thinking={type:'adaptive'}",
+            "field": "thinking",
+            "echo_back": "required",
+            "notes": "Adaptive thinking, on by default; manual budget_tokens returns 400. Thinking blocks must be echoed unchanged on tool-use continuations. Priced for prompts up to 100K tokens ($0.50/$2.50 beyond). Served ONLY over /messages on both OpenCode tiers — verified on the wire 2026-10-10 (400 ModelProtocolUnsupported on /chat/completions). https://platform.claude.com/docs/en/about-claude/models"
+          },
+          "display_name": "Claude Haiku 5.5",
+          "sdk": "anthropic",
+          "base_url": "https://opencode.ai/zen/go"
+        },
+        "glm-5.3-flash": {
+          "tier": "fast",
+          "context_window": 200000,
+          "max_output": 128000,
+          "capabilities": {
+            "vision": false,
+            "tool_use": true,
+            "streaming": true
+          },
+          "reasoning": {
+            "supported": true,
+            "field": "reasoning_content",
+            "echo_back": "optional",
+            "enable": "param:thinking.type=enabled",
+            "notes": "Hybrid; thinking default enabled. Streaming delta carries reasoning_content. https://docs.z.ai/guides/llm/glm-5.1"
+          },
+          "display_name": "GLM-5.3-Flash"
+        },
+        "mimo-v2.6-flash": {
+          "display_name": "MiMo-V2.6-Flash",
+          "context_window": 128000,
+          "max_output": 8192,
+          "capabilities": {
+            "vision": false,
+            "tool_use": true,
+            "streaming": true
+          }
+        },
+        "mimo-v2.6-pro": {
+          "display_name": "MiMo-V2.6-Pro",
+          "context_window": 128000,
+          "max_output": 8192,
+          "capabilities": {
+            "vision": false,
+            "tool_use": true,
+            "streaming": true
+          }
+        },
+        "qwen3.8-flash": {
+          "tier": "fast",
+          "context_window": 262144,
+          "max_output": 32768,
+          "capabilities": {
+            "vision": true,
+            "tool_use": true,
+            "streaming": true
+          },
+          "reasoning": {
+            "supported": true,
+            "field": "reasoning_content",
+            "echo_back": "optional",
+            "enable": "param:enable_thinking=true",
+            "notes": "Latest Qwen3.5 flagship; hybrid thinking-mode (default off). Same enable_thinking + preserve_thinking pattern.",
+            "needs_verification": true
+          },
+          "display_name": "Qwen3.8 Flash"
+        },
+        "deepseek-v4.1-flash": {
+          "tier": "hybrid",
+          "context_window": 1000000,
+          "max_output": 384000,
+          "capabilities": {
+            "vision": false,
+            "tool_use": true,
+            "streaming": true,
+            "json_mode": true
+          },
+          "reasoning": {
+            "supported": true,
+            "field": "reasoning_content",
+            "echo_back": "required",
+            "enable": "param:thinking.type=enabled",
+            "notes": "Hybrid; thinking defaults enabled. Echo-back required for tool-call turns; safest to always include reasoning_content (empty string when absent). https://api-docs.deepseek.com/guides/thinking_mode"
+          },
+          "display_name": "DeepSeek V4.1 Flash"
+        },
+        "hy4-preview": {
+          "display_name": "HY4 Preview",
+          "tier": "flagship",
+          "context_window": 1000000,
+          "max_output": 64000,
+          "capabilities": {
+            "vision": false,
+            "tool_use": true,
+            "streaming": true
+          },
+          "reasoning": {
+            "supported": true,
+            "field": "reasoning_content",
+            "echo_back": "optional",
+            "enable": "param:thinking.type=enabled",
+            "needs_verification": true,
+            "notes": "Thinking on by default (high effort); thinking={type:enabled|disabled} and reasoning_effort=high|low per Tencent Cloud docs; reasoning_content in the stream. Echo-back tolerance not yet probed live."
+          }
         }
       },
       "cache": {

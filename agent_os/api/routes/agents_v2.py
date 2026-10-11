@@ -3372,6 +3372,34 @@ def _unwrap_provider_message(raw: str) -> str:
     return raw
 
 
+_WIRE_PROTOCOL_NAMES = {
+    "openai": "OpenAI chat/completions",
+    "anthropic": "Anthropic messages",
+}
+
+
+def _describe_protocol_mismatch(model: str, sdk: str | None) -> str:
+    """Display text for an aggregator's ``ModelProtocolUnsupported`` 400.
+
+    OpenCode Zen/Go serve each model over exactly one wire protocol and answer
+    this when a request arrives on another. The raw envelope ("Model does not
+    support this protocol.") names neither the protocol tried nor the fix, and
+    reads like a dead key. Two causes, both worth naming: the model lives on
+    OpenAI's Responses API, which Orbital has no client for (Grok, GPT on
+    OpenCode); or the catalog lacks the per-model endpoint entry that would
+    have routed it to the other protocol Orbital does speak (how
+    claude-haiku-5-5 on Go was reported).
+    """
+    wire = _WIRE_PROTOCOL_NAMES.get(sdk or "", sdk or "default")
+    return (
+        f"'{model}' is not served over the {wire} protocol on this provider. "
+        "Orbital speaks OpenAI chat/completions and Anthropic messages, so a "
+        "model on OpenAI's Responses API (Grok and GPT on OpenCode) cannot be "
+        "used yet; a Claude model here means the catalog lacks an endpoint "
+        "entry for it."
+    )
+
+
 def _describe_auth_failure(raw: str | None) -> str:
     """Map a 401/403 to display text: the stable "Invalid API key" only when
     the provider says the credential was the problem."""
@@ -3502,6 +3530,9 @@ async def run_connection_test(provider: str, model: str, api_key: str,
         if status is None:
             return {"ok": False, "status": None, "code": "provider_unreachable",
                     "message": e.message}
+        if "ModelProtocolUnsupported" in (e.message or ""):
+            return {"ok": False, "status": status, "code": "provider_error",
+                    "message": _describe_protocol_mismatch(model, sdk)}
         return {"ok": False, "status": status, "code": "provider_error",
                 "message": e.message}
     except Exception as e:  # noqa: BLE001 — an SDK constructor can raise anything
