@@ -84,3 +84,15 @@ session appeared at once, and worker bubbles survived a reload.
 - Anything needing your real model key (none was received).
 - The new installer on the real machine: install, V3 sign-in screen and the first-run experience. These need
   you (UAC).
+
+## Update, 2026-10-11 evening
+
+- **"Codex still shows no usage"** came from the build still installed on the machine,
+  `C:\Orbital\bin\Orbital.exe` built 2026-10-10 17:24 UTC (run 38071223604). It still has the old
+  POSIX-shell sign-in check: its picker shows Codex as 需要登录 ("login required"). The new code, run against a
+  copy of the real data, shows "Codex · 5小时 · 剩余 100%" and the Codex usage card in the browser.
+- Issue 2 fixed (`b4261e5`): a workspace path with a space is no longer flagged as outside the workspace.
+  The other issues stay as listed, by decision.
+- Installer for manual verification: run **38142248158** (`b4261e5`), SHA-256
+  `6231EFDFD27DCD4A77882C97086946297E2734E7ACB9E5294DCE1F683DE8986C`. CI is green apart from the known
+  `test_browser_live` red (windows 4503 passed, macos 4607 passed).
