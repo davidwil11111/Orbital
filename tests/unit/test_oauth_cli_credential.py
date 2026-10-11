@@ -276,3 +276,100 @@ class TestBuildActionsOAuthCLI:
         assert len(actions) == 1
         assert actions[0].action == "configure_credential"
         assert actions[0].label == "Set API Key"
+
+
+class TestDottedCheckField:
+    """``check_field`` may be a dotted path into the probe's JSON (Kimi Code's
+    ``kimi provider list --json`` nests the login under providers.<id>)."""
+
+    def _engine_and_manifest(self, check_field="providers.managed:kimi-code.type",
+                             check_value="kimi"):
+        registry = AgentRegistry()
+        manifest = _make_manifest_with_oauth_cli()
+        cred = manifest.setup.credentials[0]
+        cred.check_field = check_field
+        cred.check_value = check_value
+        registry.register(manifest)
+        return SetupEngine(registry=registry), manifest
+
+    def _run(self, engine, manifest, payload):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps(payload)
+        with patch("agent_os.agents.setup_engine.subprocess.run", return_value=mock_result):
+            return engine.check_credentials(manifest)
+
+    def test_nested_value_matches(self):
+        engine, manifest = self._engine_and_manifest()
+        ok, missing = self._run(engine, manifest, {
+            "providers": {"managed:kimi-code": {"type": "kimi", "oauth": {"storage": "file"}}},
+            "models": {},
+        })
+        assert (ok, missing) == (True, [])
+
+    def test_logged_out_shape_is_missing(self):
+        engine, manifest = self._engine_and_manifest()
+        ok, missing = self._run(engine, manifest, {"providers": {}, "models": {}})
+        assert ok is False
+        assert missing == ["test_auth"]
+
+    def test_non_dict_intermediate_is_missing_not_a_crash(self):
+        engine, manifest = self._engine_and_manifest()
+        ok, missing = self._run(engine, manifest, {"providers": ["managed:kimi-code"]})
+        assert ok is False
+        assert missing == ["test_auth"]
+
+    def test_top_level_field_still_works(self):
+        engine, manifest = self._engine_and_manifest(check_field="loggedIn", check_value="true")
+        ok, _ = self._run(engine, manifest, {"loggedIn": True})
+        assert ok is True
+
+
+class TestOAuthCLIWithoutProbe:
+    """An oauth_cli credential with no check_command (MiniMax Code: the CLI has
+    no status subcommand) is reported as the ``unknown`` credential state —
+    dispatchable, never "missing" — instead of a login Orbital cannot see."""
+
+    def _manifest(self):
+        manifest = _make_manifest_with_oauth_cli()
+        cred = manifest.setup.credentials[0]
+        cred.check_command = ""
+        cred.check_field = ""
+        cred.check_value = ""
+        cred.setup_command = ""
+        return manifest
+
+    def test_not_missing_and_no_cli_spawned(self):
+        registry = AgentRegistry()
+        manifest = self._manifest()
+        registry.register(manifest)
+        engine = SetupEngine(registry=registry)
+        with patch("agent_os.agents.setup_engine.subprocess.run") as run:
+            ok, missing = engine.check_credentials(manifest)
+        assert (ok, missing) == (True, [])
+        run.assert_not_called()
+
+    def test_status_reports_unknown_credential_state(self):
+        registry = AgentRegistry()
+        manifest = self._manifest()
+        registry.register(manifest)
+        engine = SetupEngine(registry=registry)
+        with patch.object(engine, "resolve_binary", return_value="/usr/local/bin/test-cmd"), \
+             patch.object(engine, "_run_check_command", return_value="1.0.0"), \
+             patch.object(engine, "check_dependencies", return_value=(True, [])):
+            status = engine.check_agent(manifest.slug)
+        assert status.credentials_configured is True
+        assert status.missing_credentials == []
+        assert status.credential_state == "unknown"
+
+    def test_real_manifest_minimax_code_is_unknown(self):
+        from agent_os.agents.manifest import ManifestLoader
+        path = os.path.normpath(os.path.join(
+            os.path.dirname(__file__), os.pardir, os.pardir,
+            "agent_os", "agents", "manifests", "minimax-code.yaml"))
+        manifest = ManifestLoader.load(path)
+        registry = AgentRegistry()
+        registry.register(manifest)
+        engine = SetupEngine(registry=registry)
+        missing, state = engine._evaluate_credentials(manifest, "/opt/homebrew/bin/mcode")
+        assert (missing, state) == ([], "unknown")

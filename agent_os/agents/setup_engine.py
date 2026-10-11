@@ -51,6 +51,21 @@ class StaleOkView:
         return self._engine.check_all(allow_stale=True)
 
 
+def _json_field(data, path: str):
+    """Value at ``path`` in ``data``: a top-level key, or a dotted path.
+
+    ``providers.managed:kimi-code.type`` walks nested dicts one segment at a
+    time (segments may contain anything but a dot). Missing or non-dict
+    intermediates yield "" so the caller's string comparison simply fails.
+    """
+    current = data
+    for segment in path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return ""
+        current = current[segment]
+    return current
+
+
 class SetupEngine:
     """Probes the system for agent readiness based on manifest metadata."""
 
@@ -334,6 +349,14 @@ class SetupEngine:
                 continue
             # oauth_cli: check via CLI command
             if cred.type == "oauth_cli":
+                if not cred.check_command:
+                    # The CLI owns the login but offers no status probe
+                    # (MiniMax Code). Orbital can neither confirm nor deny
+                    # the sign-in, so say so instead of reporting a missing
+                    # credential that would read as "not logged in"; the
+                    # spawn surfaces the CLI's own auth error if it is.
+                    state = state or "unknown"
+                    continue
                 if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary):
                     missing.append(cred.key)
                 continue
@@ -434,7 +457,7 @@ class SetupEngine:
             return None
         if not isinstance(data, dict):
             return None
-        actual = str(data.get(cred.check_field, ""))
+        actual = str(_json_field(data, cred.check_field))
         if actual == cred.check_value:
             return True
         if cred.check_missing_value and actual == cred.check_missing_value:
@@ -472,7 +495,7 @@ class SetupEngine:
                 # which cmd.exe cannot run.
                 return True
             data = _json.loads(result.stdout)
-            actual = str(data.get(cred.check_field, ""))
+            actual = str(_json_field(data, cred.check_field))
             return actual.lower() == cred.check_value.lower()
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
                 _json.JSONDecodeError, ValueError):

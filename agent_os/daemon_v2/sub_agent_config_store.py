@@ -141,6 +141,46 @@ SCHEMA: dict[str, dict[str, _ParamSchema]] = {
             default="auto",
         ),
     },
+    "kimi-code": {
+        # Kimi Code's models are the aliases in its own config.toml
+        # (kimi-code/k3, kimi-code/kimi-for-coding, ...), which move with the
+        # CLI and the account, so this stays free-text. Delivered through the
+        # ACP transport, which lifts ``--model`` out of argv (Kimi takes it
+        # before the ``acp`` subcommand) and applies it to the session.
+        "model": _ParamSchema(
+            name="model",
+            allowed=None,
+            flag_template="--model {value}",
+        ),
+        # Orbital's own ACP permission policy (same contract as cursor), not
+        # a Kimi flag: ``auto`` answers every permission request itself so
+        # queue runs never block; ``ask`` routes them to the approval card.
+        "permission-mode": _ParamSchema(
+            name="permission-mode",
+            allowed=("auto", "ask"),
+            flag_template="--orbital-permission-mode {value}",
+            default="auto",
+        ),
+    },
+    "minimax-code": {
+        # MiniMax Code accepts only its session's internal model ids
+        # (m:minimax:MiniMax-M3:v:thinking); anything else is not an
+        # advertised value and the transport keeps the CLI default. The
+        # catalogue changes with the account's token plan, so free-text.
+        "model": _ParamSchema(
+            name="model",
+            allowed=None,
+            flag_template="--model {value}",
+        ),
+        # Orbital's own ACP permission policy (same contract as cursor), not
+        # a MiniMax Code flag.
+        "permission-mode": _ParamSchema(
+            name="permission-mode",
+            allowed=("auto", "ask"),
+            flag_template="--orbital-permission-mode {value}",
+            default="auto",
+        ),
+    },
     "gemini-cli": {
         # gemini-cli may not be installed today; this entry exists so the UI
         # can render the right dropdowns the moment it shows up in the

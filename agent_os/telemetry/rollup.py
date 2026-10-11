@@ -25,7 +25,8 @@ MILESTONES = ("key_set", "first_project", "first_session", "first_turn")
 # ``native``. A parity test fails when a manifest is added without a row here.
 SUBAGENT_SLUGS = (
     "aider", "claude-code", "cline", "codebuddy", "codex", "continue-cli",
-    "copilot-cli", "cursor", "dsh", "gemini-cli", "goose", "pi",
+    "copilot-cli", "cursor", "dsh", "gemini-cli", "goose", "kimi-code",
+    "minimax-code", "pi",
 )
 
 

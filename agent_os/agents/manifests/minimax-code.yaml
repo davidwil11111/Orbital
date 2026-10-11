@@ -1,0 +1,112 @@
+# -----------------------------------------------------------------------
+# MiniMax Code CLI — Research Notes (probed 2026-10-11, v0.6.8)
+# -----------------------------------------------------------------------
+# CLI command: mcode   (npm @minimax-ai/code; the official installer
+#   `curl -fsSL https://filecdn.minimax.chat/public/install.sh | bash` puts a
+#   launcher at ~/.minimax-code/bin/mcode with its own private Node runtime)
+# Install (npm): needs Node 22.19+ or 24.2+; the package's postinstall builds
+#   better-sqlite3, hence the --allow-scripts flags in install_command.
+# ACP: `mcode acp` speaks Agent Client Protocol over stdio. Orbital's
+#   ACPSDKTransport drives it unchanged: protocol v1, loadSession=true plus
+#   sessionCapabilities.resume (verified: a second spawn with the recorded
+#   session id reports "resumed" and the agent recalled the first turn),
+#   http/sse MCP, no image prompt input. Advertises no auth methods.
+#   Session config options: permissionMode (default=Ask / auto /
+#   bypassPermissions; the process starts in auto), model, thinkingEffort
+#   (default/low/medium/high/xhigh/max). usage_update notifications carry
+#   used/size tokens and a cost figure per turn.
+# Model ids: ONLY the session's internal values are accepted, of the form
+#   m:<provider>:<Model>:v:<variant> (e.g. m:minimax:MiniMax-M3:v:thinking;
+#   empty variant = non-thinking). A friendly id such as MiniMax-M3 or
+#   minimax/MiniMax-M3 is not an advertised value, so the transport keeps the
+#   CLI's default instead of failing the spawn. `mcode --model <id> acp`
+#   (global option before the subcommand) is also accepted; the transport
+#   places Orbital's --model there and applies the session option.
+# Auth: OAuth token plan via `mcode login` (default region cn →
+#   account.minimax.cn; `--region global` → the international account), or
+#   an API key via `mcode provider set-minimax-key` / MCODE_PROVIDER_API_KEY
+#   with a custom provider. State lives under ~/.minimax (shared with the
+#   MiniMax Code desktop app, so a desktop sign-in already counts). Logged
+#   out, ACP session/new fails with "Authentication required: Run `mcode
+#   login` and try again." so a spawn fails fast with that text.
+# Auth probe: none exists. `mcode provider list --json` is byte-identical
+#   signed in or out, and `mcode provider test minimax_oauth --json` always
+#   answers state "unsupported". The credential therefore has no
+#   check_command, which SetupEngine reports as the "unknown" credential
+#   state ("Verify sign-in in MiniMax Code") rather than claiming a login it
+#   cannot see. No setup_command either: the Log in button would run the
+#   cn-region flow for everyone, and the card hides it in this state anyway.
+# Headless fallback: `mcode exec --output-format stream-json` with
+#   --session/--continue and --permission smart|full|off — not used, ACP is
+#   the maintained path and the only one with approval routing.
+# -----------------------------------------------------------------------
+
+manifest_version: "1"
+name: "MiniMax Code"
+slug: "minimax-code"
+description: "MiniMax's MiniMax Code coding agent, driven over ACP"
+author: "minimax"
+version: "1.0.0"
+
+runtime:
+  adapter: cli
+  command: "mcode"
+  transport: acp-sdk
+  mode: pipe
+  interactive: false
+  args: ["acp"]
+
+setup:
+  dependencies:
+    - name: "Node.js"
+      check_command: "node --version"
+      min_version: "22.19.0"
+      install:
+        windows: "winget install OpenJS.NodeJS"
+        macos: "brew install node"
+  install_command: "npm install -g @minimax-ai/code@latest --registry=https://registry.npmjs.org/ --ignore-scripts=false --include=optional --allow-scripts=@minimax-ai/code,better-sqlite3"
+  check_command: "mcode --version"
+  credentials:
+    - key: "minimax_auth"
+      label: "MiniMax account (sign in once with `mcode login`, or `mcode login --region global` outside mainland China)"
+      type: oauth_cli
+      required: true
+  auto_detect:
+    windows:
+      - "%APPDATA%\\npm\\mcode.cmd"
+      - "%PROGRAMFILES%\\nodejs\\mcode.cmd"
+    macos:
+      - "/opt/homebrew/bin/mcode"
+      - "/usr/local/bin/mcode"
+      - "$HOME/.npm-global/bin/mcode"
+      - "$HOME/.npm/bin/mcode"
+      - "$HOME/.minimax-code/bin/mcode"
+    linux:
+      - "/usr/local/bin/mcode"
+      - "$HOME/.npm-global/bin/mcode"
+      - "$HOME/.npm/bin/mcode"
+      - "$HOME/.local/bin/mcode"
+      - "$HOME/.minimax-code/bin/mcode"
+
+capabilities:
+  skills:
+    - code_generation
+    - code_review
+    - debugging
+    - testing
+    - refactoring
+    - documentation
+  input_types: [text, files]
+  output_types: [text, files]
+  file_extensions: [.py, .js, .ts, .jsx, .tsx, .rs, .go, .java, .rb, .c, .cpp, .h]
+  routing_hint: "Use for coding tasks on MiniMax's M-series models (M3 / M3.1) via MiniMax Code"
+  needs_shell: true
+  needs_network: true
+
+permissions:
+  # network_domains deliberately omitted: transport-backed sub-agents spawn
+  # outside the project sandbox/proxy, so an entry here would be a claim
+  # Orbital cannot enforce (see the dsh manifest for the full note).
+  shell: true
+  workspace_access: read_write
+  autonomy_recommended: hands_off

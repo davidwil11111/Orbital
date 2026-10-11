@@ -7,7 +7,7 @@ import { getAgentIcon, MAIN_AGENT_HANDLE } from './agentIcons';
 
 describe('getAgentIcon', () => {
   it('gives every known slug a distinct mark and monogram', () => {
-    const known = [MAIN_AGENT_HANDLE, 'claude-code', 'codebuddy', 'codex', 'cursor', 'dsh', 'gemini', 'grok', 'pi'];
+    const known = [MAIN_AGENT_HANDLE, 'claude-code', 'codebuddy', 'codex', 'cursor', 'dsh', 'gemini', 'grok', 'kimi', 'minimax', 'pi'];
     const icons = known.map((slug) => getAgentIcon(slug));
 
     for (const icon of icons) {
@@ -91,5 +91,17 @@ describe('getAgentIcon', () => {
     expect(i.monogram).toBe('CB');
     expect(i.color).toBe('#0052D9');
     expect(i.src).toBe('/agents/codebuddy.svg');
+  });
+
+  it('resolves the kimi-code and minimax-code slugs to their vendor marks', () => {
+    // The manifest slugs carry a `-code` suffix; prefix matching lands them
+    // on the vendor entry the same way `gemini-cli` lands on `gemini`.
+    const kimi = getAgentIcon('kimi-code');
+    expect(kimi.monogram).toBe('KM');
+    expect(kimi.src).toBe('/agents/kimi.svg');
+    const minimax = getAgentIcon('minimax-code');
+    expect(minimax.monogram).toBe('MM');
+    expect(minimax.color).toBe('#E2167E');
+    expect(minimax.src).toBe('/agents/minimax.svg');
   });
 });

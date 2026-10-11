@@ -140,3 +140,37 @@ class TestCodeBuddySchema:
 
     def test_defaults_without_a_store(self):
         assert resolve_params("codebuddy") == {"permission-mode": "auto"}
+
+
+class TestKimiCodeSchema:
+    """Kimi Code: free-text model alias plus Orbital's ACP permission policy."""
+
+    def test_model_is_free_text_and_argv_delivered(self):
+        assert SCHEMA["kimi-code"]["model"].allowed is None
+        assert SCHEMA["kimi-code"]["model"].flag_template == "--model {value}"
+
+    def test_permission_mode_is_the_acp_policy(self):
+        schema = SCHEMA["kimi-code"]["permission-mode"]
+        assert schema.allowed == ("auto", "ask")
+        assert schema.default == "auto"
+        assert schema.flag_template == "--orbital-permission-mode {value}"
+
+    def test_defaults_without_a_store(self):
+        assert resolve_params("kimi-code") == {"permission-mode": "auto"}
+
+
+class TestMiniMaxCodeSchema:
+    """MiniMax Code: free-text internal model id plus the ACP permission policy."""
+
+    def test_model_is_free_text_and_argv_delivered(self):
+        assert SCHEMA["minimax-code"]["model"].allowed is None
+        assert SCHEMA["minimax-code"]["model"].flag_template == "--model {value}"
+
+    def test_permission_mode_is_the_acp_policy(self):
+        schema = SCHEMA["minimax-code"]["permission-mode"]
+        assert schema.allowed == ("auto", "ask")
+        assert schema.default == "auto"
+        assert schema.flag_template == "--orbital-permission-mode {value}"
+
+    def test_defaults_without_a_store(self):
+        assert resolve_params("minimax-code") == {"permission-mode": "auto"}

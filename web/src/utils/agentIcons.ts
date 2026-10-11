@@ -41,6 +41,8 @@ const ICONS: Record<string, AgentIcon> = {
   dsh: { src: '/agents/dsh.svg', monogram: 'DS', color: '#4D6BFE' },
   gemini: { src: '/agents/gemini.svg', monogram: 'GM', color: '#4285F4' },
   grok: { src: '/agents/grok.svg', monogram: 'GK', color: '#000000' },
+  kimi: { src: '/agents/kimi.svg', monogram: 'KM', color: '#000000' },
+  minimax: { src: '/agents/minimax.svg', monogram: 'MM', color: '#E2167E' },
   pi: { src: '/agents/pi.svg', monogram: 'PI', color: '#111111' },
 };
 
