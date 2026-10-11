@@ -967,6 +967,11 @@ describe('SubAgentSettings — Codex sign-in', () => {
 
   it('links the sign-in page, not the local callback server', async () => {
     await renderSignedOutCodex();
+    // The card subscribes to login.progress in an effect; on a slow runner the
+    // first paint can land before that effect, and an event emitted then is
+    // simply dropped (CI run 38146434946). Wait for the subscription, and read
+    // the link back through waitFor like the other WS-driven assertions.
+    await waitFor(() => expect(wsHandlers.get('login.progress')?.size ?? 0).toBeGreaterThan(0));
     emit('login.progress', {
       slug: 'codex', job_id: 'job-c',
       line: 'Starting local login server on http://localhost:1455.',
@@ -976,9 +981,11 @@ describe('SubAgentSettings — Codex sign-in', () => {
       slug: 'codex', job_id: 'job-c',
       line: 'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_X.',
     });
-    expect(screen.getByTestId('sub-agent-login-url-codex')).toHaveAttribute(
-      'href',
-      'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_X',
+    await waitFor(() =>
+      expect(screen.getByTestId('sub-agent-login-url-codex')).toHaveAttribute(
+        'href',
+        'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_X',
+      ),
     );
   });
 
