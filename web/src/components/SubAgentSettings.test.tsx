@@ -307,6 +307,60 @@ describe('SubAgentSettings', () => {
     );
   });
 
+  it('shows the MiniMax Code sign-in note and internal-model-id hint', async () => {
+    // MiniMax Code's CLI has no sign-in probe, so the daemon reports the
+    // `unknown` credential state; the card must explain where to sign in
+    // and how its model ids look rather than claiming a login.
+    api.mockResolvedValueOnce([
+      makeEntry({
+        slug: 'minimax-code',
+        name: 'MiniMax Code',
+        credentials_configured: true,
+        missing_credentials: [],
+        supports_login: false,
+        credential_state: 'unknown',
+        param_schema: {
+          model: { allowed: null, default: null },
+          'permission-mode': { allowed: ['auto', 'ask'], default: 'auto' },
+        },
+        credentials: [
+          { key: 'minimax_auth', label: 'MiniMax account', type: 'oauth_cli', required: true, configured: true, has_setup_command: false },
+        ],
+      }),
+    ]);
+
+    render(<SubAgentSettings />);
+
+    await waitFor(() => expect(screen.getByText('MiniMax Code')).toBeInTheDocument());
+    expect(screen.getByText(/Verify sign-in in MiniMax Code/)).toBeInTheDocument();
+    expect(screen.getByTestId('sub-agent-host-note-minimax-code')).toHaveTextContent(/mcode login/);
+    expect(screen.getByTestId('sub-agent-model-hint-minimax-code')).toHaveTextContent(/m:minimax:MiniMax-M3:v:thinking/);
+    expect(screen.queryByRole('button', { name: /^login$/i })).toBeNull();
+  });
+
+  it('shows the Kimi Code model-alias hint and keeps the login flow', async () => {
+    api.mockResolvedValueOnce([
+      makeEntry({
+        slug: 'kimi-code',
+        name: 'Kimi Code',
+        credentials_configured: false,
+        missing_credentials: ['kimi_auth'],
+        supports_login: true,
+        param_schema: {
+          model: { allowed: null, default: null },
+          'permission-mode': { allowed: ['auto', 'ask'], default: 'auto' },
+        },
+      }),
+    ]);
+
+    render(<SubAgentSettings />);
+
+    await waitFor(() => expect(screen.getByText('Kimi Code')).toBeInTheDocument());
+    expect(screen.getByTestId('sub-agent-model-hint-kimi-code')).toHaveTextContent(/kimi-code\/k3/);
+    expect(screen.queryByTestId('sub-agent-host-note-kimi-code')).toBeNull();
+    expect(screen.getByRole('button', { name: /^login$/i })).toBeInTheDocument();
+  });
+
   it('makes Cursor auto permission policy legible without a persisted override', async () => {
     api.mockResolvedValueOnce([
       makeEntry({

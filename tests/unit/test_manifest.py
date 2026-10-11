@@ -340,3 +340,77 @@ class TestCodeBuddyManifest:
         assert m.setup.install_command == "npm install -g @tencent-ai/codebuddy-code"
         assert m.setup.check_command == "codebuddy --version"
         assert m.permissions.network_domains == []
+
+
+class TestKimiCodeManifest:
+    """Moonshot Kimi Code rides the acp-sdk transport (`kimi acp`) with the
+    CLI's own OAuth login, probed through `kimi provider list --json`."""
+
+    def _load(self):
+        from agent_os.agents.manifest import ManifestLoader
+        return ManifestLoader.load(os.path.join(_MANIFESTS_DIR, "kimi-code.yaml"))
+
+    def test_runtime_is_acp_over_stdio(self):
+        m = self._load()
+        assert m.slug == "kimi-code"
+        assert m.runtime.adapter == "cli"
+        assert m.runtime.command == "kimi"
+        assert m.runtime.transport == "acp-sdk"
+        assert m.runtime.args == ["acp"]
+        assert m.runtime.interactive is False
+
+    def test_oauth_probe_reads_the_managed_provider(self):
+        # Logged in, `kimi provider list --json` carries the OAuth-managed
+        # provider; logged out it prints {"providers": {}}. The dotted
+        # check_field walks into it (see setup_engine._json_field).
+        m = self._load()
+        (cred,) = m.setup.credentials
+        assert cred.type == "oauth_cli"
+        assert cred.required is True
+        assert cred.check_command == "kimi provider list --json"
+        assert cred.check_field == "providers.managed:kimi-code.type"
+        assert cred.check_value == "kimi"
+        assert cred.setup_command == "kimi login"
+
+    def test_install_and_detection(self):
+        m = self._load()
+        assert m.setup.install_command == "npm install -g @moonshot-ai/kimi-code"
+        assert m.setup.check_command == "kimi --version"
+        assert m.setup.dependencies[0].min_version == "22.19.0"
+        assert m.permissions.network_domains == []
+
+
+class TestMiniMaxCodeManifest:
+    """MiniMax Code rides the acp-sdk transport (`mcode acp`). Its OAuth login
+    has no status probe, so the credential deliberately carries no
+    check_command (SetupEngine reports "unknown") and no setup_command."""
+
+    def _load(self):
+        from agent_os.agents.manifest import ManifestLoader
+        return ManifestLoader.load(os.path.join(_MANIFESTS_DIR, "minimax-code.yaml"))
+
+    def test_runtime_is_acp_over_stdio(self):
+        m = self._load()
+        assert m.slug == "minimax-code"
+        assert m.runtime.adapter == "cli"
+        assert m.runtime.command == "mcode"
+        assert m.runtime.transport == "acp-sdk"
+        assert m.runtime.args == ["acp"]
+        assert m.runtime.interactive is False
+
+    def test_oauth_credential_has_no_probe_and_no_login_button(self):
+        m = self._load()
+        (cred,) = m.setup.credentials
+        assert cred.type == "oauth_cli"
+        assert cred.required is True
+        assert cred.check_command == ""
+        assert cred.setup_command == ""
+
+    def test_install_and_detection(self):
+        m = self._load()
+        assert m.setup.install_command.startswith("npm install -g @minimax-ai/code@latest")
+        assert "--allow-scripts=@minimax-ai/code,better-sqlite3" in m.setup.install_command
+        assert m.setup.check_command == "mcode --version"
+        assert m.setup.dependencies[0].min_version == "22.19.0"
+        assert "$HOME/.minimax-code/bin/mcode" in m.setup.auto_detect["macos"]
+        assert m.permissions.network_domains == []

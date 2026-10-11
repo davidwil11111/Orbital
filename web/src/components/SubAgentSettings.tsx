@@ -94,6 +94,21 @@ const CREDENTIAL_STATE_KEY: Record<CredentialState, StringKey> = {
   unknown: 'subAgentCard.credState.unknown',
 };
 
+/** Per-agent note under the card header, for agents whose runtime differs
+ *  from the sandboxed default in a way the user has to know about. */
+const HOST_NOTE_KEY: Record<string, StringKey> = {
+  pi: 'subAgentCard.pi.hostNote',
+  'minimax-code': 'subAgentCard.minimaxCode.signInNote',
+};
+
+/** Per-agent hint under the free-text model field, for CLIs whose model ids
+ *  are not guessable from the vendor's model names. */
+const MODEL_HINT_KEY: Record<string, StringKey> = {
+  pi: 'subAgentCard.pi.modelHint',
+  'kimi-code': 'subAgentCard.kimiCode.modelHint',
+  'minimax-code': 'subAgentCard.minimaxCode.modelHint',
+};
+
 // Map daemon param names (kebab-case) to camelCase request body fields.
 const PARAM_REQUEST_KEY: Record<string, string> = {
   'model': 'model',
@@ -593,12 +608,12 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
         </div>
       </div>
 
-      {entry.slug === 'pi' && (
+      {HOST_NOTE_KEY[entry.slug] && (
         <p
           data-testid={`sub-agent-host-note-${entry.slug}`}
           className="text-xs text-secondary mt-2"
         >
-          {t('subAgentCard.pi.hostNote')}
+          {t(HOST_NOTE_KEY[entry.slug])}
         </p>
       )}
 
@@ -841,9 +856,9 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
                     {t('subAgentCard.permission.cursorHint')}
                   </p>
                 )}
-                {entry.slug === 'pi' && paramKey === 'model' && (
-                  <p className="text-xs text-secondary">
-                    {t('subAgentCard.pi.modelHint')}
+                {MODEL_HINT_KEY[entry.slug] && paramKey === 'model' && (
+                  <p className="text-xs text-secondary" data-testid={`sub-agent-model-hint-${entry.slug}`}>
+                    {t(MODEL_HINT_KEY[entry.slug])}
                   </p>
                 )}
               </div>

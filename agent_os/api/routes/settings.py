@@ -887,7 +887,7 @@ def _resolve_setup_command(slug: str, action: str) -> str | None:
         # reasonable default for known CLIs that ship a logout subcommand.
         if not binary:
             return None
-        if manifest.runtime.command in ("claude", "codex", "agent", "cursor-agent"):
+        if manifest.runtime.command in ("claude", "codex", "agent", "cursor-agent", "mcode"):
             subcommand = (
                 "auth logout"
                 if manifest.runtime.command == "claude"

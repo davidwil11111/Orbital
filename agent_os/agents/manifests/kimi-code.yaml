@@ -1,0 +1,106 @@
+# -----------------------------------------------------------------------
+# Moonshot Kimi Code CLI — Research Notes (probed 2026-10-11, v2.1.1)
+# -----------------------------------------------------------------------
+# CLI command: kimi   (npm @moonshot-ai/kimi-code — NOT the PyPI `kimi-cli`
+#   1.x, a retired product with a different headless interface, nor the npm
+#   `kimi-code` package, which is unrelated)
+# Install: npm install -g @moonshot-ai/kimi-code   (Node >= 22.19)
+# ACP: `kimi acp` speaks Agent Client Protocol over stdio. Orbital's
+#   ACPSDKTransport drives it unchanged: protocol v1, loadSession=true plus
+#   sessionCapabilities.resume (the transport's resume path was verified:
+#   a second spawn with the recorded session id reports "resumed"), prompt
+#   image input, http/sse MCP. Session config options advertised: model
+#   (the config.toml aliases, e.g. kimi-code/k3), thinking (low/high/max)
+#   and mode (default/plan/auto/yolo).
+# Model flag: `kimi --model <alias> acp` — a global option that must precede
+#   the subcommand; the ACP transport lifts Orbital's `--model` out of argv
+#   and places it there, then also applies it as the session's model option.
+# Auth: `kimi login` (device-code OAuth; writes the managed:kimi-code
+#   provider into ~/.kimi-code/config.toml, shared with the Kimi Code desktop
+#   app, so a desktop sign-in already counts). Defaults to the mainland-cn
+#   region (kimi.com); `--region global` targets kimi.ai. Logged out, ACP
+#   session/new fails with "Authentication required" so a spawn fails fast.
+#   A signed-in account whose plan lacks Kimi Code access gets a 403 on the
+#   first prompt ("Your current subscription does not have access to Kimi
+#   Code") — that is a plan problem, not an Orbital one.
+# Auth probe: `kimi provider list --json` lists the OAuth-managed provider
+#   under providers."managed:kimi-code" with type "kimi" once logged in and
+#   `{"providers": {}}` before; there is no dedicated status subcommand.
+# Headless fallback: `kimi -p --output-format stream-json` (JSONL assistant/
+#   tool/meta messages, `-S <id>` resume) — not used, ACP is the maintained path.
+# -----------------------------------------------------------------------
+
+manifest_version: "1"
+name: "Kimi Code"
+slug: "kimi-code"
+description: "Moonshot's Kimi Code coding agent, driven over ACP"
+author: "moonshot"
+version: "1.0.0"
+
+runtime:
+  adapter: cli
+  command: "kimi"
+  transport: acp-sdk
+  mode: pipe
+  interactive: false
+  args: ["acp"]
+
+setup:
+  dependencies:
+    - name: "Node.js"
+      check_command: "node --version"
+      min_version: "22.19.0"
+      install:
+        windows: "winget install OpenJS.NodeJS"
+        macos: "brew install node"
+  install_command: "npm install -g @moonshot-ai/kimi-code"
+  check_command: "kimi --version"
+  credentials:
+    - key: "kimi_auth"
+      label: "Kimi account (Log in targets kimi.com; outside mainland China run `kimi login --region global` once)"
+      type: oauth_cli
+      required: true
+      check_command: "kimi provider list --json"
+      check_field: "providers.managed:kimi-code.type"
+      check_value: "kimi"
+      setup_command: "kimi login"
+      setup_label: "Log in to Kimi"
+  auto_detect:
+    windows:
+      - "%APPDATA%\\npm\\kimi.cmd"
+      - "%PROGRAMFILES%\\nodejs\\kimi.cmd"
+    macos:
+      - "/opt/homebrew/bin/kimi"
+      - "/usr/local/bin/kimi"
+      - "$HOME/.npm-global/bin/kimi"
+      - "$HOME/.npm/bin/kimi"
+      - "$HOME/.kimi-code/bin/kimi"
+    linux:
+      - "/usr/local/bin/kimi"
+      - "$HOME/.npm-global/bin/kimi"
+      - "$HOME/.npm/bin/kimi"
+      - "$HOME/.local/bin/kimi"
+      - "$HOME/.kimi-code/bin/kimi"
+
+capabilities:
+  skills:
+    - code_generation
+    - code_review
+    - debugging
+    - testing
+    - refactoring
+    - documentation
+  input_types: [text, files]
+  output_types: [text, files]
+  file_extensions: [.py, .js, .ts, .jsx, .tsx, .rs, .go, .java, .rb, .c, .cpp, .h]
+  routing_hint: "Use for coding tasks on Moonshot's Kimi models (K2.x / K3) via Kimi Code"
+  needs_shell: true
+  needs_network: true
+
+permissions:
+  # network_domains deliberately omitted: transport-backed sub-agents spawn
+  # outside the project sandbox/proxy, so an entry here would be a claim
+  # Orbital cannot enforce (see the dsh manifest for the full note).
+  shell: true
+  workspace_access: read_write
+  autonomy_recommended: hands_off
