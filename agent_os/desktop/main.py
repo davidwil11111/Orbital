@@ -100,6 +100,25 @@ def _local_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def flush_telemetry_before_exit(port: int, timeout: float = 3.0) -> bool:
+    """Ask the in-process daemon to send today's telemetry ping now (spec 111
+    A2). Both desktop exit paths end in ``os._exit(0)``, which skips the
+    daemon's shutdown hook, so the flush has to happen here, over loopback,
+    before the process is torn down. Bounded and silent: a dead daemon or a
+    slow network must never delay or block quitting."""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/v2/settings/telemetry/flush",
+            data=b"", method="POST",
+        )
+        resp = _local_opener().open(req, timeout=timeout)
+        return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
 def is_already_running(port: int = 8000) -> bool:
     try:
         resp = _local_opener().open(f"http://127.0.0.1:{port}/api/v2/settings", timeout=2)
@@ -1401,6 +1420,7 @@ def main():
     provision_browsers_background()
 
     def shutdown():
+        flush_telemetry_before_exit(port)
         os._exit(0)
 
     # On macOS, pystray's Cocoa backend must run on the main thread, but
@@ -1423,6 +1443,7 @@ def main():
     if sys.platform == "darwin":
         # macOS: no system tray, so window close = app close.
         # This is standard macOS behavior for non-document-based apps.
+        flush_telemetry_before_exit(port)
         os._exit(0)
     else:
         # Windows/Linux: system tray keeps app alive after window close.

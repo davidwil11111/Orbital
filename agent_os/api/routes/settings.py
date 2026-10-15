@@ -511,6 +511,19 @@ async def get_telemetry_payload():
     }
 
 
+@router.post("/settings/telemetry/flush")
+async def flush_telemetry():
+    """Send today's ping (and any rebuilt past days) now, bounded (spec 111
+    A2). The desktop app calls this on its way out, before ``os._exit``, so a
+    short session is counted instead of waiting for a next launch that may be
+    days away. Same guards as the periodic sender: the dev daemon, CI and
+    temp data dirs report ``skipped``. Never raises; never blocks past 3 s."""
+    sender = telemetry.get_sender()
+    if sender is None:
+        return {"status": "skipped"}
+    return {"status": await sender.flush_now(timeout=3.0)}
+
+
 @router.get("/settings/api-key/status")
 async def get_api_key_status():
     """Whether the DEFAULT card carries a key (§3.8 shim)."""

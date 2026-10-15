@@ -52,6 +52,28 @@ class Spool:
                 if isinstance(row, dict) and str(row.get("ts", "")).startswith(day):
                     yield row
 
+    def days(self) -> list[str]:
+        """Sorted distinct UTC days (YYYY-MM-DD) that still have events in
+        the spool, across both rotations. Corrupt lines are skipped. This is
+        the rebuild window for past-day pings (spec 111 A1): a day older than
+        the retained rotation is simply absent here."""
+        found: set[str] = set()
+        for path in (self._path.with_name(self._path.name + ".1"), self._path):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict):
+                    ts = str(row.get("ts", ""))
+                    if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+                        found.add(ts[:10])
+        return sorted(found)
+
     def _rotate_if_needed(self) -> None:
         try:
             if self._path.stat().st_size >= self._max_bytes:

@@ -104,10 +104,21 @@ Both guards suppress **transmission only**: the local spool, the daily
 snapshot, and the Settings → Data & privacy viewer keep working, and each
 guard logs once at startup when it fires.
 
+Maintainers trying an installer on a VM or a spare machine should set
+`AGENT_OS_TELEMETRY_DISABLED=1` first: a fresh install mints a fresh
+`install_id`, and each such try-out otherwise shows up as a real install that
+never came back.
+
 ## Transport & retention
 
-- Sent to Orbital's ingest endpoint over HTTPS on daemon startup and every six
-  hours while running. Offline days queue locally and send late; resends are
-  idempotent (the server upserts on `install_id` + `date`).
+- Sent to Orbital's ingest endpoint over HTTPS on daemon startup, every hour
+  while running, and once more when the app quits (bounded to three seconds, so
+  quitting is never held up). Offline days queue locally and send late; resends
+  are idempotent (the server upserts on `install_id` + `date`).
+- Past days are re-aggregated from the local event spool at the next send and
+  re-sent until the server acknowledges them (`telemetry/acks.json`), so a
+  session closed between two sends, or one that crossed UTC midnight, still
+  lands in its day's counters. The spool keeps roughly the last 5–10 MB of
+  events; a day older than that is sent as whatever snapshot it last had.
 - Server-side, raw daily rows are kept for 13 months, then rolled into
   monthly aggregates.

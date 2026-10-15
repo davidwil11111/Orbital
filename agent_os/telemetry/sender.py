@@ -3,14 +3,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Ping sender: pending queue + fire-and-forget POST (spec 046 §5).
 
-Cycle (on startup + every 6h — never on shutdown, the desktop app exits via
-os._exit and shutdown hooks provably never fire there):
+Cycle (on startup, hourly while running, and once more on the way out —
+``flush_now`` is called by the daemon's shutdown hook and, because the desktop
+app exits via ``os._exit`` where that hook never fires, by the desktop exit
+paths over loopback HTTP first; spec 111 A2):
 
-  1. Build today's ping and (re)write it to ``pending/{date}.json`` — the
+  1. Rebuild every PAST day the spool still covers and that the server has not
+     acknowledged (``acks.json``), rewriting ``pending/{date}.json`` from the
+     spool (spec 111 A1). Before this step a past day's file was frozen at the
+     last cycle that ran on that day, so anything spooled after it — a
+     20-minute session closed before the next tick, everything after the last
+     tick before UTC midnight — was never counted.
+  2. Build today's ping and (re)write it to ``pending/{date}.json`` — the
      durable snapshot survives spool rotation and process death.
-  2. POST every file in ``pending/``. On 2xx, delete files for PAST days;
-     today's file stays and is rewritten next cycle (the server upserts on
-     ``(install_id, date)`` latest-wins, so resends are idempotent).
+  3. POST every file in ``pending/``. On 2xx, record the ack and delete the
+     file for PAST days; today's file stays and is rewritten next cycle (the
+     server upserts on ``(install_id, date)`` latest-wins, so resends are
+     idempotent — which is also what lets a rebuilt day overwrite the stale
+     row it sent earlier).
 
 Sends are never-raise: failure leaves the pending files for the next cycle and
 must never affect the product. The toggle is checked per cycle, so PUT
@@ -31,7 +41,7 @@ import logging
 import os
 import platform
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -47,7 +57,14 @@ DEFAULT_ENDPOINT = "https://orbital-telemetry-production.up.railway.app/ingest"
 # Abuse-limiting app token, not a secret (spec §9): the client is open source.
 APP_TOKEN = "orbital-telemetry-v1"
 
-SEND_INTERVAL_SECONDS = 6 * 60 * 60  # Q4: startup + every 6h
+# Spec 111 A2: was 6h. The exit flush covers a clean quit; the hourly tick
+# bounds what a crash, a kill, or a lost network can take with it. Cost is at
+# most 24 idempotent upserts a day.
+SEND_INTERVAL_SECONDS = 60 * 60
+
+# Acks older than this are pruned; a day that old is far outside any spool
+# rotation window, so nothing could rebuild and resend it anyway.
+ACK_RETENTION_DAYS = 90
 
 # Opt-out switch for any process that is not a user's Orbital (spec 063 §7).
 # Set in tests/conftest.py, .github/workflows/ci.yml and restart-daemon.sh.
@@ -115,8 +132,13 @@ class TelemetrySender:
         self._is_enabled = is_enabled
         self._endpoint = endpoint
         self._post = post or _httpx_post
+        self._acks_path = self._data_dir / "telemetry" / "acks.json"
         self._task: asyncio.Task | None = None
         self._suppression_logged = False
+        # One cycle at a time: the exit flush can land while the hourly tick is
+        # mid-send. Overlap would only duplicate idempotent POSTs, but the
+        # rebuild + snapshot writes should not interleave either.
+        self._cycle_lock = asyncio.Lock()
 
     # -- public ---------------------------------------------------------------
 
@@ -129,14 +151,35 @@ class TelemetrySender:
         return self._build_today()
 
     async def run_cycle(self) -> None:
-        """One snapshot+flush pass. Never raises."""
+        """One rebuild+snapshot+flush pass. Never raises."""
         try:
             if not self._is_enabled():
                 return
-            self._snapshot_today()
-            await self._flush_pending()
+            async with self._cycle_lock:
+                self._rebuild_past_days()
+                self._snapshot_today()
+                await self._flush_pending()
         except Exception:
             logger.debug("telemetry cycle failed", exc_info=True)
+
+    async def flush_now(self, timeout: float = 3.0) -> str:
+        """Bounded send-what-you-have for the exit paths (spec 111 A2).
+
+        Returns ``"sent"``, ``"skipped"`` (guarded like ``start()``, or the
+        toggle is off), ``"timeout"`` or ``"failed"``. Never raises, never
+        blocks longer than ``timeout`` — the app is on its way out and a slow
+        network must not hold the window open.
+        """
+        try:
+            if self._suppression_reason() is not None or not self._is_enabled():
+                return "skipped"
+            await asyncio.wait_for(self.run_cycle(), timeout=timeout)
+            return "sent"
+        except asyncio.TimeoutError:
+            return "timeout"
+        except Exception:
+            logger.debug("telemetry exit flush failed", exc_info=True)
+            return "failed"
 
     def start(self) -> None:
         """Startup send + 6h periodic loop as a background task.
@@ -194,8 +237,16 @@ class TelemetrySender:
             os_name=platform.system().lower(),
         )
 
-    def _snapshot_today(self) -> None:
-        ping = self._build_today()
+    def _build_day(self, day: str) -> dict:
+        return build_ping(
+            self._identity,
+            self._spool,
+            day,
+            version=get_version(),
+            os_name=platform.system().lower(),
+        )
+
+    def _write_pending(self, ping: dict) -> None:
         try:
             self._pending_dir.mkdir(parents=True, exist_ok=True)
             path = self._pending_dir / f"{ping['date']}.json"
@@ -205,13 +256,36 @@ class TelemetrySender:
         except Exception:
             pass
 
+    def _snapshot_today(self) -> None:
+        self._write_pending(self._build_today())
+
+    def _rebuild_past_days(self) -> None:
+        """Re-aggregate every unacknowledged past day the spool still holds
+        (spec 111 A1). Days the spool has rotated out keep whatever pending
+        file they have — that file is the best record left and goes out as
+        is. Today is left to ``_snapshot_today``."""
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            acks = self._read_acks()
+            for day in self._spool.days():
+                if day >= today or day in acks:
+                    continue
+                self._write_pending(self._build_day(day))
+        except Exception:
+            logger.debug("telemetry past-day rebuild failed", exc_info=True)
+
     async def _flush_pending(self) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
         headers = {"X-Orbital-Telemetry-Token": APP_TOKEN}
+        acks = self._read_acks()
         for path in sorted(self._pending_dir.glob("*.json")):
             payload = self._read_json(path)
             if payload is None:
                 path.unlink(missing_ok=True)  # corrupt snapshot: drop
+                continue
+            day = str(payload.get("date", today))
+            if day < today and day in acks:
+                path.unlink(missing_ok=True)  # acked earlier; delete failed then
                 continue
             try:
                 status = await self._post(self._endpoint, payload, headers)
@@ -219,10 +293,33 @@ class TelemetrySender:
                 return  # offline: leave everything for the next cycle
             if 200 <= status < 300:
                 self._record_last_sent(payload)
-                if payload.get("date", today) < today:
+                if day < today:
+                    self._record_ack(day)
                     path.unlink(missing_ok=True)
             else:
                 return  # server unhappy: retry next cycle, never loop hot
+
+    # Acks: ``{date: received_at}``. A missing or corrupt file reads as empty,
+    # which degrades to "resend everything in the spool window" — safe because
+    # the server upserts latest-wins.
+    def _read_acks(self) -> dict[str, str]:
+        data = self._read_json(self._acks_path)
+        if not data:
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(k, str)}
+
+    def _record_ack(self, day: str) -> None:
+        try:
+            acks = self._read_acks()
+            acks[day] = datetime.now(timezone.utc).isoformat()
+            floor = (datetime.now(timezone.utc) - timedelta(days=ACK_RETENTION_DAYS)).date().isoformat()
+            acks = {d: t for d, t in acks.items() if d >= floor}
+            self._acks_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._acks_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(acks, indent=2, sort_keys=True), encoding="utf-8")
+            tmp.replace(self._acks_path)
+        except Exception:
+            pass
 
     def _record_last_sent(self, payload: dict) -> None:
         try:

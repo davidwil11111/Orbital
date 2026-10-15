@@ -492,6 +492,10 @@ def create_app(data_dir: str | None = None) -> FastAPI:
 
         sender = telemetry.get_sender()
         if sender is not None:
+            # Spec 111 A2: one bounded send on the way out. The desktop app
+            # exits via os._exit and never reaches this hook (it flushes over
+            # HTTP first); CLI and service deployments do reach it.
+            await sender.flush_now(timeout=3.0)
             sender.stop()
 
     # 6e. Update check (notify-only): startup + 6h against the telemetry

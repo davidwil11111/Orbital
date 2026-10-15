@@ -275,3 +275,192 @@ class TestSender:
             "schema", "install_id", "account_id", "version", "os",
             "date", "first_seen", "milestones", "counters",
         }
+
+
+# ---------------------------------------------------------------------------
+# Spec 111 — counters were a stale snapshot for every past day.
+#
+# The cycle only ever built TODAY's ping. A past day's pending file froze at
+# the last cycle that ran on that day, and events spooled after it (a 20-minute
+# session closed before the next 6h tick; everything after 23:00 UTC) were
+# never aggregated again. The fix rebuilds every unacknowledged day the spool
+# still covers before flushing; acknowledgements persist in ``acks.json``.
+# ---------------------------------------------------------------------------
+
+DAY1 = "2026-10-01"
+DAY2 = "2026-10-02"
+
+
+def _rows(day: str, event: str, n: int, **fields) -> list[dict]:
+    return [{"event": event, "ts": f"{day}T12:00:00+00:00", **fields} for _ in range(n)]
+
+
+def _pending_dir(tmp_path: Path) -> Path:
+    p = tmp_path / "telemetry" / "pending"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _sent_for(post: FakePost, day: str) -> list[dict]:
+    return [payload for _, payload, _ in post.calls if payload.get("date") == day]
+
+
+class TestPastDayRebuild:
+    async def test_stale_past_snapshot_is_rebuilt_from_spool(self, tmp_path):
+        """day1 has 10 turns in the spool but its pending file says turns=0
+        (the snapshot taken at 09:00 before any work happened). The next
+        cycle must send turns=10, not the frozen file."""
+        post = FakePost()
+        spool = seed_spool(tmp_path, _rows(DAY1, "turn_completed", 10, provider="deepseek"))
+        sender = TelemetrySender(
+            tmp_path, InstallIdentity(tmp_path), spool,
+            is_enabled=lambda: True, endpoint="https://example.invalid/ingest", post=post,
+        )
+        stale = build_ping(InstallIdentity(tmp_path), Spool(tmp_path / "empty"), DAY1,
+                           version="0.16.0", os_name="darwin")
+        assert stale["counters"]["turns"] == 0
+        (_pending_dir(tmp_path) / f"{DAY1}.json").write_text(json.dumps(stale))
+
+        await sender.run_cycle()
+
+        sent = _sent_for(post, DAY1)
+        assert len(sent) == 1
+        assert sent[0]["counters"]["turns"] == 10
+
+    async def test_day_with_events_but_no_pending_file_is_generated(self, tmp_path):
+        """Start at 23:00 UTC (cycle writes day1), work until 01:00, quit:
+        day2 never got a file. The next start must produce and send it."""
+        post = FakePost()
+        spool = seed_spool(tmp_path, _rows(DAY2, "session_created", 3))
+        sender = make_sender(tmp_path, post)
+        sender._spool = spool
+
+        await sender.run_cycle()
+
+        sent = _sent_for(post, DAY2)
+        assert len(sent) == 1
+        assert sent[0]["counters"]["sessions"] == 3
+
+    async def test_acked_day_is_not_resent(self, tmp_path):
+        post = FakePost()
+        spool = seed_spool(tmp_path, _rows(DAY1, "turn_completed", 2))
+        sender = make_sender(tmp_path, post)
+        sender._spool = spool
+
+        await sender.run_cycle()
+        assert len(_sent_for(post, DAY1)) == 1
+        acks = json.loads((tmp_path / "telemetry" / "acks.json").read_text())
+        assert DAY1 in acks
+
+        await sender.run_cycle()
+        assert len(_sent_for(post, DAY1)) == 1  # still one — not resent
+        # And the past day's file is gone; only today's snapshot remains.
+        names = sorted(p.name for p in (tmp_path / "telemetry" / "pending").glob("*.json"))
+        assert f"{DAY1}.json" not in names and len(names) == 1
+
+    async def test_corrupt_ack_file_degrades_to_resend_all(self, tmp_path):
+        """Resends are idempotent (server upserts latest-wins), so a broken
+        ack record must mean "send everything again", never "send nothing"."""
+        post = FakePost()
+        spool = seed_spool(tmp_path, _rows(DAY1, "turn_completed", 2))
+        sender = make_sender(tmp_path, post)
+        sender._spool = spool
+        (tmp_path / "telemetry" / "acks.json").write_text("{not json")
+
+        await sender.run_cycle()
+
+        assert len(_sent_for(post, DAY1)) == 1
+        acks = json.loads((tmp_path / "telemetry" / "acks.json").read_text())
+        assert DAY1 in acks
+
+    async def test_failed_send_does_not_ack(self, tmp_path):
+        post = FakePost(status=500)
+        spool = seed_spool(tmp_path, _rows(DAY1, "turn_completed", 2))
+        sender = make_sender(tmp_path, post)
+        sender._spool = spool
+
+        await sender.run_cycle()
+
+        assert not (tmp_path / "telemetry" / "acks.json").exists()
+        assert (tmp_path / "telemetry" / "pending" / f"{DAY1}.json").exists()
+
+    async def test_day_outside_spool_window_is_sent_as_is(self, tmp_path):
+        """Spool rotation (5 MB + one predecessor) can drop a day's events
+        while its pending file survives. That file is the best record left:
+        send it verbatim, then ack it. No error, no rebuild to zeros."""
+        post = FakePost()
+        sender = make_sender(tmp_path, post)  # empty spool
+        old = {"schema": 1, "date": "2026-09-01", "install_id": "inst_x",
+               "counters": {"turns": 7}}
+        (_pending_dir(tmp_path) / "2026-09-01.json").write_text(json.dumps(old))
+
+        await sender.run_cycle()
+
+        sent = _sent_for(post, "2026-09-01")
+        assert sent == [old]
+        acks = json.loads((tmp_path / "telemetry" / "acks.json").read_text())
+        assert "2026-09-01" in acks
+        assert not (tmp_path / "telemetry" / "pending" / "2026-09-01.json").exists()
+
+    async def test_today_is_never_acked(self, tmp_path):
+        """Today keeps being rewritten and resent until the day is over."""
+        post = FakePost()
+        sender = make_sender(tmp_path, post)
+        await sender.run_cycle()
+        today = post.calls[0][1]["date"]
+        acks_path = tmp_path / "telemetry" / "acks.json"
+        acks = json.loads(acks_path.read_text()) if acks_path.exists() else {}
+        assert today not in acks
+
+    async def test_rebuild_covers_every_unacked_spool_day(self, tmp_path):
+        """Three days of spool, nothing acked: all three go out in one cycle,
+        each aggregated from its own day's rows."""
+        post = FakePost()
+        rows = (_rows(DAY1, "turn_completed", 1) + _rows(DAY2, "turn_completed", 2)
+                + _rows("2026-10-03", "turn_completed", 3))
+        spool = seed_spool(tmp_path, rows)
+        sender = make_sender(tmp_path, post)
+        sender._spool = spool
+
+        await sender.run_cycle()
+
+        got = {d: _sent_for(post, d)[0]["counters"]["turns"]
+               for d in (DAY1, DAY2, "2026-10-03")}
+        assert got == {DAY1: 1, DAY2: 2, "2026-10-03": 3}
+
+
+class TestFlushNow:
+    """A2: the exit path needs a bounded, never-raising "send what you have"."""
+
+    async def test_flush_now_runs_a_cycle_when_allowed(self, tmp_path, monkeypatch):
+        post = FakePost()
+        sender = make_sender(tmp_path, post)
+        monkeypatch.setattr(sender, "_suppression_reason", lambda: None)
+        assert await sender.flush_now(timeout=3.0) == "sent"
+        assert len(post.calls) == 1
+
+    async def test_flush_now_is_suppressed_like_start(self, tmp_path, monkeypatch):
+        """The dev daemon / CI / a temp data dir must not transmit on exit
+        either — the same guard ``start()`` applies."""
+        post = FakePost()
+        sender = make_sender(tmp_path, post)  # tmp_path → structural guard
+        assert await sender.flush_now(timeout=3.0) == "skipped"
+        assert post.calls == []
+
+    async def test_flush_now_times_out_quietly(self, tmp_path, monkeypatch):
+        import asyncio
+
+        async def hang(url, payload, headers):
+            await asyncio.sleep(10)
+            return 200
+
+        sender = make_sender(tmp_path, hang)
+        monkeypatch.setattr(sender, "_suppression_reason", lambda: None)
+        assert await sender.flush_now(timeout=0.05) == "timeout"
+
+    async def test_flush_now_toggle_off_is_skipped(self, tmp_path, monkeypatch):
+        post = FakePost()
+        sender = make_sender(tmp_path, post, enabled=False)
+        monkeypatch.setattr(sender, "_suppression_reason", lambda: None)
+        assert await sender.flush_now(timeout=3.0) == "skipped"
+        assert post.calls == []
