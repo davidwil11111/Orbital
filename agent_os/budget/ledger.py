@@ -225,6 +225,10 @@ def append_event(project_dir: str, event: LedgerEvent) -> None:
             },
         )
         telemetry.latch("first_turn")
+        # A turn happens inside a session, so the session milestone cannot
+        # lag the turn milestone (spec 111 A3 backstop for any mint path that
+        # does not cross ``_mint_session_uuid``).
+        telemetry.latch("first_session")
     except Exception:  # noqa: BLE001
         pass
     # Spend-notification chokepoint (see the hook block above): the UI refresh

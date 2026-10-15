@@ -420,6 +420,19 @@ class AgentManager:
         project = self._project_store.get_project(project_id) if self._project_store else None
         project_name = (project or {}).get("name", "")
         sanitized = _sanitize_project_name(project_name)
+        # Telemetry sessions counter + ``first_session`` milestone (spec 063
+        # §3, moved here by spec 111 A3). This primitive is the one place every
+        # session identity is born: ``new_session`` (the button, the cold-start
+        # scan, the workbench spawn, the queue dispatcher), the lazy chat funnel
+        # (``_ensure_chat_session`` — the chat-first user who never clicks
+        # "+ new session") and ``_start_loop``'s own neither-session-nor-id
+        # branch. The emit used to sit in ``new_session`` only, so the two
+        # other mints reached ``first_turn`` with ``first_session`` still
+        # False (13 installs in the 2026-10-13 audit). Counters only — no ids.
+        from agent_os import telemetry
+
+        telemetry.emit("session_created")
+        telemetry.latch("first_session")
         return f"{sanitized}_{uuid4().hex[:8]}"
 
     def _broadcast(self, project_id: str, payload: dict,
@@ -3514,16 +3527,9 @@ class AgentManager:
             "new_session(%s): minted uuid %s (uuid-only; F1 retired)",
             project_id, new_session_uuid,
         )
-        # Telemetry sessions counter (spec 063 §3): this mint point is the
-        # chokepoint all four callers cross — the "+ new session" button, the
-        # cold-start scan, the workbench seeded spawn and the queue dispatcher
-        # (one fresh session per item). It used to live in the route, so three
-        # of the four were uncounted and `counters.sessions` measured a button.
-        # Same discipline `turn_completed` gets from riding ledger.append_event.
-        from agent_os import telemetry
-
-        telemetry.emit("session_created")
-        telemetry.latch("first_session")
+        # Telemetry's ``session_created`` + ``first_session`` ride the uuid
+        # mint primitive (``_mint_session_uuid``), not this method — see the
+        # note there (spec 063 §3 → spec 111 A3).
         return {
             "status": "ok",
             "session_id": new_session_uuid,
