@@ -4,9 +4,9 @@
 
 
 
-<p align="center"><strong>任务进行到一半，Claude Code余额用完了。Codex在同一个对话里接着做——完全无需重新解释。</strong></p>
+<p align="center"><strong>任务进行到一半，Claude Code余额用完了，Codex在同一个对话直接接手。</strong></p>
 
-<p align="center"><img src="docs/screenshots/handoff-codex-continue.gif" alt="同一个对话里 Claude Code 额度用完了，用户 @codex 说「你继续吧」，Codex 读取同一份项目上下文接着做" width="100%"></p>
+<p align="center"><img src="docs/screenshots/hero-agent-switch-zh.gif" alt="同一个 Orbital 对话里，Claude Code 提示额度用完（You're out of usage credits）；用户在 agent 选择器里切到 Codex，说「你继续吧」，Codex 读取同一份项目上下文直接接手" width="100%"></p>
 
 <p align="center">
   <img src="docs/screenshots/orbital-logo.png" alt="Orbital" width="80">
@@ -16,18 +16,18 @@
 <p align="center"><strong>project agent（项目 agent）</strong></p>
 <h3 align="center">Agent只负责一次会话，Orbital负责整个项目。</h3>
 
-<p align="center">Orbital 把项目的上下文（状态、决策、经验教训、产出）以普通文件的形式维护在你的本地文件夹里。Claude Code、Codex、Cursor、Gemini CLI 轮流接手同一个项目，不用你再讲一遍。它自己也能直接干活。</p>
+<p align="center">Orbital是一个agent上下文管家，帮助你维护项目上下文，让所有agent在同一份上下文上工作。任何agent的产出和沉淀，都会给所有agent复用。</p>
 
-<p align="center"><strong>上下文资产是你的，智能是可替换的。</strong></p>
+<p align="center"><strong>上下文是你的，agent是可替换的。</strong></p>
 
 <p align="center">
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-Setup.exe"><img src="https://img.shields.io/badge/Windows-%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85_.exe-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgNC42bDcuNi0xLjA1djcuMzVIM3ptOC41LTEuMkwyMSAyLjF2OC44aC05LjV6TTMgMTIuMWg3LjZ2Ny4zNUwzIDE4LjR6bTguNSAwSDIxdjguOGwtOS41LTEuM3oiLz48L3N2Zz4=" alt="下载 Windows 安装包 (.exe)"></a>
   &nbsp;&nbsp;
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-macOS.dmg"><img src="https://img.shields.io/badge/macOS-%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85_.dmg-000000?style=for-the-badge&logo=apple&logoColor=white" alt="下载 macOS 安装包 (.dmg)"></a>
 </p>
-<p align="center">5 分钟就能装好。需要自备 API key。第一次用？看 <a href="https://orbital.top/guide/">Orbital 使用教程</a>。</p>
+<p align="center"> <a href="https://orbital.top/guide/">Orbital 使用教程</a>。</p>
 
-<p align="center"><em>1 分钟演示：执行 agent 换了三次，项目没停</em></p>
+<p align="center"><em>1 分钟演示：切换agent，项目继续进行</em></p>
 
 https://github.com/user-attachments/assets/88cf118c-1dd9-4429-897d-f2003de3049d
 
@@ -53,9 +53,9 @@ https://github.com/user-attachments/assets/88cf118c-1dd9-4429-897d-f2003de3049d
 
 Orbital 把上下文从会话里拿出来，放回你的本地文件夹，把工作的单位从「会话」换成「项目」。
 
-project agent 跨任务、跨会话、跨执行 agent 持续对项目负责：维护共享的上下文，判断下一步该做什么，需要时把活派出去，并把每一次的结果记录回项目。
+project agent记录下项目中所有agent的进度，保证下一个agent有充分的上下文接手任务。任何agent的产物和沉淀，都会被所有agent参考和复用。不需要重新发明轮子，所有agent在同一个项目上自进化。
 
-单个 agent 完成任务。Orbital 让项目往前走。
+单个 agent 完成任务。Orbital 推动整体项目进展。
 
 ---
 
@@ -85,19 +85,19 @@ Agent可以换。你的上下文资产一直在。
    **Step 1 — LLM Provider:** 中国大陆用户点「一键登录词元跳动」，授权后免费领取 Token，直接开始。也可以从预设卡片里选择服务商，点「获取 API 密钥」直达密钥控制台，粘贴即可——支持 DeepSeek、Moonshot (Kimi)、智谱、MiniMax、Anthropic、OpenAI 等十余家服务商。
 
    <p align="center">
-     <img src="docs/screenshots/zh/apikey-setup.png" alt="设置向导第一步——从预设卡片选择 LLM provider 并配置 API key" width="700">
+     <img src="docs/screenshots/zh/apikey-setup.png" alt="设置向导第一步——从预设卡片选择 LLM provider 并配置 API key" width="480">
    </p>
 
    **Step 2 — 关联账户：** 连接 API 连接器（Google Calendar、Drive），并提前登录 agent 需要访问的站点（Google、GitHub 等），防止它在浏览时被验证码挡住。这一步可跳过，之后随时可在设置中完成。
 
    <p align="center">
-     <img src="docs/screenshots/zh/connect-accounts.png" alt="设置向导第二步——关联账户：API 连接器与 Agent 浏览器登录" width="700">
+     <img src="docs/screenshots/zh/connect-accounts.png" alt="设置向导第二步——关联账户：API 连接器与 Agent 浏览器登录" width="480">
    </p>
 
 2. **创建项目** —— 起个名字，选择本地的一个文件夹，设定 autonomy 等级
 
    <p align="center">
-     <img src="docs/screenshots/zh/new-project-setting.png" alt="新建项目对话框：填写项目名称，选择一个新文件夹或已有文件夹，agent 就在里面工作" width="700">
+     <img src="docs/screenshots/zh/new-project-setting.png" alt="新建项目对话框：填写项目名称，选择一个新文件夹或已有文件夹，agent 就在里面工作" width="480">
    </p>
 3. **开始对话** —— 在聊天框输入任务，管理 agent 自己处理
 4. **走开** —— 把后续任务排进队列；每个完成项都会成为下一项的上下文
