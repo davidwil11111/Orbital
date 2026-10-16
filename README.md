@@ -2,10 +2,10 @@
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-<p align="center"><strong>Codex hits its usage limit mid-task. Switch to Claude Code in the same conversation. Nothing re-explained.</strong></p>
+<p align="center"><strong>Codex hits its usage limit mid-task. Claude Code picks up in the same conversation.</strong></p>
 
 <p align="center"><img src="docs/screenshots/hero-agent-switch.gif" alt="In one Orbital conversation Codex stops with a usage-limit error; the user opens the agent picker, which shows Codex's limit reached and Claude Code with 91% left, switches to Claude Code, and it reads the project's context files and answers the original question" width="100%"></p>
-<p align="center"><em>Codex stops at its usage limit. One switch in the picker, and Claude Code answers the same question from the project's own context files.</em></p>
+<p align="center"><em>Codex stops at its usage limit. One switch in the picker, and Claude Code continues the answer from the project's context.</em></p>
 
 <p align="center">
   <img src="docs/screenshots/orbital-logo.png" alt="Orbital" width="80">
@@ -15,9 +15,9 @@
 <p align="center"><strong>The project agent</strong></p>
 <h3 align="center">Every agent owns a session. Orbital owns the project.</h3>
 
-<p align="center">Orbital keeps your project's context (state, decisions, lessons, output) as plain files in your local folder, so Claude Code, Codex, Cursor and Gemini CLI can take turns on the same project without you explaining it again. It can also do the work itself.</p>
+<p align="center">Orbital is the context steward for your agents. It maintains your project's context so every agent works from the same one. Whatever any agent produces or learns, Orbital keeps for all the others to reuse. Your agents evolve together on the same project.</p>
 
-<p align="center"><strong>The context is yours. The intelligence is interchangeable.</strong></p>
+<p align="center"><strong>Context is yours. Agents are interchangeable.</strong></p>
 
 <p align="center">
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-Setup.exe"><img src="https://img.shields.io/badge/Windows-Download_.exe-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgNC42bDcuNi0xLjA1djcuMzVIM3ptOC41LTEuMkwyMSAyLjF2OC44aC05LjV6TTMgMTIuMWg3LjZ2Ny4zNUwzIDE4LjR6bTguNSAwSDIxdjguOGwtOS41LTEuM3oiLz48L3N2Zz4=" alt="Download the Windows installer (.exe)"></a>
@@ -52,9 +52,9 @@ So you carry the project between them: restating goals, explaining previous deci
 
 Orbital takes the context out of the session and puts it back in your local folder, and changes the unit of work from the session to the project.
 
-A project agent stays responsible for the project across tasks, sessions, and worker agents. It maintains the shared context, decides what needs to happen next, delegates when useful, and records every outcome back into the project.
+The project agent records every agent's progress on the project, so the next agent picks up the task with the full context. Whatever one agent produces or learns is kept for every other agent to draw on and reuse. No wheel gets reinvented: all your agents evolve together on the same project.
 
-Individual agents complete tasks. Orbital keeps the project moving.
+Individual agents complete tasks. Orbital moves the whole project forward.
 
 ---
 
@@ -84,17 +84,17 @@ The worker can change. The project continues.
 
    **Step 1 — LLM Provider:** In mainland China, tap **Sign in with TokenDance**, authorize, and start on free tokens. Otherwise pick a provider from the preset cards, follow the key-console link to grab an API key, and paste it in. Supports DeepSeek, Anthropic, OpenAI, Moonshot, and a dozen other providers.
 
-   <p align="center"><img src="docs/screenshots/apikey-setup.png" alt="Setup wizard step 1: pick an LLM provider from preset cards and enter your API key" width="100%"></p>
+   <p align="center"><img src="docs/screenshots/apikey-setup.png" alt="Setup wizard step 1: pick an LLM provider from preset cards and enter your API key" width="480"></p>
 
 
    **Step 2 — Connect Your Accounts:** Link API connectors (Google Calendar, Drive) and sign in to sites your agents will need (Google, GitHub, etc.) so they can browse without getting blocked by CAPTCHAs. Everything here is optional and can be done later in Settings.
 
-   <p align="center"><img src="docs/screenshots/connect-accounts.png" alt="Setup wizard step 2: connect accounts — API connectors and agent browser sign-in" width="100%"></p>
+   <p align="center"><img src="docs/screenshots/connect-accounts.png" alt="Setup wizard step 2: connect accounts — API connectors and agent browser sign-in" width="480"></p>
 
 
 2. **Create a project** — give it a name, pick a workspace directory, set an autonomy level
 
-<p align="center"><img src="docs/screenshots/new-project-setting.png" alt="New project dialog: a project name and a folder, which can be new or an existing one the agent works inside" width="100%"></p>
+<p align="center"><img src="docs/screenshots/new-project-setting.png" alt="New project dialog: a project name and a folder, which can be new or an existing one the agent works inside" width="480"></p>
 
 3. **Chat** — type a task in the chat bar and the project agent handles it
 4. **Walk away** — queue the next tasks; each finished one becomes context the next builds on
