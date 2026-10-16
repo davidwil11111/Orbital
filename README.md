@@ -716,6 +716,20 @@ Orbital is proudly sponsored by **[Watcha (观猹)](https://watcha.cn)** — the
 
 ---
 
+## Star History
+
+<p align="center">
+<a href="https://www.star-history.com/#zqiren/Orbital&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zqiren/Orbital&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zqiren/Orbital&type=Date" />
+    <img alt="Orbital star history chart" src="https://api.star-history.com/svg?repos=zqiren/Orbital&type=Date" width="600" />
+  </picture>
+</a>
+</p>
+
+---
+
 ## Telemetry
 
 Orbital sends **one anonymous aggregate per day** — counters, enums, and
