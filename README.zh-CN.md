@@ -76,7 +76,18 @@ Agent可以换。你的上下文资产一直在。
 
 ---
 
+<p align="center">
+  <img src="docs/screenshots/wechat-qr.png" alt="微信二维码：加作者微信，拉你进 Orbital 用户反馈群" width="150"><br>
+  <em>微信扫码加我，拉你进用户反馈群</em>
+</p>
+<p align="center">
+  <a href="https://discord.gg/57v7dku8JU"><img src="https://img.shields.io/badge/Discord-%E5%8A%A0%E5%85%A5%E7%A4%BE%E5%8C%BA-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="加入 Orbital Discord"></a>
+</p>
+
 ## 快速开始
+
+<details>
+<summary><strong>展开 4 步上手流程（带截图）</strong></summary>
 
 > 每一步都带截图的完整教程见 **[Orbital 使用教程](https://orbital.top/guide/)**：配置 API key、新建项目、切换子 Agent、任务队列、自动任务和项目设置。
 
@@ -101,6 +112,8 @@ Agent可以换。你的上下文资产一直在。
    </p>
 3. **开始对话** —— 在聊天框输入任务，管理 agent 自己处理
 4. **走开** —— 把后续任务排进队列；每个完成项都会成为下一项的上下文
+
+</details>
 
 ---
 

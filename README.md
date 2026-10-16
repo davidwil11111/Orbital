@@ -76,7 +76,18 @@ The worker can change. The project continues.
 
 ---
 
+<p align="center">
+  <a href="https://discord.gg/57v7dku8JU"><img src="https://img.shields.io/badge/Discord-Join_the_community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Orbital Discord"></a>
+</p>
+<p align="center">
+  <img src="docs/screenshots/wechat-qr.png" alt="WeChat QR code: add the author and get pulled into the Orbital user group" width="150"><br>
+  <em>WeChat: scan to add me, I'll pull you into the user group</em>
+</p>
+
 ## Quick Start
+
+<details>
+<summary><strong>Expand the 4-step walkthrough (with screenshots)</strong></summary>
 
 > Want the step-by-step version with screenshots? See the **[Orbital user guide](https://orbital.top/en/guide/)**: API keys, projects, switching agents, the task queue, automations and project settings.
 
@@ -98,6 +109,8 @@ The worker can change. The project continues.
 
 3. **Chat** — type a task in the chat bar and the project agent handles it
 4. **Walk away** — queue the next tasks; each finished one becomes context the next builds on
+
+</details>
 
 ---
 
