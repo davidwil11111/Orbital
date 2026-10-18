@@ -555,6 +555,8 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         sub_agent_config_store=sub_agent_config_store,
         ws_manager=ws_manager,
         project_store=project_store,
+        # Spec 116 D8: the update route refuses while a worker is alive.
+        sub_agent_manager=sub_agent_manager,
     )
     app.include_router(settings_routes.router)
 

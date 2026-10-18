@@ -117,6 +117,11 @@ def _is_batch_file(path: str) -> bool:
     return path.lower().endswith((".cmd", ".bat"))
 
 
+# claude-agent-sdk's own message when handed a .cmd/.bat as cli_path
+# (``_reject_windows_batch_cli``). Spec 116 D9 maps it to an update hint.
+BATCH_REFUSAL_PREFIX = "Refusing to execute batch script"
+
+
 def native_claude_cli(
     command: str | None,
     *,
@@ -290,7 +295,21 @@ class SDKTransport(AgentTransport):
         options = ClaudeAgentOptions(**options_kwargs)
         self._client = ClaudeSDKClient(options=options)
         self._session_cost_seen = 0.0
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception as exc:
+            # Spec 116 D9: the SDK's refusal to spawn npm's claude.cmd shim
+            # means no native claude.exe exists beside it — an npm layout
+            # older than 2.1.114, or a 2.1.114+ install whose postinstall
+            # left the stub. Say that, and what to do, instead of the SDK's
+            # batch-script paragraph. Everything else re-raises untouched.
+            if BATCH_REFUSAL_PREFIX in str(exc):
+                raise RuntimeError(
+                    f"Claude Code at {options_kwargs['cli_path']} has no native "
+                    f"claude.exe (npm layout older than 2.1.114 or an incomplete "
+                    f"install); open Settings → Sub-agents and click Update"
+                ) from exc
+            raise
         self._alive = True
         self._capture_process_handle()
 

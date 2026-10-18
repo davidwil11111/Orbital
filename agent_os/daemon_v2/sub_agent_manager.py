@@ -16,6 +16,12 @@ from collections import deque
 from dataclasses import dataclass
 
 from agent_os import telemetry
+from agent_os.telemetry.diagnostics import (
+    classify_stderr,
+    clean_version,
+    error_class_of,
+    install_kind_of,
+)
 from agent_os.agent.adapters.cli_adapter import CLIAdapter
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.project_paths import ProjectPaths
@@ -104,6 +110,12 @@ class SubAgentManager:
         # Maps (project_id, content_hash) -> "warned" | "dismissed".
         # Cleared on daemon restart (in-memory only).
         self._claudemd_warning_state: dict[tuple[str, str], str] = {}
+        # Why the last ``start()`` for (project_id, handle) returned an
+        # "Error: …" string (spec 113 A2/A6, spec 116 D5): a reason enum plus
+        # structured diagnostics. Read by ``send()`` for the telemetry row
+        # and by the inject route for the chat row's ``_meta``; reset at the
+        # start of every attempt.
+        self._start_failures: dict[tuple[str, str], dict] = {}
         # Per-(project_id, agent_slug) locks guarding ORBITAL-SIDE writes to a
         # sub-agent's MEMORY.md. Track F4 / dispatch 2026-05-20 §5.
         #
@@ -739,6 +751,127 @@ class SubAgentManager:
         """
         self._claudemd_warning_state[(project_id, content_hash)] = "dismissed"
 
+    # ------------------------------------------------------------------
+    # Start-failure diagnostics (spec 113) + pre-dispatch gates (113 A6, 116 D5)
+    # ------------------------------------------------------------------
+
+    def last_start_failure_meta(self, project_id: str, handle: str) -> dict | None:
+        """Why the most recent ``start()`` for this handle refused, or None.
+
+        ``{reason, min_version, version, cli_version, install_kind,
+        error_class, stderr_category, duration_ms}`` — ``reason`` is one of
+        ``SUBAGENT_FAILURE_REASONS`` (``update_needed`` / ``not_authenticated``
+        for the gates, ``spawn`` for everything else), ``min_version`` only
+        for ``update_needed``. The inject route copies ``reason`` and
+        ``min_version`` onto the failure chat row's ``_meta`` so the UI can
+        render a translated sentence; ``send()`` turns the rest into the
+        ``subagent_failed`` telemetry fields. Cleared by the next attempt.
+        """
+        meta = self._start_failures.get((project_id, handle))
+        return dict(meta) if meta is not None else None
+
+    def _note_start_failure(self, project_id: str, handle: str, reason: str, *,
+                            status=None, binary: str | None = None,
+                            exc: BaseException | None = None,
+                            text: str | None = None,
+                            started: float | None = None) -> None:
+        version = getattr(status, "version", None) if status is not None else None
+        binary = binary or (getattr(status, "binary_path", None) if status is not None else None)
+        self._start_failures[(project_id, handle)] = {
+            "reason": reason,
+            "min_version": (getattr(status, "min_version", None)
+                            if reason == "update_needed" and status is not None else None),
+            "version": clean_version(version),
+            "cli_version": clean_version(version),
+            "install_kind": install_kind_of(binary),
+            "error_class": error_class_of(exc),
+            "stderr_category": classify_stderr(text or (str(exc) if exc else reason)),
+            "duration_ms": (int((time.monotonic() - started) * 1000)
+                            if started is not None else None),
+        }
+
+    def has_live_adapter(self, handle: str) -> bool:
+        """Spec 116 D8: is an adapter for ``handle`` registered in ANY session
+        whose transport is not known-dead? An idle SDK worker still holds its
+        CLI process, so "idle" is not "safe to replace the binary under"."""
+        for slate in self._adapters.values():
+            adapter = slate.get(handle)
+            if adapter is None:
+                continue
+            is_alive = getattr(adapter, "is_alive", None)
+            if callable(is_alive) and is_alive() is False:
+                continue
+            return True
+        return False
+
+    async def _gate_status(self, handle: str):
+        """The setup status the pre-dispatch gates decide on: the last status
+        sweep's entry when there is one (what the UI shows), else one direct
+        ``check_agent`` off the event loop. None when the engine cannot say,
+        which lets the spawn proceed as before."""
+        engine = self._setup_engine
+        cached = getattr(engine, "cached_status", None)
+        status = cached(handle) if callable(cached) else None
+        if status is not None:
+            return status
+        check = getattr(engine, "check_agent", None)
+        if not callable(check):
+            return None
+        try:
+            return await asyncio.to_thread(check, handle)
+        except Exception:
+            logger.warning("pre-dispatch status check failed for %s", handle,
+                           exc_info=True)
+            return None
+
+    async def _pre_dispatch_gate(self, project_id: str, handle: str, manifest, *,
+                                 started: float) -> str | None:
+        """Refuse a dispatch the CLI cannot serve, with a sentence the user
+        can act on, BEFORE the process is spawned.
+
+        Spec 116 D5 first: a CLI older than the manifest floor ("Claude Code
+        v2.1.100 is older than 2.1.114; … click Update" — the SDK's batch-
+        script paragraph said nothing a user could act on). Then spec 113 A6:
+        installed but not signed in / missing its key, which used to run the
+        CLI into a runtime error with no signal beforehand. Identity checks
+        (``is True`` / ``is False``) so a mocked engine never trips a gate.
+        """
+        status = await self._gate_status(handle)
+        if status is None:
+            return None
+        if getattr(status, "update_needed", False) is True:
+            version = clean_version(getattr(status, "version", None)) or "?"
+            floor = getattr(status, "min_version", None) or "a newer version"
+            self._note_start_failure(project_id, handle, "update_needed",
+                                     status=status, started=started)
+            return (f"Error: {manifest.name} v{version} is older than {floor}; "
+                    f"open Settings → Sub-agents and click Update")
+        if getattr(status, "credentials_configured", True) is False:
+            missing = list(getattr(status, "missing_credentials", None) or [])
+            by_key = {c.key: c for c in manifest.setup.credentials}
+            signed_out = any(by_key.get(k) is not None and by_key[k].type == "oauth_cli"
+                             for k in missing)
+            keys = [k for k in missing
+                    if by_key.get(k) is None or by_key[k].type != "oauth_cli"]
+            parts = []
+            if signed_out:
+                parts.append("not signed in")
+            if keys:
+                parts.append("missing " + ", ".join(keys))
+            what = " / ".join(parts) or "not signed in"
+            probe = getattr(self._setup_engine, "last_auth_probe", None)
+            probe = probe(handle) if callable(probe) else None
+            self._note_start_failure(project_id, handle, "not_authenticated",
+                                     status=status, started=started,
+                                     text=f"'{handle}' is installed but {what}")
+            if isinstance(probe, dict):
+                self._start_failures[(project_id, handle)].update({
+                    k: probe[k] for k in ("exit_code", "error_class", "stderr_category")
+                    if probe.get(k) is not None})
+            return (f"Error: '{handle}' is installed but {what} — "
+                    f"open Settings → Sub-agents")
+        return None
+
     async def _start_from_registry(self, project_id: str, handle: str, depth: int = 0,
                                    *, session_id: str | None = None,
                                    announce: bool = True,
@@ -755,6 +888,8 @@ class SubAgentManager:
         """
         session_id = self._resolve_session_id(session_id)
         sk = make_session_key(project_id, session_id)
+        started = time.monotonic()
+        self._start_failures.pop((project_id, handle), None)
         if sk in self._stopping:
             return "Error: project is shutting down, cannot start new agents"
 
@@ -785,7 +920,15 @@ class SubAgentManager:
                 project_workspace=workspace,
             )
         except ValueError as e:
+            self._note_start_failure(project_id, handle, "spawn", exc=e, started=started)
             return f"Error: {e}"
+
+        # Spec 116 D5 then spec 113 A6: refuse what the CLI cannot serve
+        # before any process is spawned or network rule written.
+        refusal = await self._pre_dispatch_gate(project_id, handle, manifest,
+                                                started=started)
+        if refusal is not None:
+            return refusal
 
         env = config_dict.get("env") or {}
         env.pop("CLAUDECODE", None)  # Prevent nested Claude Code detection
@@ -992,6 +1135,9 @@ class SubAgentManager:
                     pass
                 from agent_os.agents.composition import unlink_rendered
                 unlink_rendered(rendered_config)
+                self._note_start_failure(project_id, handle, "spawn", exc=e,
+                                         binary=config_dict.get("command"),
+                                         started=started)
                 return f"Error: adapter start failed: {e}"
             if sk not in self._adapters:
                 self._adapters[sk] = {}
@@ -1130,8 +1276,21 @@ class SubAgentManager:
             )
             if start_result.startswith("Error"):
                 # A spawn that never started is the dispatch's failure; no
-                # observer terminal will ever fire for it.
-                telemetry.emit("subagent_failed", {"agent": handle})
+                # observer terminal will ever fire for it. Spec 113: the
+                # reason (``spawn`` unless a gate refused) and structured
+                # diagnostics ride along — enums and numbers only.
+                meta = self.last_start_failure_meta(project_id, handle) or {}
+                telemetry.emit("subagent_failed", {
+                    "agent": handle,
+                    "reason": meta.get("reason", "spawn"),
+                    "exit_code": meta.get("exit_code"),
+                    "cli_version": meta.get("cli_version"),
+                    "install_kind": meta.get("install_kind", "unknown"),
+                    "duration_ms": meta.get("duration_ms"),
+                    "error_class": meta.get("error_class"),
+                    "stderr_category": meta.get("stderr_category",
+                                                classify_stderr(start_result)),
+                })
                 return start_result
             spawned = self._adapters.get(sk, {}).get(handle)
             status, reason = getattr(

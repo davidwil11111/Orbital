@@ -536,6 +536,11 @@ const SUB_AGENT_STARTED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+started\b/;
 const SUB_AGENT_SENT_RE = /^\[Sub-agent\]\s+Message sent to\s+([\w.-]+):\s*(.*)$/;
 const SUB_AGENT_COMPLETED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+completed\.\s*Summary:\s*([\s\S]*)$/;
 const SUB_AGENT_FAILED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+failed:\s*([\s\S]*)$/;
+// b17edb8 (v0.16.0): a pinned send whose spawn failed writes a durable
+// "could not start" row; spec 116 gives it a rule (it rendered as nothing)
+// and, when the row's _meta names a reason, a translated sentence.
+const SUB_AGENT_COULD_NOT_START_RE =
+  /^\[Sub-agent\]\s+([\w.-]+)\s+could not start:\s*([\s\S]*)$/;
 // backlog #23 D2: on_error's marker ("stopped with error:") had no rule here
 // at all, so the durable error row rendered as nothing — the contract
 // drifted when on_error was added alongside on_failed's "failed:" shape.
@@ -629,6 +634,30 @@ function parseFanoutSummary(
 
 type SubAgentActivity = Extract<DisplayItem, { type: 'sub_agent_activity' }>;
 
+/**
+ * Spec 116 D5: a `sub_agent_dispatch_failed` row whose `_meta.reason` is
+ * `update_needed` renders the translated update sentence instead of the
+ * backend's English error (backend text is never translated; a reason enum
+ * is data the UI may map). Any other reason, or no meta, keeps the content.
+ */
+function applyDispatchFailureReason(
+  activity: SubAgentActivity,
+  meta: Record<string, unknown> | undefined,
+  tr: ActivityTranslate,
+): SubAgentActivity {
+  if (!meta || meta.event !== 'sub_agent_dispatch_failed') return activity;
+  if (meta.reason !== 'update_needed') return activity;
+  const name = typeof meta.name === 'string' ? meta.name : activity.handle;
+  return {
+    ...activity,
+    error: tr('chat.subAgentNeedsUpdate', {
+      name,
+      version: typeof meta.version === 'string' ? meta.version : '?',
+      min: typeof meta.min_version === 'string' ? meta.min_version : '?',
+    }),
+  };
+}
+
 function parseSubAgentSystemMessage(
   content: string,
   timestamp: string,
@@ -655,7 +684,7 @@ function parseSubAgentSystemMessage(
       timestamp,
     };
   }
-  if ((m = content.match(SUB_AGENT_FAILED_RE))) {
+  if ((m = content.match(SUB_AGENT_FAILED_RE)) || (m = content.match(SUB_AGENT_COULD_NOT_START_RE))) {
     return {
       type: 'sub_agent_activity',
       action: 'failed',
@@ -1133,7 +1162,7 @@ export function transformChatHistory(
       const activity = parseSubAgentSystemMessage(activityContent, msg.timestamp);
       if (activity) {
         finalizeCapsule();
-        items.push(activity);
+        items.push(applyDispatchFailureReason(activity, msg._meta, tr));
       }
       // Other system messages (ping-pong guard, etc.) remain dropped — they
       // are not user-facing.

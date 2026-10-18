@@ -30,6 +30,7 @@ No real login command runs here — the CLI is a stub script. A real
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -412,10 +413,14 @@ class TestLoginTelemetry:
         _run_job(_stub_cli(tmp_path, 'print("hi")\n'))
         assert ("login_attempted", {"agent": "claude-code"}) in recorder.events
 
-    def test_unverified_completion_counts_as_a_failure(self, login_env,
-                                                       tmp_path, recorder):
+    def test_unverified_completion_is_its_own_event_not_a_failure(
+            self, login_env, tmp_path, recorder):
+        """Spec 113 A1 (decision P2): the UI never called an unconfirmed
+        exit-0 a failure, and a status probe that breaks on one platform
+        must not read as users failing to sign in. It is ``login_unverified``."""
         _run_job(_stub_cli(tmp_path, 'print("Login successful.")\n'))
-        assert "login_failed" in recorder.names
+        assert "login_failed" not in recorder.names
+        assert "login_unverified" in recorder.names
 
     def test_verified_completion_does_not_count_as_a_failure(
             self, login_env, tmp_path, recorder, monkeypatch):
@@ -435,3 +440,348 @@ class TestLoginTelemetry:
         body = 'import time\ntime.sleep(60)\n'
         _run_job(_stub_cli(tmp_path, body))
         assert "login_failed" in recorder.names
+
+
+# ---------------------------------------------------------------------------
+# 6. Spec 113 A1/A3 — every terminal carries a reason, structured
+#    diagnostics, and one redacted daemon.log line
+# ---------------------------------------------------------------------------
+
+_SETTINGS_LOGGER = "agent_os.api.routes.settings"
+
+
+def _field(recorder, event):
+    rows = [fields for name, fields in recorder.events if name == event]
+    assert len(rows) == 1, f"expected one {event}, got {recorder.events}"
+    return rows[0]
+
+
+class TestLoginFailureReasons:
+
+    @pytest.fixture
+    def recorder(self, monkeypatch):
+        rec = _RecordingTelemetry()
+        monkeypatch.setattr(settings_routes, "telemetry", rec)
+        return rec
+
+    def test_spawn_error_reason(self, login_env, recorder, caplog, monkeypatch):
+        async def _boom(*_a, **_k):
+            raise OSError(2, "No such file or directory", "claude")
+        monkeypatch.setattr(settings_routes.asyncio, "create_subprocess_shell", _boom)
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job("claude auth login")
+        fields = _field(recorder, "login_failed")
+        assert fields["reason"] == "spawn_error"
+        assert fields["agent"] == "claude-code"
+        assert fields["exit_code"] is None
+        assert fields["error_class"] == "FileNotFoundError"
+        assert fields["stderr_category"] == "unknown_command"
+        assert settings_routes._login_jobs["job1"]["reason"] == "spawn_error"
+        assert any("reason=spawn_error" in r.getMessage() for r in caplog.records)
+
+    def test_timeout_reason(self, login_env, tmp_path, recorder, monkeypatch, caplog):
+        monkeypatch.setattr(settings_routes, "LOGIN_IDLE_TIMEOUT_SECONDS", 0.4)
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job(_stub_cli(tmp_path, 'import time\ntime.sleep(60)\n'))
+        fields = _field(recorder, "login_failed")
+        assert fields["reason"] == "timeout"
+        assert fields["error_class"] == "TimeoutError"
+        assert fields["stderr_category"] == "timeout"
+        assert isinstance(fields["duration_ms"], int)
+        assert any("reason=timeout" in r.getMessage() and "timed_out=True" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_nonzero_exit_reason_carries_the_exit_code(self, login_env, tmp_path,
+                                                       recorder, caplog):
+        body = 'import sys\nprint("unknown command: auth")\nsys.exit(3)\n'
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job(_stub_cli(tmp_path, body))
+        fields = _field(recorder, "login_failed")
+        assert fields["reason"] == "nonzero_exit"
+        assert fields["exit_code"] == 3
+        assert fields["error_class"] is None
+        assert fields["stderr_category"] == "unknown_command"
+        assert any("return_code=3" in r.getMessage() for r in caplog.records)
+
+    def test_unverified_reason_and_diagnostics(self, login_env, tmp_path, recorder):
+        _run_job(_stub_cli(tmp_path, 'print("Login successful.")\n'))
+        fields = _field(recorder, "login_unverified")
+        assert fields["reason"] == "unverified"
+        assert fields["exit_code"] == 0
+        assert set(fields) >= {"agent", "reason", "exit_code", "cli_version",
+                               "install_kind", "duration_ms", "error_class",
+                               "stderr_category"}
+        # Nothing free-text rides along.
+        assert not any(isinstance(v, str) and "http" in v for v in fields.values())
+
+    def test_cli_version_and_install_kind_come_from_the_status_cache(
+            self, login_env, tmp_path, recorder, monkeypatch):
+        from types import SimpleNamespace
+        engine = settings_routes._setup_engine
+        engine.cached_status = lambda slug: SimpleNamespace(
+            version="2.1.100 (Claude Code)",
+            binary_path=r"C:\\Users\\x\\AppData\\Roaming\\npm\\claude.CMD")
+        # The job invalidates the cache BEFORE it reports; the diagnostics
+        # must have been read at job start, not at the terminal.
+        original = engine.invalidate_cache
+
+        def _invalidate():
+            engine.cached_status = lambda slug: None
+            original()
+        engine.invalidate_cache = _invalidate
+        _run_job(_stub_cli(tmp_path, 'import sys\nsys.exit(1)\n'))
+        fields = _field(recorder, "login_failed")
+        assert fields["cli_version"] == "2.1.100"
+        assert fields["install_kind"] == "npm"
+
+    def test_log_line_redacts_oauth_query_strings(self, login_env, tmp_path, caplog):
+        body = (
+            'import sys\n'
+            'print("Open https://claude.com/cai/oauth/authorize?code=SECRET123&state=abc")\n'
+            'sys.exit(1)\n'
+        )
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job(_stub_cli(tmp_path, body))
+        lines = [r.getMessage() for r in caplog.records if "job job1" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert "SECRET123" not in lines[0]
+        assert "?code=" not in lines[0]
+        assert "https://claude.com/cai/oauth/authorize?…" in lines[0]
+        # The job entry (read back over the login-jobs route) is redacted too.
+        tail = settings_routes._login_jobs["job1"]["tail"]
+        assert tail and "SECRET123" not in "".join(tail)
+
+    def test_log_line_keeps_only_the_last_five_lines(self, login_env, tmp_path, caplog):
+        body = 'import sys\n' + ''.join(f'print("line {i}")\n' for i in range(9)) + 'sys.exit(1)\n'
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job(_stub_cli(tmp_path, body))
+        assert settings_routes._login_jobs["job1"]["tail"] == [
+            "line 4", "line 5", "line 6", "line 7", "line 8"]
+
+    def test_verified_login_writes_a_log_line_but_no_failure_event(
+            self, login_env, tmp_path, recorder, monkeypatch, caplog):
+        monkeypatch.setattr(settings_routes, "_setup_engine", _StubEngine(configured=True))
+        with caplog.at_level(logging.WARNING, logger=_SETTINGS_LOGGER):
+            _run_job(_stub_cli(tmp_path, 'print("Login successful.")\n'))
+        assert recorder.names == ["login_attempted"]
+        assert any("status=complete" in r.getMessage() for r in caplog.records)
+
+
+class TestLoginJobHistory:
+    """Spec 113 A3: the job table keeps the last 20 terminal entries and
+    serves them read-only."""
+
+    def test_finished_jobs_are_kept_up_to_the_limit(self, login_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings_routes, "LOGIN_JOB_HISTORY", 3)
+        for i in range(5):
+            _run_job(_stub_cli(tmp_path, 'import sys\nsys.exit(1)\n'), job_id=f"job{i}")
+        assert list(settings_routes._login_jobs) == ["job2", "job3", "job4"]
+
+    def test_running_jobs_are_never_pruned(self, login_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings_routes, "LOGIN_JOB_HISTORY", 1)
+        settings_routes._login_jobs["live"] = {"slug": "codex", "status": "running"}
+        for i in range(3):
+            _run_job(_stub_cli(tmp_path, 'import sys\nsys.exit(1)\n'), job_id=f"job{i}")
+        assert "live" in settings_routes._login_jobs
+        assert "job2" in settings_routes._login_jobs
+        assert "job0" not in settings_routes._login_jobs
+
+    def test_read_route_exposes_reason_code_tail_and_nothing_sensitive(
+            self, login_env, tmp_path):
+        _run_job(_stub_cli(tmp_path, 'import sys\nprint("bye")\nsys.exit(2)\n'))
+        rows = asyncio.run(settings_routes.list_login_jobs())
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["job_id"] == "job1"
+        assert row["kind"] == "login"
+        assert row["status"] == "failed"
+        assert row["reason"] == "nonzero_exit"
+        assert row["return_code"] == 2
+        assert row["tail"] == ["bye"]
+        assert "command" not in row and "pid" not in row
+
+
+# ---------------------------------------------------------------------------
+# 7. Spec 116 D2/D3/D8 — the Update job and route
+# ---------------------------------------------------------------------------
+
+class _UpdateEngine(_StubEngine):
+    """A stub whose re-probed version flips when ``updated`` is set, so the
+    test controls what ``claude --version`` says AFTER ``claude update``."""
+
+    def __init__(self, *, min_version="2.1.114", after="2.1.100 (Claude Code)"):
+        super().__init__(configured=True)
+        self._after = after
+        self._min = min_version
+        self.resolved_path_invalidations: list[str] = []
+        self.check_agent_calls = 0
+
+    def invalidate_resolved_path(self, slug):
+        self.resolved_path_invalidations.append(slug)
+
+    def check_agent(self, slug):
+        from types import SimpleNamespace
+        self.check_agent_calls += 1
+        version = self._after
+        detected = SetupEngine._extract_version(version) if version else None
+        return SimpleNamespace(
+            slug=slug, installed=version is not None, version=version,
+            update_needed=bool(detected) and not SetupEngine._version_gte(detected, self._min),
+            min_version=self._min, binary_path="/fake/bin/claude",
+        )
+
+    def cached_status(self, slug):
+        return None
+
+
+def _run_update(command: str, slug: str = "claude-code", job_id: str = "upd1") -> None:
+    settings_routes._login_jobs[job_id] = {
+        "slug": slug, "status": "running", "command": command, "kind": "update"}
+    asyncio.run(settings_routes._run_login_job(slug, job_id, command, kind="update"))
+
+
+class TestUpdateJob:
+
+    @pytest.fixture
+    def recorder(self, monkeypatch):
+        rec = _RecordingTelemetry()
+        monkeypatch.setattr(settings_routes, "telemetry", rec)
+        return rec
+
+    def test_every_event_carries_kind_update(self, login_env, tmp_path, monkeypatch):
+        ws, _ = login_env
+        monkeypatch.setattr(settings_routes, "_setup_engine", _UpdateEngine())
+        _run_update(_stub_cli(tmp_path, 'print("Updating...")\n'))
+        assert ws.events, "nothing broadcast"
+        assert all(e.get("kind") == "update" for e in ws.events), ws.events
+        assert ws.of_type("login.progress")[0]["line"] == "Updating..."
+
+    def test_exit_zero_below_the_floor_is_not_verified(self, login_env, tmp_path,
+                                                       monkeypatch, recorder):
+        """D3: the 2.1.288 lesson — the npm updater can report success with
+        only the stub in place. Only the re-probed version decides."""
+        ws, _ = login_env
+        engine = _UpdateEngine(after="2.1.100 (Claude Code)")
+        monkeypatch.setattr(settings_routes, "_setup_engine", engine)
+        _run_update(_stub_cli(tmp_path, 'print("Successfully updated")\n'))
+        final = ws.terminal()
+        assert final["type"] == "login.complete"
+        assert final["verified"] is False
+        assert final["kind"] == "update"
+        assert settings_routes._login_jobs["upd1"]["status"] == "unverified"
+        assert engine.check_agent_calls == 1
+        assert ("update_attempted", {"agent": "claude-code"}) in recorder.events
+        failed = _field(recorder, "update_failed")
+        assert failed["reason"] == "unverified"
+        assert failed["exit_code"] == 0
+        # The version that matters is the RE-PROBED one.
+        assert failed["cli_version"] == "2.1.100"
+
+    def test_exit_zero_at_the_floor_is_verified_and_the_path_is_forgotten(
+            self, login_env, tmp_path, monkeypatch, recorder):
+        ws, _ = login_env
+        engine = _UpdateEngine(after="2.1.302 (Claude Code)")
+        monkeypatch.setattr(settings_routes, "_setup_engine", engine)
+        _run_update(_stub_cli(tmp_path, 'print("Successfully updated")\n'))
+        final = ws.terminal()
+        assert final["type"] == "login.complete"
+        assert final["verified"] is True
+        assert settings_routes._login_jobs["upd1"]["status"] == "complete"
+        assert "update_failed" not in recorder.names
+        # The update may move the binary (npm → native); the cached path and
+        # the status cache are both dropped before the re-probe.
+        assert engine.resolved_path_invalidations == ["claude-code"]
+        assert engine.invalidations >= 1
+        assert "update_failed" not in recorder.names
+        assert "login_attempted" not in recorder.names
+
+    def test_stub_only_update_leaves_no_version_and_is_not_verified(
+            self, login_env, tmp_path, monkeypatch):
+        ws, _ = login_env
+        monkeypatch.setattr(settings_routes, "_setup_engine", _UpdateEngine(after=None))
+        _run_update(_stub_cli(tmp_path, 'print("done")\n'))
+        assert ws.terminal()["verified"] is False
+
+    def test_nonzero_exit_is_an_update_failure(self, login_env, tmp_path,
+                                               monkeypatch, recorder):
+        ws, _ = login_env
+        monkeypatch.setattr(settings_routes, "_setup_engine", _UpdateEngine())
+        _run_update(_stub_cli(tmp_path, 'import sys\nsys.exit(1)\n'))
+        assert ws.terminal()["type"] == "login.failed"
+        assert _field(recorder, "update_failed")["reason"] == "nonzero_exit"
+
+
+def _real_engine_with(update_command: str | None, binary: str = "/opt/fake/claude"):
+    """A real SetupEngine over a one-manifest registry, with the binary
+    pre-resolved so no subprocess runs."""
+    from agent_os.agents.manifest import (
+        AgentManifest, ManifestRuntime, ManifestSetup)
+    from agent_os.agents.registry import AgentRegistry
+
+    manifest = AgentManifest(
+        manifest_version="1", name="Claude Code", slug="claude-code",
+        description="", author="t", version="1.0.0",
+        runtime=ManifestRuntime(adapter="cli", command="claude"),
+        setup=ManifestSetup(update_command=update_command, min_version="2.1.114"),
+    )
+    registry = AgentRegistry()
+    registry.register(manifest)
+    engine = SetupEngine(registry)
+    engine._resolved_paths["claude-code"] = binary
+    return engine
+
+
+class TestUpdateRoute:
+
+    @pytest.fixture
+    def no_real_job(self, monkeypatch):
+        """The route only schedules the job; never let a command run here."""
+        calls: list[tuple] = []
+
+        async def _fake(slug, job_id, command, kind="login"):
+            calls.append((slug, job_id, command, kind))
+        monkeypatch.setattr(settings_routes, "_run_login_job", _fake)
+        return calls
+
+    def test_resolves_the_manifest_update_command_with_the_binary(self, monkeypatch):
+        monkeypatch.setattr(settings_routes, "_setup_engine",
+                            _real_engine_with("claude update"))
+        assert settings_routes._resolve_setup_command("claude-code", "update") \
+            == "/opt/fake/claude update"
+
+    def test_400_without_an_update_command(self, login_env, monkeypatch, no_real_job):
+        from fastapi import HTTPException
+        monkeypatch.setattr(settings_routes, "_setup_engine", _real_engine_with(None))
+        with pytest.raises(HTTPException) as info:
+            asyncio.run(settings_routes.trigger_sub_agent_update("claude-code"))
+        assert info.value.status_code == 400
+        assert no_real_job == []
+
+    def test_409_while_a_worker_of_that_agent_is_running(self, login_env, monkeypatch,
+                                                         no_real_job):
+        from types import SimpleNamespace
+        from fastapi import HTTPException
+        monkeypatch.setattr(settings_routes, "_setup_engine",
+                            _real_engine_with("claude update"))
+        monkeypatch.setattr(settings_routes, "_sub_agent_manager",
+                            SimpleNamespace(has_live_adapter=lambda slug: slug == "claude-code"))
+        with pytest.raises(HTTPException) as info:
+            asyncio.run(settings_routes.trigger_sub_agent_update("claude-code"))
+        assert info.value.status_code == 409
+        assert no_real_job == []
+
+    def test_starts_an_update_job(self, login_env, monkeypatch, no_real_job):
+        from types import SimpleNamespace
+        monkeypatch.setattr(settings_routes, "_setup_engine",
+                            _real_engine_with("claude update"))
+        monkeypatch.setattr(settings_routes, "_sub_agent_manager",
+                            SimpleNamespace(has_live_adapter=lambda slug: False))
+
+        async def _go():
+            body = await settings_routes.trigger_sub_agent_update("claude-code")
+            await asyncio.sleep(0)  # let the scheduled task run
+            return body
+        body = asyncio.run(_go())
+        assert body["status"] == "running" and body["slug"] == "claude-code"
+        assert no_real_job == [("claude-code", body["job_id"], "/opt/fake/claude update", "update")]
+        assert settings_routes._login_jobs[body["job_id"]]["kind"] == "update"

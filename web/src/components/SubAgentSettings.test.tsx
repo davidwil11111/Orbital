@@ -81,6 +81,9 @@ interface Entry {
   emits_tool_activity?: boolean;
   credentials?: CredentialSpec[];
   credential_state?: 'configured' | 'missing' | 'unknown' | null;
+  update_needed?: boolean;
+  min_version?: string | null;
+  supports_update?: boolean;
 }
 
 function makeEntry(overrides: Partial<Entry> = {}): Entry {
@@ -485,6 +488,141 @@ describe('SubAgentSettings', () => {
 // ---------------------------------------------------------------------------
 // Pi — credential state + host-permission disclosure
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Spec 116 — a Claude Code older than the floor needs an UPDATE, not a login
+// ---------------------------------------------------------------------------
+
+describe('SubAgentSettings — version floor / Update (spec 116)', () => {
+  function oldClaude(overrides: Partial<Entry> = {}): Entry {
+    return makeEntry({
+      slug: 'claude-code',
+      name: 'Claude Code',
+      installed: true,
+      version: '2.1.100 (Claude Code)',
+      ready: false,
+      // An old CLI has no `auth status` subcommand, so it reads signed-out too.
+      credentials_configured: false,
+      missing_credentials: ['claude_auth'],
+      supports_login: true,
+      update_needed: true,
+      min_version: '2.1.114',
+      supports_update: true,
+      ...overrides,
+    });
+  }
+
+  async function renderOldClaude(overrides: Partial<Entry> = {}) {
+    api.mockResolvedValue([oldClaude(overrides)]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+  }
+
+  it('shows the needs-update notice and an Update button, and no Login button', async () => {
+    await renderOldClaude();
+    const block = screen.getByTestId('sub-agent-update-claude-code');
+    expect(block).toHaveTextContent('Claude Code v2.1.100 is too old; Orbital needs 2.1.114 or newer.');
+    expect(block).not.toHaveTextContent('(Claude Code) is too old');
+    expect(screen.getByRole('button', { name: /^update$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^login$/i })).not.toBeInTheDocument();
+  });
+
+  it('clicking Update POSTs the update route and shows the updating state', async () => {
+    await renderOldClaude();
+    api.mockResolvedValueOnce({ job_id: 'upd1', slug: 'claude-code', status: 'running' });
+
+    fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+
+    await waitFor(() => {
+      expect(api).toHaveBeenCalledWith(
+        '/api/v2/settings/sub-agents/claude-code/update',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-agent-update-spinner-claude-code')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: /updating/i })).toBeDisabled();
+  });
+
+  it('an update that leaves the CLI below the floor shows the manual npm command', async () => {
+    await renderOldClaude();
+
+    emit('login.complete', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 0, verified: false,
+    });
+
+    const notice = screen.getByTestId('sub-agent-update-notice-claude-code');
+    expect(notice).toHaveTextContent(/did not complete/i);
+    expect(notice).toHaveTextContent('npm install -g @anthropic-ai/claude-code@latest');
+    // The login notice is a different surface and stays untouched.
+    expect(screen.queryByTestId('sub-agent-login-notice-claude-code')).not.toBeInTheDocument();
+  });
+
+  it('a verified update clears the notice and refetches the entry', async () => {
+    await renderOldClaude();
+    api.mockClear();
+
+    emit('login.complete', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 0, verified: true,
+    });
+
+    expect(screen.queryByTestId('sub-agent-update-notice-claude-code')).not.toBeInTheDocument();
+    await waitFor(() => expect(api).toHaveBeenCalledWith('/api/v2/settings/sub-agents'));
+  });
+
+  it('an updater that failed outright shows the failed notice', async () => {
+    await renderOldClaude();
+    emit('login.failed', { slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 1 });
+    expect(screen.getByTestId('sub-agent-update-notice-claude-code')).toHaveTextContent(/did not complete/i);
+  });
+
+  it('a 409 (worker running) shows the busy hint instead of an error', async () => {
+    await renderOldClaude();
+    api.mockRejectedValueOnce(Object.assign(new Error('a claude-code task is running'), { status: 409 }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-agent-update-notice-claude-code')).toHaveTextContent(
+        'A Claude Code task is running; try again when it finishes.',
+      );
+    });
+    expect(screen.getByRole('button', { name: /^update$/i })).toBeEnabled();
+  });
+
+  it('login events of kind update never touch the login notice or URL', async () => {
+    await renderOldClaude();
+    emit('login.progress', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update',
+      line: 'see https://example.test/release-notes',
+    });
+    expect(screen.queryByTestId('sub-agent-login-url-claude-code')).not.toBeInTheDocument();
+  });
+
+  it('renders the notice in Simplified Chinese', async () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    api.mockResolvedValue([oldClaude({ version: '2.1.100' })]);
+    render(
+      <LocaleProvider>
+        <SubAgentSettings />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.getByTestId('sub-agent-update-claude-code')).toHaveTextContent(
+      'Claude Code 版本过旧（v2.1.100），需要 2.1.114 或更新。',
+    );
+    expect(screen.getByRole('button', { name: '更新' })).toBeInTheDocument();
+  });
+
+  it('a CLI at the floor keeps the Login button and no update block', async () => {
+    api.mockResolvedValue([oldClaude({ version: '2.1.302', update_needed: false })]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.queryByTestId('sub-agent-update-claude-code')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^login$/i })).toBeInTheDocument();
+  });
+});
 
 describe('SubAgentSettings — Pi', () => {
   function makePiEntry(overrides: Partial<Entry> = {}): Entry {

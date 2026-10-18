@@ -19,6 +19,7 @@ from agent_os.agents.manifest import AgentManifest
 from agent_os.agents.registry import AgentRegistry
 from agent_os.agents.setup_types import AgentSetupStatus, SetupAction
 from agent_os.daemon_v2.models import detect_os
+from agent_os.telemetry.diagnostics import classify_stderr, error_class_of
 from agent_os.utils.subprocess_flags import win_no_window_flags
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,11 @@ class SetupEngine:
         # finished, so its result is returned to its caller but not cached.
         self._cache_generation = 0
         self._refresh_thread: threading.Thread | None = None
+        # Spec 113: what the last ``oauth_cli`` auth probe for a slug came
+        # back with — exit code, exception class, stderr category, duration —
+        # so a dispatch refused for "not signed in" can carry structured
+        # diagnostics without re-running the probe. Enums and ints only.
+        self._last_auth_probe: dict[str, dict] = {}
 
     def set_sub_agent_config_store(self, store) -> None:
         """Late-bind the sub-agent config store (called by app factory)."""
@@ -150,6 +156,12 @@ class SetupEngine:
             cmd = self._substitute_binary(manifest.setup.check_command, manifest.runtime.command, binary)
             version = self._run_check_command(cmd)
 
+        # Spec 116 D1/D4: the manifest's version floor, checked offline
+        # against the version just read. No version → no floor (the agent
+        # is simply not installed, or its CLI could not answer).
+        min_version = manifest.setup.min_version
+        update_needed = self._below_floor(installed, version, min_version)
+
         # Dependencies
         deps_met, missing_deps = self.check_dependencies(manifest)
 
@@ -158,7 +170,8 @@ class SetupEngine:
         creds_ok = not missing_creds
 
         # Build setup actions
-        actions = self._build_actions(manifest, installed, missing_deps, missing_creds)
+        actions = self._build_actions(manifest, installed, missing_deps, missing_creds,
+                                      update_needed=update_needed)
 
         return AgentSetupStatus(
             slug=manifest.slug,
@@ -172,7 +185,41 @@ class SetupEngine:
             missing_credentials=missing_creds,
             setup_actions=actions,
             credential_state=credential_state,
+            update_needed=update_needed,
+            min_version=min_version,
         )
+
+    @classmethod
+    def _below_floor(cls, installed: bool, version: str | None,
+                     min_version: str | None) -> bool:
+        """Spec 116 D1: installed, version readable, floor declared, and the
+        parsed version is older than the floor. Any missing piece → False."""
+        if not installed or not version or not min_version:
+            return False
+        detected = cls._extract_version(version)
+        if not detected:
+            return False
+        return not cls._version_gte(detected, min_version)
+
+    def cached_status(self, slug: str) -> AgentSetupStatus | None:
+        """The slug's entry in the last ``check_all`` sweep, stale or not —
+        never probes. For callers who want what the UI last showed (the
+        dispatch gates, the login job's diagnostics) without paying for a
+        subprocess on the event loop."""
+        cached = self._check_all_cache
+        if cached is None:
+            return None
+        for status in cached[0]:
+            if status.slug == slug:
+                return status
+        return None
+
+    def last_auth_probe(self, slug: str) -> dict | None:
+        """Structured outcome of the last auth probe for ``slug`` (spec 113):
+        ``{exit_code, error_class, stderr_category, duration_ms}``, or None
+        when no probe has run yet."""
+        probe = self._last_auth_probe.get(slug)
+        return dict(probe) if probe is not None else None
 
     def check_all(self, allow_stale: bool = False) -> list[AgentSetupStatus]:
         """Status check for all registered agents.
@@ -357,7 +404,8 @@ class SetupEngine:
                     # spawn surfaces the CLI's own auth error if it is.
                     state = state or "unknown"
                     continue
-                if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary):
+                if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary,
+                                            slug=manifest.slug):
                     missing.append(cred.key)
                 continue
             # Check credential store
@@ -464,15 +512,45 @@ class SetupEngine:
             return False
         return None
 
-    def _check_cli_auth(self, cred, command: str | None = None, resolved_binary: str | None = None) -> bool:
+    def _check_cli_auth(self, cred, command: str | None = None,
+                        resolved_binary: str | None = None, *,
+                        slug: str | None = None) -> bool:
         """Run a CLI command to check auth status (e.g. claude auth status --json).
 
         Parses JSON output and checks check_field == check_value.
+
+        Spec 116 D7: every False used to be silent — a CLI too old to know
+        ``auth status`` (exit 1), a probe past the 10 s timeout, or garbage
+        output all read as "not logged in" with nothing in the log. Each
+        False now writes ONE warning naming the slug, the binary, and the
+        exit code or exception class plus the first 200 chars of stderr; the
+        structured outcome is kept for the dispatch gate's telemetry.
         """
         import json as _json
         if not cred.check_command:
             return False
         check_cmd = self._substitute_binary(cred.check_command, command, resolved_binary)
+        key = slug or cred.key
+        started = time.monotonic()
+
+        def _record(ok: bool, *, exit_code: int | None, exc: BaseException | None,
+                    stderr: str, why: str) -> bool:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            self._last_auth_probe[key] = {
+                "exit_code": exit_code,
+                "error_class": error_class_of(exc),
+                "stderr_category": classify_stderr(stderr or why),
+                "duration_ms": duration_ms,
+            }
+            if not ok:
+                # ``check_cmd`` is the probe only: the resolved binary plus
+                # the manifest's status args (never a login/update command).
+                logger.warning(
+                    "auth probe failed for %s (%s): `%s` -> %s; stderr: %r",
+                    key, cred.key, check_cmd, why, (stderr or "")[:200],
+                )
+            return ok
+
         try:
             result = subprocess.run(
                 check_cmd,
@@ -486,20 +564,35 @@ class SetupEngine:
                 timeout=10,
                 creationflags=win_no_window_flags(),
             )
+            # Tests hand back MagicMock results: only a real string is text.
+            stderr = result.stderr if isinstance(result.stderr, str) else ""
+            stdout = result.stdout if isinstance(result.stdout, str) else ""
             if result.returncode != 0:
-                return False
+                return _record(False, exit_code=result.returncode, exc=None,
+                               stderr=stderr or stdout,
+                               why=f"exit code {result.returncode}")
             if not cred.check_field:
                 # Exit-code mode: a CLI whose status command prints plain
                 # text (`codex login status`) and signals via its exit code.
                 # Shell-neutral, unlike wrapping it in `&& echo '{...}'`,
                 # which cmd.exe cannot run.
-                return True
-            data = _json.loads(result.stdout)
+                return _record(True, exit_code=0, exc=None, stderr="", why="")
+            try:
+                data = _json.loads(result.stdout)
+            except (_json.JSONDecodeError, ValueError) as exc:
+                return _record(False, exit_code=0, exc=exc, stderr=stderr or stdout,
+                               why=f"{type(exc).__name__} parsing stdout")
             actual = str(_json_field(data, cred.check_field))
-            return actual.lower() == cred.check_value.lower()
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
-                _json.JSONDecodeError, ValueError):
-            return False
+            ok = actual.lower() == cred.check_value.lower()
+            return _record(ok, exit_code=0, exc=None,
+                           stderr=stderr or f"{cred.check_field}={actual}",
+                           why=f"{cred.check_field}={actual!r}, expected {cred.check_value!r}")
+        except subprocess.TimeoutExpired as exc:
+            return _record(False, exit_code=None, exc=exc, stderr="",
+                           why="TimeoutExpired after 10s")
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return _record(False, exit_code=None, exc=exc, stderr=str(exc),
+                           why=f"{type(exc).__name__}: {exc}")
 
     @staticmethod
     def _substitute_binary(cmd: str, command: str | None, resolved: str | None) -> str:
@@ -660,10 +753,22 @@ class SetupEngine:
         installed: bool,
         missing_deps: list[str],
         missing_creds: list[str],
+        update_needed: bool = False,
     ) -> list[SetupAction]:
         """Build the list of setup actions needed."""
         actions: list[SetupAction] = []
         current_os = detect_os()
+
+        # Spec 116 D4: an installed CLI older than the floor. Listed before
+        # the credential actions — a too-old CLI cannot be logged in through
+        # Orbital, so the update is the step that unblocks everything else.
+        if update_needed:
+            actions.append(SetupAction(
+                action="update_agent",
+                label=manifest.setup.update_label or f"Update {manifest.name}",
+                command=manifest.setup.update_command,
+                blocking=True,
+            ))
 
         # Missing dependencies
         for dep in manifest.setup.dependencies:

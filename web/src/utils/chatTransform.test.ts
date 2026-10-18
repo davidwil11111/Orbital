@@ -2377,3 +2377,55 @@ describe('describeWorkerTool', () => {
     );
   });
 });
+
+
+// --------------------------------------------------------------------------
+// Spec 116 D5 — a pinned send refused for an old CLI (b17edb8's
+// "could not start" row) renders, and a reason-tagged row is translated.
+// --------------------------------------------------------------------------
+
+describe('transformChatHistory — sub_agent_dispatch_failed rows (spec 116)', () => {
+  const RAW = '[Sub-agent] claude-code could not start: Error: Claude Code v2.1.100 is older than 2.1.114; open Settings → Sub-agents and click Update';
+  const row = (meta?: Record<string, unknown>): ChatMessage => ({
+    role: 'system', source: 'daemon', content: RAW, timestamp: TS,
+    ...(meta ? { _meta: meta } : {}),
+  });
+  const failedItem = (items: ReturnType<typeof transformChatHistory>) => {
+    const item = items.find(i => i.type === 'sub_agent_activity');
+    if (!item || item.type !== 'sub_agent_activity') throw new Error('no activity row');
+    return item;
+  };
+
+  it('a could-not-start row renders as a failed activity with its raw content', () => {
+    const item = failedItem(transformChatHistory([row()]));
+    expect(item.action).toBe('failed');
+    expect(item.handle).toBe('claude-code');
+    expect(item.error).toBe('Error: Claude Code v2.1.100 is older than 2.1.114; open Settings → Sub-agents and click Update');
+  });
+
+  it('reason=update_needed renders the translated sentence (zh)', () => {
+    const zh: ActivityTranslate = (key, vars) => translate('zh', key, vars);
+    const item = failedItem(transformChatHistory([row({
+      event: 'sub_agent_dispatch_failed', handle: 'claude-code', suppress_wake: true,
+      reason: 'update_needed', version: '2.1.100', min_version: '2.1.114', name: 'Claude Code',
+    })], undefined, zh));
+    expect(item.action).toBe('failed');
+    expect(item.error).toBe('Claude Code 版本过旧（v2.1.100），需要 2.1.114 或更新。请到 设置 → 子Agent 点击更新。');
+  });
+
+  it('reason=update_needed renders the English sentence by default, naming the handle when no name is given', () => {
+    const item = failedItem(transformChatHistory([row({
+      event: 'sub_agent_dispatch_failed', handle: 'claude-code',
+      reason: 'update_needed', version: '2.1.100', min_version: '2.1.114',
+    })]));
+    expect(item.error).toBe('claude-code v2.1.100 is too old; Orbital needs 2.1.114 or newer. Open Settings → Sub-agents and click Update.');
+  });
+
+  it('any other reason keeps the raw content', () => {
+    const item = failedItem(transformChatHistory([row({
+      event: 'sub_agent_dispatch_failed', handle: 'claude-code', reason: 'not_authenticated',
+    })]));
+    expect(item.error).toContain('older than 2.1.114');
+    expect(item.error).toContain('click Update');
+  });
+});

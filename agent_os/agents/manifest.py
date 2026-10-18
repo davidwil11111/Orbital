@@ -99,6 +99,12 @@ class ManifestSetup:
     credentials: list[ManifestCredential] = field(default_factory=list)
     orbital_install: ManifestOrbitalInstall = field(
         default_factory=ManifestOrbitalInstall)
+    # Spec 116 D1/D2: the oldest CLI version Orbital can drive, checked
+    # offline against ``check_command``'s output, and the CLI's own updater
+    # (run through the login-job runner). All optional; None = no floor.
+    min_version: str | None = None        # "2.1.114"
+    update_command: str | None = None     # "claude update"
+    update_label: str | None = None       # "Update Claude Code"
 
 
 @dataclass
@@ -279,6 +285,9 @@ class ManifestLoader:
                 platforms=(setup_data.get("orbital_install") or {}).get(
                     "platforms", []),
             ),
+            min_version=setup_data.get("min_version"),
+            update_command=setup_data.get("update_command"),
+            update_label=setup_data.get("update_label"),
         )
 
         # Capabilities

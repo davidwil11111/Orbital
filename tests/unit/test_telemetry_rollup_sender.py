@@ -143,10 +143,15 @@ class TestRollup:
         )["counters"]
         assert c["subagent_dispatches"] == 3
         assert c["subagent_failed"] == 2
+        # Spec 113 A2 widened the per-agent entry with ``failed_by_reason``;
+        # rows without a reason (this fixture, and every pre-113 build) land
+        # in ``unknown``.
         assert c["subagent_by_agent"] == {
-            "claude-code": {"dispatched": 2, "failed": 1},
-            "native": {"dispatched": 1, "failed": 0},
-            "codex": {"dispatched": 0, "failed": 1},
+            "claude-code": {"dispatched": 2, "failed": 1,
+                            "failed_by_reason": {"unknown": 1}},
+            "native": {"dispatched": 1, "failed": 0, "failed_by_reason": {}},
+            "codex": {"dispatched": 0, "failed": 1,
+                      "failed_by_reason": {"unknown": 1}},
         }
 
     def test_subagent_agent_outside_builtin_set_is_bucketed(self, tmp_path):
@@ -160,7 +165,7 @@ class TestRollup:
             InstallIdentity(tmp_path), spool, DAY, version="0.13.1", os_name="darwin",
         )["counters"]
         assert c["subagent_by_agent"] == {
-            "other": {"dispatched": 1, "failed": 1},
+            "other": {"dispatched": 1, "failed": 1, "failed_by_reason": {"unknown": 1}},
         }
 
     def test_empty_day_has_zero_subagent_counters(self, tmp_path):
@@ -464,3 +469,172 @@ class TestFlushNow:
         monkeypatch.setattr(sender, "_suppression_reason", lambda: None)
         assert await sender.flush_now(timeout=3.0) == "skipped"
         assert post.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Spec 113 — login / dispatch failures carry a reason and structured
+# diagnostics; the ping lists the last 20 failure events.
+# ---------------------------------------------------------------------------
+
+class TestFailureReasons:
+
+    def _counters(self, tmp_path, rows):
+        return build_ping(
+            InstallIdentity(tmp_path), seed_spool(tmp_path, rows), DAY,
+            version="0.17.0", os_name="windows",
+        )["counters"]
+
+    def test_login_funnel_splits_by_agent_and_reason(self, tmp_path):
+        """§3.1: unverified is its own counter, NOT a login failure."""
+        c = self._counters(tmp_path, [
+            ev("login_attempted", agent="codex"),
+            ev("login_attempted", agent="codex"),
+            ev("login_attempted", agent="codex"),
+            ev("login_failed", agent="codex", reason="nonzero_exit"),
+            ev("login_failed", agent="codex", reason="nonzero_exit"),
+            ev("login_unverified", agent="codex"),
+        ])
+        assert c["login_attempted"] == 3
+        assert c["login_failed"] == 2
+        assert c["login_unverified"] == 1
+        assert c["login_by_agent"] == {"codex": {"attempted": 3, "failed": 2, "unverified": 1}}
+        assert c["login_failed_by_reason"] == {"nonzero_exit": 2}
+
+    def test_non_builtin_slug_and_missing_reason_degrade_safely(self, tmp_path):
+        c = self._counters(tmp_path, [
+            ev("login_attempted", agent="my-private-cli"),
+            ev("login_failed", agent="my-private-cli"),        # old format: no reason
+            ev("login_failed", agent="codex", reason="stack trace text"),
+        ])
+        assert c["login_by_agent"] == {
+            "other": {"attempted": 1, "failed": 1, "unverified": 0},
+            "codex": {"attempted": 0, "failed": 1, "unverified": 0},
+        }
+        assert c["login_failed_by_reason"] == {"unknown": 2}
+
+    def test_subagent_failure_reason_counts_top_level_and_per_agent(self, tmp_path):
+        c = self._counters(tmp_path, [
+            ev("subagent_failed", agent="claude-code", reason="spawn"),
+            ev("subagent_failed", agent="claude-code", reason="update_needed"),
+            ev("subagent_failed", agent="codex", reason="not_authenticated"),
+            ev("subagent_failed", agent="codex"),                 # old format
+            ev("subagent_dispatched", agent="codex"),
+        ])
+        assert c["subagent_failed"] == 4
+        assert c["subagent_failed_by_reason"] == {
+            "spawn": 1, "update_needed": 1, "not_authenticated": 1, "unknown": 1}
+        assert c["subagent_by_agent"]["claude-code"] == {
+            "dispatched": 0, "failed": 2,
+            "failed_by_reason": {"spawn": 1, "update_needed": 1}}
+        assert c["subagent_by_agent"]["codex"] == {
+            "dispatched": 1, "failed": 2,
+            "failed_by_reason": {"not_authenticated": 1, "unknown": 1}}
+
+    def test_update_job_counters(self, tmp_path):
+        c = self._counters(tmp_path, [
+            ev("update_attempted", agent="claude-code"),
+            ev("update_failed", agent="claude-code", reason="unverified",
+               exit_code=0, cli_version="2.1.100", install_kind="npm"),
+        ])
+        assert c["update_attempted"] == 1
+        assert c["update_failed"] == 1
+        assert c["recent_failures"][0]["event"] == "update_failed"
+        assert c["recent_failures"][0]["reason"] == "unverified"
+
+    def test_recent_failures_carry_structured_diagnostics_only(self, tmp_path):
+        """The 2026-10-18 Windows case (spec 116 §0) must be readable from
+        the fields alone: CLI 2.1.100, npm layout, refused for the floor."""
+        c = self._counters(tmp_path, [
+            ev("subagent_failed", agent="claude-code", reason="update_needed",
+               exit_code=None, cli_version="2.1.100 (Claude Code)",
+               install_kind="npm", duration_ms=12, error_class=None,
+               stderr_category="other",
+               # Anything free-text a careless emitter adds must NOT leak:
+               error="Refusing to execute batch script C:\\\\Users\\\\x\\\\claude.CMD",
+               binary_path="C:\\\\Users\\\\x\\\\AppData\\\\Roaming\\\\npm\\\\claude.CMD"),
+            ev("login_failed", agent="claude-code", reason="nonzero_exit",
+               exit_code=1, cli_version="2.1.100", install_kind="npm",
+               duration_ms=840, error_class=None, stderr_category="unknown_command"),
+            ev("subagent_failed", agent="weird-agent", reason="made-up",
+               exit_code="not-an-int", cli_version="latest", install_kind="brew",
+               error_class="SomethingError", stderr_category="raw text"),
+        ])
+        recent = c["recent_failures"]
+        assert len(recent) == 3
+        windows = recent[0]
+        assert windows == {
+            "ts": f"{DAY}T10:00:00+00:00", "event": "subagent_failed",
+            "agent": "claude-code", "reason": "update_needed", "exit_code": None,
+            "cli_version": "2.1.100", "install_kind": "npm", "duration_ms": 12,
+            "error_class": None, "stderr_category": "other",
+        }
+        assert recent[1]["exit_code"] == 1
+        assert recent[1]["stderr_category"] == "unknown_command"
+        degraded = recent[2]
+        assert degraded["agent"] == "other"
+        assert degraded["reason"] == "unknown"
+        assert degraded["exit_code"] is None
+        assert degraded["cli_version"] is None
+        assert degraded["install_kind"] == "unknown"
+        assert degraded["error_class"] == "other"
+        assert degraded["stderr_category"] == "other"
+        # No row carries anything but the fixed key set.
+        for row in recent:
+            assert set(row) == {"ts", "event", "agent", "reason", "exit_code",
+                                "cli_version", "install_kind", "duration_ms",
+                                "error_class", "stderr_category"}
+
+    def test_recent_failures_is_bounded_to_the_last_twenty(self, tmp_path):
+        rows = [ev("subagent_failed", agent="codex", reason="spawn", duration_ms=i)
+                for i in range(25)]
+        c = self._counters(tmp_path, rows)
+        assert len(c["recent_failures"]) == 20
+        assert [r["duration_ms"] for r in c["recent_failures"]] == list(range(5, 25))
+        assert c["subagent_failed"] == 25
+
+    def test_empty_day_has_empty_failure_shapes(self, tmp_path):
+        c = self._counters(tmp_path, [])
+        assert c["login_unverified"] == 0
+        assert c["login_by_agent"] == {}
+        assert c["login_failed_by_reason"] == {}
+        assert c["update_attempted"] == 0
+        assert c["update_failed"] == 0
+        assert c["subagent_failed_by_reason"] == {}
+        assert c["recent_failures"] == []
+
+    def test_reason_keys_are_subsets_of_the_declared_enums(self, tmp_path):
+        """Enum parity (§3.1): nothing outside the constant tuples can appear
+        as a ``*_by_reason`` key, however the spool rows were written."""
+        from agent_os.telemetry.diagnostics import (
+            LOGIN_FAILURE_REASONS, SUBAGENT_FAILURE_REASONS)
+
+        c = self._counters(tmp_path, [
+            ev("login_failed", agent="codex", reason="Traceback (most recent call last)"),
+            ev("login_failed", agent="codex", reason="timeout"),
+            ev("subagent_failed", agent="codex", reason="https://evil.example/?code=1"),
+            ev("subagent_failed", agent="codex", reason="runtime_error"),
+        ])
+        assert set(c["login_failed_by_reason"]) <= set(LOGIN_FAILURE_REASONS)
+        assert set(c["subagent_failed_by_reason"]) <= set(SUBAGENT_FAILURE_REASONS)
+        for entry in c["subagent_by_agent"].values():
+            assert set(entry["failed_by_reason"]) <= set(SUBAGENT_FAILURE_REASONS)
+
+
+class TestSchemaDocParity:
+    """§3.4: the published example in docs/TELEMETRY.md and ``build_ping``
+    agree on the ``counters`` key set, so the doc can never drift from the
+    payload (it is what users are told leaves their machine)."""
+
+    def test_doc_example_counters_match_build_ping(self, tmp_path):
+        import re
+        from pathlib import Path
+
+        doc = (Path(__file__).resolve().parents[2] / "docs" / "TELEMETRY.md").read_text(
+            encoding="utf-8")
+        block = re.search(r"```json\n(\{.*?\n\})\n```", doc, re.S)
+        assert block, "docs/TELEMETRY.md has no JSON example"
+        example = json.loads(block.group(1))
+        ping = build_ping(InstallIdentity(tmp_path), seed_spool(tmp_path, []), DAY,
+                          version="0.17.0", os_name="darwin")
+        assert set(example["counters"]) == set(ping["counters"])
+        assert set(example) == set(ping)

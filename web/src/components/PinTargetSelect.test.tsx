@@ -251,6 +251,24 @@ describe('PinTargetSelect — usage + availability (spec 099)', () => {
     expect(dot('pi')?.dataset.color).toBe('grey');
   });
 
+  it('an installed-but-too-old agent reads "Needs update", not "Needs login" (spec 116)', () => {
+    act(() => setAgentAvailability([{
+      slug: 'claude-code', name: 'Claude Code', installed: true, ready: false,
+      version: '2.1.100 (Claude Code)', update_needed: true, min_version: '2.1.114',
+      // An old CLI reads signed-out too — the version branch must win.
+      missing_credentials: ['claude_auth'],
+    }]));
+    render(<PinTargetSelect agents={ROWS.slice(0, 1)} value={null} onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('Needs update');
+    expect(dot('claude-code')?.dataset.color).toBe('grey');
+    fireEvent.mouseEnter(screen.getByRole('option', { name: /Claude Code/ }));
+    const card = screen.getByTestId('pin-quota-card');
+    expect(card.textContent).toContain(
+      'Claude Code v2.1.100 is too old; Orbital needs 2.1.114 or newer.');
+    expect(card.textContent).not.toContain('not signed in');
+  });
+
   it('the running worker pulses green', () => {
     act(() => setAgentAvailability(FOUR));
     render(<PinTargetSelect agents={ROWS} value="codex" onChange={() => {}}

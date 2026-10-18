@@ -203,6 +203,10 @@ function usageLines(
   t: T, locale: 'en' | 'zh',
 ): Line[] {
   if (!info) return [];
+  // Spec 116 D4: "needs update" BEFORE the generic not-ready branch — a CLI
+  // too old to know `auth status` reads as signed-out too, and the user
+  // must hear "update", not "login".
+  if (info.update_needed) return [{ text: t('pinAgent.status.needsUpdate'), tone: 'ok' }];
   if (info.ready === false) return [{ text: t('pinAgent.status.needsLogin'), tone: 'ok' }];
   if (!QUOTA_SLUGS.has(slug)) return [];
   const s = summarizeQuota(info.quota, now);
@@ -242,7 +246,8 @@ function unitText(unit: 'minutes' | 'hours' | 'days', n: number, prefix: 'age' |
 
 function hasCard(slug: string | null, info: AgentAvailability | undefined): boolean {
   if (!slug || !info) return false;
-  return info.ready === false || QUOTA_SLUGS.has(slug) || slug === 'cursor';
+  return info.update_needed === true || info.ready === false
+    || QUOTA_SLUGS.has(slug) || slug === 'cursor';
 }
 
 function QuotaCard({ slug, name, info, now, t, locale }: {
@@ -261,13 +266,19 @@ function QuotaCard({ slug, name, info, now, t, locale }: {
   );
   const note = (text: string) => <p className="m-0 text-xs text-secondary">{text}</p>;
 
-  if (info.ready === false) {
+  if (info.update_needed || info.ready === false) {
     return shell(
       <>
         <AvatarWithDot slug={slug} dot={{ color: 'grey', pulse: false }} dotTestId="pin-card-dot" t={t} />
         <b className="text-[13px] font-semibold">{name}</b>
       </>,
-      note(t('pinAgent.card.needsLogin', { name })),
+      note(info.update_needed
+        ? t('pinAgent.card.needsUpdate', {
+            name,
+            version: info.version?.match(/\d+\.\d+\.\d+/)?.[0] ?? info.version ?? '?',
+            min: info.min_version ?? '?',
+          })
+        : t('pinAgent.card.needsLogin', { name })),
     );
   }
   if (!QUOTA_SLUGS.has(slug)) {
