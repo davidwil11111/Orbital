@@ -328,3 +328,56 @@ describe('Sidebar — project dot while a worker runs (spec 095)', () => {
     expect(rowDot()).toHaveClass('bg-error');
   });
 });
+
+// Spec 117 D10: one dismissible notice for upgraded users, on the project
+// list. A brand-new install (no project in safe mode) never sees it.
+describe('Sidebar — safe-mode upgrade notice (spec 117)', () => {
+  const NOTICE =
+    'New projects now run without the sandbox. Your existing projects keep Safe mode on; you can turn it off in Project settings → Safe mode.';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('shows when at least one project is in safe mode', () => {
+    render(<Sidebar {...defaultProps} projects={[{ ...mockProject, safe_mode: true }]} />);
+    expect(screen.getByTestId('safe-mode-notice')).toHaveTextContent(NOTICE);
+  });
+
+  it('never shows on a fresh install: no projects, projects created open, or only Quick Tasks', () => {
+    const { unmount } = render(<Sidebar {...defaultProps} projects={[]} />);
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+    unmount();
+
+    const { unmount: unmount2 } = render(
+      <Sidebar {...defaultProps} projects={[{ ...mockProject, safe_mode: false }]} />,
+    );
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+    unmount2();
+
+    // A daemon that predates the field sends no safe_mode at all: no notice.
+    const { unmount: unmount3 } = render(<Sidebar {...defaultProps} projects={[mockProject]} />);
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+    unmount3();
+
+    render(
+      <Sidebar
+        {...defaultProps}
+        projects={[{ ...mockProject, project_id: 'scratch', is_scratch: true, safe_mode: true }]}
+      />,
+    );
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+  });
+
+  it('dismisses for good on this device', () => {
+    const projects = [{ ...mockProject, safe_mode: true }];
+    const { unmount } = render(<Sidebar {...defaultProps} projects={projects} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+    expect(localStorage.getItem('orbital.safeModeNotice.dismissed')).toBe('1');
+    unmount();
+
+    render(<Sidebar {...defaultProps} projects={projects} />);
+    expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
+  });
+});

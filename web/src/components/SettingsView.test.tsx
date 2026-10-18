@@ -306,3 +306,165 @@ describe('SettingsView autosave', () => {
     );
   });
 });
+
+// Spec 117 §3.7: the Safe mode row, the sections that only make sense inside
+// the sandbox, and the "runs outside the sandbox" list with its remove.
+describe('SettingsView Safe mode (spec 117)', () => {
+  const safeProject: Project = {
+    ...project,
+    safe_mode: true,
+    approved_domains: ['example.com'],
+    unsandboxed_executables: ['git', 'gh'],
+    pending_unsandboxed_runs: [
+      {
+        id: 'run-1',
+        command: 'git push origin main',
+        reason: 'Seatbelt denied file-read-data ~/.ssh/config',
+        created_at: '2026-10-18T00:00:00+00:00',
+        session_id: 'sess-1',
+      },
+    ],
+    granted_folders: [{ path: '/Users/me/Shared', mode: 'read_only' }],
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    mockApi.mockReset();
+    mockApi.mockImplementation((path: string) => {
+      if (path === '/api/v2/providers') return Promise.resolve({});
+      if (path === '/api/v2/projects/project-1') return Promise.resolve({ ...safeProject });
+      if (path.includes('/unsandboxed-runs/')) return Promise.resolve({ status: 'ok' });
+      if (path === '/api/v2/platform/folders/revoke') return Promise.resolve({ status: 'ok' });
+      return Promise.resolve([]);
+    });
+  });
+
+  function safeModeSwitch() {
+    return screen.getByRole('switch', { name: 'Safe mode' });
+  }
+
+  it('reflects the project: on, off, and absent (treated as on)', () => {
+    const { unmount } = render(
+      <SettingsView project={safeProject} onSave={vi.fn()} onDelete={vi.fn()} />,
+    );
+    expect(safeModeSwitch().getAttribute('aria-checked')).toBe('true');
+    unmount();
+
+    const { unmount: unmount2 } = render(
+      <SettingsView project={{ ...safeProject, safe_mode: false }} onSave={vi.fn()} onDelete={vi.fn()} />,
+    );
+    expect(safeModeSwitch().getAttribute('aria-checked')).toBe('false');
+    unmount2();
+
+    render(<SettingsView project={{ ...safeProject, safe_mode: undefined }} onSave={vi.fn()} onDelete={vi.fn()} />);
+    expect(safeModeSwitch().getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('a flip saves safe_mode at once', async () => {
+    const onSave = vi.fn(() => Promise.resolve());
+    render(<SettingsView project={safeProject} onSave={onSave} onDelete={vi.fn()} />);
+    // Let the mount-time detail GET land first: it hydrates the same value
+    // the row was rendered with, and a flip raced against it would be
+    // overwritten by the hydration, not by the user.
+    await act(async () => {});
+    fireEvent.click(safeModeSwitch());
+    expect(onSave).toHaveBeenCalledWith({ safe_mode: false });
+    expect(safeModeSwitch().getAttribute('aria-checked')).toBe('false');
+    fireEvent.click(safeModeSwitch());
+    // The second save queues behind the first one's promise.
+    await waitFor(() => expect(onSave).toHaveBeenLastCalledWith({ safe_mode: true }));
+  });
+
+  it('hides Folder access and Network access when safe mode is off, keeps them when on', () => {
+    const { container, unmount } = render(
+      <SettingsView project={safeProject} onSave={vi.fn()} onDelete={vi.fn()} />,
+    );
+    expect(container.querySelector('[data-settings-section="network"]')).not.toBeNull();
+    expect(container.querySelector('[data-settings-section="folders"]')).not.toBeNull();
+    expect(container.querySelector('[data-settings-section="unsandboxed"]')).not.toBeNull();
+    fireEvent.click(safeModeSwitch());
+    expect(container.querySelector('[data-settings-section="network"]')).toBeNull();
+    expect(container.querySelector('[data-settings-section="folders"]')).toBeNull();
+    unmount();
+
+    const { container: c2 } = render(
+      <SettingsView project={{ ...safeProject, safe_mode: false }} onSave={vi.fn()} onDelete={vi.fn()} />,
+    );
+    expect(c2.querySelector('[data-settings-section="network"]')).toBeNull();
+    expect(c2.querySelector('[data-settings-section="folders"]')).toBeNull();
+  });
+
+  it('lists the executables allowed outside the sandbox and saves the list without a removed one', () => {
+    const onSave = vi.fn(() => Promise.resolve());
+    render(<SettingsView project={safeProject} onSave={onSave} onDelete={vi.fn()} />);
+    expect(screen.getByText('git')).toBeInTheDocument();
+    expect(screen.getByText('gh')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove git' }));
+    expect(onSave).toHaveBeenCalledWith({ unsandboxed_executables: ['gh'] });
+    expect(screen.queryByText('git')).toBeNull();
+  });
+
+  it('answers a parked request through the resolve route and applies the answer locally', async () => {
+    const onSave = vi.fn(() => Promise.resolve());
+    render(<SettingsView project={safeProject} onSave={onSave} onDelete={vi.fn()} />);
+    expect(screen.getByText('git push origin main')).toBeInTheDocument();
+    expect(screen.getByText('Seatbelt denied file-read-data ~/.ssh/config')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Always allow git in this project' }));
+    await waitFor(() =>
+      expect(mockApi).toHaveBeenCalledWith(
+        '/api/v2/projects/project-1/unsandboxed-runs/run-1/resolve',
+        { method: 'POST', body: JSON.stringify({ decision: 'always' }) },
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText('git push origin main')).toBeNull());
+    // The executable joins the remembered list locally; the daemon wrote it
+    // server-side, so no PUT is sent for it.
+    expect(screen.getByText('git')).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('offers all four answers on a parked request, and "turn off safe mode" flips the row', async () => {
+    render(<SettingsView project={safeProject} onSave={vi.fn()} onDelete={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Always allow git in this project' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Turn off Safe mode for this project' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Turn off Safe mode for this project' }));
+    await waitFor(() =>
+      expect(mockApi).toHaveBeenCalledWith(
+        '/api/v2/projects/project-1/unsandboxed-runs/run-1/resolve',
+        { method: 'POST', body: JSON.stringify({ decision: 'disable_safe_mode' }) },
+      ),
+    );
+    await waitFor(() => expect(safeModeSwitch().getAttribute('aria-checked')).toBe('false'));
+  });
+
+  it('removes a granted folder through the platform revoke route with the project id', async () => {
+    render(<SettingsView project={safeProject} onSave={vi.fn()} onDelete={vi.fn()} />);
+    expect(screen.getByText('/Users/me/Shared')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove /Users/me/Shared' }));
+    await waitFor(() =>
+      expect(mockApi).toHaveBeenCalledWith('/api/v2/platform/folders/revoke', {
+        method: 'POST',
+        body: JSON.stringify({ path: '/Users/me/Shared', project_id: 'project-1' }),
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText('/Users/me/Shared')).toBeNull());
+  });
+
+  it('renders the row in Simplified Chinese with the spec copy', () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    render(
+      <LocaleProvider>
+        <SettingsView project={safeProject} onSave={vi.fn()} onDelete={vi.fn()} />
+      </LocaleProvider>,
+    );
+    expect(screen.getByRole('switch', { name: '安全模式' })).toBeInTheDocument();
+    expect(screen.getByText('沙盒外运行')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '允许这一次' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '本项目始终允许 git' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '关闭本项目的安全模式' })).toBeInTheDocument();
+  });
+});

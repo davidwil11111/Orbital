@@ -224,6 +224,10 @@ export function useAgent() {
       replyText?: string,
       approveAll?: boolean,
       sessionId?: string,
+      // Spec 117 D5: the unsandboxed_run card's answer ("once" | "always" |
+      // "disable_safe_mode") rides the existing approve route's
+      // response_payload field, as MFA codes already do.
+      responsePayload?: string,
     ) => {
       return api<ActionResult>(
         `/api/v2/agents/${encodeURIComponent(projectId)}/approve`,
@@ -234,6 +238,7 @@ export function useAgent() {
             ...(replyText !== undefined && { reply_text: replyText }),
             ...(approveAll && { approve_all: true }),
             ...(sessionId !== undefined && { session_id: sessionId }),
+            ...(responsePayload !== undefined && { response_payload: responsePayload }),
           }),
         },
       );

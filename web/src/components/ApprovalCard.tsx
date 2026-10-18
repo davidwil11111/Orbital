@@ -7,6 +7,8 @@ import { useAgent } from '../hooks/useAgent';
 import { useT, translate } from '../i18n/useT';
 import { useLocale } from '../i18n/LocaleContext';
 import { describeLiveActivity } from '../utils/chatTransform';
+import { commandExecutable } from './UnsandboxedRunsSection';
+import type { UnsandboxedRunDecision } from '../types';
 
 type TFunc = ReturnType<typeof useT>;
 
@@ -18,6 +20,11 @@ interface ApprovalCardProps {
     tool_args: Record<string, unknown>;
     recent_activity: Array<{ role: string; content: string | null }>;
     reasoning?: string;
+    /** Spec 117 D4/D5: `"unsandboxed_run"` — the sandbox blocked `command`
+     *  for `reason`; the card offers once / always / turn off safe mode. */
+    kind?: string;
+    command?: string;
+    reason?: string;
   };
   projectId: string;
   /** F1 session_id this approval belongs to (the viewed/holder session).
@@ -101,19 +108,25 @@ export default function ApprovalCard({
 }: ApprovalCardProps) {
   const t = useT();
   const { locale } = useLocale();
+  // Spec 117: a sandbox denial the agent may run outside the sandbox. Not a
+  // separate card — same chrome, same deny, different answers.
+  const isUnsandboxedRun = approval.kind === 'unsandboxed_run';
+  const unsandboxedCommand = approval.command ?? String(approval.tool_args?.command ?? '');
   // approval.what is backend-authored English; the payload carries the
   // structured tool call, so derive a localized sentence from it and keep
   // the wire prose only as the unknown-tool fallback.
   const localizedWhat = useMemo(
     () =>
-      describeLiveActivity(
-        approval.tool_name,
-        approval.tool_args,
-        undefined,
-        (k, v) => translate(locale, k, v),
-        approval.what,
-      ),
-    [locale, approval],
+      isUnsandboxedRun
+        ? translate(locale, 'approval.unsandboxed.what')
+        : describeLiveActivity(
+          approval.tool_name,
+          approval.tool_args,
+          undefined,
+          (k, v) => translate(locale, k, v),
+          approval.what,
+        ),
+    [locale, approval, isUnsandboxedRun],
   );
   const [replyText, setReplyText] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -147,11 +160,11 @@ export default function ApprovalCard({
       content: String(m.content),
     }));
 
-  async function handleApprove(approveAll = false) {
+  async function handleApprove(approveAll = false, decision?: UnsandboxedRunDecision) {
     setSubmitting(true);
     setError(null);
     try {
-      await approveToolCall(projectId, approval.tool_call_id, replyText || undefined, approveAll || undefined, sessionId);
+      await approveToolCall(projectId, approval.tool_call_id, replyText || undefined, approveAll || undefined, sessionId, decision);
       setLocalResolution('approved');
       onResolve?.(approval.tool_call_id, 'approved');
     } catch {
@@ -228,7 +241,20 @@ export default function ApprovalCard({
           <summary className="text-xs text-secondary cursor-pointer select-none mb-1">
             {t('approval.actionDetails')}
           </summary>
-          {renderToolArgs(approval.tool_name, approval.tool_args, t)}
+          {isUnsandboxedRun ? (
+            <div className="space-y-1.5">
+              <code className="block text-xs font-mono bg-[#1a1a2e] text-green-400 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap max-h-40">
+                {unsandboxedCommand}
+              </code>
+              {approval.reason && (
+                <p className="text-xs text-secondary whitespace-pre-wrap break-words">
+                  {approval.reason}
+                </p>
+              )}
+            </div>
+          ) : (
+            renderToolArgs(approval.tool_name, approval.tool_args, t)
+          )}
         </details>
 
         {recentLines.length > 0 && (
@@ -312,25 +338,62 @@ export default function ApprovalCard({
             >
               {t('credCard.deny')}
             </button>
-            <button
-              type="button"
-              onClick={() => handleApprove(true)}
-              onTouchEnd={(e) => { e.preventDefault(); handleApprove(true); }}
-              disabled={submitting}
-              title={t('approval.autoApprove.title')}
-              className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
-            >
-              {t('approval.autoApprove')}
-            </button>
-            <button
-              type="button"
-              onClick={() => handleApprove()}
-              onTouchEnd={(e) => { e.preventDefault(); handleApprove(); }}
-              disabled={submitting}
-              className="bg-primary text-white rounded-sm text-xs font-medium px-3.5 py-1.5 hover:opacity-90 transition-opacity duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
-            >
-              {t('approval.approve')}
-            </button>
+            {isUnsandboxedRun ? (
+              // Spec 117 D5: the three answers. "Turn off Safe mode" is where
+              // full access lives — this card is the one place every user who
+              // hits the sandbox wall passes through.
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleApprove(false, 'disable_safe_mode')}
+                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(false, 'disable_safe_mode'); }}
+                  disabled={submitting}
+                  className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                >
+                  {t('approval.unsandboxed.disableSafeMode')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApprove(false, 'always')}
+                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(false, 'always'); }}
+                  disabled={submitting}
+                  className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                >
+                  {t('approval.unsandboxed.alwaysAllow', { exe: commandExecutable(unsandboxedCommand) })}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApprove(false, 'once')}
+                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(false, 'once'); }}
+                  disabled={submitting}
+                  className="bg-primary text-white rounded-sm text-xs font-medium px-3.5 py-1.5 hover:opacity-90 transition-opacity duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                >
+                  {t('approval.unsandboxed.allowOnce')}
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleApprove(true)}
+                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(true); }}
+                  disabled={submitting}
+                  title={t('approval.autoApprove.title')}
+                  className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                >
+                  {t('approval.autoApprove')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApprove()}
+                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(); }}
+                  disabled={submitting}
+                  className="bg-primary text-white rounded-sm text-xs font-medium px-3.5 py-1.5 hover:opacity-90 transition-opacity duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                >
+                  {t('approval.approve')}
+                </button>
+              </>
+            )}
           </div>
         )}
 

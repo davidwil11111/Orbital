@@ -765,6 +765,11 @@ interface PendingApproval {
   recent_activity: ChatMessageType[];
   reasoning?: string;
   resolved?: 'approved' | 'denied';
+  /** Spec 117 D4/D5: `"unsandboxed_run"` with the blocked command and the
+   *  detected denial; the card offers once / always / turn off safe mode. */
+  kind?: string;
+  command?: string;
+  reason?: string;
 }
 
 export default function ChatView({ projectId, project, agentStatus, statusTick, agents, sessionId, initialDraft, onDraftConsumed, onRefreshProject }: ChatViewProps) {
@@ -1324,6 +1329,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       what?: string;
       recent_activity?: ChatMessageType[];
       reasoning?: string;
+      kind?: string;
+      command?: string;
+      reason?: string;
     }>(`/api/v2/agents/${encodeURIComponent(projectId)}/pending-approval${qs}`)
       .then((result) => {
         if (!result.pending || !result.tool_call_id) return;
@@ -1348,6 +1356,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             tool_args: result.tool_args ?? {},
             recent_activity: result.recent_activity ?? [],
             reasoning: result.reasoning,
+            kind: result.kind,
+            command: result.command,
+            reason: result.reason,
           });
           return next;
         });
@@ -2291,6 +2302,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
           tool_args: e.tool_args,
           recent_activity: e.recent_activity,
           reasoning: e.reasoning,
+          kind: e.kind,
+          command: e.command,
+          reason: e.reason,
         });
         return next;
       });

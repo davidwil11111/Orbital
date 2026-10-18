@@ -2,16 +2,20 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import ApprovalCard from './ApprovalCard';
 
 // useAgent reads BASE_URL + the websocket auth context; stub the methods we
 // need so the card can render without a live daemon.
+const { approveMock, denyMock } = vi.hoisted(() => ({
+  approveMock: vi.fn(),
+  denyMock: vi.fn(),
+}));
 vi.mock('../hooks/useAgent', () => ({
   useAgent: () => ({
-    approveToolCall: vi.fn(),
-    denyToolCall: vi.fn(),
+    approveToolCall: approveMock,
+    denyToolCall: denyMock,
   }),
 }));
 
@@ -101,5 +105,62 @@ describe('ApprovalCard — localized what sentence (China i18n)', () => {
       />,
     );
     expect(screen.getByText('Do a mystery thing')).toBeTruthy();
+  });
+});
+
+// Spec 117 D5: a sandbox denial raises an approval of kind `unsandboxed_run`.
+// The card shows the command and the detected reason, and offers three ways
+// to run it outside the sandbox (plus the ordinary Deny).
+describe('ApprovalCard — unsandboxed_run kind (spec 117)', () => {
+  const unsandboxed = {
+    what: 'Run outside the sandbox',
+    tool_name: 'shell',
+    tool_call_id: 'call-9',
+    tool_args: { command: 'git push origin main' },
+    recent_activity: [],
+    kind: 'unsandboxed_run',
+    command: 'git push origin main',
+    reason: 'Seatbelt denied file-read-data ~/.ssh/config',
+  };
+
+  it('shows the command in a code block, the reason, and the three answers', () => {
+    render(<ApprovalCard approval={unsandboxed} projectId="p1" sessionId="s1" />);
+    const code = screen.getByText('git push origin main');
+    expect(code.tagName).toBe('CODE');
+    expect(screen.getByText('Seatbelt denied file-read-data ~/.ssh/config')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Always allow git in this project' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Turn off Safe mode for this project' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeTruthy();
+    // The generic answers do not apply to this kind.
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Auto-approve 10 min' })).toBeNull();
+  });
+
+  it.each([
+    ['Allow once', 'once'],
+    ['Always allow git in this project', 'always'],
+    ['Turn off Safe mode for this project', 'disable_safe_mode'],
+  ])('"%s" approves with response_payload %s', async (label, payload) => {
+    approveMock.mockClear();
+    approveMock.mockResolvedValue({});
+    const onResolve = vi.fn();
+    render(
+      <ApprovalCard approval={unsandboxed} projectId="p1" sessionId="s1" onResolve={onResolve} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: label }));
+    await waitFor(() =>
+      expect(approveMock).toHaveBeenCalledWith('p1', 'call-9', undefined, undefined, 's1', payload),
+    );
+    await waitFor(() => expect(onResolve).toHaveBeenCalledWith('call-9', 'approved'));
+  });
+
+  it('Deny still goes through the existing deny route', async () => {
+    denyMock.mockClear();
+    denyMock.mockResolvedValue({});
+    render(<ApprovalCard approval={unsandboxed} projectId="p1" sessionId="s1" />);
+    fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Deny' }));
+    await waitFor(() => expect(denyMock).toHaveBeenCalledWith('p1', 'call-9', 'Denied by user', 's1'));
   });
 });

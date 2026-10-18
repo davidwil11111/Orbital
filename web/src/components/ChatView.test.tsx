@@ -169,6 +169,7 @@ let cancelPendingInputMock: (...args: unknown[]) => Promise<unknown> = async () 
   removed: true,
 });
 const cancelPendingInputCalls: unknown[][] = [];
+const approveToolCallCalls: unknown[][] = [];
 
 // Return a STABLE instance so useAgent's functions keep referential identity
 // across renders (the real hook wraps them in useCallback). The session-load
@@ -200,6 +201,12 @@ vi.mock('../hooks/useAgent', () => {
       cancelPendingInputCalls.push(args);
       return cancelPendingInputMock(...args);
     }),
+    // ApprovalCard answers through these (spec 117 card test below).
+    approveToolCall: vi.fn((...args: unknown[]) => {
+      approveToolCallCalls.push(args);
+      return Promise.resolve({});
+    }),
+    denyToolCall: vi.fn(async () => ({})),
   };
   return { useAgent: () => inst };
 });
@@ -4188,5 +4195,43 @@ describe('Spec 105: composer auto-resize writes the height only when it changes'
     s.scrollHeight = 520;
     await type('xy');
     expect(s.writes).toEqual([]);
+  });
+});
+
+// Spec 117 D5: the approval card renders kind `unsandboxed_run` with the
+// command, the detected reason and the three answers, each posting its
+// response_payload through the existing approve route.
+describe('ChatView: unsandboxed_run approval card (spec 117)', () => {
+  it('renders the command and three answers, and "Allow once" approves with once', async () => {
+    runStatusHolder = 's1';
+    approveToolCallCalls.length = 0;
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('approval.request', {
+        type: 'approval.request', project_id: 'p1', session_id: 's1',
+        what: 'Run outside the sandbox', tool_name: 'shell', tool_call_id: 'tc-unsb',
+        tool_args: { command: 'git push origin main' }, recent_activity: [],
+        kind: 'unsandboxed_run', command: 'git push origin main',
+        reason: 'Seatbelt denied file-read-data ~/.ssh/config',
+      });
+    });
+
+    const text = container.textContent ?? '';
+    expect(text).toContain('git push origin main');
+    expect(text).toContain('Seatbelt denied file-read-data ~/.ssh/config');
+    const buttons = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
+    expect(buttons).toContain('Allow once');
+    expect(buttons).toContain('Always allow git in this project');
+    expect(buttons).toContain('Turn off Safe mode for this project');
+    expect(buttons).toContain('Deny');
+
+    const once = Array.from(container.querySelectorAll('button')).find((b) => b.textContent === 'Allow once')!;
+    await act(async () => { once.click(); });
+    expect(approveToolCallCalls).toEqual([['p1', 'tc-unsb', undefined, undefined, 's1', 'once']]);
+    // A resolved live approval leaves the list (the history row, when the
+    // session JSONL carries it, is what shows "Approved" later).
+    expect(container.textContent ?? '').not.toContain('Allow once');
   });
 });
