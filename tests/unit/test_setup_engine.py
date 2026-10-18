@@ -425,3 +425,80 @@ class TestGetAdapterConfig:
                 slug="test-agent",
                 project_workspace="/tmp/workspace",
             )
+
+
+# ---------------------------------------------------------------------------
+# Spec 116 D1/D4 — version floor (``setup.min_version``)
+# ---------------------------------------------------------------------------
+
+class TestVersionFloor:
+    """An installed CLI older than the manifest's floor is its own state:
+    ``update_needed`` set, ``ready`` false, an ``update_agent`` action. A
+    missing version or a manifest without a floor never trips it."""
+
+    @staticmethod
+    def _engine(version_output, min_version="2.1.114", update_command="testagent update"):
+        manifest = _make_cli_manifest()
+        manifest.setup.min_version = min_version
+        manifest.setup.update_command = update_command
+        manifest.setup.update_label = "Update Test Agent"
+        registry = AgentRegistry()
+        registry.register(manifest)
+        engine = SetupEngine(registry)
+        engine._resolved_paths["test-agent"] = "/usr/local/bin/testagent"
+        engine._run_check_command = MagicMock(return_value=version_output)
+        engine.check_dependencies = MagicMock(return_value=(True, []))
+        engine._evaluate_credentials = MagicMock(return_value=([], None))
+        return engine
+
+    def test_version_below_the_floor_needs_update(self):
+        status = self._engine("2.1.100 (Claude Code)").check_agent("test-agent")
+        assert status.update_needed is True
+        assert status.min_version == "2.1.114"
+        assert status.installed is True
+        actions = [a for a in status.setup_actions if a.action == "update_agent"]
+        assert len(actions) == 1
+        assert actions[0].command == "testagent update"
+        assert actions[0].label == "Update Test Agent"
+        assert actions[0].blocking is True
+
+    @pytest.mark.parametrize("version", ["2.1.114 (Claude Code)", "2.1.302 (Claude Code)",
+                                         "v3.0.0"])
+    def test_version_at_or_above_the_floor_is_fine(self, version):
+        status = self._engine(version).check_agent("test-agent")
+        assert status.update_needed is False
+        assert status.min_version == "2.1.114"
+        assert not [a for a in status.setup_actions if a.action == "update_agent"]
+
+    def test_unreadable_version_does_not_apply_the_floor(self):
+        status = self._engine(None).check_agent("test-agent")
+        assert status.version is None
+        assert status.update_needed is False
+        assert not [a for a in status.setup_actions if a.action == "update_agent"]
+
+    def test_manifest_without_a_floor_never_needs_update(self):
+        status = self._engine("0.0.1", min_version=None).check_agent("test-agent")
+        assert status.update_needed is False
+        assert status.min_version is None
+
+    def test_claude_code_manifest_floor_parses(self):
+        from agent_os.agents.manifest import ManifestLoader
+
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "agent_os",
+                            "agents", "manifests", "claude_code.yaml")
+        manifest = ManifestLoader.load(os.path.abspath(path))
+        assert manifest.setup.min_version == "2.1.114"
+        assert manifest.setup.update_command == "claude update"
+        assert manifest.setup.update_label
+        assert SetupEngine._version_gte("2.1.114", manifest.setup.min_version)
+        assert not SetupEngine._version_gte("2.1.100", manifest.setup.min_version)
+
+    def test_cached_status_reads_the_last_sweep_without_probing(self):
+        engine = self._engine("2.1.100 (Claude Code)")
+        assert engine.cached_status("test-agent") is None
+        engine.check_all()
+        engine._run_check_command.reset_mock()
+        cached = engine.cached_status("test-agent")
+        assert cached is not None and cached.update_needed is True
+        engine._run_check_command.assert_not_called()
+        assert engine.cached_status("nope") is None

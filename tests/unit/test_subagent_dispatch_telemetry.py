@@ -78,6 +78,10 @@ def _subagent_rows(rows):
     return [(r["event"], r.get("agent")) for r in rows if r["event"].startswith("subagent_")]
 
 
+def _reasons(rows):
+    return [(r["event"], r.get("reason")) for r in rows if r["event"] == "subagent_failed"]
+
+
 def _manager(observer=None, handle="claude-code"):
     manager = SubAgentManager(_ProcessManager(), lifecycle_observer=observer)
     transport = _Transport()
@@ -125,6 +129,13 @@ async def test_spawn_failure_counts_as_failed_without_a_dispatch(spool_rows):
 
     assert result.startswith("Error")
     assert _subagent_rows(spool_rows()) == [("subagent_failed", "codex")]
+    # Spec 113 A2: a spawn that never started says so, with the structured
+    # diagnostic fields present (unknown where nothing can be known).
+    row = [r for r in spool_rows() if r["event"] == "subagent_failed"][0]
+    assert row["reason"] == "spawn"
+    assert row["install_kind"] == "unknown"
+    assert set(row) >= {"exit_code", "cli_version", "duration_ms", "error_class",
+                        "stderr_category"}
 
 
 @pytest.mark.asyncio
@@ -139,6 +150,25 @@ async def test_negative_terminals_count_as_failed(spool_rows, terminal):
                                  session_id="s1")
 
     assert _subagent_rows(spool_rows()) == [("subagent_failed", "codex")]
+    # Spec 113 A2: the three failure classes are told apart by reason.
+    expected = "runtime_error" if terminal == "on_error" else "adapter_broken"
+    assert _reasons(spool_rows()) == [("subagent_failed", expected)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_error_writes_a_local_log_line(spool_rows, caplog):
+    """Spec 113 A3: on_error had no daemon.log line at all."""
+    import logging
+
+    observer = LifecycleObserver(_AgentManager(), _WS())
+    with caplog.at_level(logging.WARNING, logger="agent_os.daemon_v2.lifecycle_observer"):
+        await observer.on_error("p1", "codex", "ECONNRESET from the gateway", "/t.jsonl",
+                                session_id="s1")
+    assert any("codex" in r.getMessage() and "ECONNRESET" in r.getMessage()
+               for r in caplog.records)
+    row = [r for r in spool_rows() if r["event"] == "subagent_failed"][0]
+    assert row["stderr_category"] == "network"
+    assert "ECONNRESET" not in json.dumps(row)
 
 
 @pytest.mark.asyncio

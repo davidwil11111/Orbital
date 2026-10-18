@@ -70,6 +70,12 @@ interface SubAgentEntry {
    *  false, the agent only accepts an API key — hide the Login button so it
    *  can't 400. Optional for backward-compat with older daemon payloads. */
   supports_login?: boolean;
+  /** Spec 116 D4: the installed CLI is older than `min_version`, the oldest
+   *  version Orbital can drive. The card then shows the Update button
+   *  (`supports_update`: the manifest declares an updater) instead of Login. */
+  update_needed?: boolean;
+  min_version?: string | null;
+  supports_update?: boolean;
   setup_actions: Array<{ action: string; label: string; command: string | null; blocking: boolean }>;
   config: Record<string, string>;
   param_schema: Record<string, ParamSchemaEntry>;
@@ -101,6 +107,20 @@ const HOST_NOTE_KEY: Record<string, StringKey> = {
   pi: 'subAgentCard.pi.hostNote',
   'minimax-code': 'subAgentCard.minimaxCode.signInNote',
 };
+
+/** What to run by hand when the in-app updater leaves the CLI below the
+ *  floor (spec 116 D3: a pre-2.1.288 npm updater can "succeed" with only the
+ *  placeholder stub installed). Dynamic command text, never translated. */
+const MANUAL_UPDATE_COMMAND: Record<string, string> = {
+  'claude-code': 'npm install -g @anthropic-ai/claude-code@latest',
+};
+
+/** The dotted number out of a `--version` line ("2.1.100 (Claude Code)" →
+ *  "2.1.100") for the floor notice; the raw line stays on the version pill. */
+export function shortVersion(raw: string | null | undefined): string {
+  const m = raw?.match(/\d+\.\d+\.\d+/);
+  return m ? m[0] : (raw ?? '?');
+}
 
 /** Per-agent hint under the free-text model field, for CLIs whose model ids
  *  are not guessable from the vendor's model names. */
@@ -370,8 +390,18 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
   // slow keychain write looks identical), so it reads as "couldn't confirm".
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
   const [loginNotice, setLoginNotice] = useState<'unverified' | 'failed' | null>(null);
+  // Update (spec 116 D2/D3): the same job runner as login, told apart by
+  // `kind: 'update'` on every event. `updating` spans the job; the notice is
+  // 'failed' when the re-probed version is still below the floor (or the
+  // updater failed), 'busy' when the daemon refused (409) because a worker
+  // of this agent is running (D8).
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateNotice, setUpdateNotice] = useState<'failed' | 'busy' | null>(null);
 
   const paramKeys = Object.keys(entry.param_schema);
+  const updateNeeded = entry.update_needed === true;
+  const supportsUpdate = entry.supports_update !== false;
   const isApiKeyFlow = API_KEY_LOGIN_SLUGS.has(entry.slug);
   // Hide the Login button when the daemon reports the agent has no interactive
   // login flow (API-key-only agents). Treat undefined as "supported" so older
@@ -445,12 +475,21 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     const onLoginProgress = (event: WebSocketEvent) => {
       if (event.type !== 'login.progress') return;
       if (event.slug !== entry.slug) return;
+      if (event.kind === 'update') return; // updater output carries no sign-in URL
       const url = pickLoginUrl(event.line);
       if (url) setLoginUrl(prev => prev ?? url);
     };
     const onLoginComplete = (event: WebSocketEvent) => {
       if (event.type !== 'login.complete') return;
       if (event.slug !== entry.slug) return;
+      if (event.kind === 'update') {
+        setUpdating(false);
+        // D3: `verified` is the re-probed version reaching the floor. An
+        // exit-0 that left the stub behind is a failure here, unlike login.
+        setUpdateNotice(event.verified === false ? 'failed' : null);
+        void onChanged();
+        return;
+      }
       setLoginBusy(false);
       setLoginUrl(null);
       // `verified === undefined` means an older daemon that does not re-check;
@@ -461,6 +500,11 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     const onLoginFailed = (event: WebSocketEvent) => {
       if (event.type !== 'login.failed') return;
       if (event.slug !== entry.slug) return;
+      if (event.kind === 'update') {
+        setUpdating(false);
+        setUpdateNotice('failed');
+        return;
+      }
       setLoginBusy(false);
       setLoginUrl(null);
       setLoginNotice('failed');
@@ -539,6 +583,28 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoginBusy(false);
+    }
+  };
+
+  const handleUpdate = async () => {
+    setUpdateBusy(true);
+    setActionError(null);
+    setUpdateNotice(null);
+    try {
+      await api(`/api/v2/settings/sub-agents/${encodeURIComponent(entry.slug)}/update`, {
+        method: 'POST',
+      });
+      // Progress streams over the WS; the terminal event ends `updating`.
+      setUpdating(true);
+    } catch (e) {
+      const status = e && typeof e === 'object' ? (e as { status?: number }).status : undefined;
+      if (status === 409) {
+        setUpdateNotice('busy');
+      } else {
+        setActionError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setUpdateBusy(false);
     }
   };
 
@@ -634,6 +700,53 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
         </p>
       )}
 
+      {/* Spec 116 D4: too old to drive — say "update", offer the updater,
+          and hide Login (a too-old CLI cannot be logged in through Orbital). */}
+      {updateNeeded && (
+        <div
+          data-testid={`sub-agent-update-${entry.slug}`}
+          className="flex flex-col gap-2 mt-3 mb-3"
+        >
+          <p className="text-xs text-warning">
+            {t('subAgentCard.updateNeeded', {
+              name: entry.name,
+              version: shortVersion(entry.version),
+              min: entry.min_version ?? '?',
+            })}
+          </p>
+          {supportsUpdate && (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleUpdate}
+                disabled={updateBusy || updating || !entry.installed}
+                className="text-xs bg-accent text-white rounded px-3 py-1.5 hover:bg-accent/90 transition-all duration-150 disabled:opacity-50"
+              >
+                {updateBusy || updating ? t('subAgentCard.updating') : t('subAgentCard.update')}
+              </button>
+              {updating && (
+                <span
+                  data-testid={`sub-agent-update-spinner-${entry.slug}`}
+                  className="inline-block h-3 w-3 rounded-full border-2 border-accent border-t-transparent animate-spin"
+                  aria-hidden="true"
+                />
+              )}
+            </div>
+          )}
+          {updateNotice && (
+            <p
+              data-testid={`sub-agent-update-notice-${entry.slug}`}
+              className={`text-[11px] ${updateNotice === 'busy' ? 'text-warning' : 'text-error'}`}
+            >
+              {updateNotice === 'busy'
+                ? t('subAgentCard.updateBusy', { name: entry.name })
+                : t('subAgentCard.updateFailed', {
+                    command: MANUAL_UPDATE_COMMAND[entry.slug] ?? entry.setup_actions.find(a => a.action === 'install_agent')?.command ?? '',
+                  })}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Orbital-managed install */}
       {!entry.installed && canInstall && (
         <div
@@ -706,7 +819,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
 
       {/* Login / Logout */}
       <div className="flex flex-wrap items-center gap-2 mt-3 mb-3">
-        {!entry.credentials_configured && supportsLogin && (
+        {!entry.credentials_configured && supportsLogin && !updateNeeded && (
           <button
             onClick={handleLogin}
             disabled={loginBusy || !entry.installed}

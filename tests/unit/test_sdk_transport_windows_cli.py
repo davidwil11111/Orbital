@@ -171,3 +171,45 @@ def test_off_windows_the_sdk_is_left_alone(monkeypatch):
     monkeypatch.setattr(subprocess_cli, "anyio", original)
     sdk_transport.install_sdk_no_window_spawn(windows=False)
     assert subprocess_cli.anyio is original
+
+
+# ---------------------------------------------------------------------------
+# Spec 116 D9: the SDK's batch-script refusal becomes an update hint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_refusal_is_reraised_as_the_update_message(tmp_path, monkeypatch):
+    """No native exe beside the shim (npm layout < 2.1.114, or a stub-only
+    install): the SDK refuses the .cmd. The user hears what to do."""
+    import functools
+
+    from agent_os.agent.transports import sdk_transport
+
+    shim = _npm_shim(tmp_path)
+    monkeypatch.setattr(sdk_transport, "native_claude_cli", functools.partial(
+        native_claude_cli, windows=True, home=str(tmp_path / "home"),
+        which=lambda _: None))
+    transport = SDKTransport()
+    with patch("agent_os.agent.transports.sdk_transport.ClaudeSDKClient") as client, \
+         patch("agent_os.agent.transports.sdk_transport.ClaudeAgentOptions"):
+        client.return_value.connect = AsyncMock(side_effect=RuntimeError(
+            f"Refusing to execute batch script '{shim}'. cmd.exe re-parses ..."))
+        with pytest.raises(RuntimeError) as info:
+            await transport.start(str(shim), [], str(tmp_path))
+    message = str(info.value)
+    assert message.startswith(f"Claude Code at {shim} has no native claude.exe")
+    assert "older than 2.1.114" in message
+    assert "click Update" in message
+    assert "Refusing to execute batch script" in str(info.value.__cause__)
+    assert transport._alive is False
+
+
+@pytest.mark.asyncio
+async def test_other_connect_errors_pass_through_untouched(tmp_path):
+    transport = SDKTransport()
+    with patch("agent_os.agent.transports.sdk_transport.ClaudeSDKClient") as client, \
+         patch("agent_os.agent.transports.sdk_transport.ClaudeAgentOptions"):
+        client.return_value.connect = AsyncMock(side_effect=OSError("boom"))
+        with pytest.raises(OSError, match="boom"):
+            await transport.start("claude", [], str(tmp_path))

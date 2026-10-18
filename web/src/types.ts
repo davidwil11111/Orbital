@@ -663,6 +663,12 @@ export interface AgentAvailability {
   ready?: boolean;
   missing_credentials?: string[];
   quota?: QuotaSnapshot;
+  /** Spec 116 D4: the installed CLI is older than the version Orbital can
+   *  drive (`min_version`). Checked BEFORE the generic not-ready branch so
+   *  the row says "update", never "login". `version` is the detected one. */
+  version?: string | null;
+  update_needed?: boolean;
+  min_version?: string | null;
 }
 
 /** Spec 099 — the daemon's quota store changed (null = cleared). Global:
@@ -874,6 +880,9 @@ export interface LoginProgressEvent {
   slug: string;
   job_id: string;
   line: string;
+  /** Spec 116 D2: the Update job reuses the login event names; `kind`
+   *  tells them apart. Absent on daemons before the update route = login. */
+  kind?: 'login' | 'update';
 }
 
 // The CLI exited 0. `verified` is the post-run re-check of the manifest's
@@ -887,6 +896,7 @@ export interface LoginCompleteEvent {
   job_id: string;
   return_code: number;
   verified?: boolean;
+  kind?: 'login' | 'update';
 }
 
 // The CLI exited non-zero, could not be spawned, or went idle past the timeout.
@@ -899,6 +909,7 @@ export interface LoginFailedEvent {
   return_code?: number;
   error?: string;
   timed_out?: boolean;
+  kind?: 'login' | 'update';
 }
 
 export interface TriggerCreatedEvent {

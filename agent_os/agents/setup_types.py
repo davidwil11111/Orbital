@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 @dataclass
 class SetupAction:
     """A single action needed to get an agent ready."""
-    action: str         # "install_dependency" | "install_agent" | "configure_credential" | "none"
+    action: str         # "install_dependency" | "install_agent" | "configure_credential" | "update_agent" | "none"
     label: str          # human-readable: "Install Node.js 18+"
     command: str | None  # suggested command, or None for credential prompts
     blocking: bool      # can't proceed without this
@@ -33,3 +33,10 @@ class AgentSetupStatus:
     # credential (Pi). "unknown" is dispatchable but not verified. None for
     # every other agent, whose state is ``credentials_configured`` alone.
     credential_state: str | None = None
+    # Spec 116 D4: the installed CLI is older than the manifest's
+    # ``setup.min_version`` floor. Its own state, distinct from "needs
+    # login": ``ready`` is false while it is set, and the UI says "update".
+    # ``min_version`` is echoed so the message can name the floor. False/None
+    # when the version could not be read or the manifest declares no floor.
+    update_needed: bool = False
+    min_version: str | None = None

@@ -37,6 +37,19 @@ setup:
         macos: "brew install node"
   install_command: "npm install -g @anthropic-ai/claude-code"
   check_command: "claude --version"
+  # Spec 116 D1: the oldest CLI Orbital can drive. 2.1.114 is the first npm
+  # release whose install carries a native `bin/claude.exe` (older packages
+  # ship only `cli.js` + the `claude.cmd` shim, which claude-agent-sdk
+  # refuses to spawn on Windows). It is NOT 2.1.41 — the version that added
+  # the `claude auth status/login` subcommands this manifest probes with —
+  # because a 2.1.41–2.1.112 install still has no exe to hand the SDK.
+  # Checked offline against `check_command`'s output; no registry lookup.
+  min_version: "2.1.114"
+  # Spec 116 D2: the CLI's own updater (npm and native paths alike). Success
+  # is decided by re-probing `--version` against the floor, never by exit
+  # code (a pre-2.1.288 npm updater reports success with only the stub).
+  update_command: "claude update"
+  update_label: "Update Claude Code"
   credentials:
     - key: "claude_auth"
       label: "Claude Account"

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -16,6 +17,12 @@ from pydantic import BaseModel
 
 from agent_os import telemetry
 from agent_os.agent.transports.process_kill import kill_spawned_tree
+from agent_os.telemetry.diagnostics import (
+    classify_stderr,
+    clean_version,
+    error_class_of,
+    install_kind_of,
+)
 from agent_os.agents.installer import (
     InstallInProgress,
     InstallUnsupported,
@@ -36,9 +43,19 @@ _setup_engine = None
 _sub_agent_config_store = None
 _ws_manager = None
 _installer: SubAgentInstaller | None = None
-# Tracks in-flight login subprocesses keyed by job_id, so callers can poll
-# WS events for ``login.progress`` / ``login.complete`` / ``login.failed``.
+# The sub-agent manager, for the update route's "is a worker running" check
+# (spec 116 D8). None when unwired (tests, older app factories): no check.
+_sub_agent_manager = None
+# Login / update jobs keyed by job_id (spec 116 D2: the update job is the
+# same runner with ``kind="update"``). Running entries plus the last
+# ``LOGIN_JOB_HISTORY`` terminal ones (spec 113 A3): reason, return code,
+# redacted output tail — what a user pastes into an issue, read back over
+# ``GET /settings/sub-agents/login-jobs``. In-memory: a restart clears it,
+# the daemon.log line written per terminal is the durable record.
 _login_jobs: dict[str, dict] = {}
+LOGIN_JOB_HISTORY = 20
+# How many trailing output lines a terminal keeps (local log + job entry).
+LOGIN_JOB_TAIL_LINES = 5
 
 # Seconds of silence (no output line) before an in-flight login is killed.
 # It is an IDLE timeout, not a wall-clock cap: the user is off in a browser
@@ -80,15 +97,17 @@ def _strip_terminal_escapes(line: str) -> str:
 
 
 def configure(settings_store, credential_store=None, setup_engine=None,
-              sub_agent_config_store=None, ws_manager=None, project_store=None):
+              sub_agent_config_store=None, ws_manager=None, project_store=None,
+              sub_agent_manager=None):
     global _settings_store, _credential_store, _setup_engine, _project_store
-    global _sub_agent_config_store, _ws_manager, _installer
+    global _sub_agent_config_store, _ws_manager, _installer, _sub_agent_manager
     _settings_store = settings_store
     _credential_store = credential_store
     _project_store = project_store
     _setup_engine = setup_engine
     _sub_agent_config_store = sub_agent_config_store
     _ws_manager = ws_manager
+    _sub_agent_manager = sub_agent_manager
     # The installer's job registry is per-daemon by design: a restart mid-run
     # leaves no completion marker, which is the "partial, re-run" signal the
     # next status read wants. Rebuilding it here keeps that lifetime tied to
@@ -652,13 +671,21 @@ def _build_sub_agent_status_entry(s) -> dict:
             logger.warning("Failed to read sub-agent config for %s",
                            s.slug, exc_info=True)
     manifest = _registry_manifest(s.slug)
+    # Spec 116 D4: an installed CLI older than the manifest's floor is not
+    # ready, and the card/picker say "update" rather than "login".
+    update_needed = bool(getattr(s, "update_needed", False))
     return {
         "slug": s.slug,
         "name": s.name,
         "installed": s.installed,
         "binary_path": s.binary_path,
         "version": s.version,
-        "ready": s.installed and s.dependencies_met and s.credentials_configured,
+        "ready": (s.installed and s.dependencies_met and s.credentials_configured
+                  and not update_needed),
+        "update_needed": update_needed,
+        "min_version": getattr(s, "min_version", None),
+        "supports_update": bool(manifest is not None
+                                and manifest.setup.update_command),
         "dependencies_met": s.dependencies_met,
         "missing_dependencies": s.missing_dependencies,
         "credentials_configured": s.credentials_configured,
@@ -868,10 +895,12 @@ async def refresh_sub_agent_status():
 def _resolve_setup_command(slug: str, action: str) -> str | None:
     """Find the manifest's command string for a setup action.
 
-    ``action`` is one of "login", "logout". Looks up the matching credential
-    on the agent's manifest and returns ``setup_command`` (login) or
-    ``logout_command`` (not currently in manifest schema; falls back to
-    deriving from binary name for known agents).
+    ``action`` is one of "login", "logout", "update". Looks up the matching
+    credential on the agent's manifest and returns ``setup_command`` (login)
+    or ``logout_command`` (not currently in manifest schema; falls back to
+    deriving from binary name for known agents). "update" (spec 116 D2) is
+    the manifest's ``setup.update_command`` — the CLI's own updater — with
+    the same binary substitution as login.
 
     Returns None if the agent has no such action.
     """
@@ -884,6 +913,14 @@ def _resolve_setup_command(slug: str, action: str) -> str | None:
     if manifest is None:
         return None
     binary = _setup_engine.resolve_binary(manifest)
+    if action == "update":
+        cmd = manifest.setup.update_command
+        if not cmd:
+            return None
+        if binary and manifest.runtime.command:
+            return _setup_engine._substitute_binary(
+                cmd, manifest.runtime.command, binary)
+        return cmd
     if action == "login":
         # Use the manifest credential's setup_command if defined.
         for cred in manifest.setup.credentials:
@@ -941,8 +978,67 @@ async def _credentials_now_configured(slug: str) -> bool:
     return bool(configured)
 
 
-async def _run_login_job(slug: str, job_id: str, command: str) -> None:
-    """Background task: run the CLI login command, broadcast progress.
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#\"'<>]+)\?[^\s\"'<>]*")
+
+
+def _redact_urls(text: str) -> str:
+    """Drop the query string of every http(s) URL (spec 113 A3).
+
+    ``claude auth login`` / ``codex login`` print OAuth URLs whose query
+    carries ``code`` / ``state`` tokens; the local log may hold text, never a
+    credential, so the URL keeps its path and loses everything after ``?``.
+    """
+    return _URL_QUERY_RE.sub(r"\1?…", text)
+
+
+def _cli_diagnostics(slug: str) -> dict:
+    """``{cli_version, install_kind}`` for ``slug`` without spawning anything
+    (spec 113): the last status sweep's version, and the install kind judged
+    from the resolved binary path. Both degrade to unknown/None."""
+    version = None
+    binary = None
+    if _setup_engine is not None:
+        cached = getattr(_setup_engine, "cached_status", None)
+        status = cached(slug) if callable(cached) else None
+        if status is not None:
+            version = getattr(status, "version", None)
+            binary = getattr(status, "binary_path", None)
+        if binary is None:
+            get_path = getattr(_setup_engine, "get_resolved_path", None)
+            binary = get_path(slug) if callable(get_path) else None
+    return {"cli_version": clean_version(version), "install_kind": install_kind_of(binary)}
+
+
+def _prune_login_jobs() -> None:
+    """Keep every running job plus the newest ``LOGIN_JOB_HISTORY`` finished
+    ones (insertion order == start order)."""
+    finished = [jid for jid, job in _login_jobs.items() if job.get("status") != "running"]
+    for jid in finished[:-LOGIN_JOB_HISTORY] if len(finished) > LOGIN_JOB_HISTORY else []:
+        _login_jobs.pop(jid, None)
+
+
+def _login_job_view(job_id: str, job: dict) -> dict:
+    """The read-only shape of one job entry (``GET .../login-jobs``): no
+    command string (it carries the binary path) and no pid."""
+    return {
+        "job_id": job_id,
+        "slug": job.get("slug"),
+        "kind": job.get("kind", "login"),
+        "status": job.get("status"),
+        "reason": job.get("reason"),
+        "return_code": job.get("return_code"),
+        "timed_out": bool(job.get("timed_out")),
+        "verified": job.get("verified"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "duration_ms": job.get("duration_ms"),
+        "tail": list(job.get("tail") or []),
+    }
+
+
+async def _run_login_job(slug: str, job_id: str, command: str,
+                         kind: str = "login") -> None:
+    """Background task: run the CLI login (or update) command, broadcast progress.
 
     Captures stdout+stderr line by line and emits sanitised ``login.progress``
     events over WebSocket. Final ``login.complete`` or ``login.failed`` carries
@@ -952,11 +1048,72 @@ async def _run_login_job(slug: str, job_id: str, command: str) -> None:
     turn a real login into a reported error — but it is reported honestly so
     the UI can say "signed in, but couldn't confirm".
 
+    ``kind`` (spec 116 D2): ``"update"`` runs the manifest's
+    ``update_command`` through this same runner. Every event carries
+    ``kind`` so the card can tell the two apart; the post-run verification
+    differs (D3): an update is verified when the RE-PROBED version is at or
+    above the floor — never by the exit code, since a pre-2.1.288 npm
+    updater reports success with only the stub installed.
+
+    Spec 113 A1/A3: every terminal emits its reason (``spawn_error`` /
+    ``timeout`` / ``nonzero_exit``; ``unverified`` is its own event for a
+    login and a failure for an update) with structured diagnostics, writes
+    ONE daemon.log line (reason, return code, the last few output lines with
+    URL queries redacted), and the job entry keeps the same for the
+    login-jobs read route.
+
     Tokens from this flow never enter Orbital's storage — the CLI writes them
     to its own location. (Agents with no credential store of their own don't
     come through here at all; they use the ``/credential`` routes.)
     """
-    telemetry.emit("login_attempted", {"agent": slug})
+    started = time.monotonic()
+    job = _login_jobs.setdefault(job_id, {"slug": slug, "status": "running"})
+    job["kind"] = kind
+    job.setdefault("started_at", _now_iso())
+    tail: list[str] = []
+    # Snapshot the CLI version / install kind NOW: the terminal paths below
+    # invalidate the status cache before they report, so reading it then
+    # would yield nothing. An update's terminal refreshes this from the
+    # re-probed status (the version that matters is the one after).
+    diagnostics = _cli_diagnostics(slug)
+    telemetry.emit(f"{kind}_attempted", {"agent": slug})
+
+    def _finish(status: str, *, reason: str | None, return_code: int | None,
+                timed_out: bool = False, verified: bool | None = None,
+                exc: BaseException | None = None) -> None:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        job.update({
+            "status": status, "reason": reason, "return_code": return_code,
+            "timed_out": timed_out, "verified": verified,
+            "finished_at": _now_iso(), "duration_ms": duration_ms,
+            "tail": list(tail),
+        })
+        _prune_login_jobs()
+        logger.warning(
+            "%s job %s for %s ended: status=%s reason=%s return_code=%s "
+            "timed_out=%s verified=%s duration_ms=%d; last output: %r",
+            kind, job_id, slug, status, reason, return_code, timed_out,
+            verified, duration_ms, tail,
+        )
+        if reason is None:
+            return
+        # Telemetry (spec 113): enums + numbers only. ``unverified`` is a
+        # separate, non-failure event for a login; an update that leaves the
+        # CLI below the floor is a failure (116 D3).
+        fields = {
+            "agent": slug, "reason": reason, "exit_code": return_code,
+            "duration_ms": duration_ms, "error_class": error_class_of(exc),
+            # Output first; failing that the exception text; failing that
+            # the reason itself (a silent timeout still reads as "timeout").
+            "stderr_category": classify_stderr(
+                "\n".join(tail) or (str(exc) if exc else "") or reason),
+            **diagnostics,
+        }
+        if kind == "login" and reason == "unverified":
+            telemetry.emit("login_unverified", fields)
+        else:
+            telemetry.emit(f"{kind}_failed", fields)
+
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -965,18 +1122,19 @@ async def _run_login_job(slug: str, job_id: str, command: str) -> None:
             creationflags=win_no_window_flags(),
         )
     except OSError as exc:
-        telemetry.emit("login_failed", {"agent": slug})
+        tail.append(_redact_urls(str(exc)))
+        _finish("failed", reason="spawn_error", return_code=None, exc=exc)
         if _ws_manager is not None:
             _ws_manager.broadcast_global({
                 "type": "login.failed",
                 "job_id": job_id,
                 "slug": slug,
+                "kind": kind,
                 "error": str(exc),
             })
-        _login_jobs[job_id]["status"] = "failed"
         return
 
-    _login_jobs[job_id]["pid"] = proc.pid
+    job["pid"] = proc.pid
     assert proc.stdout is not None
     timed_out = False
     while True:
@@ -991,11 +1149,15 @@ async def _run_login_job(slug: str, job_id: str, command: str) -> None:
         if not raw:
             break
         line = _strip_terminal_escapes(raw.decode("utf-8", errors="replace"))
+        if line:
+            tail.append(_redact_urls(line))
+            del tail[:-LOGIN_JOB_TAIL_LINES]
         if _ws_manager is not None and line:
             _ws_manager.broadcast_global({
                 "type": "login.progress",
                 "job_id": job_id,
                 "slug": slug,
+                "kind": kind,
                 "line": line,
             })
 
@@ -1004,59 +1166,96 @@ async def _run_login_job(slug: str, job_id: str, command: str) -> None:
         # child: proc.kill() alone ended only cmd.exe on Windows and left
         # `claude auth login` running (and holding the pipe open, so this
         # wait blocked until it exited on its own).
-        await kill_spawned_tree(proc, label=f"{slug} login")
-        _login_jobs[job_id]["status"] = "failed"
-        _login_jobs[job_id]["timed_out"] = True
-        telemetry.emit("login_failed", {"agent": slug})
+        await kill_spawned_tree(proc, label=f"{slug} {kind}")
+        _finish("failed", reason="timeout", return_code=None, timed_out=True,
+                exc=asyncio.TimeoutError())
         if _ws_manager is not None:
             _ws_manager.broadcast_global({
                 "type": "login.failed",
                 "job_id": job_id,
                 "slug": slug,
+                "kind": kind,
                 "timed_out": True,
                 "error": (
-                    f"login timed out after "
+                    f"{kind} timed out after "
                     f"{int(LOGIN_IDLE_TIMEOUT_SECONDS)}s with no activity"
                 ),
             })
         return
 
     rc = await proc.wait()
-    _login_jobs[job_id]["return_code"] = rc
+    job["return_code"] = rc
 
     # Re-check status now that the auth state may have changed. This has to
     # come before the re-check below so the list the UI refetches and the
     # verdict we broadcast are reading the same (fresh) state.
     if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    if kind == "update" and _setup_engine is not None \
+            and hasattr(_setup_engine, "invalidate_resolved_path"):
+        # The updater may have moved the binary (npm → native migration into
+        # ~/.local/bin); the next probe must find the new one (116 D3).
+        _setup_engine.invalidate_resolved_path(slug)
 
     if rc != 0:
-        _login_jobs[job_id]["status"] = "failed"
-        telemetry.emit("login_failed", {"agent": slug})
+        _finish("failed", reason="nonzero_exit", return_code=rc)
         if _ws_manager is not None:
             _ws_manager.broadcast_global({
                 "type": "login.failed",
                 "job_id": job_id,
                 "slug": slug,
+                "kind": kind,
                 "return_code": rc,
             })
         return
 
-    _forget_quota(slug)
-    verified = await _credentials_now_configured(slug)
-    _login_jobs[job_id]["status"] = "complete" if verified else "unverified"
-    _login_jobs[job_id]["verified"] = verified
-    if not verified:
-        telemetry.emit("login_failed", {"agent": slug})
+    if kind == "update":
+        verified, after = await _update_now_sufficient(slug)
+        if after is not None:
+            diagnostics = {
+                "cli_version": clean_version(getattr(after, "version", None)),
+                "install_kind": install_kind_of(getattr(after, "binary_path", None)),
+            }
+    else:
+        _forget_quota(slug)
+        verified = await _credentials_now_configured(slug)
+    _finish("complete" if verified else "unverified",
+            reason=None if verified else "unverified", return_code=rc,
+            verified=verified)
 
     if _ws_manager is not None:
         _ws_manager.broadcast_global({
             "type": "login.complete",
             "job_id": job_id,
             "slug": slug,
+            "kind": kind,
             "return_code": rc,
             "verified": verified,
         })
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _update_now_sufficient(slug: str):
+    """Spec 116 D3: after ``<cli> update`` exits, re-probe the version and
+    compare it with the manifest floor. Exit 0 is necessary, not sufficient
+    — a 2.1.288-era npm updater reports success with only the stub in place
+    (then ``--version`` fails and the agent reads as not installed).
+
+    Returns ``(verified, status)``; ``status`` is None when no probe ran.
+    """
+    if _setup_engine is None or not hasattr(_setup_engine, "check_agent"):
+        return False, None
+    try:
+        status = await asyncio.to_thread(_setup_engine.check_agent, slug)
+    except Exception:
+        logger.exception("post-update version re-check failed for %s", slug)
+        return False, None
+    return bool(status.installed and status.version
+                and not getattr(status, "update_needed", False)), status
 
 
 @router.post("/settings/sub-agents/{slug}/login")
@@ -1081,9 +1280,63 @@ async def trigger_sub_agent_login(slug: str):
             ),
         )
     job_id = uuid4().hex[:12]
-    _login_jobs[job_id] = {"slug": slug, "status": "running", "command": command}
+    _login_jobs[job_id] = {"slug": slug, "status": "running", "command": command,
+                           "kind": "login", "started_at": _now_iso()}
     asyncio.create_task(_run_login_job(slug, job_id, command))
     return {"job_id": job_id, "slug": slug, "status": "running"}
+
+
+def _worker_running(slug: str) -> bool:
+    """Spec 116 D8: is a ``slug`` worker alive in any project? Replacing the
+    binary under a live process is what the update must not do. Unknown
+    (no manager wired) reads as not running."""
+    if _sub_agent_manager is None:
+        return False
+    probe = getattr(_sub_agent_manager, "has_live_adapter", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe(slug))
+    except Exception:
+        logger.warning("could not tell whether %s is running", slug, exc_info=True)
+        return False
+
+
+@router.post("/settings/sub-agents/{slug}/update")
+async def trigger_sub_agent_update(slug: str):
+    """Run the CLI's own updater (spec 116 D2) through the login-job runner.
+
+    Returns immediately with a ``job_id``; progress streams over WebSocket
+    as ``login.progress`` / ``login.complete`` / ``login.failed`` with
+    ``kind: "update"``. ``login.complete.verified`` is whether the re-probed
+    version reached the manifest floor (D3). 400 when the manifest declares
+    no ``update_command``; 409 while a worker of this agent is running (D8).
+    """
+    command = _resolve_setup_command(slug, "update")
+    if not command:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sub-agent '{slug}' does not expose an update command",
+        )
+    if _worker_running(slug):
+        raise HTTPException(
+            status_code=409,
+            detail=f"a {slug} task is running; wait for it to finish before updating",
+        )
+    job_id = uuid4().hex[:12]
+    _login_jobs[job_id] = {"slug": slug, "status": "running", "command": command,
+                           "kind": "update", "started_at": _now_iso()}
+    asyncio.create_task(_run_login_job(slug, job_id, command, kind="update"))
+    return {"job_id": job_id, "slug": slug, "status": "running"}
+
+
+@router.get("/settings/sub-agents/login-jobs")
+async def list_login_jobs():
+    """The login/update jobs this daemon has run (spec 113 A3): the running
+    ones plus the last 20 finished, newest last, each with its reason,
+    return code and redacted output tail. Read-only; for the "view the last
+    login log" affordance and for pasting into an issue."""
+    return [_login_job_view(jid, job) for jid, job in _login_jobs.items()]
 
 
 @router.post("/settings/sub-agents/{slug}/install", status_code=202)

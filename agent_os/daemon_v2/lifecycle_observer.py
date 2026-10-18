@@ -13,6 +13,7 @@ import logging
 import json
 
 from agent_os import telemetry
+from agent_os.telemetry.diagnostics import classify_stderr
 
 logger = logging.getLogger(__name__)
 
@@ -407,7 +408,14 @@ class LifecycleObserver:
                        transcript_path: str,
                        *, session_id: str | None = None) -> None:
         """Sub-agent encountered an error."""
-        telemetry.emit("subagent_failed", {"agent": handle})
+        # Spec 113 A2/A3: the reason enum for the ping, and one local log
+        # line (the on_failed call sites already log; this path never did).
+        telemetry.emit("subagent_failed", {
+            "agent": handle, "reason": "runtime_error",
+            "stderr_category": classify_stderr(error),
+        })
+        logger.warning("sub-agent %s stopped with error in %s/%s: %s",
+                       handle, project_id, session_id, error)
         content = f"[Sub-agent] {handle} stopped with error: {error}. Transcript: {transcript_path}"
         pinned = self._is_pinned_dispatch(project_id, handle, session_id)
         # A worker that errored out IS the assigned item's outcome: the
@@ -451,7 +459,12 @@ class LifecycleObserver:
         on a sub-agent that was already dead
         (TASK-honest-subagent-completion-reporting, path e).
         """
-        telemetry.emit("subagent_failed", {"agent": handle})
+        telemetry.emit("subagent_failed", {
+            "agent": handle, "reason": "adapter_broken",
+            "stderr_category": classify_stderr(reason),
+        })
+        logger.warning("sub-agent %s adapter failed in %s/%s: %s",
+                       handle, project_id, session_id, reason)
         content = (
             f"[Sub-agent] {handle} failed: {reason}. "
             f"The dispatched task did not complete."
