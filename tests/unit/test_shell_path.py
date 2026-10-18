@@ -154,7 +154,7 @@ def test_merge_drops_empty_entries():
     sp.merge_shell_path_into_environ(
         environ=environ, runner=_runner(login="/a::/b:", interactive=""),
         platform="darwin")
-    assert environ["PATH"].split(os.pathsep) == ["/a", "/b"]
+    assert environ["PATH"].split(":") == ["/a", "/b"]
 
 
 def test_windows_short_circuit_never_spawns_a_shell():
