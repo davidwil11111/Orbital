@@ -1639,8 +1639,8 @@ async def inject_message(project_id: str, req: InjectRequest):
             # translated sentence for a known reason; unknown reasons keep
             # the raw content. Same helper send() uses for telemetry, so the
             # row and the ping agree.
-            start_meta = _sub_agent_manager.last_start_failure_meta(
-                project_id, req.target) or {}
+            meta_reader = getattr(_sub_agent_manager, "last_start_failure_meta", None)
+            start_meta = (meta_reader(project_id, req.target) or {}) if meta_reader else {}
             failure_row["_meta"].update({
                 k: start_meta[k] for k in ("reason", "min_version", "version")
                 if start_meta.get(k) is not None
