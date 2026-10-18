@@ -50,6 +50,10 @@ DEFAULT_PROJECT_FIELDS: dict = {
     # default, nothing to explain" without a migration pass of its own.
     "card_id": None,
     "migration_note": None,
+    # Spec 117 D1: a record with no ``safe_mode`` key predates the switch and
+    # was created under the sandbox — it stays in safe mode (downgrade-safe:
+    # an older build ignores the key and sandboxes everything).
+    "safe_mode": True,
 }
 
 # Pre-cards per-project LLM fields (spec 082 §3.7 step 5). They still LOAD —
@@ -167,6 +171,9 @@ class ProjectStore:
             # alias one shared list across every legacy project; the literal
             # here creates a fresh list on first access instead.
             project.setdefault("enabled_connectors", [])
+            # Spec 117 — same fresh-list rule for the safe-mode lists.
+            project.setdefault("unsandboxed_executables", [])
+            project.setdefault("pending_unsandboxed_runs", [])
         return project
 
     @staticmethod

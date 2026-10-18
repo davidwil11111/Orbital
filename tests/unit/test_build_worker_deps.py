@@ -284,4 +284,9 @@ class TestWorkerReadRootsInheritScratchScope:
         deps = mgr.build_worker_deps("p_other", "sess_1")
         registry = deps.make_tool_registry(None, None, "worker:test-0")
         read_tool = registry._tools["read"]
-        assert read_tool._read_roots is None
+        # Spec 117 D7: every project's read tools carry a root callable (so
+        # a folder granted through the access card is readable), but a normal
+        # project with no grants resolves to its single workspace root and
+        # keeps the single-root LLM-facing text.
+        assert read_tool._read_roots() == [str(other_ws)]
+        assert read_tool.description == "Read a file or list a directory within the workspace."

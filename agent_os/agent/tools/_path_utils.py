@@ -63,20 +63,25 @@ def _excluded_in_secondary(candidate_real: str, root_real: str) -> bool:
     return any(part in _SECONDARY_EXCLUDED_COMPONENTS for part in rel.split(os.sep))
 
 
-def resolve_safe_read(roots: list[str], path: str) -> str | None:
+def resolve_safe_read(roots: list[str], path: str, *,
+                      open_reads: bool = False) -> str | None:
     """Resolve ``path`` for READ against a list of roots, or None if it escapes.
 
     ``roots[0]`` is the primary workspace; the rest are read-only reference
-    roots (other projects). Semantics:
+    roots (other projects, or folders the user granted). Semantics:
 
       * Relative ``path`` resolves against the PRIMARY root only (never a
         secondary) — same containment as :func:`resolve_safe`.
       * Absolute ``path`` passes if it lands inside ANY root (realpath + the
         ``os.sep`` guard). Inside a SECONDARY root, paths under ``orbital/`` or
         ``.git/`` are rejected (agent internals, not work product).
+      * ``open_reads=True`` (spec 117 D3, a project with safe mode OFF): an
+        absolute path is returned as its realpath with NO containment check —
+        the shell can run ``rg /`` in that project, so confining the read
+        tools would be theatre. Relative paths are still workspace-bound.
 
-    With a single-element ``roots`` list this is byte-identical to
-    ``resolve_safe(roots[0], path)`` — normal projects are unaffected.
+    With a single-element ``roots`` list and the default ``open_reads`` this
+    is byte-identical to ``resolve_safe(roots[0], path)``.
     """
     if not roots:
         return None
@@ -89,6 +94,8 @@ def resolve_safe_read(roots: list[str], path: str) -> str | None:
         return None
 
     candidate = os.path.realpath(path)
+    if open_reads:
+        return candidate
     # Primary root first — no exclusions (it's the reader's own workspace).
     if candidate == primary_real or candidate.startswith(primary_real + os.sep):
         return candidate
@@ -100,3 +107,31 @@ def resolve_safe_read(roots: list[str], path: str) -> str | None:
                 return None
             return candidate
     return None
+
+
+# --- Spec 117 §3.4 — the read tools say which mode they are in -------------
+#
+# The shell is open or sandboxed per project, and the read tools follow it.
+# The mode is a per-call callback (a Settings flip applies on the next tool
+# call, no restart), so the tools expose their mode-dependent text through
+# ``schema()`` rather than a fixed attribute. ``OPEN_READS_SENTENCE`` is the
+# sentence the spec names; the safe-mode text is today's, byte-identical.
+OPEN_READS_SENTENCE = (
+    "Absolute paths anywhere on this computer are allowed; relative paths "
+    "are inside your workspace."
+)
+OPEN_READS_PATH_SENTENCE = (
+    "Relative paths resolve inside your workspace; an absolute path may "
+    "point anywhere on this computer."
+)
+
+
+def open_reads_active(cb) -> bool:
+    """Evaluate an optional ``open_reads`` callback; failures mean safe mode."""
+    if cb is None:
+        return False
+    try:
+        return bool(cb())
+    except Exception:
+        return False
+

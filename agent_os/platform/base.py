@@ -84,6 +84,26 @@ class PlatformProvider(ABC):
     @abstractmethod
     def configure_network(self, project_id: str, rules: NetworkRules) -> None: ...
 
+    async def clear_network(self, project_id: str) -> None:
+        """Tear down the project's network restriction (spec 117 §3.5).
+
+        Called when a project flips to safe mode OFF: drop any rules held for
+        it and stop its allowlist proxy, so the next ``configure_network``
+        starts from scratch when safe mode comes back. Default no-op for
+        providers without a proxy.
+        """
+        return None
+
+    def portal_paths_for_scope(self, scope: str) -> dict[str, str]:
+        """Read-only view of the portals granted under ``scope`` (spec 117 D7).
+
+        ``{path: "read" | "read_only" | "read_write"}`` for the owning
+        workspace realpath ``scope`` — the same set ``run_command`` bakes into
+        that scope's profile. Lets the daemon's read tools honour a folder the
+        user granted through the access card. Default: nothing granted.
+        """
+        return {}
+
     def prevent_sleep(self, reason: str) -> object:
         """Prevent the system from sleeping. Returns a handle for allow_sleep()."""
         return None

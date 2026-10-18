@@ -1530,6 +1530,34 @@ class AgentLoop:
                             self._note_exit("credential_request", iteration)
                             exit_outer = True
                             break
+
+                        # Spec 117 D4 — a safe-mode shell result the sandbox
+                        # blocked: the interceptor raises an ``unsandboxed_run``
+                        # approval off the daemon's own denial detection and
+                        # the turn pauses on it exactly like an intercepted
+                        # call (the rest of the batch is CANCELLED below). Not
+                        # under a queue run — there is no card to answer there.
+                        _denial = result.meta.get("sandbox_denial") if result.meta else None
+                        if (_denial and self._interceptor is not None
+                                and self._queue_state != "running"
+                                and hasattr(self._interceptor, "on_sandbox_denial")):
+                            try:
+                                _pending_id = self._interceptor.on_sandbox_denial(
+                                    tc, _denial, self._session.recent_activity(),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_sandbox_denial raised for tool_call_id=%s",
+                                    tc.get("id"),
+                                )
+                                _pending_id = None
+                            if _pending_id:
+                                intercepted_tc_id = tc["id"]
+                                self._session._paused_for_approval = True
+                                self._session.pause()
+                                self._note_exit("approval_pause", iteration)
+                                exit_outer = True
+                                break
                     except Exception as e:
                         tool_content = f"Error executing tool: {e}"
                         self._session.append_tool_result(

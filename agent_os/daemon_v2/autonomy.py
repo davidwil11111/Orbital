@@ -10,9 +10,22 @@ Preset-based tool interception with approval bypass window.
 import hashlib
 import json
 import time
+from typing import Callable
+from uuid import uuid4
 
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.daemon_v2.activity_translator import _describe_tool
+
+# Spec 117 D4/D5 — the pending-approval kind raised when the sandbox blocked a
+# shell command in safe mode. It rides the SAME pending registry, WS event
+# (``approval.request``) and routes (``/approve`` with ``response_payload``
+# ``once`` | ``always`` | ``disable_safe_mode``, ``/deny``) as every other
+# approval; ``kind`` is what tells the card apart. The pending's
+# ``tool_call_id`` is SYNTHETIC (``unsandboxed_<hex>``): the shell call that
+# triggered it already has its tool result (the ``[sandbox]`` text), so the
+# answer is injected as a terminal system row, never as a second tool result.
+UNSANDBOXED_RUN_KIND = "unsandboxed_run"
+UNSANDBOXED_RUN_DECISIONS = ("once", "always", "disable_safe_mode")
 
 BROWSER_WRITE_ACTIONS = frozenset({
     "click", "type", "fill", "press", "hover", "select",
@@ -29,10 +42,14 @@ class AutonomyInterceptor:
     """Implements ToolInterceptor protocol from Component A."""
 
     def __init__(self, preset: Autonomy, ws_manager, project_id: str,
-                 user_credential_store=None, *, session_id: str | None = None):
+                 user_credential_store=None, *, session_id: str | None = None,
+                 safe_mode_cb: Callable[[], bool] | None = None):
         self._preset = preset
         self._ws = ws_manager
         self._project_id = project_id
+        # Spec 117 D3: read per call. On an open project the network ask is
+        # not intercepted — the tool itself answers "unrestricted" (no card).
+        self._safe_mode_cb = safe_mode_cb
         # Seam 3 / Phase 2: the canonical session id this project handle runs
         # under, stamped on the approval.request broadcast so the frontend can
         # route it by session_id (management approvals previously carried no
@@ -71,8 +88,11 @@ class AutonomyInterceptor:
 
         # Credentials and network-domain grants always require human
         # interaction, regardless of autonomy preset
-        if name in ("request_credential", "request_network_access"):
+        if name == "request_credential":
             return True
+        if name == "request_network_access":
+            # Spec 117 D3: nothing to grant on an open project.
+            return self._safe_mode_on()
 
         # Check approve-all bypass (time-bounded session-level override)
         if self._bypass_all_until is not None and time.time() < self._bypass_all_until:
@@ -137,6 +157,62 @@ class AutonomyInterceptor:
             self._pending_approvals[tool_call_id]["reasoning"] = payload["reasoning"]
 
         self._ws.broadcast(self._project_id, payload)
+
+    def _safe_mode_on(self) -> bool:
+        if self._safe_mode_cb is None:
+            return True
+        try:
+            return bool(self._safe_mode_cb())
+        except Exception:
+            return True  # an unreadable switch fails closed
+
+    def on_sandbox_denial(self, tool_call: dict, denial: dict,
+                          recent_context: list[dict]) -> str | None:
+        """Raise an ``unsandboxed_run`` approval for a blocked shell result.
+
+        Spec 117 D4: called by the loop's tool-result path when a safe-mode
+        shell result carries ``meta["sandbox_denial"]`` (the daemon's own
+        denial detection). Registers ONE pending under a synthetic id,
+        broadcasts the usual ``approval.request`` with ``kind``, ``command``
+        and ``reason`` added, and returns the pending id (the loop then
+        pauses on it exactly as on an intercepted call). Returns ``None``
+        when the project is open — belt and braces; the open shell path
+        never emits the meta.
+        """
+        if not self._safe_mode_on():
+            return None
+        command = str((denial or {}).get("command") or
+                      (tool_call.get("arguments") or {}).get("command") or "")
+        reason = str((denial or {}).get("reason") or "The sandbox blocked this command.")
+        pending_id = f"unsandboxed_{uuid4().hex[:12]}"
+        tool_args = {"command": command}
+        pending = {
+            "tool_name": "shell",
+            "tool_args": tool_args,
+            "what": f"Run outside the sandbox: {command}",
+            "tool_call_id": pending_id,
+            "recent_activity": recent_context,
+            "kind": UNSANDBOXED_RUN_KIND,
+            "command": command,
+            "reason": reason,
+            "session_id": self._session_id,
+            "origin_tool_call_id": tool_call.get("id", ""),
+        }
+        self._pending_approvals[pending_id] = pending
+        self._ws.broadcast(self._project_id, {
+            "type": "approval.request",
+            "project_id": self._project_id,
+            "session_id": self._session_id,
+            "what": pending["what"],
+            "tool_name": "shell",
+            "tool_call_id": pending_id,
+            "tool_args": tool_args,
+            "recent_activity": recent_context,
+            "kind": UNSANDBOXED_RUN_KIND,
+            "command": command,
+            "reason": reason,
+        })
+        return pending_id
 
     def get_pending(self, tool_call_id: str) -> dict | None:
         """Return the pending approval info for a tool_call_id, or None."""

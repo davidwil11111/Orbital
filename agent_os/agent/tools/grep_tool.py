@@ -30,7 +30,13 @@ from typing import Callable
 
 from agent_os.utils.subprocess_flags import win_no_window_flags
 
-from ._path_utils import _excluded_in_secondary, resolve_safe_read
+from ._path_utils import (
+    OPEN_READS_PATH_SENTENCE,
+    OPEN_READS_SENTENCE,
+    _excluded_in_secondary,
+    open_reads_active,
+    resolve_safe_read,
+)
 from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -109,19 +115,32 @@ class GrepTool(Tool):
 
     def __init__(self, workspace: str,
                  read_roots: Callable[[], list[str]] | None = None,
-                 root_labels: Callable[[], dict[str, str]] | None = None):
+                 root_labels: Callable[[], dict[str, str]] | None = None,
+                 open_reads: Callable[[], bool] | None = None,
+                 cross_project: bool | None = None):
+        # ``cross_project`` picks the LLM-facing text: the scratch (Quick
+        # Tasks) wording that names other in-scope projects, or the normal
+        # single-root wording. Defaults to "a root callable was given" so
+        # existing callers are unchanged; spec 117 wires a root callable for
+        # EVERY project (granted portals, D7) and passes False for normal ones.
+        if cross_project is None:
+            cross_project = read_roots is not None
         self._workspace = os.path.realpath(workspace)
         # Callables (evaluated per call) so per-session scope changes apply on
         # the next call. None → single-root, byte-identical to normal projects.
         self._read_roots = read_roots
         self._root_labels = root_labels
+        # Spec 117 D3: safe mode OFF → an explicit absolute path may point
+        # anywhere on disk. The DEFAULT root list (an unscoped search) is the
+        # same in both modes so it stays fast and relevant.
+        self._open_reads = open_reads
         self.name = "grep"
         self.description = (
             "Search for text within workspace files using ripgrep. "
             "Supports regex by default, or literal matches via fixed_strings. "
             "Returns matches in 'path:line:content' format, capped at 100 matches."
         )
-        if read_roots is None:
+        if not cross_project:
             path_desc = "Directory or file within your workspace, relative to workspace root (e.g. 'src' or 'docs/notes.md'). Defaults to workspace root. Do NOT start with '/'."
         else:
             path_desc = (
@@ -152,6 +171,27 @@ class GrepTool(Tool):
             "required": ["pattern"],
         }
 
+    def schema(self) -> dict:
+        """Spec 117 §3.4 — the LLM-facing text follows the project's mode."""
+        if not open_reads_active(self._open_reads):
+            return super().schema()
+        params = {**self.parameters, "properties": dict(self.parameters["properties"])}
+        params["properties"]["path"] = {
+            **params["properties"]["path"],
+            "description": (
+                f"Directory or file to search. {OPEN_READS_PATH_SENTENCE} "
+                "Defaults to your workspace."
+            ),
+        }
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": f"{self.description} {OPEN_READS_SENTENCE}",
+                "parameters": params,
+            },
+        }
+
     def execute(self, **arguments) -> ToolResult:
         try:
             pattern = arguments.get("pattern")
@@ -167,7 +207,8 @@ class GrepTool(Tool):
 
             path_arg = arguments.get("path", ".")
             if path_arg not in (".", "", None):
-                resolved = resolve_safe_read(roots, path_arg)
+                resolved = resolve_safe_read(
+                    roots, path_arg, open_reads=open_reads_active(self._open_reads))
                 if resolved is None:
                     return ToolResult(content=f"Error: path outside workspace: {path_arg}")
                 if not os.path.exists(resolved):

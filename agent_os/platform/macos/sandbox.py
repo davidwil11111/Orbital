@@ -142,20 +142,24 @@ def generate_profile(
     # ------------------------------------------------------------------
     # 5. Writable roots (M2, M4). Each one also re-grants read, which is what
     #    overrides a credential deny above it.
+    #
+    #    Order inside this section is load-bearing too (last match wins):
+    #    the shared roots (temp, caches) come first, then the read-only
+    #    portal denies, then the workspace and read-write portals. See 5b.
     # ------------------------------------------------------------------
     lines.append('(allow file-write* (subpath "/dev"))')
 
-    # 5a. Workspace — full read/write.
-    lines.append(f'(allow file-read* (subpath "{workspace_path}"))')
-    lines.append(f'(allow file-write* (subpath "{workspace_path}"))')
-
-    # 5b. Portals.
+    # 5a. Portal read grants + classification. Read-only portals contribute
+    #     a deny-write rule; WHERE it is emitted is the point:
     #
-    #     Read-only portals contribute a deny-write rule, but it is held back
-    #     to section 6: a portal under /tmp or $TMPDIR would otherwise be
-    #     re-opened by the temp write grants emitted just below, because the
-    #     later rule wins. (v1 had this bug — its temp allows came after the
-    #     portal denies.)
+    #     * after the temp/cache grants (5c), or a portal under /tmp, $TMPDIR
+    #       or a cache root would be re-opened for writing by them (v1 had
+    #       this bug — its temp allows came after the portal denies);
+    #     * BEFORE the workspace and read-write portal grants (5e), or a
+    #       read-only portal that is an ANCESTOR of the workspace — a read
+    #       grant on ~/Desktop for a workspace under it — denies every write
+    #       inside the workspace (spec 117 D8; memory
+    #       ``project_readonly_portal_above_workspace_kills_writes``).
     read_write_roots: list[str] = []
     read_only_denies: list[str] = []
     if portal_paths:
@@ -165,7 +169,6 @@ def generate_profile(
             # credential-denied tree be read at all, and it documents intent.
             lines.append(f'(allow file-read* (subpath "{real_path}"))')
             if access == "read_write":
-                lines.append(f'(allow file-write* (subpath "{real_path}"))')
                 read_write_roots.append(real_path)
             else:
                 # "read" and "read_only" are synonyms: read-only. Emit an
@@ -195,12 +198,19 @@ def generate_profile(
         cache_path = os.path.join(home, *rel.split("/"))
         lines.append(f'(allow file-write* (subpath "{cache_path}"))')
 
-    # ------------------------------------------------------------------
-    # 6. Every deny-write rule, last, so nothing above can re-open it.
-    # ------------------------------------------------------------------
-
-    # 6a. Read-only portals (held back from 5b — see the note there).
+    # 5e. Read-only portal denies (see 5a), THEN the workspace and the
+    #     read-write portals — the roots that hold the user's code win over
+    #     any read-only grant that happens to contain them.
     lines.extend(read_only_denies)
+    lines.append(f'(allow file-read* (subpath "{workspace_path}"))')
+    lines.append(f'(allow file-write* (subpath "{workspace_path}"))')
+    for real_path in read_write_roots:
+        lines.append(f'(allow file-write* (subpath "{real_path}"))')
+
+    # ------------------------------------------------------------------
+    # 6. Every remaining deny-write rule, last, so nothing above can re-open
+    #    it. (The read-only portal denies moved up to 5e — spec 117 D8.)
+    # ------------------------------------------------------------------
 
     # 6b. Protected control files (M3) — applied to each writable root that
     #    holds user code (the workspace and every read-write portal), using

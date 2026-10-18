@@ -7,8 +7,11 @@
 import asyncio
 import os
 import re
+import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
+from typing import Callable
 from uuid import uuid4
 
 from agent_os.utils.subprocess_flags import win_no_window_flags
@@ -49,7 +52,13 @@ _NETWORK_POLICY_HINT = (
 _SANDBOX_DENIAL_MARKERS = (
     "operation not permitted",   # macOS Seatbelt
     "access is denied",          # Windows ACLs
+    "拒绝访问",                   # Windows ACLs, zh-CN (spec 117 D4)
 )
+# Spec 117 D4 — per-kind markers, lowercased. The Windows set carries the
+# zh-CN wording of ERROR_ACCESS_DENIED alongside the English one; other
+# localizations are a follow-up (spec 117 §6).
+_SEATBELT_DENIAL_MARKERS = ("operation not permitted",)
+_WINDOWS_DENIAL_MARKERS = ("access is denied", "拒绝访问")
 
 _SANDBOX_HINT = (
     "\n[sandbox] This command may have been blocked by the workspace sandbox. "
@@ -58,6 +67,62 @@ _SANDBOX_HINT = (
     "allowlist proxy. If you need a folder outside the workspace, ask the user "
     "to add it under Settings › Folder access, or call request_access."
 )
+
+# Spec 117 D4/D5 — appended in safe mode when the daemon raises an
+# ``unsandboxed_run`` approval for this command: the user may answer it.
+_SANDBOX_WAIT_HINT = (
+    " You may wait for the user's decision on running this outside the sandbox."
+)
+
+# The open path (spec 117 D3) runs as the user with the user's network. A
+# provider call made earlier in this process may have exported the allowlist
+# proxy into the daemon's own environment; the child must never inherit it.
+_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+
+
+@dataclass(frozen=True)
+class SandboxDenial:
+    """A failed command the daemon attributes to the sandbox (spec 117 D4).
+
+    ``kind`` is ``"seatbelt"`` (macOS Seatbelt denial), ``"windows_acl"``
+    (the worker account was refused a path) or ``"proxy"`` (the allowlist
+    proxy returned 403). ``reason`` is one sentence for the approval card.
+    """
+    kind: str
+    reason: str
+
+
+def detect_sandbox_denial(exit_code: int, output: str) -> SandboxDenial | None:
+    """Decide whether a non-zero exit was the sandbox's doing, or ``None``.
+
+    String matching is imprecise on purpose (a tool that prints "Access is
+    denied" for its own reasons is flagged too), which is why the hint says
+    "may" — the user, not the daemon, makes the call on the approval card.
+    The Seatbelt log lookup is macOS-only and best-effort (``None`` off-mac).
+    """
+    if exit_code == 0 or not output:
+        return None
+    lowered = output.lower()
+    if any(marker in lowered for marker in _PROXY_BLOCK_MARKERS):
+        return SandboxDenial(
+            kind="proxy",
+            reason="The project's network allowlist proxy refused a connection (403).",
+        )
+    if any(marker in lowered for marker in _SEATBELT_DENIAL_MARKERS):
+        denial = _lookup_sandbox_denial()
+        if denial:
+            return SandboxDenial(
+                kind="seatbelt", reason=f"The sandbox denied {denial}.")
+        return SandboxDenial(
+            kind="seatbelt",
+            reason="The command reported 'Operation not permitted' inside the sandbox.",
+        )
+    if any(marker in lowered for marker in _WINDOWS_DENIAL_MARKERS):
+        return SandboxDenial(
+            kind="windows_acl",
+            reason="Access was denied on a path the sandboxed worker was not granted.",
+        )
+    return None
 
 # macOS violation lines look like:
 #   Sandbox: ls(57603) deny(1) file-read-data /Users/me/.ssh
@@ -130,17 +195,25 @@ def _lookup_sandbox_denial() -> str | None:
     return _parse_sandbox_denials(proc.stdout or "")
 
 
-def _sandbox_hint(exit_code: int, output: str) -> str:
-    """The ``[sandbox]`` suffix for a failed command, or an empty string."""
+def _sandbox_hint(exit_code: int, output: str,
+                  denial: SandboxDenial | None = None) -> str:
+    """The ``[sandbox]`` suffix for a failed command, or an empty string.
+
+    Proxy blocks get their own ``[network-policy]`` hint at the call site and
+    no ``[sandbox]`` line — unchanged from before the detector existed.
+    """
     if exit_code == 0:
         return ""
     lowered = output.lower()
     if not any(marker in lowered for marker in _SANDBOX_DENIAL_MARKERS):
         return ""
     hint = _SANDBOX_HINT
-    denial = _lookup_sandbox_denial()
-    if denial:
-        hint += f" The most recent sandbox denial was: {denial}."
+    if denial is None:
+        denial = detect_sandbox_denial(exit_code, output)
+    if denial is not None and denial.kind == "seatbelt" and denial.reason.startswith(
+            "The sandbox denied "):
+        hint += " The most recent sandbox denial was: " + denial.reason[
+            len("The sandbox denied "):]
     return hint
 
 
@@ -203,11 +276,19 @@ class ShellTool(Tool):
         return command
 
     def __init__(self, workspace: str, os_type: str,
-                 platform_provider=None, project_id: str | None = None):
+                 platform_provider=None, project_id: str | None = None,
+                 safe_mode_cb: Callable[[], bool] | None = None,
+                 unsandboxed_cb: Callable[[], list[str]] | None = None):
         self._workspace = workspace
         self._os_type = os_type
         self._platform_provider = platform_provider
         self._project_id = project_id
+        # Spec 117 §3.2 — project config read PER CALL (like ``read_roots``):
+        # ``safe_mode_cb()`` False → the open path; an executable named by
+        # ``unsandboxed_cb()`` runs open even in safe mode (D5 "always
+        # allow"). Both None → the legacy rule (provider when one is set up).
+        self._safe_mode_cb = safe_mode_cb
+        self._unsandboxed_cb = unsandboxed_cb
         self.name = "shell"
         self.description = "Execute a shell command in the workspace."
         self.parameters = {
@@ -395,12 +476,31 @@ class ShellTool(Tool):
         lowered = output.lower()
         if meta.get("network") and any(m in lowered for m in _PROXY_BLOCK_MARKERS):
             content += _NETWORK_POLICY_HINT
-        content += _sandbox_hint(cmd_result.exit_code, output)
+        denial = detect_sandbox_denial(cmd_result.exit_code, output)
+        content += _sandbox_hint(cmd_result.exit_code, output, denial)
+        if denial is not None and self._safe_mode_cb is not None:
+            # Spec 117 D4: the daemon raises an ``unsandboxed_run`` approval
+            # off this meta (agent_manager / autonomy). Only when the
+            # callbacks are wired — a bare tool (tests, dev daemon) has no
+            # one to answer the card.
+            meta = {**meta, "sandbox_denial": {
+                "command": command, "reason": denial.reason, "kind": denial.kind,
+            }}
+            content += _SANDBOX_WAIT_HINT
         return ToolResult(content=content, meta=meta)
 
-    def _execute_via_subprocess(self, command: str, meta: dict) -> ToolResult:
-        """Execute command via subprocess.run() (legacy/dev mode)."""
+    def _execute_unsandboxed(self, command: str, meta: dict) -> ToolResult:
+        """Run the command as the user, outside the sandbox (spec 117 D3).
+
+        Inherited environment minus the allowlist-proxy variables, no
+        Seatbelt, no worker account, no portals. Also the dev-daemon path
+        (no platform provider wired), under its old name below.
+        """
         cmd = self._build_cmd(command)
+        env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in _PROXY_ENV_VARS
+        }
 
         try:
             proc = subprocess.run(
@@ -409,6 +509,7 @@ class ShellTool(Tool):
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
+                env=env,
                 creationflags=win_no_window_flags(),
             )
         except subprocess.TimeoutExpired:
@@ -426,9 +527,52 @@ class ShellTool(Tool):
         if len(output) > _HARD_CAP:
             output = output[:_HARD_CAP] + "\n[OUTPUT TRUNCATED at 50,000 characters]"
 
+        # No ``[sandbox]`` hint here: outside the sandbox an EPERM is the OS
+        # talking, and naming the sandbox would send the agent (and the user)
+        # after a wall that is not there.
         content = f"Exit code: {proc.returncode}\n{output}"
-        content += _sandbox_hint(proc.returncode, output)
         return ToolResult(content=content, meta=meta)
+
+    # Old name, kept for the dev-daemon path and existing callers.
+    _execute_via_subprocess = _execute_unsandboxed
+
+    @staticmethod
+    def executable_of(command: str) -> str:
+        """The command's first token, as recorded by "always allow" (D5).
+
+        ``FOO=1 git push`` → ``git``; ``/usr/bin/git`` → ``git``. Falls back
+        to the raw first whitespace-separated word when the shell quoting is
+        unbalanced. Empty for an empty command.
+        """
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            tokens = command.split()
+        for token in tokens:
+            if "=" in token and not token.startswith("="):
+                name = token.split("=", 1)[0]
+                if name and all(c.isalnum() or c == "_" for c in name):
+                    continue  # an environment assignment prefix
+            return os.path.basename(token.replace("\\", "/"))
+        return ""
+
+    def _runs_unsandboxed(self, command: str) -> bool:
+        """Spec 117 §3.2 routing: open project, or an always-allowed executable."""
+        if self._safe_mode_cb is None:
+            return False
+        try:
+            if not self._safe_mode_cb():
+                return True
+        except Exception:
+            return False  # an unreadable switch fails closed (sandboxed)
+        if self._unsandboxed_cb is None:
+            return False
+        try:
+            allowed = self._unsandboxed_cb() or []
+        except Exception:
+            return False
+        exe = self.executable_of(command)
+        return bool(exe) and exe in allowed
 
     def execute(self, **arguments) -> ToolResult:
         try:
@@ -436,12 +580,16 @@ class ShellTool(Tool):
             meta = self._detect_network(command)
             external_paths = self._detect_external_paths(command)
 
-            # Use provider path only when a real provider is set up (not NullProvider)
-            if (self._platform_provider is not None
+            # Spec 117: the project's switch decides first; then the legacy
+            # rule — provider path only when a real provider is set up (not
+            # NullProvider).
+            if self._runs_unsandboxed(command):
+                result = self._execute_unsandboxed(command, meta)
+            elif (self._platform_provider is not None
                     and self._platform_provider.get_capabilities().setup_complete):
                 result = self._execute_via_provider(command, meta)
             else:
-                result = self._execute_via_subprocess(command, meta)
+                result = self._execute_unsandboxed(command, meta)
 
             if external_paths:
                 # Spec 077 §4.7.2 — a focus rule, not a capability claim. Reads

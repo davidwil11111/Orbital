@@ -106,6 +106,9 @@ def _ensure_scratch_project(project_store, settings_store, data_dir):
         "autonomy": "hands_off",
         "model": "",
         "api_key": "",
+        # Spec 117 D1: a NEW project is open — written explicitly, like the
+        # create route does, so a fresh install is open everywhere.
+        "safe_mode": False,
     })
     _write_scratch_project_goals(scratch_workspace)
 
