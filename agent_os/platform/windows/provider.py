@@ -361,6 +361,10 @@ class WindowsPlatformProvider(PlatformProvider):
             logger.error("grant_folder_access() failed: %s", exc)
             return PermissionResult(success=False, path=path, error=str(exc))
 
+    def portal_paths_for_scope(self, scope: str) -> dict[str, str]:
+        """Spec 117 D7 — a copy of the portals granted under ``scope``."""
+        return dict(self._portal_paths.get(os.path.realpath(scope), {}))
+
     def revoke_folder_access(self, path: str, *, scope: str) -> PermissionResult:
         scope_key = os.path.realpath(scope)
         bucket = self._portal_paths.get(scope_key)
@@ -391,6 +395,20 @@ class WindowsPlatformProvider(PlatformProvider):
             self._proxies[project_id].set_rules(rules)
         # Store rules for deferred application when proxy starts
         self._pending_rules[project_id] = rules
+
+    async def clear_network(self, project_id: str) -> None:
+        """Spec 117 §3.5 — drop the project's rules and stop its proxy.
+
+        Mirrors the macOS provider: the open shell path never starts a
+        proxy, so nothing comes back until safe mode does.
+        """
+        self._pending_rules.pop(project_id, None)
+        proxy = self._proxies.pop(project_id, None)
+        if proxy is not None:
+            try:
+                await proxy.stop()
+            except Exception:
+                logger.warning("Failed to stop proxy for project %s", project_id)
 
     # ------------------------------------------------------------------
     # Sleep prevention

@@ -13,6 +13,7 @@ import { LabelWithHint } from './SettingsSection';
 import type { WebSocketEvent } from '../types';
 import Select from './Select';
 import { pickLoginUrl } from '../utils/loginUrl';
+import { SendDiagnosticsLink } from './SendFeedback';
 
 // ---------------------------------------------------------------------------
 // Types — wire shape of /api/v2/settings/sub-agents
@@ -752,6 +753,12 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
                 : t('subAgentCard.updateFailed', {
                     command: MANUAL_UPDATE_COMMAND[entry.slug] ?? entry.setup_actions.find(a => a.action === 'install_agent')?.command ?? '',
                   })}
+              {updateNotice !== 'busy' && (
+                <>
+                  {' '}
+                  <SendDiagnosticsLink context={{ kind: 'dispatch_failed', agent: entry.slug, detail: 'update_failed' }} />
+                </>
+              )}
             </p>
           )}
         </div>
@@ -886,6 +893,8 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
           {loginNotice === 'unverified'
             ? t('subAgentCard.loginUnverified')
             : t('subAgentCard.loginFailed')}
+          {' '}
+          <SendDiagnosticsLink context={{ kind: 'login_failed', agent: entry.slug, detail: loginNotice }} />
         </p>
       )}
 

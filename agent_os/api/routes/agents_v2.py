@@ -1633,12 +1633,18 @@ async def inject_message(project_id: str, req: InjectRequest):
                     "handle": req.target,
                     "dispatch_id": dispatch_id,
                     "suppress_wake": True,
-                    # TODO(merge): read reason/min_version from the sub-agent
-                    # manager helper (spec 116 §3.4; agent S adds it on
-                    # SubAgentManager) and stamp them here as
-                    # ``_meta.reason`` / ``_meta.min_version`` when present.
                 },
             }
+            # Spec 116 D5: the reason enum and versions let the chat render a
+            # translated sentence for a known reason; unknown reasons keep
+            # the raw content. Same helper send() uses for telemetry, so the
+            # row and the ping agree.
+            start_meta = _sub_agent_manager.last_start_failure_meta(
+                project_id, req.target) or {}
+            failure_row["_meta"].update({
+                k: start_meta[k] for k in ("reason", "min_version", "version")
+                if start_meta.get(k) is not None
+            })
             try:
                 await _retry_session_lock(
                     lambda: _agent_manager.persist_mention_message(
