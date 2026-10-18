@@ -179,7 +179,10 @@ def merge_shell_path_into_environ(
     merged = capture.union(existing)
     capture.added = len(set(merged) - set(existing))
     if merged != existing:
-        env["PATH"] = os.pathsep.join(merged)
+        # POSIX hosts only (Windows returned above), so ':' is the separator;
+        # spelled out so a forced ``platform`` in tests behaves the same on
+        # every CI runner.
+        env["PATH"] = ":".join(merged)
     # The one line support will ask for: did the interactive probe work?
     logger.info(
         "Shell PATH capture (%s): login probe %d entries%s; interactive probe "

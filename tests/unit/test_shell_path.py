@@ -137,12 +137,13 @@ def test_shell_defaults_to_environ_shell_then_bash():
 
 
 def test_union_is_interactive_then_login_then_existing_without_duplicates():
-    environ = {"PATH": os.pathsep.join(["/shared", "/exist/bin"]), "SHELL": "/bin/zsh"}
+    # A forced darwin platform: PATH is ':'-separated whatever the CI host.
+    environ = {"PATH": ":".join(["/shared", "/exist/bin"]), "SHELL": "/bin/zsh"}
     cap = sp.merge_shell_path_into_environ(
         environ=environ, runner=_runner(login="/login/bin:/shared",
                                         interactive="/inter/bin:/shared:/exist/bin"),
         platform="darwin")
-    assert environ["PATH"].split(os.pathsep) == [
+    assert environ["PATH"].split(":") == [
         "/inter/bin", "/shared", "/exist/bin", "/login/bin",
     ]
     assert cap.added == 2  # /inter/bin and /login/bin were new
