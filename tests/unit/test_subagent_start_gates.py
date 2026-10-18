@@ -157,7 +157,10 @@ class TestVersionGate:
         leaves unwired, so the spawn fails later and differently)."""
         manager = _manager(_status(version="2.1.114 (Claude Code)"))
         result = await manager.start("p1", "claude-code", session_id="s1")
-        assert "older than" not in result
+        # The gate's sentence is "v<version> is older than <floor>"; the
+        # SDK-refusal mapping (D9) says "layout older than", which the unwired
+        # transport can produce on Windows CI — only the gate matters here.
+        assert "is older than" not in result
         meta = manager.last_start_failure_meta("p1", "claude-code")
         assert meta is None or meta["reason"] == "spawn"
 

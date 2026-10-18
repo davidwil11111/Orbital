@@ -13,7 +13,10 @@ detected denial rides ``ToolResult.meta["sandbox_denial"]``.
 """
 
 import os
+import sys
 from types import SimpleNamespace
+
+import pytest
 from unittest.mock import patch
 
 from agent_os.agent.tools import shell as shell_mod
@@ -52,6 +55,7 @@ def _tool(tmp_path, provider, *, safe_mode=True, unsandboxed=()):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="runs a real POSIX shell command through the open path")
 def test_open_project_runs_unsandboxed_and_never_calls_the_provider(tmp_path):
     provider = _Provider()
     tool = _tool(tmp_path, provider, safe_mode=False)
@@ -69,6 +73,7 @@ def test_safe_project_runs_through_the_provider(tmp_path):
     assert "from provider" in result.content
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="runs a real POSIX shell command through the open path")
 def test_listed_executable_runs_open_even_in_safe_mode(tmp_path):
     provider = _Provider(stdout="sandboxed")
     tool = _tool(tmp_path, provider, safe_mode=True, unsandboxed=["echo"])
@@ -105,6 +110,7 @@ def test_execute_via_subprocess_alias_still_exists(tmp_path):
     assert ShellTool._execute_via_subprocess is ShellTool._execute_unsandboxed
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="runs a real POSIX shell command through the open path")
 def test_unsandboxed_child_sees_no_proxy_variables(tmp_path):
     """A previous provider call may have left HTTP(S)_PROXY / NO_PROXY in the
     daemon's environment; the open path must not inherit them."""

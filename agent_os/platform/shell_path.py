@@ -94,7 +94,11 @@ def parse_sentinel_path(stdout: str) -> str | None:
 
 
 def split_path(value: str) -> list[str]:
-    return [p for p in value.split(os.pathsep) if p]
+    # The probes run a POSIX shell, whose PATH is ':'-separated regardless
+    # of the host (and the existing PATH is only merged on POSIX hosts, where
+    # os.pathsep is ':' anyway). Splitting on os.pathsep broke the parser's
+    # unit tests on Windows CI, where it is ';'.
+    return [p for p in value.split(":") if p]
 
 
 def _run_probe(shell: str, flags: str, environ: dict, timeout: float,
