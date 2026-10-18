@@ -183,6 +183,22 @@ export interface Project {
    *  GLOBAL Workbench view. The per-project lens (?project_id=) still shows
    *  them regardless — this only affects aggregation across projects. */
   workbench_exclude_global?: boolean;
+  /** Spec 117: the sandbox is on for this project. Absent on rows from a
+   *  pre-117 daemon and on projects created before the build — both mean
+   *  TODAY's model, so the UI treats a missing field as `true`. New projects
+   *  are created with `false`. */
+  safe_mode?: boolean;
+  /** Spec 117 D5: executables (first token of a command) the user answered
+   *  "always allow" for; those commands run outside the sandbox without
+   *  asking. Replace-list semantics on update, like approved_domains. */
+  unsandboxed_executables?: string[];
+  /** Spec 117 D6: sandbox-blocked commands auto-denied for a hands-off run
+   *  and parked for the user to answer in Settings → Runs outside the sandbox. */
+  pending_unsandboxed_runs?: PendingUnsandboxedRun[];
+  /** Spec 117 D7/D8: folders granted to this project's sandbox (the
+   *  provider's portal paths), listed in Settings → Folder access with a
+   *  remove. Optional: a daemon that does not report them hides the list. */
+  granted_folders?: GrantedFolder[];
 }
 
 /** One TOFU network-access ask (Plan 2), as carried by
@@ -191,6 +207,27 @@ export interface PendingDomainRequest {
   domain: string;
   reason: string;
   requested_at: string;
+}
+
+/** One parked `unsandboxed_run` ask (spec 117 D6), as carried by
+ *  Project.pending_unsandboxed_runs. Answered through
+ *  POST /projects/{id}/unsandboxed-runs/{run id}/resolve. */
+export interface PendingUnsandboxedRun {
+  id: string;
+  command: string;
+  reason: string;
+  created_at: string;
+  session_id: string | null;
+}
+
+/** The user's answer to an `unsandboxed_run` ask (spec 117 D5), on the
+ *  approval card (`response_payload`) and the parked-request route (`decision`). */
+export type UnsandboxedRunDecision = 'once' | 'always' | 'disable_safe_mode';
+
+/** One folder granted to a project's sandbox (spec 117 D8). */
+export interface GrantedFolder {
+  path: string;
+  mode: 'read_only' | 'read_write';
 }
 
 export interface ProjectCreateRequest {
@@ -206,6 +243,9 @@ export interface ProjectCreateRequest {
   agent_name?: string;
   sub_agent_deployment_instructions?: string;
   budget_limit_usd?: number | null;
+  /** Spec 117 D1: always sent by the create dialog — `false` unless the
+   *  Safe mode switch was turned on. */
+  safe_mode?: boolean;
 }
 
 export interface ProjectUpdateRequest {
@@ -246,6 +286,10 @@ export interface ProjectUpdateRequest {
   pending_domain_requests?: PendingDomainRequest[];
   /** Workbench privacy toggle — see Project.workbench_exclude_global. */
   workbench_exclude_global?: boolean;
+  /** Spec 117 — see Project.safe_mode. Takes effect at the next shell command. */
+  safe_mode?: boolean;
+  /** Spec 117 — see Project.unsandboxed_executables (replace-list). */
+  unsandboxed_executables?: string[];
 }
 
 /** PUT /projects response field carrying the reset outcome (codes only). */
@@ -588,6 +632,12 @@ export interface ApprovalRequestEvent {
   tool_args: Record<string, unknown>;
   recent_activity: ChatMessage[];
   reasoning?: string;
+  /** Spec 117 D4: `"unsandboxed_run"` when the sandbox blocked a shell
+   *  command and the agent may run it outside; `command` is the exact
+   *  command, `reason` the detected denial. Absent on ordinary approvals. */
+  kind?: string;
+  command?: string;
+  reason?: string;
 }
 
 export interface ApprovalResolvedEvent {

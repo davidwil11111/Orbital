@@ -4,7 +4,7 @@
 
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useState } from 'react';
-import { Calendar, GripVertical, Inbox } from 'lucide-react';
+import { Calendar, GripVertical, Inbox, X } from 'lucide-react';
 import {
   DndContext,
   MouseSensor,
@@ -146,6 +146,27 @@ function useWorkbenchCount(): number {
   return count;
 }
 
+/** Spec 117 D10: per-device dismissal of the upgrade notice, like the tour
+ *  state. Every access is guarded — storage can be absent or throw (private
+ *  window, cleared site data), and the notice must still render correctly. */
+const SAFE_MODE_NOTICE_KEY = 'orbital.safeModeNotice.dismissed';
+
+function readNoticeDismissed(): boolean {
+  try {
+    return localStorage.getItem(SAFE_MODE_NOTICE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeNoticeDismissed(): void {
+  try {
+    localStorage.setItem(SAFE_MODE_NOTICE_KEY, '1');
+  } catch {
+    // Best effort: the notice is gone for this render either way.
+  }
+}
+
 function truncate(str: string, max: number): string {
   if (str.length <= max) return str;
   return str.slice(0, max) + '…';
@@ -170,6 +191,21 @@ export default function Sidebar({
   const t = useT();
   const selectedProjectId = route.name === 'project' ? route.projectId : null;
   const workbenchCount = useWorkbenchCount();
+
+  // Spec 117 D10: the sandbox is off for NEW projects; projects that predate
+  // the build keep it on. The notice exists for the people with such a
+  // project and nobody else — a fresh install never has one (`safe_mode` is
+  // checked for an explicit true: a pre-117 daemon sends no field, and the
+  // feature it describes does not exist there). Quick Tasks is excluded: it
+  // is created by the daemon, not the user, so its flag says nothing about
+  // whether the user has projects that were sandboxed before.
+  const [noticeDismissed, setNoticeDismissed] = useState(readNoticeDismissed);
+  const showSafeModeNotice =
+    !noticeDismissed && projects.some((p) => !p.is_scratch && p.safe_mode === true);
+  function dismissSafeModeNotice() {
+    writeNoticeDismissed();
+    setNoticeDismissed(true);
+  }
 
   // Quick Tasks (is_scratch) is pinned to the top of the Projects list; the
   // rest follow below a hairline so it is never duplicated. It sat in the
@@ -364,6 +400,27 @@ export default function Sidebar({
           {regularProjects.length}
         </span>
       </div>
+
+      {showSafeModeNotice && (
+        <div
+          role="status"
+          data-testid="safe-mode-notice"
+          className="mx-2 mb-1.5 flex items-start gap-2 rounded-lg border border-border/60 bg-card/55 px-2.5 py-2"
+        >
+          <p className="min-w-0 flex-1 text-2xs leading-relaxed text-secondary">
+            {t('safeMode.notice.body')}
+          </p>
+          <button
+            type="button"
+            onClick={dismissSafeModeNotice}
+            aria-label={t('safeMode.notice.dismiss')}
+            title={t('safeMode.notice.dismiss')}
+            className="shrink-0 -mr-0.5 -mt-0.5 p-0.5 text-secondary hover:text-primary transition-colors duration-150 max-md:min-h-[44px] max-md:min-w-[44px] max-md:flex max-md:items-center max-md:justify-center"
+          >
+            <X size={12} aria-hidden="true" />
+          </button>
+        </div>
+      )}
 
       {/* Project list — Quick Tasks pinned above the rest.
           Deliberately the same row as any other project (same dot, same name

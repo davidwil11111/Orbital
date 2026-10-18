@@ -47,6 +47,7 @@ vi.mock('../config', () => ({
 }));
 
 import CreateProject from './CreateProject';
+import { LocaleProvider } from '../i18n/LocaleContext';
 
 afterEach(() => cleanup());
 
@@ -402,5 +403,81 @@ describe('CreateProject — modal a11y (backlog #26c)', () => {
 
     fireEvent.keyDown(last, { key: 'Tab' });
     expect(document.activeElement).toBe(first);
+  });
+});
+
+// Spec 117 D1/D2: the sandbox is off for new projects. A "Safe mode" switch
+// below the autonomy cards turns it on; the POST always says which way it is.
+describe('CreateProject — Safe mode switch (spec 117)', () => {
+  const TOOLTIP_EN =
+    "On: the agent's commands can only touch this project's folder and folders you grant, and use an allowlist for the network; it asks before going further. Off: the agent has the same access you have in your terminal.";
+
+  function safeModeSwitch() {
+    return screen.getByRole('switch', { name: 'Safe mode' }) as HTMLButtonElement;
+  }
+
+  it('is off by default and visible without expanding Advanced, as the last row before it', () => {
+    render(<CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    const sw = safeModeSwitch();
+    expect(sw.getAttribute('aria-checked')).toBe('false');
+    // Advanced is still collapsed — the switch is on the top-level form.
+    expect(screen.queryByText('Autonomy Level')).toBeNull();
+    // DOM order: the switch row sits right above the Advanced disclosure.
+    const advanced = screen.getByText('Advanced options');
+    expect(sw.compareDocumentPosition(advanced) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows the hover copy on hover and pins it on the (i) tap', () => {
+    render(<CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    expect(screen.queryByText(TOOLTIP_EN)).toBeNull();
+
+    const row = screen.getByTestId('safe-mode-row');
+    fireEvent.mouseEnter(row);
+    expect(screen.getByText(TOOLTIP_EN)).toBeTruthy();
+    fireEvent.mouseLeave(row);
+    expect(screen.queryByText(TOOLTIP_EN)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'About Safe mode' }));
+    expect(screen.getByText(TOOLTIP_EN)).toBeTruthy();
+    fireEvent.mouseLeave(row);
+    // Tapped open stays open until tapped again.
+    expect(screen.getByText(TOOLTIP_EN)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'About Safe mode' }));
+    expect(screen.queryByText(TOOLTIP_EN)).toBeNull();
+  });
+
+  it('POSTs safe_mode: false when left off and true when switched on', async () => {
+    const onSubmit = vi.fn(() => Promise.resolve());
+    render(<CreateProject onSubmit={onSubmit} onCancel={vi.fn()} />);
+    fireEvent.change(nameInput(), { target: { value: 'my-app' } });
+    await pickFolder();
+    fireEvent.click(createButton());
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit).toHaveBeenLastCalledWith(expect.objectContaining({ safe_mode: false }));
+
+    fireEvent.click(safeModeSwitch());
+    expect(safeModeSwitch().getAttribute('aria-checked')).toBe('true');
+    fireEvent.click(createButton());
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(onSubmit).toHaveBeenLastCalledWith(expect.objectContaining({ safe_mode: true }));
+  });
+
+  it('renders the label and hover copy in Simplified Chinese', () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    try {
+      render(
+        <LocaleProvider>
+          <CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />
+        </LocaleProvider>,
+      );
+      const sw = screen.getByRole('switch', { name: '安全模式' });
+      expect(sw.getAttribute('aria-checked')).toBe('false');
+      fireEvent.mouseEnter(screen.getByTestId('safe-mode-row'));
+      expect(
+        screen.getByText('开启后，Agent 的命令只能访问本项目文件夹和你授权的文件夹，联网走白名单；需要其它权限时会先问你。关闭时，Agent 的权限与你在终端中相同。'),
+      ).toBeTruthy();
+    } finally {
+      localStorage.removeItem('orbital.locale');
+    }
   });
 });

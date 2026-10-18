@@ -24,7 +24,15 @@ import BudgetSection from './BudgetSection';
 import ProjectConnectorToggles from './ProjectConnectorToggles';
 import BetaBadge from './BetaBadge';
 import { NetworkAccessSection } from './NetworkAccessSection';
-import type { PendingDomainRequest } from '../types';
+import { UnsandboxedRunsSection, commandExecutable } from './UnsandboxedRunsSection';
+import { FolderAccessSection } from './FolderAccessSection';
+import SafeModeSwitch from './SafeModeSwitch';
+import type {
+  GrantedFolder,
+  PendingDomainRequest,
+  PendingUnsandboxedRun,
+  UnsandboxedRunDecision,
+} from '../types';
 import SettingsRail, {
   scrollToSettingsSection,
   type SettingsRailSection,
@@ -77,8 +85,13 @@ export const PROJECT_SETTINGS_SECTIONS: SettingsRailSection[] = [
   { id: 'llm', labelKey: 'cards.project.heading', groupKey: 'settings.group.model' },
   { id: 'fallback-models', labelKey: 'fallback.heading', groupKey: 'settings.group.model' },
   { id: 'autonomy', labelKey: 'autonomy.level.label', groupKey: 'settings.group.limits' },
+  { id: 'safe-mode', labelKey: 'safeMode.label', groupKey: 'settings.group.limits' },
   { id: 'budget', labelKey: 'settings.budget.label', groupKey: 'settings.group.limits' },
+  // Spec 117: the three sandbox surfaces. Folder access and Network access
+  // only mount in safe mode, and the rail drops entries with no element.
+  { id: 'folders', labelKey: 'settings.folders.label', groupKey: 'settings.group.limits' },
   { id: 'network', labelKey: 'settings.network.label', groupKey: 'settings.group.limits' },
+  { id: 'unsandboxed', labelKey: 'settings.unsandboxed.label', groupKey: 'settings.group.limits' },
   { id: 'notifications', labelKey: 'settings.notifications.label', groupKey: 'settings.group.preferences' },
   { id: 'workbench', labelKey: 'settings.workbench.label', groupKey: 'settings.group.preferences' },
   // No groupKey: a one-entry chapter whose heading repeats the entry is noise.
@@ -192,6 +205,22 @@ export default function SettingsView({
     project.pending_domain_requests ?? [],
   );
 
+  // Spec 117. A missing `safe_mode` is TODAY's model (sandbox on): projects
+  // from before the field, and rows from a daemon that predates it, both
+  // read as on. The remembered executables are a replace-list saved through
+  // the project PUT like approved_domains; parked runs and granted folders
+  // are answered through their own routes and then dropped locally.
+  const [safeMode, setSafeMode] = useState<boolean>(project.safe_mode ?? true);
+  const [unsandboxedExecutables, setUnsandboxedExecutables] = useState<string[]>(
+    project.unsandboxed_executables ?? [],
+  );
+  const [pendingUnsandboxedRuns, setPendingUnsandboxedRuns] = useState<PendingUnsandboxedRun[]>(
+    project.pending_unsandboxed_runs ?? [],
+  );
+  const [grantedFolders, setGrantedFolders] = useState<GrantedFolder[]>(
+    project.granted_folders ?? [],
+  );
+
   // Budget state. Spend is NOT tracked here anymore — the Budget section reads
   // it exclusively from GET /cost via useCost (P3-F coupled removal of the
   // legacy budget_spent_usd accumulator).
@@ -247,6 +276,16 @@ export default function SettingsView({
         }
         if (Array.isArray(detail.pending_domain_requests)) {
           setPendingDomainRequests(detail.pending_domain_requests);
+        }
+        if (typeof detail.safe_mode === 'boolean') setSafeMode(detail.safe_mode);
+        if (Array.isArray(detail.unsandboxed_executables)) {
+          setUnsandboxedExecutables(detail.unsandboxed_executables);
+        }
+        if (Array.isArray(detail.pending_unsandboxed_runs)) {
+          setPendingUnsandboxedRuns(detail.pending_unsandboxed_runs);
+        }
+        if (Array.isArray(detail.granted_folders)) {
+          setGrantedFolders(detail.granted_folders);
         }
         setSubAgentDeploymentInstructions(detail.sub_agent_deployment_instructions ?? '');
       })
@@ -406,6 +445,50 @@ export default function SettingsView({
 
   function handleDelete() {
     onDelete();
+  }
+
+  function handleSafeModeChange(next: boolean) {
+    setSafeMode(next);
+    saveNow({ safe_mode: next });
+  }
+
+  function handleRemoveExecutable(exe: string) {
+    const next = unsandboxedExecutables.filter((e) => e !== exe);
+    setUnsandboxedExecutables(next);
+    saveNow({ unsandboxed_executables: next });
+  }
+
+  // Spec 117 D5/D6: a parked run is answered through its own route — the
+  // daemon runs the command (once/always/disable) or drops it (deny) and
+  // records the consequence itself, so nothing here goes through the PUT.
+  // The visible consequence is applied locally once the daemon accepted it.
+  async function handleResolveRun(
+    run: PendingUnsandboxedRun,
+    decision: UnsandboxedRunDecision | 'deny',
+  ) {
+    await api(
+      `/api/v2/projects/${encodeURIComponent(pid)}/unsandboxed-runs/${encodeURIComponent(run.id)}/resolve`,
+      { method: 'POST', body: JSON.stringify({ decision }) },
+    );
+    setPendingUnsandboxedRuns((prev) => prev.filter((r) => r.id !== run.id));
+    if (decision === 'always') {
+      const exe = commandExecutable(run.command);
+      if (exe) {
+        setUnsandboxedExecutables((prev) => (prev.includes(exe) ? prev : [...prev, exe]));
+      }
+    } else if (decision === 'disable_safe_mode') {
+      setSafeMode(false);
+    }
+  }
+
+  // Spec 117 D8: the existing platform revoke, scoped to THIS project's
+  // portal set by project_id (omitted, it would target Quick Tasks).
+  async function handleRevokeFolder(folder: GrantedFolder) {
+    await api('/api/v2/platform/folders/revoke', {
+      method: 'POST',
+      body: JSON.stringify({ path: folder.path, project_id: pid }),
+    });
+    setGrantedFolders((prev) => prev.filter((f) => f.path !== folder.path));
   }
 
   // Index the per-project memory entries by slug so the merged sub-agent
@@ -726,6 +809,12 @@ export default function SettingsView({
           </div>
         </SettingsSection>
 
+        {/* Safe mode (spec 117 D2) — the same row as the create dialog, next
+            to autonomy. Flipping it takes effect at the next shell command. */}
+        <SettingsSection id="safe-mode">
+          <SafeModeSwitch checked={safeMode} onChange={handleSafeModeChange} />
+        </SettingsSection>
+
         {/* Budget — limit-as-sentence, behavior cards, spend meter, breakdown.
             Spend is read EXCLUSIVELY from GET /cost (useCost), refreshed on the
             budget.spend_updated WS event. The data-settings-section tag anchors
@@ -755,23 +844,55 @@ export default function SettingsView({
           />
         </SettingsSection>
 
+        {/* Folder access (spec 117 D8) — the folders granted to this project's
+            sandbox, with remove. Safe-mode only: an open project needs no
+            grants (its existing ones are kept and come back with safe mode). */}
+        {safeMode && (
+          <SettingsSection
+            id="folders"
+            title={t('settings.folders.label')}
+            description={t('settings.folders.hint')}
+          >
+            <FolderAccessSection folders={grantedFolders} onRevoke={handleRevokeFolder} />
+          </SettingsSection>
+        )}
+
         {/* Network access — TOFU allowlist (Plan 2 Task 7). Approved domains +
             pending requests; approve/dismiss saves approved_domains /
             pending_domain_requests at once (Task 2's PUT route live-rebuilds
-            the proxy rules server-side). */}
+            the proxy rules server-side). Safe-mode only (spec 117 D3): an
+            open project has no proxy; its approved domains stay on disk. */}
+        {safeMode && (
+          <SettingsSection
+            id="network"
+            title={t('settings.network.label')}
+            description={t('settings.network.hint')}
+          >
+            <NetworkAccessSection
+              approvedDomains={approvedDomains}
+              pendingRequests={pendingDomainRequests}
+              onChange={({ approvedDomains: next, pendingRequests }) => {
+                setApprovedDomains(next);
+                setPendingDomainRequests(pendingRequests);
+                saveNow({ approved_domains: next, pending_domain_requests: pendingRequests });
+              }}
+            />
+          </SettingsSection>
+        )}
+
+        {/* Runs outside the sandbox (spec 117 D5/D6) — the executables the
+            user said "always allow" for, and the parked requests a hands-off
+            run auto-denied, with the four answers. */}
         <SettingsSection
-          id="network"
-          title={t('settings.network.label')}
-          description={t('settings.network.hint')}
+          id="unsandboxed"
+          title={t('settings.unsandboxed.label')}
+          description={t('settings.unsandboxed.hint')}
         >
-          <NetworkAccessSection
-            approvedDomains={approvedDomains}
-            pendingRequests={pendingDomainRequests}
-            onChange={({ approvedDomains: next, pendingRequests }) => {
-              setApprovedDomains(next);
-              setPendingDomainRequests(pendingRequests);
-              saveNow({ approved_domains: next, pending_domain_requests: pendingRequests });
-            }}
+          <UnsandboxedRunsSection
+            executables={unsandboxedExecutables}
+            pendingRuns={pendingUnsandboxedRuns}
+            onRemoveExecutable={handleRemoveExecutable}
+            onResolve={handleResolveRun}
           />
         </SettingsSection>
         </SettingsGroup>

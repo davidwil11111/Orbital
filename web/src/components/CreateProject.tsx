@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import LLMProviderSettings from './LLMProviderSettings';
 import FolderBrowserPanel from './FolderBrowserPanel';
+import SafeModeSwitch from './SafeModeSwitch';
 import { ApiError } from '../config';
 import { useT } from '../i18n/useT';
 import type { StringKey } from '../i18n/strings';
@@ -62,6 +63,8 @@ export default function CreateProject({
   const [workspace, setWorkspace] = useState('');
   const [instructions, setInstructions] = useState('');
   const [autonomy, setAutonomy] = useState<Autonomy>('hands_off');
+  // Spec 117 D1: the sandbox is OFF for a new project unless asked for.
+  const [safeMode, setSafeMode] = useState(false);
   const [budgetLimit, setBudgetLimit] = useState('');
   const [errors, setErrors] = useState<FormErrors>({});
   const [pickerExpanded, setPickerExpanded] = useState(false);
@@ -202,6 +205,10 @@ export default function CreateProject({
         autonomy,
         agent_name: agentName.trim() || undefined,
         budget_limit_usd: budgetLimit ? parseFloat(budgetLimit) : undefined,
+        // Always explicit: the daemon's dataclass default is `true` (so that
+        // projects from before the field keep today's model); a new project
+        // says which way its switch was.
+        safe_mode: safeMode,
       });
     } catch (err) {
       // agent_name collisions (likelier now that the name is often
@@ -340,6 +347,13 @@ export default function CreateProject({
 
           {/* LLM info: renders only the no-api-key warning; nothing otherwise */}
           <LLMProviderSettings mode="wizard" />
+
+          {/* Safe mode (spec 117 D2) — the last row of the always-visible
+              form, NOT inside Advanced: the user's decision was a toggle on
+              the creation page they can hover, and a switch behind a
+              collapsed disclosure is not that. Default off; the hover copy
+              says what on/off mean. */}
+          <SafeModeSwitch checked={safeMode} onChange={setSafeMode} />
 
           {/* Advanced options (collapsed by default): Agent Name, Instructions, Autonomy, Budget */}
           <div>
