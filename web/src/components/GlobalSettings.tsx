@@ -19,6 +19,7 @@ import PairPhone from './PairPhone';
 import SubAgentSettings from './SubAgentSettings';
 import ConnectorSettings from './ConnectorSettings';
 import TelemetrySettings from './TelemetrySettings';
+import SendFeedback from './SendFeedback';
 import AboutSection from './AboutSection';
 import SettingsRail, { type SettingsRailSection } from './SettingsRail';
 import { useLocale } from '../i18n/LocaleContext';
@@ -71,6 +72,7 @@ export const GLOBAL_SETTINGS_SECTIONS: SettingsRailSection[] = [
   { id: 'sub-agents', labelKey: 'global.subAgents.heading', groupKey: 'settings.group.capabilities' },
   { id: 'phone-pairing', labelKey: 'settingsRail.phone', groupKey: 'settings.group.device' },
   { id: 'privacy', labelKey: 'telemetry.heading', groupKey: 'settings.group.device' },
+  { id: 'feedback', labelKey: 'feedback.button', groupKey: 'settings.group.device' },
   // No groupKey: a one-entry chapter whose heading repeats the entry is noise
   // (same call as project settings' Danger Zone).
   { id: 'about', labelKey: 'update.about.heading' },
@@ -359,6 +361,13 @@ export default function GlobalSettings({ onBack, onTakeTour, canTakeTour }: Glob
               {/* Telemetry toggle + verbatim payload viewer (spec 046 §6). */}
               <SettingsSection id="privacy" title={t('telemetry.heading')}>
                 <TelemetrySettings />
+              </SettingsSection>
+
+              {/* Send feedback with diagnostics (spec 113 D): preview-then-upload
+                  of a sanitised bundle; explicit action, independent of the
+                  telemetry toggle above. */}
+              <SettingsSection id="feedback" title={t('feedback.button')}>
+                <SendFeedback />
               </SettingsSection>
             </SettingsGroup>
 

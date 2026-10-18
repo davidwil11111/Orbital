@@ -605,6 +605,12 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     pricing_v2.configure()
     app.include_router(pricing_v2.router)
 
+    # 7c-feedback. Send feedback with diagnostics (spec 113 D): preview +
+    # explicit upload of a sanitised bundle. Reads the telemetry runtime and
+    # the settings module's singletons; nothing to inject.
+    from agent_os.api.routes import feedback as feedback_routes
+    app.include_router(feedback_routes.router)
+
     # 7d. Cloud relay (opt-in via AGENT_OS_RELAY_URL env var)
     relay_url = os.environ.get("AGENT_OS_RELAY_URL")
     if relay_url:
