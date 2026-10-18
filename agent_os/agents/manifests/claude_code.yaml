@@ -55,6 +55,8 @@ setup:
     windows:
       - "%APPDATA%\\npm\\claude.cmd"
       - "%PROGRAMFILES%\\nodejs\\claude.cmd"
+      # The native (non-npm) installer, `irm https://claude.ai/install.ps1 | iex`.
+      - "%USERPROFILE%\\.local\\bin\\claude.exe"
     macos:
       - "/usr/local/bin/claude"
       - "$HOME/.local/bin/claude"
@@ -62,11 +64,31 @@ setup:
       - "$HOME/.npm-global/bin/claude"
       - "$HOME/.npm/bin/claude"
       - "/opt/homebrew/bin/claude"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/claude"
+      - "$HOME/.volta/bin/claude"
+      - "$HOME/Library/pnpm/claude"
+      - "$HOME/.bun/bin/claude"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/claude"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/claude"
+      - "/opt/homebrew/opt/node@*/bin/claude"
     linux:
       - "/usr/local/bin/claude"
       - "$HOME/.local/bin/claude"
       - "$HOME/.claude/local/claude"
       - "$HOME/.npm-global/bin/claude"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/claude"
+      - "$HOME/.volta/bin/claude"
+      - "$HOME/.local/share/pnpm/claude"
+      - "$HOME/.bun/bin/claude"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/claude"
 
 capabilities:
   skills:

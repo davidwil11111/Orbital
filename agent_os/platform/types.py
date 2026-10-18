@@ -137,11 +137,34 @@ def windows_worker_env(
     that writes a cache (npm, pip, uv, pnpm) aimed at the main user's profile
     and failed on write. ``PATH`` is deliberately NOT overridden — it is what
     makes the W1 toolchain grants discoverable.
+
+    Spec 114 D3 — ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_n`` /
+    ``GIT_CONFIG_VALUE_n`` carry ``safe.directory=*``. Git >= 2.35.2 refuses a
+    repository owned by a different user than the one running it ("dubious
+    ownership"), and every workspace is owned by the main user, so without
+    this the worker fails on every repository even once reads work. Why the
+    environment and not a ``.gitconfig`` in the worker home: it needs no git
+    binary at setup time, it applies to every spawn, and the worker cannot
+    edit it — its home is worker-writable, so a gitconfig there would be a
+    worker-writable git config, exactly the class of file W3 protects. Why
+    ``*`` and not a per-root list: the worker only runs inside roots the user
+    granted (the ACLs enforce that), the ownership check exists to stop a
+    human from running git in a stranger's directory, and the glob form
+    ``<root>/*`` needs git >= 2.46 while ``*`` works from 2.35.2. When the
+    inherited environment already carries a ``GIT_CONFIG_*`` pair, the entry
+    takes the next index instead of clobbering index 0.
     """
     import ntpath
+    import os as _os
 
+    env = _os.environ if environ is None else environ
     root = home or windows_worker_home(environ)
     drive, tail = ntpath.splitdrive(root)
+    try:
+        git_index = int((env.get("GIT_CONFIG_COUNT") or "0").strip())
+    except ValueError:
+        git_index = 0
+    git_index = max(git_index, 0)
     return {
         "USERPROFILE": root,
         "HOMEDRIVE": drive or "C:",
@@ -150,6 +173,9 @@ def windows_worker_env(
         "LOCALAPPDATA": ntpath.join(root, "AppData", "Local"),
         "TEMP": ntpath.join(root, "Temp"),
         "TMP": ntpath.join(root, "Temp"),
+        "GIT_CONFIG_COUNT": str(git_index + 1),
+        f"GIT_CONFIG_KEY_{git_index}": "safe.directory",
+        f"GIT_CONFIG_VALUE_{git_index}": "*",
     }
 
 

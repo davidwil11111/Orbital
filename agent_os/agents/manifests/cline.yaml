@@ -84,10 +84,32 @@ setup:
       - "/usr/local/bin/cline"
       - "$HOME/.npm-global/bin/cline"
       - "/opt/homebrew/bin/cline"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/cline"
+      - "$HOME/.volta/bin/cline"
+      - "$HOME/Library/pnpm/cline"
+      - "$HOME/.bun/bin/cline"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/cline"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/cline"
+      - "/opt/homebrew/opt/node@*/bin/cline"
+      - "$HOME/.local/bin/cline"
     linux:
       - "/usr/local/bin/cline"
       - "$HOME/.npm-global/bin/cline"
       - "$HOME/.npm/bin/cline"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/cline"
+      - "$HOME/.volta/bin/cline"
+      - "$HOME/.local/share/pnpm/cline"
+      - "$HOME/.bun/bin/cline"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/cline"
+      - "$HOME/.local/bin/cline"
 
 capabilities:
   skills:

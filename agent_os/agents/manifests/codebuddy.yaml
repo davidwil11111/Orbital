@@ -73,11 +73,32 @@ setup:
       - "$HOME/.npm-global/bin/codebuddy"
       - "$HOME/.npm/bin/codebuddy"
       - "/opt/homebrew/bin/codebuddy"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/codebuddy"
+      - "$HOME/.volta/bin/codebuddy"
+      - "$HOME/Library/pnpm/codebuddy"
+      - "$HOME/.bun/bin/codebuddy"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/codebuddy"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/codebuddy"
+      - "/opt/homebrew/opt/node@*/bin/codebuddy"
+      - "$HOME/.local/bin/codebuddy"
     linux:
       - "/usr/local/bin/codebuddy"
       - "$HOME/.npm-global/bin/codebuddy"
       - "$HOME/.npm/bin/codebuddy"
       - "$HOME/.local/bin/codebuddy"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/codebuddy"
+      - "$HOME/.volta/bin/codebuddy"
+      - "$HOME/.local/share/pnpm/codebuddy"
+      - "$HOME/.bun/bin/codebuddy"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/codebuddy"
 
 capabilities:
   skills:

@@ -75,10 +75,32 @@ setup:
       - "/usr/local/bin/gemini"
       - "$HOME/.npm-global/bin/gemini"
       - "/opt/homebrew/bin/gemini"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/gemini"
+      - "$HOME/.volta/bin/gemini"
+      - "$HOME/Library/pnpm/gemini"
+      - "$HOME/.bun/bin/gemini"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/gemini"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/gemini"
+      - "/opt/homebrew/opt/node@*/bin/gemini"
+      - "$HOME/.local/bin/gemini"
     linux:
       - "/usr/local/bin/gemini"
       - "$HOME/.npm-global/bin/gemini"
       - "$HOME/.npm/bin/gemini"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/gemini"
+      - "$HOME/.volta/bin/gemini"
+      - "$HOME/.local/share/pnpm/gemini"
+      - "$HOME/.bun/bin/gemini"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/gemini"
+      - "$HOME/.local/bin/gemini"
 
 capabilities:
   skills:

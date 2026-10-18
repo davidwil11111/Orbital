@@ -83,10 +83,32 @@ setup:
       - "/usr/local/bin/cn"
       - "$HOME/.npm-global/bin/cn"
       - "/opt/homebrew/bin/cn"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/cn"
+      - "$HOME/.volta/bin/cn"
+      - "$HOME/Library/pnpm/cn"
+      - "$HOME/.bun/bin/cn"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/cn"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/cn"
+      - "/opt/homebrew/opt/node@*/bin/cn"
+      - "$HOME/.local/bin/cn"
     linux:
       - "/usr/local/bin/cn"
       - "$HOME/.npm-global/bin/cn"
       - "$HOME/.npm/bin/cn"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/cn"
+      - "$HOME/.volta/bin/cn"
+      - "$HOME/.local/share/pnpm/cn"
+      - "$HOME/.bun/bin/cn"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/cn"
+      - "$HOME/.local/bin/cn"
 
 capabilities:
   skills:

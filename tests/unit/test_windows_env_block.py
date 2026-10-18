@@ -80,6 +80,40 @@ def test_worker_env_does_not_override_path():
 
 
 # ---------------------------------------------------------------------------
+# Spec 114 D3 — git's ownership check, answered through the environment
+# ---------------------------------------------------------------------------
+
+
+def test_worker_env_marks_every_directory_safe_for_git():
+    """Git >= 2.35.2 refuses a repository owned by a different user than the
+    one running it ("dubious ownership"); every workspace is owned by the
+    main user. The answer rides in the env block rather than a ``.gitconfig``
+    in the worker home, which the worker could edit — the class of file W3
+    exists to protect."""
+    env = windows_worker_env(environ=ENV)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "*"
+
+
+def test_worker_env_appends_after_an_inherited_git_config_pair():
+    # A developer's shell may already export a GIT_CONFIG_* pair; clobbering
+    # index 0 would silently drop it. Take the next index instead.
+    inherited = dict(ENV, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="user.name",
+                     GIT_CONFIG_VALUE_0="dev")
+    env = windows_worker_env(environ=inherited)
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_1"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_1"] == "*"
+    assert "GIT_CONFIG_KEY_0" not in env and "GIT_CONFIG_VALUE_0" not in env
+
+
+def test_worker_env_treats_a_garbage_git_config_count_as_zero():
+    env = windows_worker_env(environ=dict(ENV, GIT_CONFIG_COUNT="lots"))
+    assert env["GIT_CONFIG_COUNT"] == "1" and env["GIT_CONFIG_KEY_0"] == "safe.directory"
+
+
+# ---------------------------------------------------------------------------
 # The launcher's env block
 # ---------------------------------------------------------------------------
 
@@ -146,6 +180,29 @@ def test_explicit_env_vars_still_win(launcher_cls, monkeypatch):
     assert env["TEMP"] == r"D:\scratch"
     # …while the ones the caller did not set are still redirected.
     assert env["APPDATA"] == r"C:\ProgramData\Orbital\worker\AppData\Roaming"
+
+
+def test_env_block_carries_the_safe_directory_override(launcher_cls, monkeypatch):
+    # Spec 114 D3 end to end through the launcher: the block the worker gets
+    # answers git's ownership check without any file in the worker home.
+    monkeypatch.setenv("ProgramData", r"C:\ProgramData")
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    env = _decode(launcher_cls._build_env_block(None, inherit_env=True))
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "*"
+
+
+def test_env_block_chains_after_the_daemons_own_git_config(launcher_cls, monkeypatch):
+    monkeypatch.setenv("ProgramData", r"C:\ProgramData")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "dev")
+    env = _decode(launcher_cls._build_env_block(None, inherit_env=True))
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert env["GIT_CONFIG_KEY_1"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_1"] == "*"
 
 
 def test_no_inherit_env_gets_no_worker_home(launcher_cls, monkeypatch):

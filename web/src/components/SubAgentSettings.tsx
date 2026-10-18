@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../config';
 import { useWebSocket } from '../hooks/useWebSocket';
 import MessageAvatar from './MessageAvatar';
+import NotDetectedRow from './NotDetectedRow';
 import type { StringKey } from '../i18n/strings';
 import { useT } from '../i18n/useT';
 import { LabelWithHint } from './SettingsSection';
@@ -166,10 +167,17 @@ function isVisibleEntry(entry: SubAgentEntry): boolean {
   if (entry.installed === true) return true;
   // A non-empty `platforms` list — echoed from the manifest — is the daemon's
   // "Orbital installs this agent" signal; `[]` means bring-your-own, which
-  // stays hidden exactly as it was before the install route existed.
-  // `supported` then narrows that to this host, and an excluded host gets an
-  // explanation on the card rather than a vanished row.
-  return (entry.install?.platforms?.length ?? 0) > 0;
+  // used to stay hidden. Spec 115 D4: a bring-your-own agent that is not
+  // detected now gets a compact "Not detected" row (isNotDetectedEntry)
+  // instead of vanishing — the reporter of #57 read the silence as "codex
+  // is not supported". `supported` then narrows the installable set to this
+  // host, and an excluded host gets an explanation on the card.
+  return true;
+}
+
+/** Spec 115 D4: bring-your-own (no Orbital install) and the CLI was not found. */
+function isNotDetectedEntry(entry: SubAgentEntry): boolean {
+  return entry.installed !== true && (entry.install?.platforms?.length ?? 0) === 0;
 }
 
 /** The credentials this card can take a value for: manifest-declared secrets
@@ -238,9 +246,9 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
 
   // This daemon-level screen lists installed sub-agents plus the ones Orbital
   // can install for the user. Agents whose CLI isn't on the machine and can't
-  // be installed from here are hidden; the helper line tells the user how to
-  // surface one. (The /settings/sub-agents payload still includes them — other
-  // screens consume the full list — so we filter here in the frontend.)
+  // be installed from here get a one-line "Not detected" row (spec 115 D4);
+  // project settings and the pin switcher keep hiding them. (The filter is
+  // kept as the seam for any future hide rule.)
   const visibleEntries = entries === null
     ? null
     : entries.filter(isVisibleEntry);
@@ -312,11 +320,13 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
       {visibleEntries !== null && visibleEntries.length > 0 && (
         <div className="flex flex-col gap-4">
           {visibleEntries.map(entry => (
-            <SubAgentCard
-              key={entry.slug}
-              entry={entry}
-              onChanged={load}
-            />
+            isNotDetectedEntry(entry)
+              ? <NotDetectedRow key={entry.slug} slug={entry.slug} name={entry.name} />
+              : <SubAgentCard
+                key={entry.slug}
+                entry={entry}
+                onChanged={load}
+              />
           ))}
         </div>
       )}

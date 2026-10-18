@@ -97,10 +97,32 @@ setup:
       - "/usr/local/bin/codex"
       - "$HOME/.npm-global/bin/codex"
       - "/opt/homebrew/bin/codex"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/codex"
+      - "$HOME/.volta/bin/codex"
+      - "$HOME/Library/pnpm/codex"
+      - "$HOME/.bun/bin/codex"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/codex"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/codex"
+      - "/opt/homebrew/opt/node@*/bin/codex"
+      - "$HOME/.local/bin/codex"
     linux:
       - "/usr/local/bin/codex"
       - "$HOME/.npm-global/bin/codex"
       - "$HOME/.npm/bin/codex"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/codex"
+      - "$HOME/.volta/bin/codex"
+      - "$HOME/.local/share/pnpm/codex"
+      - "$HOME/.bun/bin/codex"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/codex"
+      - "$HOME/.local/bin/codex"
 
 capabilities:
   skills:

@@ -159,6 +159,103 @@ class TestResolveBinary:
 
 
 # ---------------------------------------------------------------------------
+# Spec 115 D3 — glob-capable auto_detect and the PATH rule
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBinaryAutoDetectGlob:
+    """A version manager (nvm, fnm, ``node@XX`` kegs) puts the binary under a
+    per-version directory the manifest cannot spell out. An ``auto_detect``
+    entry containing ``*`` is expanded with ``glob``, newest version first by
+    natural sort, first existing regular file wins — and the hit's directory
+    joins the daemon PATH once, so the ``#!/usr/bin/env node`` shim and the
+    ``node --version`` dependency check resolve too (finding 4: without that
+    rule the agent reads "installed" and fails at dispatch)."""
+
+    @staticmethod
+    def _nvm_tree(tmp_path, versions, name="testagent"):
+        for v in versions:
+            d = tmp_path / ".nvm" / "versions" / "node" / v / "bin"
+            d.mkdir(parents=True)
+            (d / name).write_text("#!/usr/bin/env node\n")
+        return str(tmp_path / ".nvm" / "versions" / "node" / "*" / "bin" / name)
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
+    @patch("agent_os.agents.setup_engine.detect_os", return_value="macos")
+    def test_glob_entry_resolves_to_the_newest_version(self, _os, _which, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        # Lexical order would put v9 first; natural sort puts v22 first.
+        pattern = self._nvm_tree(tmp_path, ["v9.0.0", "v20.1.0", "v22.3.0"])
+        manifest = _make_cli_manifest(auto_detect={"macos": [pattern]})
+        engine = SetupEngine(_make_registry(manifest))
+
+        result = engine.resolve_binary(manifest)
+
+        assert result == str(tmp_path / ".nvm/versions/node/v22.3.0/bin/testagent")
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
+    @patch("agent_os.agents.setup_engine.detect_os", return_value="macos")
+    def test_glob_skips_directories_and_missing_files(self, _os, _which, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        pattern = self._nvm_tree(tmp_path, ["v20.1.0"])
+        # A newer version whose "binary" is a directory (a broken install).
+        bogus = tmp_path / ".nvm" / "versions" / "node" / "v23.0.0" / "bin" / "testagent"
+        bogus.mkdir(parents=True)
+        manifest = _make_cli_manifest(auto_detect={"macos": [pattern]})
+        engine = SetupEngine(_make_registry(manifest))
+
+        assert engine.resolve_binary(manifest) == str(
+            tmp_path / ".nvm/versions/node/v20.1.0/bin/testagent")
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
+    @patch("agent_os.agents.setup_engine.detect_os", return_value="macos")
+    def test_glob_with_no_match_falls_through(self, _os, _which, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        pattern = str(tmp_path / "nothing" / "*" / "bin" / "testagent")
+        manifest = _make_cli_manifest(auto_detect={"macos": [pattern]}, check_command=None)
+        engine = SetupEngine(_make_registry(manifest))
+        assert engine.resolve_binary(manifest) is None
+        assert os.environ["PATH"] == "/usr/bin"
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
+    @patch("agent_os.agents.setup_engine.detect_os", return_value="macos")
+    def test_auto_detect_hit_joins_the_daemon_path_exactly_once(self, _os, _which, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        pattern = self._nvm_tree(tmp_path, ["v22.3.0"])
+        bin_dir = str(tmp_path / ".nvm/versions/node/v22.3.0/bin")
+        manifest = _make_cli_manifest(auto_detect={"macos": [pattern]})
+        engine = SetupEngine(_make_registry(manifest))
+
+        engine.resolve_binary(manifest)
+        engine.invalidate_resolved_path("test-agent")
+        engine.resolve_binary(manifest)
+
+        entries = os.environ["PATH"].split(os.pathsep)
+        assert entries.count(bin_dir) == 1
+        assert entries[0] == "/usr/bin", "appended, never prepended over the user's PATH"
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
+    @patch("agent_os.agents.setup_engine.detect_os", return_value="macos")
+    def test_plain_auto_detect_hit_also_joins_the_path(self, _os, _which, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        d = tmp_path / ".volta" / "bin"
+        d.mkdir(parents=True)
+        (d / "testagent").write_text("")
+        manifest = _make_cli_manifest(auto_detect={"macos": [str(d / "testagent")]})
+        engine = SetupEngine(_make_registry(manifest))
+        engine.resolve_binary(manifest)
+        assert str(d) in os.environ["PATH"].split(os.pathsep)
+
+    @patch("agent_os.agents.setup_engine.shutil.which", return_value="/opt/homebrew/bin/testagent")
+    def test_which_hit_leaves_the_path_alone(self, _which, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin")
+        manifest = _make_cli_manifest()
+        engine = SetupEngine(_make_registry(manifest))
+        assert engine.resolve_binary(manifest) == "/opt/homebrew/bin/testagent"
+        assert os.environ["PATH"] == "/usr/bin"
+
+
+# ---------------------------------------------------------------------------
 # check_dependencies tests
 # ---------------------------------------------------------------------------
 

@@ -1047,6 +1047,8 @@ export const STRINGS = {
   "subAgentCard.logout": { en: "Logout", zh: "退出登录" },
   "subAgentCard.missingDeps": { en: "Missing dependencies: {list}", zh: "缺少依赖：{list}" },
   "subAgentCard.noParams": { en: "No daemon-level parameters available for this sub-agent.", zh: "该子Agent没有可用的参数。" },
+  "subAgentCard.notDetected": { en: "Not detected", zh: "未检测到" },
+  "subAgentCard.notDetectedHint": { en: "{name} is not on Orbital's PATH. Install it, or if it already works in Terminal, click Refresh. If it still does not appear, add its folder to your login PATH (~/.zprofile on macOS).", zh: "Orbital 的 PATH 中找不到 {name}。请先安装；如果它在终端里已经能用，点击刷新。仍未出现时，把它所在目录加入登录 PATH（macOS 为 ~/.zprofile）。" },
   "subAgentCard.notInstalled": { en: "Not installed", zh: "未安装" },
   "subAgentCard.notLoggedIn": { en: "Not logged in", zh: "未登录" },
   "subAgentCard.param.approvalMode": { en: "Approval mode", zh: "审批模式" },

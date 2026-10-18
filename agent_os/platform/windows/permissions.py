@@ -24,6 +24,22 @@ from agent_os.utils.subprocess_flags import win_no_window_flags
 
 logger = logging.getLogger("agent_os.platform.windows.permissions")
 
+#: Spec 114 D1 — the rights a W3 deny names, i.e. generic-write minus
+#: ``SYNCHRONIZE``: write data / add file, append data / add subdirectory,
+#: write extended attributes, write attributes. The writer and the classifier
+#: both render from this tuple so they cannot drift.
+W3_DENY_RIGHTS: tuple[str, ...] = ("WD", "AD", "WEA", "WA")
+
+#: Classification of what an ``icacls`` listing already holds for the worker.
+DenyState = Literal["none", "current", "stale"]
+
+_ACE_GROUP_RE = re.compile(r"\(([^()]*)\)")
+
+
+def w3_deny_rights_string() -> str:
+    """``(WD,AD,WEA,WA)`` — the rights group icacls takes and prints."""
+    return "(" + ",".join(W3_DENY_RIGHTS) + ")"
+
 
 class PermissionManager:
     """Manages file-system permissions for the sandbox user via icacls."""
@@ -105,22 +121,36 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     def deny_access(self, username: str, path: str) -> PermissionResult:
-        """Add a deny-write ACE for *username* on *path* (spec 077 W3).
+        """Add a deny-write ACE for *username* on *path* (spec 077 W3, 114 D1).
 
         Deny ACEs precede allows in Windows access evaluation, so the
         read-write grant on the enclosing workspace cannot override this. The
         inheritance flags ``(OI)(CI)`` are only valid on a directory, so a file
-        target (``.git\\config``) gets the bare ``W`` right.
+        target (``.git\\config``) gets the rights group alone.
 
-        Consequence, same as Claude Code documents: ``git remote add`` from
-        inside the sandbox fails, because it writes ``.git\\config``. The agent
-        passes the URL on the command line instead.
+        The rights are the four write rights **by name** —
+        :data:`W3_DENY_RIGHTS`, rendered ``(WD,AD,WEA,WA)`` — never the ``W``
+        shorthand. ``W`` expands to the generic-write mask, which carries
+        ``SYNCHRONIZE`` next to the write bits, and Windows evaluates a deny
+        bit by bit: every synchronous ``CreateFile`` (every normal open,
+        read-only included) asks for ``SYNCHRONIZE``, so a ``W`` deny failed
+        *reads* of ``.git\\config`` and with them every git command the worker
+        ran (issue #58). .NET strips ``Synchronize`` from deny rules for the
+        same reason.
+
+        What stays blocked for the worker: writing or creating files under
+        ``.git\\hooks`` and rewriting ``.git\\config`` — ``git remote add``,
+        ``git config --local``, hook edits. What works: reads, and every git
+        command that leaves those two alone (``status``, ``log``, ``diff``,
+        ``add``, ``commit``, ``checkout``). Delete was never part of ``W`` and
+        is not added.
         """
         resolved = self._resolve_path(path)
         if resolved is None:
             return PermissionResult(success=False, path=path, error="Path does not exist")
 
-        flags = "(OI)(CI)W" if os.path.isdir(resolved) else "W"
+        rights = w3_deny_rights_string()
+        flags = f"(OI)(CI){rights}" if os.path.isdir(resolved) else rights
         args = [resolved, "/deny", f"{username}:{flags}", "/Q"]
         if os.path.isdir(resolved):
             args.insert(-1, "/T")
@@ -155,15 +185,28 @@ class PermissionManager:
             return PermissionResult(success=False, path=resolved, error=err)
         return PermissionResult(success=True, path=resolved)
 
-    def has_deny(self, username: str, path: str) -> bool:
-        """True when *username* already carries a deny ACE on *path*."""
+    def deny_state(self, username: str, path: str) -> DenyState:
+        """What *path* already carries for *username* (spec 114 D2).
+
+        ``"current"`` — the D1 rights group; ``"stale"`` — any other deny for
+        the account (in practice the v0.16.0 ``(W)`` shape, which must be
+        rewritten); ``"none"`` — no deny, or the query failed.
+        """
         resolved = self._resolve_path(path)
         if resolved is None:
-            return False
+            return "none"
         result = self._run_icacls([resolved])
         if result.returncode != 0:
-            return False
-        return _has_deny_ace(result.stdout, username)
+            return "none"
+        return _classify_deny_ace(result.stdout, username)
+
+    def has_deny(self, username: str, path: str) -> bool:
+        """True when *username* carries the **current** W3 deny on *path*.
+
+        A stale deny (the pre-114 ``W`` shape) reads as "not protected yet":
+        :meth:`protect_control_files` has to rewrite it, not skip it.
+        """
+        return self.deny_state(username, path) == "current"
 
     def protect_control_files(self, username: str, root: str) -> list[PermissionResult]:
         """Apply the W3 deny ACEs to every control file that exists under *root*.
@@ -177,8 +220,21 @@ class PermissionManager:
         for target in windows_protected_control_files(root):
             if not os.path.exists(target):
                 continue
-            if self.has_deny(username, target):
+            state = self.deny_state(username, target)
+            if state == "current":
                 continue
+            if state == "stale":
+                # Spec 114 D2: an install that carries the v0.16.0 ``W`` deny
+                # heals here, on the worker's first command in the workspace.
+                # ``/remove:d`` clears every deny shape, so the old ACE and
+                # the new one never coexist. The ACE itself is the state —
+                # no version marker, no installer step.
+                logger.info(
+                    "Rewriting stale W3 deny ACE for %s on %s (spec 114: "
+                    "W carried SYNCHRONIZE and blocked git reads)",
+                    username, target,
+                )
+                self.remove_deny(username, target)
             results.append(self.deny_access(username, target))
         return results
 
@@ -424,18 +480,43 @@ class PermissionManager:
             )
 
 
-def _has_deny_ace(output: str, username: str) -> bool:
-    """True when *username* has a ``(DENY)`` entry in ``icacls`` output.
+def _classify_deny_ace(output: str, username: str) -> DenyState:
+    """Classify the deny ACEs *username* has in ``icacls`` output (spec 114 D2).
 
-    icacls renders one as ``AgentOS-Worker:(DENY)(OI)(CI)(W)`` (or
-    ``DESKTOP-ABC\\AgentOS-Worker:(DENY)(W)`` for a file).
+    icacls renders a specific-rights deny as
+    ``DESKTOP-ABC\\AgentOS-Worker:(DENY)(WD,AD,WEA,WA)`` for a file and
+    ``...:(DENY)(OI)(CI)(WD,AD,WEA,WA)`` for a directory; inherited copies
+    under ``.git\\hooks`` carry a leading ``(I)``; the pre-114 shape is
+    ``(DENY)(W)`` / ``(DENY)(OI)(CI)(W)``. The rights group is always the last
+    parenthesised group on the line and is compared as a *set*, so icacls'
+    ordering of the rights is irrelevant. Any deny for the account whose
+    rights are not exactly :data:`W3_DENY_RIGHTS` is ``"stale"``, and one
+    stale line outranks any number of current ones — the rewrite must run.
     """
-    username_lower = username.lower()
+    username_lower = username.lower() + ":"
+    expected = {r.lower() for r in W3_DENY_RIGHTS}
+    state: DenyState = "none"
     for line in output.splitlines():
         line_lower = line.lower()
-        if username_lower + ":" in line_lower and "(deny)" in line_lower:
-            return True
-    return False
+        at = line_lower.find(username_lower)
+        if at < 0:
+            continue
+        # The account name must end right at the colon and start after a
+        # separator — ``AgentOS-Worker2:`` contains ``AgentOS-Worker`` but
+        # is not it, and ``DOMAIN\\AgentOS-Worker`` is.
+        if at > 0 and line_lower[at - 1] not in " \\\t":
+            continue
+        entry = line_lower[at + len(username_lower):]
+        groups = _ACE_GROUP_RE.findall(entry)
+        if "deny" not in groups:
+            continue
+        rights = {r.strip() for r in groups[-1].split(",") if r.strip()}
+        if rights == expected:
+            if state == "none":
+                state = "current"
+        else:
+            return "stale"
+    return state
 
 
 def _has_explicit_entry(output: str, username: str) -> bool:
