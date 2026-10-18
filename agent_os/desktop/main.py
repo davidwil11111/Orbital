@@ -154,33 +154,15 @@ def _inherit_shell_path():
 
     PyInstaller bundles run with a minimal PATH that doesn't include
     user-installed tool directories (homebrew, npm global, ~/.local/bin,
-    etc.).  This prevents agent binary discovery via shutil.which().
-
-    We invoke the user's login shell once at startup to capture the
-    real PATH, then merge it into os.environ so all downstream code
-    (including SetupEngine.resolve_binary()) benefits.
+    nvm, ...). Spec 115: the capture lives in ``agent_os.platform.shell_path``
+    so Settings → Refresh can re-run the same thing; it probes a login shell
+    AND an interactive login shell (``.zshrc`` is where version managers put
+    their PATH line) and never blocks launch — a failed probe keeps the
+    current PATH.
     """
-    import subprocess as _sp
+    from agent_os.platform.shell_path import merge_shell_path_into_environ
 
-    shell = os.environ.get("SHELL", "/bin/bash")
-    try:
-        result = _sp.run(
-            [shell, "-lc", "echo $PATH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            shell_path = result.stdout.strip()
-            current = os.environ.get("PATH", "")
-            # Merge: shell paths first, then existing (deduped)
-            seen = set()
-            merged = []
-            for p in shell_path.split(os.pathsep) + current.split(os.pathsep):
-                if p and p not in seen:
-                    seen.add(p)
-                    merged.append(p)
-            os.environ["PATH"] = os.pathsep.join(merged)
-    except Exception:
-        pass  # Fall back to existing PATH silently
+    merge_shell_path_into_environ()
 
 
 def _prepare_bundled_ripgrep():
@@ -882,6 +864,106 @@ def _fail_missing_webview2() -> None:
     sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Spec 115 §6 (O2) — the close button hides the window; a Dock click or app
+# activation brings it back; Cmd+Q and Dock → Quit still quit.
+# ---------------------------------------------------------------------------
+
+#: Whether the window is currently hidden *by the close button* (as opposed
+#: to minimized by the user, which AppKit restores on its own).
+_close_state: dict[str, bool] = {"hidden": False}
+_REOPEN_DELEGATE_CLASS = None
+
+
+def _close_requests_quit() -> bool:
+    """True when the closing event comes from app termination.
+
+    On macOS, Cmd+Q and Dock → Quit go through ``applicationShouldTerminate_``,
+    which also fires pywebview's ``closing`` event; walking the stack is how
+    the two are told apart.
+    """
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code.co_name == "applicationShouldTerminate_":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _handle_window_close(window) -> bool:
+    """pywebview ``closing`` handler: False keeps the window (hidden), True
+    lets it close.
+
+    macOS used to *miniaturize* here: the window shrank into the Dock's
+    minimized zone, which users read as "I pressed the wrong button" (#57).
+    The convention for a document-less app whose process keeps running
+    (Slack, Discord, Spotify) is ``orderOut:`` — pywebview's ``hide()`` — and
+    a reopen on Dock click (:func:`_reopen_delegate_class`). The WKWebView is
+    not torn down while hidden, so the WebSocket state is live on reshow.
+    """
+    if sys.platform == "darwin" and _close_requests_quit():
+        return True
+    try:
+        window.hide()
+        _close_state["hidden"] = True
+    except Exception:
+        pass
+    return False
+
+
+def _restore_hidden_window(window) -> None:
+    """Show the window again if the close button hid it. Idempotent."""
+    if not _close_state["hidden"]:
+        return
+    _close_state["hidden"] = False
+    try:
+        window.show()
+    except Exception:
+        pass
+
+
+def _reopen_delegate_class(base, restore):
+    """Subclass pywebview's NSApplication delegate with the reopen hooks.
+
+    ``applicationShouldHandleReopen:hasVisibleWindows:`` fires on a Dock
+    click; ``applicationDidBecomeActive:`` also covers Cmd+Tab, which sends no
+    reopen. Both return the window only when *we* hid it — a window the user
+    minimized is left to AppKit, which deminiaturizes it on its own. Built
+    over a plain base in tests; PyObjC infers the selector signatures from
+    the ``NSApplicationDelegate`` protocol, as it does for pywebview's own
+    ``applicationShouldTerminate_``.
+    """
+
+    class OrbitalAppDelegate(base):
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_visible_windows):
+            if not has_visible_windows and _close_state["hidden"]:
+                restore()
+                return False  # handled: do not open an untitled document
+            return True
+
+        def applicationDidBecomeActive_(self, notification):
+            if _close_state["hidden"]:
+                restore()
+
+    return OrbitalAppDelegate
+
+
+def _install_macos_reopen_handler(restore) -> None:
+    """Swap pywebview's ``BrowserView.AppDelegate`` for the reopen-aware
+    subclass. Must run before ``webview.start``, which instantiates it."""
+    global _REOPEN_DELEGATE_CLASS
+    if sys.platform != "darwin":
+        return
+    try:
+        from webview.platforms import cocoa
+    except Exception:
+        return
+    if _REOPEN_DELEGATE_CLASS is None:
+        _REOPEN_DELEGATE_CLASS = _reopen_delegate_class(
+            cocoa.BrowserView.AppDelegate, restore)
+    cocoa.BrowserView.AppDelegate = _REOPEN_DELEGATE_CLASS
+
+
 def webview_storage_kwargs(data_dir: str) -> dict:
     """``webview.start`` options that keep the window's web storage.
 
@@ -948,29 +1030,15 @@ def open_window(port: int):
             pass
 
     def _on_closing():
-        """Intercept window close — hide instead of closing.
+        """Intercept window close — hide instead of closing (spec 115 §6).
 
         On macOS: Cmd+Q and Dock→Quit go through applicationShouldTerminate_
-        which also fires this event — detect via call stack and allow quit.
-        On Windows/Linux: quit happens via system tray menu (os._exit).
+        which also fires this event — _handle_window_close detects that via
+        the call stack and allows the quit; otherwise the window is hidden
+        (orderOut) and a Dock click brings it back. On Windows/Linux: hidden
+        to the tray; quit happens via the tray menu (os._exit).
         """
-        if sys.platform == "darwin":
-            # During app termination (Cmd+Q, Dock→Quit), the call stack
-            # includes applicationShouldTerminate_.  Allow the quit.
-            frame = sys._getframe()
-            while frame is not None:
-                if frame.f_code.co_name == "applicationShouldTerminate_":
-                    return True
-                frame = frame.f_back
-        # Hide instead of close — app stays alive in tray (Windows) or Dock (macOS)
-        try:
-            if sys.platform == "darwin":
-                window.native.miniaturize_(window.native)
-            else:
-                window.hide()
-        except Exception:
-            pass
-        return False
+        return _handle_window_close(window)
 
     def _reveal_traffic_lights():
         """Put the macOS window buttons back after the frameless style hides them.
@@ -1157,6 +1225,8 @@ def open_window(port: int):
         # falls back to MSHTML internally if WebView2 vanished after the
         # guard above — the guard is what produces the loud failure.)
         start_kwargs["gui"] = "edgechromium"
+    # Spec 115 §6: must precede webview.start(), which instantiates the delegate.
+    _install_macos_reopen_handler(lambda: _restore_hidden_window(_window))
     webview.start(icon=resolve_window_icon_path(), func=_activate_macos, **start_kwargs)
 
 

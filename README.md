@@ -578,6 +578,7 @@ Orbital runs agent commands as a separate, low-privilege local Windows account n
 - Its password is random; nobody knows it, and nobody needs to.
 - Uninstalling Orbital removes the account.
 - Giving that account read access to your developer tools (the folders holding npm, cargo, Python and so on) happens in the background the first time Orbital starts; it does not slow the installation down.
+- Inside a project folder the account cannot write `.git\config` or `.git\hooks` (those run code outside the sandbox), so `git remote add`, `git config --local` and hook edits fail for the agent; every other git command — `git status`, `git log`, `git add`, `git commit`, `git checkout` — works.
 
 The AgentOS-Worker you see under Computer Management > Local Users and Groups > Users carries a description saying it belongs to Orbital.
 </details>

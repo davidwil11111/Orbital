@@ -876,8 +876,22 @@ async def refresh_sub_agent_status():
     """Invalidate the SetupEngine cache and return fresh status."""
     if _setup_engine is None:
         return []
+    # Spec 115 D2: PATH was a launch-time snapshot, so a CLI installed into a
+    # directory that was not on PATH then stayed invisible until relaunch.
+    # Re-run the shell PATH capture first. One or two shell spawns per manual
+    # Refresh — a user click, not a hot path. Imported here so tests can
+    # patch the source module.
+    from agent_os.platform.shell_path import merge_shell_path_into_environ
+    await asyncio.to_thread(merge_shell_path_into_environ)
     if hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    # Spec 115 §7: resolve_binary caches hits for the daemon lifetime, so a
+    # binary that moved (claude-code's self-update) kept its dead path across
+    # Refresh. Forget every slug's hit; the probe below re-resolves.
+    registry = getattr(_setup_engine, "_registry", None)
+    if registry is not None and hasattr(_setup_engine, "invalidate_resolved_path"):
+        for manifest in registry.list_all():
+            _setup_engine.invalidate_resolved_path(manifest.slug)
     # User-triggered refresh wants CURRENT state — drop the codex model/list
     # cache too so a just-fixed install / new model generation shows up.
     from agent_os.agent.transports.codex_models import clear_codex_models_cache

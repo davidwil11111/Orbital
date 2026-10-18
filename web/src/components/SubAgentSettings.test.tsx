@@ -5,7 +5,7 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { LocaleProvider } from '../i18n/LocaleContext';
 
 // Mock the config module's `api` helper so the component never touches the
@@ -140,7 +140,7 @@ describe('SubAgentSettings', () => {
     api.mockReset();
   });
 
-  it('lists only installed agents (filters out not-installed)', async () => {
+  it('renders a not-installed bring-your-own agent as a Not-detected row (spec 115 D4)', async () => {
     api.mockResolvedValueOnce([
       makeEntry({ slug: 'claude-code', name: 'Claude Code', installed: true }),
       makeEntry({
@@ -156,8 +156,13 @@ describe('SubAgentSettings', () => {
     await waitFor(() => {
       expect(screen.getByText('Claude Code')).toBeInTheDocument();
     });
-    // The not-installed agent must not appear.
-    expect(screen.queryByText('Gemini CLI')).not.toBeInTheDocument();
+    // The not-installed agent used to vanish; now it says so in one line,
+    // with no login / config controls.
+    const row = screen.getByTestId('sub-agent-not-detected-gemini-cli');
+    expect(row).toHaveTextContent('Gemini CLI');
+    expect(row).toHaveTextContent('Not detected');
+    expect(row).toHaveTextContent("Gemini CLI is not on Orbital's PATH.");
+    expect(within(row).queryByRole('button')).not.toBeInTheDocument();
   });
 
   it('keeps the install helper out of the embedded view, and on the standalone page', async () => {
@@ -734,7 +739,7 @@ describe('SubAgentSettings — Orbital-managed install', () => {
     expect(screen.getByRole('button', { name: 'Install' })).toBeInTheDocument();
   });
 
-  it('still hides a not-installed agent Orbital cannot install', async () => {
+  it('shows a not-installed agent Orbital cannot install as Not detected, without an Install button', async () => {
     mockList([
       makeEntry({ slug: 'claude-code', name: 'Claude Code', installed: true }),
       makeDshEntry({
@@ -748,7 +753,10 @@ describe('SubAgentSettings — Orbital-managed install', () => {
     render(<SubAgentSettings />);
 
     await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
-    expect(screen.queryByText('Gemini CLI')).not.toBeInTheDocument();
+    // Spec 115 D4: the compact row, not the full card — so no Install.
+    expect(screen.getByTestId('sub-agent-not-detected-gemini-cli')).toHaveTextContent('Not detected');
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('sub-agent-install-unsupported-gemini-cli')).not.toBeInTheDocument();
   });
 
   it('explains an unsupported platform instead of offering the button', async () => {

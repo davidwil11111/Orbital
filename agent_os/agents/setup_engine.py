@@ -8,8 +8,10 @@ Reads agent manifests from the registry, probes the system for installed
 binaries and satisfied dependencies, and reports what is available.
 """
 
+import glob
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -65,6 +67,36 @@ def _json_field(data, path: str):
             return ""
         current = current[segment]
     return current
+
+
+def _natural_key(path: str) -> list:
+    """Sort key that orders ``v9`` < ``v20`` < ``v22`` (lexical would not)."""
+    return [int(tok) if tok.isdigit() else tok.lower()
+            for tok in re.split(r"(\d+)", path)]
+
+
+def _expand_auto_detect_entry(expanded: str) -> list[str]:
+    """Spec 115 D3: an ``auto_detect`` entry containing ``*`` is a glob —
+    ``$HOME/.nvm/versions/node/*/bin/codex`` — expanded newest-version-first
+    by natural sort so nvm's highest installed node wins. Plain entries are
+    returned as they are."""
+    if "*" not in expanded:
+        return [expanded]
+    return sorted(glob.glob(expanded), key=_natural_key, reverse=True)
+
+
+def _append_to_daemon_path(directory: str) -> None:
+    """Append *directory* to ``os.environ["PATH"]`` once (spec 115 D3 rule).
+
+    Appended, never prepended: the user's own PATH order stays authoritative
+    for anything it already resolves."""
+    if not directory:
+        return
+    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if directory in entries:
+        return
+    entries.append(directory)
+    os.environ["PATH"] = os.pathsep.join(entries)
 
 
 class SetupEngine:
@@ -341,9 +373,18 @@ class SetupEngine:
                 # Scoped to token entries only: plain auto_detect paths are
                 # returned verbatim, as they always were.
                 expanded = os.path.normpath(expanded)
-            if os.path.isfile(expanded):
-                self._resolved_paths[manifest.slug] = expanded
-                return expanded
+            for candidate in _expand_auto_detect_entry(expanded):
+                if not os.path.isfile(candidate):
+                    continue
+                self._resolved_paths[manifest.slug] = candidate
+                # Spec 115 D3 rule: a binary found here is one shutil.which
+                # could not see, so its directory is not on PATH. An npm
+                # entry point is a `#!/usr/bin/env node` shim and the
+                # manifest's Node.js dependency is checked with
+                # `node --version` on the same PATH — both would fail, and
+                # the agent would read "installed" and die at dispatch.
+                _append_to_daemon_path(os.path.dirname(candidate))
+                return candidate
 
         # Strategy 3: try check_command via subprocess
         if manifest.setup.check_command:

@@ -81,12 +81,33 @@ setup:
       - "$HOME/.npm-global/bin/mcode"
       - "$HOME/.npm/bin/mcode"
       - "$HOME/.minimax-code/bin/mcode"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/mcode"
+      - "$HOME/.volta/bin/mcode"
+      - "$HOME/Library/pnpm/mcode"
+      - "$HOME/.bun/bin/mcode"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/mcode"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/mcode"
+      - "/opt/homebrew/opt/node@*/bin/mcode"
+      - "$HOME/.local/bin/mcode"
     linux:
       - "/usr/local/bin/mcode"
       - "$HOME/.npm-global/bin/mcode"
       - "$HOME/.npm/bin/mcode"
       - "$HOME/.local/bin/mcode"
       - "$HOME/.minimax-code/bin/mcode"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/mcode"
+      - "$HOME/.volta/bin/mcode"
+      - "$HOME/.local/share/pnpm/mcode"
+      - "$HOME/.bun/bin/mcode"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/mcode"
 
 capabilities:
   skills:

@@ -252,6 +252,7 @@ Orbital 会用一个独立的低权限本地 Windows 账户 **AgentOS-Worker** �
 - 它的密码是随机生成的，没有人知道，也不需要有人知道。
 - 卸载 Orbital 时会一并删除该账户。
 - 让该账户能读取你的开发工具（npm、cargo、Python 等所在的目录）这一步，会在 Orbital 第一次启动时在后台完成，不会拖慢安装。
+- 在项目目录里，该账户不能写入 `.git\config` 和 `.git\hooks`（这两处会在沙箱之外执行代码），因此 agent 执行 `git remote add`、`git config --local` 或修改 hook 会失败；其他 git 命令——`git status`、`git log`、`git add`、`git commit`、`git checkout`——都正常。
 
 在「计算机管理 → 本地用户和组 → 用户」里看到的 AgentOS-Worker，描述栏会写明它属于 Orbital。
 </details>

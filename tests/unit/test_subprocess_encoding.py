@@ -38,12 +38,6 @@ _ASYNCIO_SPAWNERS = {"create_subprocess_exec", "create_subprocess_shell"}
 #: Files permitted to keep text-mode sites without explicit encoding/errors,
 #: mapped to ``(exact number of exempt sites, why)``.
 _ALLOWLIST: dict[str, tuple[int, str]] = {
-    "agent_os/desktop/main.py": (
-        1,
-        "$SHELL login-shell PATH probe — effectively macOS-only ($SHELL is "
-        "unset on Windows) and wrapped in a broad `except Exception` that "
-        "falls back to the existing PATH.",
-    ),
     "agent_os/agent/tools/shell.py": (
         1,
         "Shell tool runs arbitrary user commands; locale decoding of their "

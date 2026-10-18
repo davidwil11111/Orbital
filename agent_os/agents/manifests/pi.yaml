@@ -111,12 +111,30 @@ setup:
       - "$HOME/.npm/bin/pi"
       - "$HOME/.local/bin/pi"
       - "$HOME/.bun/bin/pi"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/pi"
+      - "$HOME/.volta/bin/pi"
+      - "$HOME/Library/pnpm/pi"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/pi"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/pi"
+      - "/opt/homebrew/opt/node@*/bin/pi"
     linux:
       - "/usr/local/bin/pi"
       - "$HOME/.npm-global/bin/pi"
       - "$HOME/.npm/bin/pi"
       - "$HOME/.local/bin/pi"
       - "$HOME/.bun/bin/pi"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/pi"
+      - "$HOME/.volta/bin/pi"
+      - "$HOME/.local/share/pnpm/pi"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/pi"
 
 capabilities:
   skills:

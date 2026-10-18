@@ -75,12 +75,33 @@ setup:
       - "$HOME/.npm-global/bin/kimi"
       - "$HOME/.npm/bin/kimi"
       - "$HOME/.kimi-code/bin/kimi"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/kimi"
+      - "$HOME/.volta/bin/kimi"
+      - "$HOME/Library/pnpm/kimi"
+      - "$HOME/.bun/bin/kimi"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/kimi"
+      - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/kimi"
+      - "/opt/homebrew/opt/node@*/bin/kimi"
+      - "$HOME/.local/bin/kimi"
     linux:
       - "/usr/local/bin/kimi"
       - "$HOME/.npm-global/bin/kimi"
       - "$HOME/.npm/bin/kimi"
       - "$HOME/.local/bin/kimi"
       - "$HOME/.kimi-code/bin/kimi"
+      # Version managers (nvm, fnm, volta, pnpm, bun, node@XX kegs) install here
+      # and put their PATH line in ~/.zshrc. The daemon's PATH capture (spec 115
+      # D1) normally covers that; these globs are the second line of defence when
+      # it cannot run (hostile rc file). `*` picks the newest version.
+      - "$HOME/.nvm/versions/node/*/bin/kimi"
+      - "$HOME/.volta/bin/kimi"
+      - "$HOME/.local/share/pnpm/kimi"
+      - "$HOME/.bun/bin/kimi"
+      - "$HOME/.local/share/fnm/node-versions/*/installation/bin/kimi"
 
 capabilities:
   skills:
