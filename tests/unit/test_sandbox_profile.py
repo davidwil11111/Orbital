@@ -263,6 +263,36 @@ class TestProtectedControlFiles:
         temp_at = _index(profile, '(allow file-write* (subpath "/tmp"))')
         assert temp_at < deny_at, "the read-only portal deny must be emitted last"
 
+    def test_read_only_portal_above_the_workspace_keeps_workspace_writes(self):
+        """Spec 117 D8: a read-only grant on an ancestor of the workspace (a
+        read grant on ~/Desktop for a workspace under it) used to deny every
+        write inside the workspace — the portal deny was emitted after the
+        workspace allow and Seatbelt takes the last match. The workspace (and
+        read-write portal) allows must come after the read-only denies."""
+        ws = "/Users/testuser/Desktop/project"
+        rw = "/Users/testuser/Shared/rw-portal"
+        profile = generate_profile(ws, portal_paths={
+            "/Users/testuser/Desktop": "read", rw: "read_write",
+        })
+        deny_at = _index(
+            profile, '(deny file-write* (subpath "/Users/testuser/Desktop")')
+        ws_allow_at = _index(profile, f'(allow file-write* (subpath "{ws}"))')
+        rw_allow_at = _index(profile, f'(allow file-write* (subpath "{rw}"))')
+        assert deny_at < ws_allow_at
+        assert deny_at < rw_allow_at
+        # The protected control files stay denied last of all.
+        hooks_at = _index(
+            profile, f'(deny file-write* (subpath "{os.path.join(ws, ".git", "hooks")}")')
+        assert ws_allow_at < hooks_at
+
+    def test_read_only_portal_deny_still_follows_the_cache_grants(self):
+        """The reordering must not re-open a read-only portal under a cache root."""
+        portal = os.path.join(HOME, ".cache", "reference")
+        profile = generate_profile("/Users/testuser/project", portal_paths={portal: "read"})
+        cache_at = _index(profile, f'(allow file-write* (subpath "{os.path.join(HOME, ".cache")}"))')
+        deny_at = _index(profile, f'(deny file-write* (subpath "{os.path.realpath(portal)}")')
+        assert cache_at < deny_at
+
     def test_protected_denies_come_after_the_write_allows(self):
         ws = "/Users/testuser/project"
         profile = generate_profile(ws)

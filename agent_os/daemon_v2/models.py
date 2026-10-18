@@ -147,6 +147,20 @@ class AgentConfig:
     # awaiting a Settings decision — entries {domain, reason, requested_at}.
     approved_domains: list[str] = field(default_factory=list)
     pending_domain_requests: list[dict] = field(default_factory=list)
+    # Spec 117 — 安全模式 / Safe mode. ``True`` is the locked spec-077 sandbox
+    # (shell through the platform provider, allowlist proxy, read tools
+    # workspace-bound plus granted portals); ``False`` runs the shell as the
+    # user with the user's network and lets the read tools see the whole
+    # disk. The DATACLASS default is True so a project row written before this
+    # build (no key) keeps today's behaviour; the creation route writes False
+    # explicitly for new projects (D1). ``unsandboxed_executables`` are the
+    # first tokens the user answered "always allow" for (D5);
+    # ``pending_unsandboxed_runs`` are hands-off asks that auto-denied for
+    # the run and await a Settings decision — entries
+    # {id, command, reason, created_at, session_id} (D6).
+    safe_mode: bool = True
+    unsandboxed_executables: list[str] = field(default_factory=list)
+    pending_unsandboxed_runs: list[dict] = field(default_factory=list)
     project_name: str = ""
     project_instructions: str = ""
     sub_agent_deployment_instructions: str = ""
@@ -183,6 +197,23 @@ class AgentConfig:
     budget_period: str = "daily"  # "daily" | "weekly" | "monthly" | "total"
     budget_anchor_ts: str | None = None  # ISO8601; lower bound for the "total" window
     budget_currency: str | None = None  # ISO 4217; the LIMIT owns its currency
+
+
+def safe_mode_enabled(project) -> bool:
+    """Spec 117 D1 — read a project's safe-mode switch, absent key = ON.
+
+    Accepts a project-store row (dict) or an ``AgentConfig``. The single
+    reader every consumer goes through (shell routing, read tools, network
+    rules, the interceptor), so "absent means on" is decided once.
+    """
+    if project is None:
+        return True
+    if isinstance(project, dict):
+        value = project.get("safe_mode", True)
+    else:
+        value = getattr(project, "safe_mode", True)
+    return True if value is None else bool(value)
+
 
 # ``resolve_api_key`` is GONE (spec 082 §3.4). There is no longer a per-project
 # key to resolve: a project references a credential card, and the card's key is

@@ -12,7 +12,13 @@ import os
 from pathlib import Path
 from typing import Callable
 
-from ._path_utils import _excluded_in_secondary, resolve_safe_read
+from ._path_utils import (
+    OPEN_READS_PATH_SENTENCE,
+    OPEN_READS_SENTENCE,
+    _excluded_in_secondary,
+    open_reads_active,
+    resolve_safe_read,
+)
 from .base import Tool, ToolResult
 
 _MAX_RESULTS = 1000
@@ -23,19 +29,31 @@ class GlobTool(Tool):
 
     def __init__(self, workspace: str,
                  read_roots: Callable[[], list[str]] | None = None,
-                 root_labels: Callable[[], dict[str, str]] | None = None):
+                 root_labels: Callable[[], dict[str, str]] | None = None,
+                 open_reads: Callable[[], bool] | None = None,
+                 cross_project: bool | None = None):
+        # ``cross_project`` picks the LLM-facing text: the scratch (Quick
+        # Tasks) wording that names other in-scope projects, or the normal
+        # single-root wording. Defaults to "a root callable was given" so
+        # existing callers are unchanged; spec 117 wires a root callable for
+        # EVERY project (granted portals, D7) and passes False for normal ones.
+        if cross_project is None:
+            cross_project = read_roots is not None
         self._workspace = os.path.realpath(workspace)
         # Callables (evaluated per call) so per-session scope changes apply on
         # the next call. None → single-root, byte-identical to normal projects.
         self._read_roots = read_roots
         self._root_labels = root_labels
+        # Spec 117 D3: safe mode OFF → an explicit absolute path may point
+        # anywhere on disk; the default root list is unchanged.
+        self._open_reads = open_reads
         self.name = "glob"
         self.description = (
             "Find files matching a glob pattern (e.g. '**/*.py'). "
             "Returns paths relative to workspace root, sorted alphabetically, "
             "capped at 1000 results."
         )
-        if read_roots is None:
+        if not cross_project:
             dir_desc = "Directory within your workspace, relative to workspace root (e.g. 'src' or 'docs/notes'). Defaults to workspace root. Do NOT start with '/'."
         else:
             dir_desc = (
@@ -58,6 +76,27 @@ class GlobTool(Tool):
             "required": ["pattern"],
         }
 
+    def schema(self) -> dict:
+        """Spec 117 §3.4 — the LLM-facing text follows the project's mode."""
+        if not open_reads_active(self._open_reads):
+            return super().schema()
+        params = {**self.parameters, "properties": dict(self.parameters["properties"])}
+        params["properties"]["path"] = {
+            **params["properties"]["path"],
+            "description": (
+                f"Directory to search. {OPEN_READS_PATH_SENTENCE} "
+                "Defaults to your workspace."
+            ),
+        }
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": f"{self.description} {OPEN_READS_SENTENCE}",
+                "parameters": params,
+            },
+        }
+
     def execute(self, **arguments) -> ToolResult:
         try:
             pattern = arguments.get("pattern")
@@ -75,7 +114,8 @@ class GlobTool(Tool):
             if path_arg not in (".", "", None):
                 # Explicit path: scope the search to that single resolved dir
                 # (may be a secondary root's subtree via an absolute path).
-                resolved = resolve_safe_read(roots, path_arg)
+                resolved = resolve_safe_read(
+                    roots, path_arg, open_reads=open_reads_active(self._open_reads))
                 if resolved is None:
                     return ToolResult(content=f"Error: path outside workspace: {path_arg}")
                 if not os.path.exists(resolved):
@@ -83,6 +123,12 @@ class GlobTool(Tool):
                 if not os.path.isdir(resolved):
                     return ToolResult(content=f"Error: path is not a directory: {path_arg}")
                 search_dirs = [resolved]
+                if self._owning_root(resolved, primary_real, secondary_reals) is None:
+                    # Spec 117 D3 (open reads): an explicit path outside every
+                    # root is searched as an ad-hoc secondary root, labelled
+                    # by its own path so the matches stay absolute.
+                    secondary_reals = [*secondary_reals, resolved]
+                    labels = {**labels, resolved: resolved}
             else:
                 search_dirs = [primary_real] + secondary_reals
 

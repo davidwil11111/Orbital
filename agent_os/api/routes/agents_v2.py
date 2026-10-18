@@ -81,6 +81,10 @@ class CreateProjectRequest(BaseModel):
     # be suffixed -2, -3, … when taken. Default False keeps an explicit,
     # user-typed duplicate 409ing loudly in the create-project modal.
     auto_unique_name: bool = False
+    # Spec 117 D1 — 安全模式 / Safe mode. Omitted → stored as False: a NEW
+    # project is open. (The dataclass/store default is True so a record
+    # WITHOUT the key — written by an older build — stays in safe mode.)
+    safe_mode: bool | None = None
 
     @field_validator("sub_agent_deployment_instructions", mode="before")
     @classmethod
@@ -136,6 +140,12 @@ class ProjectUpdate(BaseModel):
     # Workbench view (its verbatim user quotes stay off the aggregated, relay-
     # served surface). Persists automatically via the generic ``updates`` merge.
     workbench_exclude_global: bool | None = None
+    # Spec 117 — the safe-mode switch and the "always allow" executables
+    # (replace-list semantics, like ``approved_domains``). Pending
+    # unsandboxed runs are answered through their own resolve route, never
+    # edited raw here.
+    safe_mode: bool | None = None
+    unsandboxed_executables: list[str] | None = None
 
     @field_validator("sub_agent_deployment_instructions", mode="before")
     @classmethod
@@ -544,6 +554,17 @@ def _card_refs(entries) -> list[dict]:
     return out
 
 
+def _granted_folders_for(project_id: str | None) -> list[dict]:
+    """``[{path, mode}]`` of the folders granted to a project (spec 117)."""
+    if not project_id or _agent_manager is None:
+        return []
+    try:
+        return _agent_manager.granted_folders(project_id)
+    except Exception:
+        logger.warning("granted_folders lookup failed for %s", project_id, exc_info=True)
+        return []
+
+
 def _redact_project(project: dict) -> dict:
     """Return the wire shape of a project row.
 
@@ -562,6 +583,15 @@ def _redact_project(project: dict) -> dict:
     result.setdefault("sub_agent_deployment_instructions", "")
     result.setdefault("card_id", None)
     result.setdefault("migration_note", None)
+    # Spec 117: absent key = safe mode ON (D1); fresh lists per row.
+    if result.get("safe_mode") is None:
+        result["safe_mode"] = True
+    result["safe_mode"] = bool(result["safe_mode"])
+    result["unsandboxed_executables"] = list(result.get("unsandboxed_executables") or [])
+    result["pending_unsandboxed_runs"] = list(result.get("pending_unsandboxed_runs") or [])
+    # The provider's current portals for this project (Folder-access section):
+    # live state, never persisted on the row.
+    result["granted_folders"] = _granted_folders_for(result.get("project_id"))
     # Legacy dead config (TASK-network-config-cleanup): tolerated on old
     # records, never exposed externally; dropped from disk on next save.
     result.pop("network_extra_domains", None)
@@ -680,6 +710,11 @@ async def create_project(req: CreateProjectRequest):
         "autonomy": req.autonomy or "hands_off",
         "instructions": req.instructions or "",
         "is_scratch": req.is_scratch,
+        # Spec 117 D1: written explicitly — a new project is open unless the
+        # creation form switched safe mode on.
+        "safe_mode": bool(req.safe_mode) if req.safe_mode is not None else False,
+        "unsandboxed_executables": [],
+        "pending_unsandboxed_runs": [],
     }
     if req.agent_name is not None:
         project_data["agent_name"] = req.agent_name
@@ -854,6 +889,15 @@ async def update_project(project_id: str, body: ProjectUpdate):
             if d is not None and d not in normalized:
                 normalized.append(d)
         updates["approved_domains"] = normalized
+    # Spec 117: the executable list is replaced wholesale — trimmed, deduped,
+    # empties dropped. Stored as the command's first token (``git``, ``gh``).
+    if "unsandboxed_executables" in updates:
+        executables: list[str] = []
+        for entry in updates["unsandboxed_executables"]:
+            name = str(entry).strip()
+            if name and name not in executables:
+                executables.append(name)
+        updates["unsandboxed_executables"] = executables
     # P3-F coupled removal: the legacy ``budget_spent_usd`` /
     # ``runtime_budget_spent_usd`` reset sentinels are GONE. The token ledger is
     # the single source of recorded spend; the ONLY reset surface is
@@ -942,6 +986,17 @@ async def update_project(project_id: str, body: ProjectUpdate):
     if "approved_domains" in updates and _agent_manager is not None:
         _agent_manager._apply_network_rules(project_id)
 
+    # Spec 117 §3.5: a safe-mode flip tears the proxy down (→ open) or
+    # rebuilds it from the kept grants (→ safe). The shell and read tools
+    # need no push — they read the switch per call.
+    if "safe_mode" in updates and _agent_manager is not None:
+        try:
+            await _agent_manager.on_safe_mode_changed(project_id)
+        except Exception:
+            logger.warning(
+                "safe-mode network update failed for %s", project_id, exc_info=True,
+            )
+
     # P2-D nudge: a budget config change (limit raise, period roll, anchor move)
     # must reach a budget-paused dispatcher so its lazy auto-resume guard re-runs
     # PROMPTLY rather than only on the next _wait_idle timeout. Reuse the exact
@@ -975,6 +1030,42 @@ async def update_project(project_id: str, body: ProjectUpdate):
     # ``not_total_mode`` no-op code. None when no reset was requested this PUT.
     if budget_reset is not None:
         result["budget_reset"] = budget_reset
+    return result
+
+
+class UnsandboxedRunResolveRequest(BaseModel):
+    """Spec 117 D6 — answer a hands-off ask that was parked in
+    ``pending_unsandboxed_runs`` from project settings."""
+    decision: Literal["once", "always", "disable_safe_mode", "deny"]
+
+
+@router.post("/projects/{project_id}/unsandboxed-runs/{run_id}/resolve")
+async def resolve_unsandboxed_run(project_id: str, run_id: str,
+                                  body: UnsandboxedRunResolveRequest):
+    """Run, record or drop a parked unsandboxed-run request (spec 117 D6).
+
+    ``once`` runs the stored command through the open path and injects the
+    result as a terminal event into the stored session; ``always`` records
+    the executable first; ``disable_safe_mode`` flips the project first;
+    ``deny`` only drops the request. Returns the project's wire shape (plus
+    ``run_output`` for the three running answers).
+    """
+    project = _project_store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if _agent_manager is None:
+        raise HTTPException(status_code=503, detail="Agent manager not available")
+    try:
+        updated = await _agent_manager.resolve_parked_unsandboxed_run(
+            project_id, run_id, body.decision,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="No pending unsandboxed run with that id")
+    run_output = updated.pop("run_output", None) if isinstance(updated, dict) else None
+    result = _redact_project(_project_store.get_project(project_id) or updated)
+    _enrich_with_disk_content(result, project.get("workspace", ""))
+    if run_output is not None:
+        result["run_output"] = run_output
     return result
 
 
@@ -1519,8 +1610,13 @@ async def inject_message(project_id: str, req: InjectRequest):
                 session_id=mention_session_id, dispatch_id=dispatch_id,
                 initiator=initiator,
             )
-        except Exception:
-            raise HTTPException(status_code=404, detail="No active session for project")
+        except Exception as exc:
+            # Spec 116 D7: the reason used to be swallowed here — a 404 with a
+            # generic detail and nothing in the log.
+            logger.exception("Pinned dispatch to %s raised for %s/%s",
+                             req.target, project_id, mention_session_id)
+            raise HTTPException(
+                status_code=404, detail=str(exc) or "No active session for project")
         if result.startswith("Error"):
             # The reason used to travel only in this 404: no log line and no
             # chat row, so after a reload the user's message just sat there
@@ -1537,6 +1633,10 @@ async def inject_message(project_id: str, req: InjectRequest):
                     "handle": req.target,
                     "dispatch_id": dispatch_id,
                     "suppress_wake": True,
+                    # TODO(merge): read reason/min_version from the sub-agent
+                    # manager helper (spec 116 §3.4; agent S adds it on
+                    # SubAgentManager) and stamp them here as
+                    # ``_meta.reason`` / ``_meta.min_version`` when present.
                 },
             }
             try:
@@ -2504,6 +2604,9 @@ async def approve(project_id: str, req: ApproveRequest):
         await _agent_manager.approve(
             project_id, req.tool_call_id, reply_text=req.reply_text,
             approve_all=req.approve_all, session_id=req.session_id,
+            # Spec 117 D5: "once" | "always" | "disable_safe_mode" for an
+            # unsandboxed_run pending; ignored by every other kind.
+            response_payload=req.response_payload,
         )
     except KeyError:
         # Try sub-agent approval path

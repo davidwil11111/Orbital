@@ -30,7 +30,11 @@ from agent_os.agent.workspace_files import WorkspaceFileManager, run_session_end
 from agent_os.agents.setup_engine import StaleOkView
 from agent_os.config.provider_registry import ProviderRegistry
 from agent_os.daemon_v2.default_skills_installer import install_default_skills
-from agent_os.daemon_v2.autonomy import AutonomyInterceptor
+from agent_os.daemon_v2.autonomy import (
+    UNSANDBOXED_RUN_DECISIONS,
+    UNSANDBOXED_RUN_KIND,
+    AutonomyInterceptor,
+)
 from agent_os.daemon_v2.sub_agent_visibility import resolve_visible_sub_agent_slugs
 from agent_os.daemon_v2.session_index import read_session_f1, resolve_session_uuid
 from agent_os.daemon_v2.provider_errors import (
@@ -43,7 +47,13 @@ from agent_os.daemon_v2.models import (
     detect_os,
     make_session_key,
     resolve_session_id,
+    safe_mode_enabled,
 )
+
+# Spec 117 — terminal rows that must wake an idle-after-turn management loop,
+# alongside the sub-agent terminals of spec 091 §4: the result of a command
+# the user let run outside the sandbox is an answer the agent is waiting on.
+_WAKE_EVENTS = frozenset({"sub_agent_terminal", "unsandboxed_run"})
 from agent_os.queue.dispatcher import QueueDispatcher
 from agent_os.queue.store import QueueStore
 
@@ -309,7 +319,9 @@ class AgentManager:
         return dict(record)
 
     def _compute_scope_roots(self, project_id: str,
-                             session_id: str | None) -> tuple[list[str], dict[str, str]]:
+                             session_id: str | None, *,
+                             include_portals: bool = False,
+                             ) -> tuple[list[str], dict[str, str]]:
         """Read roots + labels for a session's file tools.
 
         Returns ``([primary_workspace, *in_scope_project_workspaces], labels)``
@@ -317,30 +329,105 @@ class AgentManager:
         (for the ``[project: <name>]`` prefix). For a normal project — or a
         scratch session scoped ``off`` — the list is just ``[workspace]`` and
         labels are empty (byte-identical single-root behavior).
+
+        ``include_portals`` (spec 117 D7): in SAFE mode, append the folders
+        the user granted to this project through the access card (the
+        provider's portals under the workspace scope, read and read-write)
+        as secondary roots, labelled by their path, so read/grep/glob can
+        read what the shell can. Off by default: the scratch portal sync
+        reads the plain list, and re-granting a portal onto itself as a
+        read-only portal would downgrade a read-write grant. An open project
+        gets no portals here — its read tools are open anyway.
         """
         project = self._project_store.get_project(project_id) if self._project_store else None
         workspace = (project or {}).get("workspace") or ""
         roots: list[str] = [workspace]
         labels: dict[str, str] = {}
-        if not (project and project.get("is_scratch")):
-            return roots, labels
-        scope = self.get_session_scope(project_id, session_id)
-        mode = scope.get("mode", "all")
-        if mode == "off":
-            return roots, labels
-        selected = set(scope.get("selected_project_ids", []))
-        for p in (self._project_store.list_projects() if self._project_store else []):
-            pid = p.get("project_id")
-            if pid == project_id or p.get("is_scratch"):
-                continue
-            if mode == "all" or pid in selected:
-                ws = p.get("workspace")
-                if ws:
-                    roots.append(ws)
-                    labels[os.path.realpath(ws)] = (
-                        p.get("name") or p.get("agent_name") or pid
-                    )
+        if project and project.get("is_scratch"):
+            scope = self.get_session_scope(project_id, session_id)
+            mode = scope.get("mode", "all")
+            selected = set(scope.get("selected_project_ids", []))
+            if mode != "off":
+                for p in (self._project_store.list_projects() if self._project_store else []):
+                    pid = p.get("project_id")
+                    if pid == project_id or p.get("is_scratch"):
+                        continue
+                    if mode == "all" or pid in selected:
+                        ws = p.get("workspace")
+                        if ws:
+                            roots.append(ws)
+                            labels[os.path.realpath(ws)] = (
+                                p.get("name") or p.get("agent_name") or pid
+                            )
+        if include_portals and workspace and safe_mode_enabled(project):
+            for path in self._portal_paths_for_project(workspace):
+                real = os.path.realpath(path)
+                if any(real == os.path.realpath(r) for r in roots):
+                    continue  # the workspace lists itself as a portal
+                roots.append(path)
+                labels[real] = path
         return roots, labels
+
+    def _portal_paths_for_project(self, workspace: str) -> list[str]:
+        """The provider's granted portals under ``workspace``'s scope (D7)."""
+        provider = self._platform_provider
+        accessor = getattr(provider, "portal_paths_for_scope", None)
+        if provider is None or not callable(accessor):
+            return []
+        try:
+            portals = accessor(os.path.realpath(workspace)) or {}
+        except Exception:
+            logger.warning("portal lookup failed for %s", workspace, exc_info=True)
+            return []
+        return [str(path) for path in portals]
+
+    def granted_folders(self, project_id: str) -> list[dict]:
+        """Spec 117 wire shape: the folders granted to this project through
+        the access card — ``[{path, mode: "read_only" | "read_write"}]`` from
+        the provider's portals under the workspace scope (the same set D7
+        hands the read tools). The workspace itself is never listed."""
+        project = self._project_store.get_project(project_id) if self._project_store else None
+        workspace = (project or {}).get("workspace") or ""
+        provider = self._platform_provider
+        accessor = getattr(provider, "portal_paths_for_scope", None)
+        if not workspace or provider is None or not callable(accessor):
+            return []
+        try:
+            portals = accessor(os.path.realpath(workspace)) or {}
+        except Exception:
+            logger.warning("portal lookup failed for %s", workspace, exc_info=True)
+            return []
+        ws_real = os.path.realpath(workspace)
+        out: list[dict] = []
+        for path, mode in portals.items():
+            if os.path.realpath(str(path)) == ws_real:
+                continue
+            out.append({
+                "path": str(path),
+                "mode": "read_write" if mode == "read_write" else "read_only",
+            })
+        return out
+
+    # ── Spec 117 — the project's safe-mode switch, read per call ──────────
+
+    def _project_safe_mode(self, project_id: str) -> bool:
+        """``True`` → spec-077 sandbox; ``False`` → open. Absent key = on."""
+        if self._project_store is None:
+            return True
+        try:
+            return safe_mode_enabled(self._project_store.get_project(project_id))
+        except Exception:
+            return True
+
+    def _project_unsandboxed_executables(self, project_id: str) -> list[str]:
+        """The executables the user answered "always allow" for (D5)."""
+        if self._project_store is None:
+            return []
+        try:
+            project = self._project_store.get_project(project_id) or {}
+            return list(project.get("unsandboxed_executables") or [])
+        except Exception:
+            return []
 
     def _scope_projects_for_prompt(self, project_id: str,
                                    session_id: str | None) -> list[dict]:
@@ -1050,6 +1137,7 @@ class AgentManager:
             config.autonomy, self._ws, project_id,
             user_credential_store=self._user_credential_store,
             session_id=session_id,
+            safe_mode_cb=lambda: self._project_safe_mode(project_id),
         )
 
         # Push this project's TOFU network grants to the platform provider so
@@ -1379,18 +1467,27 @@ class AgentManager:
         # read across in-scope project workspaces; Write/Edit stay single-root.
         # Callables so a mid-session scope change applies on the next tool call.
         # None for normal projects → byte-identical single-root behavior.
-        read_roots_cb = None
-        root_labels_cb = None
-        if config.is_scratch:
-            read_roots_cb = lambda: self._compute_scope_roots(project_id, session_id)[0]
-            root_labels_cb = lambda: self._compute_scope_roots(project_id, session_id)[1]
+        # Spec 117 D7: every project's read tools also see the portals the
+        # user granted (safe mode), through the same callable; the LLM-facing
+        # text stays single-root for a normal project (``cross_project``).
+        # D3: ``open_reads`` follows the project's switch per call.
+        read_roots_cb = lambda: self._compute_scope_roots(
+            project_id, session_id, include_portals=True)[0]
+        root_labels_cb = lambda: self._compute_scope_roots(
+            project_id, session_id, include_portals=True)[1]
+        open_reads_cb = lambda: not self._project_safe_mode(project_id)
+        safe_mode_cb = lambda: self._project_safe_mode(project_id)
+        unsandboxed_cb = lambda: self._project_unsandboxed_executables(project_id)
+        cross_project = bool(config.is_scratch)
         try:
             from agent_os.agent.tools.read import ReadTool
             # context_window sizes the read cap to the active model — same
             # model_info.context_window ContextManager uses.
             registry.register(ReadTool(workspace=config.workspace,
                                        read_roots=read_roots_cb,
-                                       context_window=context_window))
+                                       context_window=context_window,
+                                       open_reads=open_reads_cb,
+                                       cross_project=cross_project))
         except ImportError:
             pass
         try:
@@ -1406,13 +1503,17 @@ class AgentManager:
         try:
             from agent_os.agent.tools.glob_tool import GlobTool
             registry.register(GlobTool(workspace=config.workspace,
-                                       read_roots=read_roots_cb, root_labels=root_labels_cb))
+                                       read_roots=read_roots_cb, root_labels=root_labels_cb,
+                                       open_reads=open_reads_cb,
+                                       cross_project=cross_project))
         except ImportError:
             pass
         try:
             from agent_os.agent.tools.grep_tool import GrepTool
             registry.register(GrepTool(workspace=config.workspace,
-                                       read_roots=read_roots_cb, root_labels=root_labels_cb))
+                                       read_roots=read_roots_cb, root_labels=root_labels_cb,
+                                       open_reads=open_reads_cb,
+                                       cross_project=cross_project))
         except ImportError:
             pass
         try:
@@ -1438,6 +1539,8 @@ class AgentManager:
                 os_type=detect_os(),
                 platform_provider=self._platform_provider,
                 project_id=project_id,
+                safe_mode_cb=safe_mode_cb,
+                unsandboxed_cb=unsandboxed_cb,
             ))
         except ImportError:
             pass
@@ -1448,7 +1551,7 @@ class AgentManager:
             pass
         try:
             from agent_os.agent.tools.request_network_access import RequestNetworkAccessTool
-            registry.register(RequestNetworkAccessTool())
+            registry.register(RequestNetworkAccessTool(safe_mode_cb=safe_mode_cb))
         except ImportError:
             pass
         try:
@@ -1593,11 +1696,16 @@ class AgentManager:
         # can. write/edit stay single-root (and ScopedToolRegistry clamps them
         # per task on top). Callables — a mid-batch scope change applies on
         # the worker's next tool call, mirroring _register_tools.
-        read_roots_cb = None
-        root_labels_cb = None
-        if project and project.get("is_scratch"):
-            read_roots_cb = lambda: self._compute_scope_roots(project_id, session_id)[0]
-            root_labels_cb = lambda: self._compute_scope_roots(project_id, session_id)[1]
+        # Spec 117: workers (native fanout) follow the project's switch the
+        # same way the manager does — same callables, same per-call reads.
+        read_roots_cb = lambda: self._compute_scope_roots(
+            project_id, session_id, include_portals=True)[0]
+        root_labels_cb = lambda: self._compute_scope_roots(
+            project_id, session_id, include_portals=True)[1]
+        open_reads_cb = lambda: not self._project_safe_mode(project_id)
+        safe_mode_cb = lambda: self._project_safe_mode(project_id)
+        unsandboxed_cb = lambda: self._project_unsandboxed_executables(project_id)
+        cross_project = bool(project and project.get("is_scratch"))
 
         def make_tool_registry(allowed, forbidden, worker_handle):
             registry = ToolRegistry()
@@ -1608,18 +1716,23 @@ class AgentManager:
             # default, i.e. exactly what workers had before. Thread it if
             # worker reads ever need to scale with the model.
             registry.register(ReadTool(workspace=workspace, read_roots=read_roots_cb,
-                                       context_window=None))
+                                       context_window=None, open_reads=open_reads_cb,
+                                       cross_project=cross_project))
             registry.register(WriteTool(workspace=workspace))
             registry.register(EditTool(workspace=workspace))
             registry.register(GlobTool(workspace=workspace,
-                                       read_roots=read_roots_cb, root_labels=root_labels_cb))
+                                       read_roots=read_roots_cb, root_labels=root_labels_cb,
+                                       open_reads=open_reads_cb, cross_project=cross_project))
             registry.register(GrepTool(workspace=workspace,
-                                       read_roots=read_roots_cb, root_labels=root_labels_cb))
+                                       read_roots=read_roots_cb, root_labels=root_labels_cb,
+                                       open_reads=open_reads_cb, cross_project=cross_project))
             registry.register(ShellTool(
                 workspace=workspace,
                 os_type=detect_os(),
                 platform_provider=platform_provider,
                 project_id=project_id,
+                safe_mode_cb=safe_mode_cb,
+                unsandboxed_cb=unsandboxed_cb,
             ))
             if self._browser_manager is not None:
                 try:
@@ -1892,6 +2005,11 @@ class AgentManager:
             card_name=card_name,
             budget_limit_usd=project.get("budget_limit_usd"),
             budget_action=project.get("budget_action", "pause"),
+            # Spec 117 — informational on the config; the tools read the
+            # switch live from the store per call.
+            safe_mode=safe_mode_enabled(project),
+            unsandboxed_executables=list(project.get("unsandboxed_executables") or []),
+            pending_unsandboxed_runs=list(project.get("pending_unsandboxed_runs") or []),
         )
 
     async def _abuild_agent_config_from_project(self, project_id: str) -> AgentConfig:
@@ -2042,7 +2160,7 @@ class AgentManager:
         # Loop is running — defer for safe insertion after tool batch
         handle.session.defer_message(content, role="system", source="daemon",
                                      meta=meta)
-        if (meta and meta.get("event") == "sub_agent_terminal"
+        if (meta and meta.get("event") in _WAKE_EVENTS
                 and not suppress_wake):
             # Decide the wake now (spec 091 §4): by the time _on_loop_done
             # runs, the loop's own finally has already drained this row.
@@ -3127,6 +3245,11 @@ class AgentManager:
             return
         from agent_os.daemon_v2.network_rules_builder import build_network_rules
         project = self._project_store.get_project(project_id) or {}
+        if not safe_mode_enabled(project):
+            # Spec 117 §3.5: an open project has no proxy to configure; its
+            # approved domains stay on disk untouched for when safe mode
+            # comes back.
+            return
         approved = (
             project.get("approved_domains")
             if isinstance(project, dict)
@@ -3140,6 +3263,189 @@ class AgentManager:
             logger.warning(
                 "network rules push failed for %s", project_id, exc_info=True,
             )
+
+    async def on_safe_mode_changed(self, project_id: str) -> None:
+        """Spec 117 §3.5 — apply a safe-mode flip to the live network setup.
+
+        Flipped to OPEN: tear the project's proxy and rules down. Flipped to
+        SAFE: rebuild the rules from the kept ``approved_domains`` so the next
+        sandboxed command sees them. Called by the projects PUT route and by
+        the ``disable_safe_mode`` answer on the approval card. The shell and
+        read tools need nothing: they read the switch per call.
+        """
+        if self._platform_provider is None:
+            return
+        if self._project_safe_mode(project_id):
+            self._apply_network_rules(project_id)
+            return
+        clear = getattr(self._platform_provider, "clear_network", None)
+        if not callable(clear):
+            return
+        try:
+            result = clear(project_id)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.warning("network teardown failed for %s", project_id, exc_info=True)
+
+    # ── Spec 117 D5/D6 — running a command outside the sandbox ──────────
+
+    async def _run_unsandboxed_command(self, project_id: str, command: str) -> str:
+        """Run ``command`` through the shell tool's open path (``_execute_unsandboxed``)
+        in the project's workspace and return the tool's content."""
+        from agent_os.agent.tools.shell import ShellTool
+        project = self._project_store.get_project(project_id) or {}
+        workspace = project.get("workspace") or ""
+        tool = ShellTool(workspace=workspace, os_type=detect_os())
+        meta = tool._detect_network(command)
+        result = await asyncio.to_thread(tool._execute_unsandboxed, command, meta)
+        content = result.content
+        return content if isinstance(content, str) else json.dumps(content)
+
+    async def _apply_unsandboxed_decision(self, project_id: str, command: str,
+                                          decision: str) -> None:
+        """Persist what ``always`` / ``disable_safe_mode`` mean before the run."""
+        from agent_os.agent.tools.shell import ShellTool
+        if decision == "always":
+            exe = ShellTool.executable_of(command)
+            if exe:
+                allowed = self._project_unsandboxed_executables(project_id)
+                if exe not in allowed:
+                    allowed.append(exe)
+                    self._project_store.update_project(
+                        project_id, {"unsandboxed_executables": allowed})
+        elif decision == "disable_safe_mode":
+            self._project_store.update_project(project_id, {"safe_mode": False})
+            await self.on_safe_mode_changed(project_id)
+
+    @staticmethod
+    def _unsandboxed_run_row(command: str, output: str, decision: str,
+                             pending_id: str | None = None) -> tuple[str, dict]:
+        """The terminal system row for a command run outside the sandbox."""
+        label = {
+            "once": "allowed once",
+            "always": "always allowed for this executable in this project",
+            "disable_safe_mode": "turned safe mode off for this project",
+        }.get(decision, decision)
+        content = (
+            f"[Unsandboxed run] The user {label}; the command ran outside the "
+            f"sandbox:\n$ {command}\n{output}"
+        )
+        meta = {"event": "unsandboxed_run", "decision": decision, "command": command}
+        if pending_id:
+            meta["pending_id"] = pending_id
+        return content, meta
+
+    async def _resolve_unsandboxed_run(self, project_id: str, session_id: str | None,
+                                       handle, pending: dict, decision: str) -> None:
+        """Answer an ``unsandboxed_run`` card (D5): record the decision, run
+        the stored command open, append the result as a terminal row to the
+        paused session. The caller resumes the loop."""
+        command = str(pending.get("command") or pending.get("tool_args", {}).get("command") or "")
+        if decision not in UNSANDBOXED_RUN_DECISIONS:
+            decision = "once"
+        await self._apply_unsandboxed_decision(project_id, command, decision)
+        try:
+            output = await self._run_unsandboxed_command(project_id, command)
+        except Exception as exc:  # the row must land even if the run blew up
+            logger.warning("unsandboxed run failed for %s", project_id, exc_info=True)
+            output = f"Error running the command: {exc}"
+        content, meta = self._unsandboxed_run_row(
+            command, output, decision, pending.get("tool_call_id"))
+        handle.session.append({
+            "role": "system",
+            "content": content,
+            "source": "daemon",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "_meta": meta,
+        })
+
+    async def resolve_parked_unsandboxed_run(self, project_id: str, run_id: str,
+                                             decision: str) -> dict:
+        """Spec 117 D6 — answer a hands-off ask from project settings.
+
+        ``deny`` drops it; ``once`` / ``always`` / ``disable_safe_mode``
+        record the decision, run the stored command through the open path
+        and inject the result as a terminal event into the stored session
+        (hydrating it from disk if idle). Returns the updated project row.
+        Raises ``KeyError`` when no parked run has ``run_id``.
+        """
+        project = self._project_store.get_project(project_id)
+        if project is None:
+            raise KeyError(project_id)
+        parked = list(project.get("pending_unsandboxed_runs") or [])
+        entry = next((r for r in parked if r.get("id") == run_id), None)
+        if entry is None:
+            raise KeyError(run_id)
+        remaining = [r for r in parked if r.get("id") != run_id]
+        self._project_store.update_project(
+            project_id, {"pending_unsandboxed_runs": remaining})
+        if decision == "deny":
+            return self._project_store.get_project(project_id) or {}
+        command = str(entry.get("command") or "")
+        await self._apply_unsandboxed_decision(project_id, command, decision)
+        try:
+            output = await self._run_unsandboxed_command(project_id, command)
+        except Exception as exc:
+            logger.warning("parked unsandboxed run failed for %s", project_id, exc_info=True)
+            output = f"Error running the command: {exc}"
+        content, meta = self._unsandboxed_run_row(command, output, decision, run_id)
+        target = entry.get("session_id")
+        if target:
+            status = await self.inject_system_message(
+                project_id, content, session_id=target, meta=meta)
+            logger.info("parked unsandboxed run %s delivered to %s/%s: %s",
+                        run_id, project_id, target, status)
+        else:
+            logger.info("parked unsandboxed run %s had no session; output kept "
+                        "in the route response only", run_id)
+        result = dict(self._project_store.get_project(project_id) or {})
+        result["run_output"] = output
+        return result
+
+    async def _park_unsandboxed_run(self, project_id: str, session_id: str | None,
+                                    handle, tool_call_id: str, pending: dict) -> None:
+        """D6: the hands-off timer fired — deny for the run, keep the ask."""
+        command = str(pending.get("command") or "")
+        project = self._project_store.get_project(project_id) or {}
+        parked = list(project.get("pending_unsandboxed_runs") or [])
+        if all(r.get("command") != command for r in parked):
+            parked.append({
+                "id": f"ur_{uuid4().hex[:12]}",
+                "command": command,
+                "reason": str(pending.get("reason") or ""),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+            })
+            self._project_store.update_project(
+                project_id, {"pending_unsandboxed_runs": parked})
+        handle.interceptor.remove_pending(tool_call_id)
+        self._broadcast(project_id, {
+            "type": "approval.resolved",
+            "project_id": project_id,
+            "tool_call_id": tool_call_id,
+            "resolution": "denied",
+            "auto_denied": True,
+        }, session_id=session_id)
+        # A system row, never a tool result: the pending id is synthetic and
+        # the shell call already has its result.
+        handle.session.append_system(
+            f"Denied for this run: the user was unavailable to allow "
+            f"`{command}` outside the sandbox within "
+            f"{self._approval_timeout_label()}. The request remains pending in "
+            f"Project Settings → Safe mode — it may be allowed for future runs. "
+            f"Complete what you can and note the gap."
+        )
+        handle.session._paused_for_approval = False
+        handle.session.resume()
+        self._broadcast_blocked_count()
+        await self._start_loop(project_id, session_id=session_id)
+
+    @staticmethod
+    def _approval_timeout_label() -> str:
+        from agent_os.daemon_v2 import autonomy
+        seconds = int(autonomy.NETWORK_APPROVAL_TIMEOUT_S)
+        return f"{seconds // 60} minutes" if seconds >= 60 else f"{seconds} seconds"
 
     # ── Hands-off network-approval auto-deny timer ──────────────────────
     #
@@ -3157,8 +3463,11 @@ class AgentManager:
     def _maybe_schedule_network_approval_timeout(
         self, project_id: str, session_id: str | None,
         tool_call_id: str, tool_name: str, preset,
+        kind: str | None = None,
     ) -> None:
-        """Start the auto-deny timer iff this is a hands-off network ask.
+        """Start the auto-deny timer iff this is a hands-off network ask —
+        or, spec 117 D6, a hands-off ``unsandboxed_run`` ask (same timeout,
+        same "deny for the run, keep the request" rule).
 
         Idempotent: a tool_call_id that already has a live timer is left
         alone (guards against ``_on_loop_done`` somehow observing the same
@@ -3166,7 +3475,9 @@ class AgentManager:
         """
         from agent_os.agent.prompt_builder import Autonomy
 
-        if preset != Autonomy.HANDS_OFF or tool_name != "request_network_access":
+        if preset != Autonomy.HANDS_OFF:
+            return
+        if tool_name != "request_network_access" and kind != UNSANDBOXED_RUN_KIND:
             return
         if tool_call_id in self._network_approval_timers:
             return
@@ -3222,6 +3533,10 @@ class AgentManager:
         pending = handle.interceptor.get_pending(tool_call_id)
         if pending is None:
             return  # already resolved via approve/deny/dismiss
+        if pending.get("kind") == UNSANDBOXED_RUN_KIND:
+            await self._park_unsandboxed_run(
+                project_id, session_id, handle, tool_call_id, pending)
+            return
         if handle.session.has_result_for(tool_call_id):
             handle.interceptor.remove_pending(tool_call_id)
             return
@@ -3302,11 +3617,14 @@ class AgentManager:
     async def approve(self, project_id: str, tool_call_id: str,
                       reply_text: str | None = None, *,
                       approve_all: bool = False,
-                      session_id: str | None = None) -> None:
+                      session_id: str | None = None,
+                      response_payload: str | None = None) -> None:
         """Approve a pending tool call and execute it.
 
         ``session_id`` selects the chat session; defaults to the
-        single-loop default session.
+        single-loop default session. ``response_payload`` carries the
+        card's answer for an ``unsandboxed_run`` pending (spec 117 D5):
+        ``once`` (default) | ``always`` | ``disable_safe_mode``.
         """
         session_id = self._sid_read(project_id, session_id)
         handle = self._handles.get(make_session_key(project_id, session_id))
@@ -3329,8 +3647,12 @@ class AgentManager:
         # this tool_call_id — cancel it so it can't double-fire later.
         self._cancel_network_approval_timer(tool_call_id)
 
-        # Guard: don't append a second result if one already exists
-        if handle.session.has_result_for(tool_call_id):
+        is_unsandboxed_run = pending.get("kind") == UNSANDBOXED_RUN_KIND
+
+        # Guard: don't append a second result if one already exists. (An
+        # unsandboxed_run pending has a synthetic id that never had a tool
+        # call, so the guard does not apply to it.)
+        if not is_unsandboxed_run and handle.session.has_result_for(tool_call_id):
             handle.interceptor.remove_pending(tool_call_id)
             handle.session.resume()
             await self._start_loop(project_id, session_id=session_id)
@@ -3345,8 +3667,13 @@ class AgentManager:
         if approve_all:
             handle.interceptor.activate_bypass_all()
 
+        if is_unsandboxed_run:
+            # Spec 117 D5 — the three answers; the result is a terminal row.
+            decision = (response_payload or "once").strip().lower()
+            await self._resolve_unsandboxed_run(
+                project_id, session_id, handle, pending, decision)
         # For request_access tools, grant folder access via platform provider
-        if pending["tool_name"] == "request_access" and self._platform_provider is not None:
+        elif pending["tool_name"] == "request_access" and self._platform_provider is not None:
             tool_args = pending["tool_args"]
             path = tool_args.get("path", "")
             access_type = tool_args.get("access_type", "read")
@@ -3482,8 +3809,15 @@ class AgentManager:
                 session_id=session_id,
             )
 
+        if pending and pending.get("kind") == UNSANDBOXED_RUN_KIND:
+            # Spec 117: a synthetic pending — a system row, never an orphan
+            # tool result the provider would reject.
+            handle.session.append_system(
+                f"DENIED by user: running `{pending.get('command', '')}` "
+                f"outside the sandbox. Reason: {reason}"
+            )
         # Guard: don't append a second result if one already exists
-        if not handle.session.has_result_for(tool_call_id):
+        elif not handle.session.has_result_for(tool_call_id):
             handle.session.append_tool_result(
                 tool_call_id,
                 f"DENIED by user. Reason: {reason}",
@@ -5187,7 +5521,7 @@ class AgentManager:
             if msg.get("role") == "assistant":
                 return False
             meta = msg.get("_meta") or {}
-            if (meta.get("event") == "sub_agent_terminal"
+            if (meta.get("event") in _WAKE_EVENTS
                     and not meta.get("suppress_wake")):
                 return True
         return False
@@ -5290,7 +5624,7 @@ class AgentManager:
             for msg in handle.session.pop_deferred_messages():
                 handle.session.append(msg)
                 meta = msg.get("_meta") or {}
-                if (meta.get("event") == "sub_agent_terminal"
+                if (meta.get("event") in _WAKE_EVENTS
                         and not meta.get("suppress_wake")):
                     wake_on_deferred_terminal = True
             # Spec 091 §4: the scan above only sees a row deferred after the
@@ -5319,6 +5653,7 @@ class AgentManager:
                             project_id, session_id, tc_id,
                             data.get("tool_name", ""),
                             getattr(handle.interceptor, "_preset", None),
+                            kind=data.get("kind"),
                         )
                 self._broadcast(project_id, {
                     "type": "agent.status",

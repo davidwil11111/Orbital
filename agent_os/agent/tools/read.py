@@ -10,7 +10,12 @@ import os
 import struct
 from typing import Callable
 
-from ._path_utils import resolve_safe_read
+from ._path_utils import (
+    OPEN_READS_PATH_SENTENCE,
+    OPEN_READS_SENTENCE,
+    open_reads_active,
+    resolve_safe_read,
+)
 from .base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -60,15 +65,27 @@ class ReadTool(Tool):
 
     def __init__(self, workspace: str,
                  read_roots: Callable[[], list[str]] | None = None,
-                 context_window: int | None = None):
+                 context_window: int | None = None,
+                 open_reads: Callable[[], bool] | None = None,
+                 cross_project: bool | None = None):
+        # ``cross_project`` picks the LLM-facing text: the scratch (Quick
+        # Tasks) wording that names other in-scope projects, or the normal
+        # single-root wording. Defaults to "a root callable was given" so
+        # existing callers are unchanged; spec 117 wires a root callable for
+        # EVERY project (granted portals, D7) and passes False for normal ones.
+        if cross_project is None:
+            cross_project = read_roots is not None
         self._workspace = os.path.realpath(workspace)
         self._max_chars = _cap_for_window(context_window)
         # ``read_roots`` is a CALLABLE (not a snapshot) so a per-session scope
         # change applies on the next tool call without rebuilding the tool.
         # ``None`` → single-root [workspace], byte-identical to the old path.
         self._read_roots = read_roots
+        # Spec 117 D3: ``open_reads()`` True → the project's safe mode is OFF
+        # and any absolute path on disk is readable. Read per call.
+        self._open_reads = open_reads
         self.name = "read"
-        if read_roots is None:
+        if not cross_project:
             self.description = "Read a file or list a directory within the workspace."
             path_desc = "Path within your workspace. Use a relative path like 'src/main.py' or 'docs/notes.md'. Do NOT start with '/' and do NOT pass an absolute path."
         else:
@@ -115,6 +132,24 @@ class ReadTool(Tool):
             "required": ["path"],
         }
 
+    def schema(self) -> dict:
+        """Spec 117 §3.4 — the LLM-facing text follows the project's mode."""
+        if not open_reads_active(self._open_reads):
+            return super().schema()
+        params = {**self.parameters, "properties": dict(self.parameters["properties"])}
+        params["properties"]["path"] = {
+            **params["properties"]["path"],
+            "description": OPEN_READS_PATH_SENTENCE,
+        }
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": f"Read a file or list a directory. {OPEN_READS_SENTENCE}",
+                "parameters": params,
+            },
+        }
+
     def execute(self, **arguments) -> ToolResult:
         try:
             path = arguments.get("path", ".")
@@ -123,7 +158,8 @@ class ReadTool(Tool):
             roots = self._read_roots() if self._read_roots else [self._workspace]
             if not roots:
                 roots = [self._workspace]
-            resolved = resolve_safe_read(roots, path)
+            resolved = resolve_safe_read(
+                roots, path, open_reads=open_reads_active(self._open_reads))
             if resolved is None:
                 return ToolResult(content=f"Error: path outside workspace: {path}")
 

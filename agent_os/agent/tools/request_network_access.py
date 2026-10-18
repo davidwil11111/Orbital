@@ -5,10 +5,18 @@
 """RequestNetworkAccessTool — TOFU domain grant request (always pending)."""
 
 import json
+from typing import Callable
 
 from agent_os.daemon_v2.network_rules_builder import normalize_domain
 
 from .base import Tool, ToolResult
+
+# Spec 117 D3 — the answer on a project with safe mode OFF: there is no proxy
+# and nothing to approve, so no pending is created.
+OPEN_NETWORK_SENTENCE = (
+    "The network is unrestricted in this project, no request needed. "
+    "Run the command directly."
+)
 
 
 class RequestNetworkAccessTool(Tool):
@@ -18,9 +26,13 @@ class RequestNetworkAccessTool(Tool):
     persists the domain to the project allowlist permanently. In hands-off
     the ask auto-denies for the current run after a timeout; the request
     stays pending in Project Settings.
+
+    Spec 117: on an open project (safe mode OFF) the interceptor lets the
+    call through and ``execute`` answers with ``OPEN_NETWORK_SENTENCE``.
     """
 
-    def __init__(self):
+    def __init__(self, safe_mode_cb: Callable[[], bool] | None = None):
+        self._safe_mode_cb = safe_mode_cb
         self.name = "request_network_access"
         self.description = (
             "Request permanent approval for shell/network access to a domain "
@@ -50,6 +62,12 @@ class RequestNetworkAccessTool(Tool):
         }
 
     def execute(self, **arguments) -> ToolResult:
+        if self._safe_mode_cb is not None:
+            try:
+                if not self._safe_mode_cb():
+                    return ToolResult(content=OPEN_NETWORK_SENTENCE)
+            except Exception:
+                pass  # unreadable switch → treat as safe mode (pending as before)
         raw = arguments.get("domain", "")
         domain = normalize_domain(raw)
         if domain is None:
