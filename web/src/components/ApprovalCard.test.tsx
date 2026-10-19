@@ -164,3 +164,47 @@ describe('ApprovalCard — unsandboxed_run kind (spec 117)', () => {
     await waitFor(() => expect(denyMock).toHaveBeenCalledWith('p1', 'call-9', 'Denied by user', 's1'));
   });
 });
+
+// The daemon names the program "Always allow" would allowlist (`executable`),
+// which is not always the command's first word (`cmd /c curl.exe x` →
+// `curl.exe`), and "" when the command cannot be allowlisted at all (chained,
+// piped, interpreter-wrapped). Older daemons omit the field.
+describe('ApprovalCard — unsandboxed_run uses the backend executable', () => {
+  const wrapped = {
+    what: 'Run outside the sandbox',
+    tool_name: 'shell',
+    tool_call_id: 'call-10',
+    tool_args: { command: 'cmd /c curl.exe https://example.com' },
+    recent_activity: [],
+    kind: 'unsandboxed_run',
+    command: 'cmd /c curl.exe https://example.com',
+    reason: 'Sandbox denied network access',
+  };
+
+  it('labels "Always allow" with the executable field, not the first word', () => {
+    render(
+      <ApprovalCard approval={{ ...wrapped, executable: 'curl.exe' }} projectId="p1" sessionId="s1" />,
+    );
+    expect(screen.getByRole('button', { name: 'Always allow curl.exe in this project' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Always allow cmd in this project' })).toBeNull();
+  });
+
+  it('hides "Always allow" when the command cannot be allowlisted (executable "")', () => {
+    render(
+      <ApprovalCard
+        approval={{ ...wrapped, command: 'git pull && npm i', executable: '' }}
+        projectId="p1"
+        sessionId="s1"
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /^Always allow/ })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Turn off Safe mode for this project' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeTruthy();
+  });
+
+  it('falls back to the first word when the field is absent (older daemon)', () => {
+    render(<ApprovalCard approval={wrapped} projectId="p1" sessionId="s1" />);
+    expect(screen.getByRole('button', { name: 'Always allow cmd in this project' })).toBeTruthy();
+  });
+});

@@ -46,6 +46,24 @@ export function revealLabelKey(nav?: NavigatorLike): StringKey {
 }
 
 /**
+ * The sub-agent "not detected" row's next step names the PATH fix for the OS
+ * the UI runs on — the daemon's machine whenever the row is actionable (the
+ * packaged app, a browser on localhost). `~/.zprofile` is macOS-only; Windows
+ * reads the user PATH from the environment-variables dialog and Orbital only
+ * picks a change up after a restart. Anything else gets the OS-neutral line.
+ */
+export function notDetectedHintKey(nav?: NavigatorLike): StringKey {
+  switch (clientOS(nav)) {
+    case 'mac':
+      return 'subAgentCard.notDetectedHint.mac';
+    case 'windows':
+      return 'subAgentCard.notDetectedHint.windows';
+    default:
+      return 'subAgentCard.notDetectedHint.other';
+  }
+}
+
+/**
  * Whether to offer the reveal actions at all. Never through the relay (the
  * file manager would open on the desktop, not in the user's hand), and never
  * on a client with no Finder / File Explorer (a phone on the LAN, Linux,

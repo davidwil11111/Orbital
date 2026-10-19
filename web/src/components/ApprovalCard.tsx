@@ -7,7 +7,7 @@ import { useAgent } from '../hooks/useAgent';
 import { useT, translate } from '../i18n/useT';
 import { useLocale } from '../i18n/LocaleContext';
 import { describeLiveActivity } from '../utils/chatTransform';
-import { commandExecutable } from './UnsandboxedRunsSection';
+import { allowlistExecutable } from './UnsandboxedRunsSection';
 import type { UnsandboxedRunDecision } from '../types';
 
 type TFunc = ReturnType<typeof useT>;
@@ -24,6 +24,9 @@ interface ApprovalCardProps {
      *  for `reason`; the card offers once / always / turn off safe mode. */
     kind?: string;
     command?: string;
+    /** The program "Always allow" allowlists (daemon-computed); `""` = the
+     *  command cannot be allowlisted, so the answer is not offered. */
+    executable?: string;
     reason?: string;
   };
   projectId: string;
@@ -112,6 +115,7 @@ export default function ApprovalCard({
   // separate card — same chrome, same deny, different answers.
   const isUnsandboxedRun = approval.kind === 'unsandboxed_run';
   const unsandboxedCommand = approval.command ?? String(approval.tool_args?.command ?? '');
+  const alwaysAllowExe = allowlistExecutable(unsandboxedCommand, approval.executable);
   // approval.what is backend-authored English; the payload carries the
   // structured tool call, so derive a localized sentence from it and keep
   // the wire prose only as the unknown-tool fallback.
@@ -352,15 +356,17 @@ export default function ApprovalCard({
                 >
                   {t('approval.unsandboxed.disableSafeMode')}
                 </button>
-                <button
-                  type="button"
-                  onClick={() => handleApprove(false, 'always')}
-                  onTouchEnd={(e) => { e.preventDefault(); handleApprove(false, 'always'); }}
-                  disabled={submitting}
-                  className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
-                >
-                  {t('approval.unsandboxed.alwaysAllow', { exe: commandExecutable(unsandboxedCommand) })}
-                </button>
+                {alwaysAllowExe && (
+                  <button
+                    type="button"
+                    onClick={() => handleApprove(false, 'always')}
+                    onTouchEnd={(e) => { e.preventDefault(); handleApprove(false, 'always'); }}
+                    disabled={submitting}
+                    className="border border-border bg-background text-secondary rounded-sm text-[11px] px-2.5 py-1 font-medium hover:bg-card-hover transition-colors duration-150 disabled:opacity-50 cursor-pointer w-full md:w-auto min-h-[44px]"
+                  >
+                    {t('approval.unsandboxed.alwaysAllow', { exe: alwaysAllowExe })}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => handleApprove(false, 'once')}

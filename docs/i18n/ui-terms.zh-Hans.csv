@@ -67,7 +67,7 @@ autonomy.handsOff.desc,Agent works freely. Asks only for new access.,description
 autonomy.checkIn.title,Check-in,label,CreateProject.tsx; SettingsView.tsx,Autonomy option: pauses for shell/file writes,半自动,Could be 确认模式; 签到 is literal. Consider 适度确认.
 autonomy.checkIn.desc,Pauses for shell commands and file writes.,description,CreateProject.tsx; SettingsView.tsx,Description of check-in autonomy,在执行 shell 命令和写入文件前请求用户审批。,"Keep """"shell"""" as shell or 终端命令."
 autonomy.supervised.title,Supervised,label,CreateProject.tsx; SettingsView.tsx,Autonomy option: pauses for most actions,监督模式,
-autonomy.supervised.desc,Pauses for most actions. Safe mode.,description,CreateProject.tsx; SettingsView.tsx,Description of supervised autonomy,在工具调用前暂停请求用户审批。安全模式。,
+autonomy.supervised.desc,Pauses for most actions. Most cautious.,description,CreateProject.tsx; SettingsView.tsx,Description of supervised autonomy,在工具调用前暂停请求用户审批。最稳妥。,
 settingsModal.back,Back to {project},button,SettingsModalPage.tsx,Back link in project settings header to the project,返回 {project},{project} is the project name; keep placeholder.
 settingsModal.title,Project settings — {project},heading,SettingsModalPage.tsx,Project settings page title,项目空间设置 — {project},Keep em dash or use ：.
 settingsModal.subtitle,"Configure agent behaviour, LLM provider, autonomy, and more for this project.",description,SettingsModalPage.tsx,Subtitle under the project settings header,配置该项目空间的Agent行为模式、模型商、权限级别等。,"Keep ""LLM"". behaviour (British) → 行为."

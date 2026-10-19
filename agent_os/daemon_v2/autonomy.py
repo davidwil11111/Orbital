@@ -186,6 +186,10 @@ class AutonomyInterceptor:
         reason = str((denial or {}).get("reason") or "The sandbox blocked this command.")
         pending_id = f"unsandboxed_{uuid4().hex[:12]}"
         tool_args = {"command": command}
+        # The program "always allow" would record ("" = not allowlistable),
+        # so the card never offers to allowlist ``cmd`` itself.
+        from agent_os.agent.tools.shell import ShellTool
+        executable = ShellTool.executable_of(command)
         pending = {
             "tool_name": "shell",
             "tool_args": tool_args,
@@ -195,6 +199,7 @@ class AutonomyInterceptor:
             "kind": UNSANDBOXED_RUN_KIND,
             "command": command,
             "reason": reason,
+            "executable": executable,
             "session_id": self._session_id,
             "origin_tool_call_id": tool_call.get("id", ""),
         }
@@ -211,6 +216,7 @@ class AutonomyInterceptor:
             "kind": UNSANDBOXED_RUN_KIND,
             "command": command,
             "reason": reason,
+            "executable": executable,
         })
         return pending_id
 

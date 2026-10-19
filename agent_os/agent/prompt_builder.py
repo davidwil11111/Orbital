@@ -64,6 +64,11 @@ class PromptContext:
     # each in-scope project (secondary read roots). Empty/None for normal
     # projects and scratch sessions scoped off.
     scope_projects: list = None
+    # Spec 117 D3: the project's safe-mode switch. True (the default, and an
+    # absent ``safe_mode`` key on the project) keeps the spec-077 focus rule
+    # byte-identical; False (an "open" project — commands run as the user)
+    # lets the agent act on the user's own requests outside the workspace.
+    safe_mode: bool = True
 
     def __post_init__(self):
         if self.active_sub_agents is None:
@@ -442,33 +447,79 @@ class PromptBuilder:
 
     def _safety(self, context: PromptContext) -> str:
         workspace = context.workspace
+        # Spec 117 D3 — the wording follows the project's safe-mode switch.
+        # ON (default): the spec-077 text, byte-identical. OFF: commands run
+        # as the user with the user's own permissions ("关闭时，Agent 的权限与
+        # 你在终端中相同"), so the ON text made the model refuse whoami /
+        # ls ~/.ssh / a Desktop listing the user explicitly asked for. OFF
+        # keeps "don't wander on your own initiative" and adds "do what the
+        # user asks, directly".
+        safe_mode = getattr(context, "safe_mode", True) is not False
+        if safe_mode:
+            modify_rule = (
+                "- Never modify files outside your workspace unless given portal access.\n"
+            )
+            focus = (
+                # Spec 077 §4.7 — a focus rule with a reason and an escape
+                # hatch, not a capability claim. The sandbox opens reads to the
+                # whole disk, so "you may ONLY access…" is something the model
+                # can disprove in one shell command — and a model that catches
+                # the rules lying stops trusting the rest of them.
+                "FOCUS: Your project is this workspace plus any portals you have been "
+                "granted. Everything you need to understand and change lives there. The "
+                "rest of the machine is not project context: do not read, list, or "
+                "explore files outside the workspace and portals — not the user's home, "
+                "Desktop, Documents, Downloads, or other projects — even to \"check\". "
+                "Tools and interpreters reading their own installations (python, node, "
+                "git, brew) is normal and is not exploring. If you believe you need a "
+                "folder outside the workspace, use request_access so the user can grant "
+                "it as a portal; do not work around it.\n"
+            )
+            absolute_rule = (
+                "- Do NOT pass absolute paths (do NOT start with '/'), even if the path points inside your workspace. The workspace path shown above is for orientation only.\n"
+            )
+            outside_rule = (
+                "If you need access to files outside your workspace, use the request_access "
+                "tool to ask the user. Never try to access them directly.\n"
+            )
+        else:
+            modify_rule = (
+                "- Never modify files outside your workspace unless the user asks you to.\n"
+            )
+            focus = (
+                "FOCUS: Your project is this workspace. Everything you need to understand "
+                "and change lives there, so stay focused on it: do not wander the rest of "
+                "the machine — the user's home, Desktop, Documents, Downloads, or other "
+                "projects — on your own initiative. Safe mode is OFF for this project: "
+                "your commands run as the user, with the user's own permissions, exactly "
+                "like the user's own terminal. So when the user asks you to look at or "
+                "work with something outside the workspace (a file or folder, their home "
+                "directory, another project, a command such as whoami), do it directly — "
+                "acting on the user's request is not exploring, and you should not refuse "
+                "or second-guess it. No request_access or portal is needed: shell reaches "
+                "anything the user can, and read, glob and grep accept absolute paths.\n"
+            )
+            absolute_rule = (
+                "- Inside the workspace, do NOT pass absolute paths (do NOT start with '/'). The workspace path shown above is for orientation only. For something outside the workspace that the user asked about, pass its absolute path.\n"
+            )
+            outside_rule = (
+                "Outside the workspace, act on the user's requests directly (see FOCUS); "
+                "request_access is not needed while safe mode is off.\n"
+            )
         return (
             "RULES:\n"
             "- Never attempt to escalate privileges or run sudo commands.\n"
             "- Never exfiltrate data outside your workspace unless explicitly requested.\n"
-            "- Never modify files outside your workspace unless given portal access.\n"
+            + modify_rule +
             "- If uncertain about a destructive action, use request_access to ask.\n"
             "\n"
             f"Your workspace is: {workspace}\n"
-            # Spec 077 §4.7 — a focus rule with a reason and an escape hatch,
-            # not a capability claim. The sandbox opens reads to the whole disk,
-            # so "you may ONLY access…" is something the model can disprove in
-            # one shell command — and a model that catches the rules lying
-            # stops trusting the rest of them.
-            "FOCUS: Your project is this workspace plus any portals you have been "
-            "granted. Everything you need to understand and change lives there. The "
-            "rest of the machine is not project context: do not read, list, or "
-            "explore files outside the workspace and portals — not the user's home, "
-            "Desktop, Documents, Downloads, or other projects — even to \"check\". "
-            "Tools and interpreters reading their own installations (python, node, "
-            "git, brew) is normal and is not exploring. If you believe you need a "
-            "folder outside the workspace, use request_access so the user can grant "
-            "it as a portal; do not work around it.\n"
+            + focus +
             "\n"
             "PATH CONVENTION FOR FILE TOOLS:\n"
             "- All file tools (read, write, edit, glob, grep) take paths relative to your workspace.\n"
             "- Pass relative paths only: 'src/main.py', 'docs/notes.md', '.' for workspace root.\n"
-            "- Do NOT pass absolute paths (do NOT start with '/'), even if the path points inside your workspace. The workspace path shown above is for orientation only.\n"
+            + absolute_rule +
             "\n"
             "PATHS IN CHAT REPLIES:\n"
             "- When you mention a workspace file in a chat reply, write it as a markdown link: "
@@ -479,8 +530,7 @@ class PromptBuilder:
             "lives at 'content/drafts/x.md') and never use a bare filename ('NOTES.md' for "
             "'docs/NOTES.md'). A wrong or shortened path renders a dead link.\n"
             "\n"
-            "If you need access to files outside your workspace, use the request_access "
-            "tool to ask the user. Never try to access them directly.\n"
+            + outside_rule +
             "\n"
             "CREDENTIALS:\n"
             "- When you encounter a login page, use request_credential to ask the user.\n"

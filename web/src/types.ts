@@ -215,6 +215,10 @@ export interface PendingDomainRequest {
 export interface PendingUnsandboxedRun {
   id: string;
   command: string;
+  /** The program "Always allow" would allowlist; `""` when the command
+   *  cannot be allowlisted (chained / piped / interpreter-wrapped). Absent
+   *  from older daemons — callers then fall back to the first word. */
+  executable?: string;
   reason: string;
   created_at: string;
   session_id: string | null;
@@ -637,6 +641,9 @@ export interface ApprovalRequestEvent {
    *  command, `reason` the detected denial. Absent on ordinary approvals. */
   kind?: string;
   command?: string;
+  /** `unsandboxed_run` only: the program "Always allow" would allowlist, or
+   *  `""` when it cannot be allowlisted. Absent from older daemons. */
+  executable?: string;
   reason?: string;
 }
 

@@ -11,7 +11,13 @@ vi.mock('../config', () => ({
   },
 }));
 
-import { canRevealInFileManager, clientOS, isWindowsClient, revealLabelKey } from './clientPlatform';
+import {
+  canRevealInFileManager,
+  clientOS,
+  isWindowsClient,
+  notDetectedHintKey,
+  revealLabelKey,
+} from './clientPlatform';
 
 afterEach(() => {
   relay.value = false;
@@ -60,5 +66,23 @@ describe('canRevealInFileManager', () => {
   it('is off on a client with no supported file manager (a phone on the LAN, Linux)', () => {
     expect(canRevealInFileManager({ platform: 'iPhone' })).toBe(false);
     expect(canRevealInFileManager({ platform: 'Linux x86_64' })).toBe(false);
+  });
+});
+
+describe('notDetectedHintKey', () => {
+  it('gives the ~/.zprofile hint only on macOS', () => {
+    expect(notDetectedHintKey({ platform: 'MacIntel' })).toBe('subAgentCard.notDetectedHint.mac');
+  });
+
+  it('gives the user-PATH + restart hint on Windows', () => {
+    expect(notDetectedHintKey({ platform: 'Win32' })).toBe('subAgentCard.notDetectedHint.windows');
+    expect(notDetectedHintKey({ userAgentData: { platform: 'Windows' } })).toBe(
+      'subAgentCard.notDetectedHint.windows',
+    );
+  });
+
+  it('falls back to the OS-neutral hint elsewhere (Linux, a phone on the LAN)', () => {
+    expect(notDetectedHintKey({ platform: 'Linux x86_64' })).toBe('subAgentCard.notDetectedHint.other');
+    expect(notDetectedHintKey({ platform: 'iPhone' })).toBe('subAgentCard.notDetectedHint.other');
   });
 });

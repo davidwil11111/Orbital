@@ -769,6 +769,7 @@ interface PendingApproval {
    *  detected denial; the card offers once / always / turn off safe mode. */
   kind?: string;
   command?: string;
+  executable?: string;
   reason?: string;
 }
 
@@ -1331,10 +1332,15 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       reasoning?: string;
       kind?: string;
       command?: string;
+      executable?: string;
       reason?: string;
     }>(`/api/v2/agents/${encodeURIComponent(projectId)}/pending-approval${qs}`)
       .then((result) => {
         if (!result.pending || !result.tool_call_id) return;
+        // The viewed session changed while this request was in flight: the
+        // answer belongs to the session we left, not the one on screen (the
+        // switch already re-fetched for the new one).
+        if (sessionIdRef.current !== viewed) return;
         // Seam 3 / Phase 3 carryover: route this display path strictly by
         // session_id, never by the holder. The fetch above is already scoped to
         // the viewed session (?session_id=<viewed>), and the backend
@@ -1358,6 +1364,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             reasoning: result.reasoning,
             kind: result.kind,
             command: result.command,
+            executable: result.executable,
             reason: result.reason,
           });
           return next;
@@ -1919,9 +1926,12 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       if (!viewing) return;
       wasRunningRef.current = true;
     } else if (agentStatus === 'pending_approval') {
-      if (!viewing) return;
       // Fetch pending approval via REST in case the WS event was missed.
       // Covers status poll discovering a stale approval after reconnect.
+      // Not gated on `viewing`: the fetch is scoped to the viewed session
+      // (?session_id=), so it can only surface that session's own card, and
+      // the holder may not be resolved yet (fresh mount) or may have been
+      // released while the turn sits paused on the approval.
       fetchPendingApproval();
     } else if (agentStatus === 'new_session') {
       if (!viewing) return;
@@ -1958,14 +1968,23 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     return () => clearTimeout(timer);
   }, [isCancelling]);
 
-  // On mount, always check for pending approvals via REST.
-  // Handles the case where ChatView was unmounted (tab switch to files)
-  // and remounted with a stale agentStatus that doesn't trigger the
-  // status-change effect above. Also covers page reload — the initial
-  // fetch runs before the first WS event arrives.
+  // On mount AND on every viewed-session change, check for pending approvals
+  // via REST. Handles the case where ChatView was unmounted (tab switch to
+  // files, Project Settings open) and remounted with a stale agentStatus that
+  // doesn't trigger the status-change effect above. Also covers page reload —
+  // the initial fetch runs before the first WS event arrives.
+  //
+  // Keyed on sessionId because the per-session history load above clears
+  // `approvals` on every session change (so one session's card never bleeds
+  // into another). Without re-fetching here, a session that resolves after
+  // mount (ChatTab can mount ChatView before route.sessionId is set) or a
+  // switch back to the session paused on an approval left the header saying
+  // pending_approval with no card until a full reload (Windows bench
+  // 2026-10-19). Declared after the history-load effect, so in the same
+  // commit the clear runs first and this fetch repopulates.
   useEffect(() => {
     fetchPendingApproval();
-  }, [projectId, fetchPendingApproval]);
+  }, [projectId, sessionId, fetchPendingApproval]);
 
   // Reconnect-triggered fetch: whenever the WebSocket transitions into
   // the 'connected' state (relay tunnel drop / mobile foreground), fetch
@@ -2304,6 +2323,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
           reasoning: e.reasoning,
           kind: e.kind,
           command: e.command,
+          executable: e.executable,
           reason: e.reason,
         });
         return next;
@@ -3269,6 +3289,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       } else {
         setInjectError(t('chat.injectError'));
       }
+      // A failed pinned send: the daemon persisted a
+      // `sub_agent_dispatch_failed` row (the translated reason) before
+      // answering 404, and broadcasts `sub_agent.failed` for it. Refetch too,
+      // so the row still lands when that event was missed (relay drop).
+      if (target) refreshRawMessages();
     } finally {
       // Only this send's bubble — a later send may have replaced it.
       if (loading) setSubAgentLoading((cur) => (cur === loading ? null : cur));

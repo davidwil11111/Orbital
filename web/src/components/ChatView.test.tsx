@@ -54,6 +54,10 @@ let runStatusHolder: string | null = null;
 // hydration (credential-error surfacing) after a reload.
 let runStatusTerminalEvent: unknown = null;
 
+// Configurable GET /pending-approval responder (receives the request path so
+// a test can answer only for the session it scopes to). Default: none pending.
+let pendingApprovalResponder: (path: string) => unknown = () => ({ pending: false });
+
 vi.mock('../config', () => ({
   api: vi.fn(async (path: string, opts?: { method?: string }) => {
     apiCalls.push(path);
@@ -73,9 +77,9 @@ vi.mock('../config', () => ({
         last_terminal_event: runStatusTerminalEvent,
       };
     }
-    // pending-approval: never pending in these tests.
+    // pending-approval: not pending unless a test installs a responder.
     if (path.includes('/pending-approval')) {
-      return { pending: false };
+      return pendingApprovalResponder(path);
     }
     // /chat?limit=1 (REST fallback) and anything else → empty list.
     return [];
@@ -312,6 +316,7 @@ beforeEach(() => {
   startOnboardingMock = async () => ({ status: 'started' });
   runStatusHolder = null;
   runStatusTerminalEvent = null;
+  pendingApprovalResponder = () => ({ pending: false });
   chatInitialResponse = { data: [], total: 0 };
   chatOlderResponse = { data: [], total: 0 };
   queueState = 'idle';
@@ -4233,5 +4238,204 @@ describe('ChatView: unsandboxed_run approval card (spec 117)', () => {
     // A resolved live approval leaves the list (the history row, when the
     // session JSONL carries it, is what shows "Approved" later).
     expect(container.textContent ?? '').not.toContain('Allow once');
+  });
+});
+
+// Windows bench 2026-10-19: an `unsandboxed_run` approval raised while the
+// user had Project Settings open (ChatView unmounted, the WS event missed)
+// showed no card on returning to the chat until a full reload. Every remount
+// and every viewed-session change must rehydrate from GET /pending-approval.
+describe('ChatView: pending approval rehydrates on remount / session change', () => {
+  const UNSANDBOXED = {
+    pending: true,
+    what: 'Run outside the sandbox',
+    tool_name: 'shell',
+    tool_call_id: 'tc-unsb-remount',
+    tool_args: { command: 'git push origin main' },
+    recent_activity: [],
+    kind: 'unsandboxed_run',
+    command: 'git push origin main',
+    reason: 'Sandbox denied network access',
+  };
+
+  // The backend scopes the lookup: only a request for s1 sees the approval.
+  function pendingOnlyForS1(path: string) {
+    return path.includes('session_id=s1') ? UNSANDBOXED : { pending: false };
+  }
+
+  function remountFresh() {
+    return act(async () => {
+      root.unmount();
+      container.remove();
+      container = document.createElement('div');
+      document.body.appendChild(container);
+      root = createRoot(container);
+    });
+  }
+
+  function hasCard() {
+    return Array.from(container.querySelectorAll('button')).some(
+      (b) => b.textContent === 'Allow once',
+    );
+  }
+
+  it('shows the card after a settings round-trip (unmount → remount)', async () => {
+    // 1. Chat open, nothing pending; history is cached.
+    chatInitialResponse = {
+      data: [{ role: 'user', content: 'hello', source: 'user', timestamp: '2026-10-19T01:00:00Z' }],
+      total: 1,
+    };
+    await renderChat({ agentStatus: 'running', sessionId: 's1' });
+    await flushEffects();
+    expect(hasCard()).toBe(false);
+
+    // 2. Settings opens (ChatView unmounts); the approval is raised meanwhile.
+    await remountFresh();
+    pendingApprovalResponder = pendingOnlyForS1;
+
+    // 3. Back to chat: header already says pending_approval.
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+    await flushEffects();
+    expect(hasCard()).toBe(true);
+    expect(container.textContent ?? '').toContain('git push origin main');
+  });
+
+  it('shows the card when the viewed session resolves after mount', async () => {
+    pendingApprovalResponder = pendingOnlyForS1;
+    // ChatTab can mount ChatView before route.sessionId resolves.
+    await renderChat({ agentStatus: 'pending_approval', sessionId: undefined });
+    await flushEffects();
+    expect(hasCard()).toBe(false);
+
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+    await flushEffects();
+    expect(hasCard()).toBe(true);
+  });
+
+  it('threads the daemon executable from the REST payload into the card', async () => {
+    pendingApprovalResponder = (path) =>
+      path.includes('session_id=s1')
+        ? { ...UNSANDBOXED, command: 'cmd /c curl.exe x', executable: 'curl.exe' }
+        : { pending: false };
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+    await flushEffects();
+    const labels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
+    expect(labels).toContain('Always allow curl.exe in this project');
+    expect(labels).not.toContain('Always allow cmd in this project');
+  });
+
+  it('threads executable "" from the WS event: no "Always allow"', async () => {
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+    await act(async () => {
+      emitWs('approval.request', {
+        type: 'approval.request', project_id: 'p1', session_id: 's1',
+        what: 'Run outside the sandbox', tool_name: 'shell', tool_call_id: 'tc-chain',
+        tool_args: { command: 'git pull && npm i' }, recent_activity: [],
+        kind: 'unsandboxed_run', command: 'git pull && npm i', executable: '',
+        reason: 'Sandbox denied network access',
+      });
+    });
+    expect(hasCard()).toBe(true);
+    const labels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent ?? '');
+    expect(labels.some((l) => l.startsWith('Always allow'))).toBe(false);
+  });
+
+  it('shows the card when switching to the session that is paused on it', async () => {
+    pendingApprovalResponder = pendingOnlyForS1;
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's2' });
+    await flushEffects();
+    expect(hasCard()).toBe(false);
+
+    await renderChat({ agentStatus: 'pending_approval', sessionId: 's1' });
+    await flushEffects();
+    await flushEffects();
+    expect(hasCard()).toBe(true);
+  });
+});
+
+// Windows bench 2026-10-19: a failed pinned send showed only the generic
+// "Failed to send message" until a reload rendered the persisted
+// `sub_agent_dispatch_failed` row. The row must reach the open chat live:
+// via the daemon's `sub_agent.failed` broadcast, and (fallback for a missed
+// event) via a refetch when the pinned inject itself rejects.
+describe('ChatView: pinned dispatch failure row appears without a reload', () => {
+  const FAILURE_ROW = {
+    role: 'system',
+    source: 'daemon',
+    content: '[Sub-agent] claude-code could not start: Error: too old',
+    timestamp: '2026-10-19T02:00:01Z',
+    _meta: {
+      event: 'sub_agent_dispatch_failed',
+      handle: 'claude-code',
+      dispatch_id: 's1:abcd1234',
+      suppress_wake: true,
+    },
+  };
+  const USER_ROW = {
+    role: 'user', content: 'hi worker', target: 'claude-code', source: 'user',
+    timestamp: '2026-10-19T02:00:00Z',
+  };
+
+  function chatFetchCount() {
+    return apiWithTotalCalls.filter((p) => p.includes('/chat?limit=')).length;
+  }
+
+  it('refetches the viewed session on a sub_agent.failed broadcast', async () => {
+    await renderChat({ agentStatus: 'idle', sessionId: 's1' });
+    await flushEffects();
+    const before = chatFetchCount();
+    expect(container.textContent ?? '').not.toContain('claude-code');
+
+    chatInitialResponse = { data: [USER_ROW, FAILURE_ROW], total: 2 };
+    await act(async () => {
+      emitWs('sub_agent.failed', {
+        type: 'sub_agent.failed', project_id: 'p1', session_id: 's1',
+        handle: 'claude-code', reason: 'Error: too old',
+      });
+    });
+    await flushEffects();
+
+    expect(chatFetchCount()).toBe(before + 1);
+    // The persisted failure row renders as a [Sub-agent] marker row.
+    expect(container.textContent ?? '').toContain('claude-code');
+  });
+
+  it('refetches the chat when the pinned inject rejects (missed broadcast)', async () => {
+    injectMessageMock = async () => {
+      throw new Error('Failed to dispatch to claude-code: Error: too old');
+    };
+    await renderChat({
+      agentStatus: 'idle',
+      sessionId: 's1',
+      agents: [{ slug: 'claude-code', name: 'Claude Code' }],
+    });
+    await flushEffects();
+
+    const pinToggle = container.querySelector(
+      '[data-testid="pin-target-select"] > button',
+    ) as HTMLButtonElement;
+    await act(async () => { pinToggle.click(); });
+    const option = Array.from(container.querySelectorAll('[role="option"]'))
+      .find((el) => el.textContent?.includes('Claude Code')) as HTMLButtonElement;
+    await act(async () => { option.click(); });
+    await flushEffects();
+
+    const before = chatFetchCount();
+    chatInitialResponse = { data: [USER_ROW, FAILURE_ROW], total: 2 };
+    await act(async () => { typeInComposer('hi worker'); });
+    const send = container.querySelector('button[aria-label="Send"]') as HTMLButtonElement;
+    await act(async () => { send.click(); });
+    await flushEffects();
+
+    expect(injectCalls.length).toBe(1);
+    expect(injectCalls[0][2]).toBe('claude-code');
+    // Generic composer error stays (404 contract unchanged) …
+    expect(container.textContent ?? '').toContain('Failed to send message');
+    // … and the canonical history is refetched so the failure row lands.
+    expect(chatFetchCount()).toBeGreaterThan(before);
   });
 });

@@ -4,6 +4,7 @@
 
 import MessageAvatar from './MessageAvatar';
 import { useT } from '../i18n/useT';
+import { notDetectedHintKey } from '../utils/clientPlatform';
 
 interface Props {
   slug: string;
@@ -36,7 +37,7 @@ export default function NotDetectedRow({ slug, name }: Props) {
         </span>
       </div>
       <p className="text-xs text-secondary mt-1.5">
-        {t('subAgentCard.notDetectedHint', { name })}
+        {t(notDetectedHintKey(), { name })}
       </p>
     </div>
   );

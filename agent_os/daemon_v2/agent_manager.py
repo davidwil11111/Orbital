@@ -8,6 +8,7 @@ Wires Components A-E together per project and manages the agent loop lifecycle.
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -20,7 +21,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from agent_os.agent.context import ContextManager
-from agent_os.agent.loop import AgentLoop
+from agent_os.agent.loop import AgentLoop, maybe_raise_unsandboxed_run
 from agent_os.agent.prompt_builder import PromptBuilder, PromptContext
 from agent_os.agent.providers.openai_compat import LLMProvider
 from agent_os.agent.session import Session, persist_user_row
@@ -1085,6 +1086,9 @@ class AgentManager:
             vision_enabled=model_info.capabilities.vision,
             project_id=project_id,
             cold_start=cold_start,
+            # Spec 117 D3: the FOCUS rule follows the switch (absent key = on).
+            # Kept current on a live flip by on_safe_mode_changed.
+            safe_mode=self._project_safe_mode(project_id),
         )
 
         # 4b. Reconcile default skills for legacy projects that never had them
@@ -3214,23 +3218,31 @@ class AgentManager:
         Returns True if the running agent was updated, False if no agent
         is running (disk-only update is sufficient in that case).
 
-        ``session_id`` selects the chat session; defaults to the
-        single-loop default session.
+        ``session_id`` selects one chat session. Omitted, EVERY live session
+        of the project is updated: autonomy is a project setting, and a
+        session left on the old preset kept running hands-off after the user
+        switched the project to 需确认 (bench 2026-10-19).
         """
-        session_id = self._sid_read(project_id, session_id)
-        handle = self._handles.get(make_session_key(project_id, session_id))
-        if handle is None:
-            return False
-        handle.interceptor.update_preset(preset)
-        handle.session.append_system(
-            f"[autonomy changed to {preset.value}]"
-        )
-        # Also propagate to sub-agent transports (SDK filtering)
-        if self._sub_agent_manager is not None:
-            self._sub_agent_manager.update_sub_agent_autonomy(
-                project_id, preset, session_id=session_id,
+        if session_id is not None:
+            keys = [make_session_key(project_id, self._sid_read(project_id, session_id))]
+        else:
+            keys = [key for key in list(self._handles) if key[0] == project_id]
+        updated = False
+        for key in keys:
+            handle = self._handles.get(key)
+            if handle is None:
+                continue
+            handle.interceptor.update_preset(preset)
+            handle.session.append_system(
+                f"[autonomy changed to {preset.value}]"
             )
-        return True
+            # Also propagate to sub-agent transports (SDK filtering)
+            if self._sub_agent_manager is not None:
+                self._sub_agent_manager.update_sub_agent_autonomy(
+                    project_id, preset, session_id=key[1],
+                )
+            updated = True
+        return updated
 
     def _apply_network_rules(self, project_id: str) -> None:
         """Rebuild and push this project's NetworkRules (defaults + TOFU
@@ -3264,6 +3276,21 @@ class AgentManager:
                 "network rules push failed for %s", project_id, exc_info=True,
             )
 
+    def _refresh_prompt_safe_mode(self, project_id: str) -> None:
+        """Spec 117 D3 — re-stamp ``safe_mode`` on every live session's base
+        prompt context for this project (the context is built once at agent
+        start; the switch can flip mid-session, e.g. ``disable_safe_mode``)."""
+        safe_mode = self._project_safe_mode(project_id)
+        for (pid, _sid), handle in list(self._handles.items()):
+            if pid != project_id:
+                continue
+            cm = getattr(handle, "context_manager", None)
+            base = getattr(cm, "_base_ctx", None)
+            if not isinstance(base, PromptContext):
+                continue
+            if base.safe_mode != safe_mode:
+                cm._base_ctx = dataclasses.replace(base, safe_mode=safe_mode)
+
     async def on_safe_mode_changed(self, project_id: str) -> None:
         """Spec 117 §3.5 — apply a safe-mode flip to the live network setup.
 
@@ -3271,8 +3298,11 @@ class AgentManager:
         SAFE: rebuild the rules from the kept ``approved_domains`` so the next
         sandboxed command sees them. Called by the projects PUT route and by
         the ``disable_safe_mode`` answer on the approval card. The shell and
-        read tools need nothing: they read the switch per call.
+        read tools need nothing: they read the switch per call. The live
+        sessions' prompt context is refreshed so the FOCUS rule (D3) matches
+        the new mode on the next LLM call.
         """
+        self._refresh_prompt_safe_mode(project_id)
         if self._platform_provider is None:
             return
         if self._project_safe_mode(project_id):
@@ -3320,16 +3350,32 @@ class AgentManager:
 
     @staticmethod
     def _unsandboxed_run_row(command: str, output: str, decision: str,
-                             pending_id: str | None = None) -> tuple[str, dict]:
-        """The terminal system row for a command run outside the sandbox."""
-        label = {
-            "once": "allowed once",
-            "always": "always allowed for this executable in this project",
-            "disable_safe_mode": "turned safe mode off for this project",
-        }.get(decision, decision)
+                             pending_id: str | None = None, *,
+                             parked: bool = False) -> tuple[str, dict]:
+        """The terminal system row for a command run outside the sandbox.
+
+        Worded so the model trusts it: a live run read the old "The user
+        allowed once" line as "a system notice, not from you in your own
+        words" and refused to repeat the output or continue. The row states
+        that it records the user's OWN decision on the approval card in the
+        Orbital UI, that the output is the user's, and to continue. The
+        ``[Unsandboxed run]`` prefix and the meta are load-bearing — keep them.
+        """
+        choice = {
+            "once": "\"Allow once\"",
+            "always": "\"Always allow\" for this executable in this project",
+            "disable_safe_mode": "to turn safe mode off for this project",
+        }.get(decision, f"\"{decision}\"")
+        # ``parked`` (D6): answered later from Project Settings, not the card.
+        where = ("on the pending request in Project Settings → Safe mode in the "
+                 "Orbital UI" if parked else "on the approval card in the Orbital UI")
         content = (
-            f"[Unsandboxed run] The user {label}; the command ran outside the "
-            f"sandbox:\n$ {command}\n{output}"
+            f"[Unsandboxed run] This records the user's own decision: the user "
+            f"chose {choice} {where}, so the "
+            f"command you ran (which the sandbox had blocked) was run again "
+            f"outside the sandbox, with the user's permission. The output below "
+            f"is the user's to see — show or quote it to them as the task needs, "
+            f"and continue the task using it.\n$ {command}\n{output}"
         )
         meta = {"event": "unsandboxed_run", "decision": decision, "command": command}
         if pending_id:
@@ -3389,7 +3435,8 @@ class AgentManager:
         except Exception as exc:
             logger.warning("parked unsandboxed run failed for %s", project_id, exc_info=True)
             output = f"Error running the command: {exc}"
-        content, meta = self._unsandboxed_run_row(command, output, decision, run_id)
+        content, meta = self._unsandboxed_run_row(
+            command, output, decision, run_id, parked=True)
         target = entry.get("session_id")
         if target:
             status = await self.inject_system_message(
@@ -3667,6 +3714,9 @@ class AgentManager:
         if approve_all:
             handle.interceptor.activate_bypass_all()
 
+        # Set when the approved call's result raised an unsandboxed_run card.
+        card_pending_id: str | None = None
+
         if is_unsandboxed_run:
             # Spec 117 D5 — the three answers; the result is a terminal row.
             decision = (response_payload or "once").strip().lower()
@@ -3753,6 +3803,19 @@ class AgentManager:
                 handle.session.append_tool_result(
                     tool_call_id, result.content, meta=result.meta
                 )
+                # Spec 117 D4 — the same post-execution check the loop's
+                # tool-result path runs (one shared helper): an approved
+                # safe-mode shell call the sandbox blocked raises the
+                # unsandboxed_run card. The queue-run exclusion reads the
+                # live loop's _queue_state, exactly as the loop does.
+                card_pending_id = maybe_raise_unsandboxed_run(
+                    handle.interceptor,
+                    {"id": tool_call_id, "name": pending["tool_name"],
+                     "arguments": pending["tool_args"]},
+                    result,
+                    handle.session.recent_activity,
+                    queue_state=getattr(handle.loop, "_queue_state", "chat"),
+                )
             except Exception as e:
                 handle.session.append_tool_result(
                     tool_call_id, f"Error executing tool: {e}"
@@ -3767,6 +3830,29 @@ class AgentManager:
                 "content": f"[User guidance on approved tool call]: {reply_text}",
                 "source": "user",
             })
+
+        if card_pending_id:
+            # The approved call raised a fresh unsandboxed_run card: stay
+            # paused on it and do NOT restart the loop — exactly what the
+            # loop's own pause + _on_loop_done do. The loop resumes when the
+            # user answers the card (the is_unsandboxed_run branch above).
+            handle.session._paused_for_approval = True
+            handle.session.pause()
+            new_pending = handle.interceptor.get_pending(card_pending_id) or {}
+            self._maybe_schedule_network_approval_timeout(
+                project_id, session_id, card_pending_id,
+                new_pending.get("tool_name", ""),
+                getattr(handle.interceptor, "_preset", None),
+                kind=new_pending.get("kind"),
+            )
+            self._broadcast(project_id, {
+                "type": "agent.status",
+                "project_id": project_id,
+                "status": "pending_approval",
+                "source": "management",
+            }, session_id=session_id)
+            self._broadcast_blocked_count()
+            return
 
         # Approval is resolved — clear the pause flag so the blocked-count
         # broadcast sees zero pending for this session. loop.run() also clears

@@ -25,6 +25,18 @@ export function commandExecutable(command: string): string {
   return command.trim().split(/\s+/)[0] ?? '';
 }
 
+/**
+ * The program "Always allow" would allowlist. The daemon names it
+ * (`executable`) — not always the first word (`cmd /c curl.exe x` →
+ * `curl.exe`), and `""` when the command cannot be allowlisted at all
+ * (chained, piped, interpreter-wrapped): the caller then offers no "Always
+ * allow". Only an older daemon that omits the field falls back to the first
+ * word.
+ */
+export function allowlistExecutable(command: string, executable?: string | null): string {
+  return typeof executable === 'string' ? executable : commandExecutable(command);
+}
+
 interface UnsandboxedRunsSectionProps {
   executables: string[];
   pendingRuns: PendingUnsandboxedRun[];
@@ -68,7 +80,7 @@ export function UnsandboxedRunsSection({
           </h4>
           <div className="flex flex-col gap-2">
             {pendingRuns.map((run) => {
-              const exe = commandExecutable(run.command);
+              const exe = allowlistExecutable(run.command, run.executable);
               const busy = busyId === run.id;
               return (
                 <div
@@ -90,14 +102,16 @@ export function UnsandboxedRunsSection({
                     >
                       {t('approval.unsandboxed.allowOnce')}
                     </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => resolve(run, 'always')}
-                      className={`${answerClass} text-accent border-border hover:bg-accent/5`}
-                    >
-                      {t('approval.unsandboxed.alwaysAllow', { exe })}
-                    </button>
+                    {exe && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => resolve(run, 'always')}
+                        className={`${answerClass} text-accent border-border hover:bg-accent/5`}
+                      >
+                        {t('approval.unsandboxed.alwaysAllow', { exe })}
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={busy}

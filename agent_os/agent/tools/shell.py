@@ -59,13 +59,26 @@ _SANDBOX_DENIAL_MARKERS = (
 # localizations are a follow-up (spec 117 §6).
 _SEATBELT_DENIAL_MARKERS = ("operation not permitted",)
 _WINDOWS_DENIAL_MARKERS = ("access is denied", "拒绝访问")
+# PowerShell's cmdlet wording (bench 2026-10-19, issue 3): ``Access to the
+# path 'X' is denied.`` / ``对路径“X”的访问被拒绝。``. Neither contains the
+# cmd-style text above, so most Windows denials went unnoticed.
+_WINDOWS_PATH_DENIAL_RE = re.compile(
+    r"access to the path .{1,400}? is denied|的访问被拒绝", re.IGNORECASE)
+
+#: Printed to stderr by the Windows script wrapper when any PowerShell error
+#: record of the command is a permission denial. Language-independent, and
+#: set even when a later statement succeeded (``exit 0``). Stripped before the
+#: output reaches the agent.
+ACCESS_DENIED_MARKER = "[orbital:access-denied]"
 
 _SANDBOX_HINT = (
-    "\n[sandbox] This command may have been blocked by the workspace sandbox. "
-    "Writes are allowed in the workspace, read-write portals and temp; reads of "
-    "credential stores are denied; network egress goes through the project's "
-    "allowlist proxy. If you need a folder outside the workspace, ask the user "
-    "to add it under Settings › Folder access, or call request_access."
+    "\n[sandbox] This command may have been blocked by the workspace sandbox "
+    "(safe mode), not by the file itself: the path was not granted to the "
+    "sandbox. It does not mean the file is secret or was deleted. Writes are "
+    "allowed in the workspace, read-write portals and temp; network egress "
+    "goes through the project's allowlist proxy. If you need a folder outside "
+    "the workspace, ask the user to add it under Settings › Folder access, or "
+    "call request_access."
 )
 
 # Spec 117 D4/D5 — appended in safe mode when the daemon raises an
@@ -100,6 +113,11 @@ def detect_sandbox_denial(exit_code: int, output: str) -> SandboxDenial | None:
     "may" — the user, not the daemon, makes the call on the approval card.
     The Seatbelt log lookup is macOS-only and best-effort (``None`` off-mac).
     """
+    if output and ACCESS_DENIED_MARKER in output:
+        return SandboxDenial(
+            kind="windows_acl",
+            reason="Access was denied on a path the sandboxed worker was not granted.",
+        )
     if exit_code == 0 or not output:
         return None
     lowered = output.lower()
@@ -117,7 +135,8 @@ def detect_sandbox_denial(exit_code: int, output: str) -> SandboxDenial | None:
             kind="seatbelt",
             reason="The command reported 'Operation not permitted' inside the sandbox.",
         )
-    if any(marker in lowered for marker in _WINDOWS_DENIAL_MARKERS):
+    if (any(marker in lowered for marker in _WINDOWS_DENIAL_MARKERS)
+            or _WINDOWS_PATH_DENIAL_RE.search(output)):
         return SandboxDenial(
             kind="windows_acl",
             reason="Access was denied on a path the sandboxed worker was not granted.",
@@ -195,6 +214,102 @@ def _lookup_sandbox_denial() -> str | None:
     return _parse_sandbox_denials(proc.stdout or "")
 
 
+_INTERPRETERS = frozenset({
+    "cmd", "powershell", "pwsh", "bash", "sh", "zsh", "dash", "fish", "wsl",
+})
+_COMPOUND_CHARS = frozenset(";&|(){}\n\r")
+
+
+def _is_compound(command: str) -> bool:
+    """True when *command* chains, pipes or embeds another command.
+
+    ``$(``, backticks and ``@(`` evaluate even inside double quotes (in bash
+    and PowerShell alike), so they count anywhere; the other characters count
+    outside quotes.
+    """
+    if "$(" in command or "`" in command or "@(" in command:
+        return True
+    quote = None
+    for ch in command:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in _COMPOUND_CHARS:
+            return True
+    return False
+
+
+def _split_command(command: str) -> list[str]:
+    """Tokens of *command* with their quotes removed.
+
+    Windows paths keep their backslashes (POSIX ``shlex`` would eat them).
+    """
+    posix = "\\" not in command
+    try:
+        tokens = shlex.split(command, posix=posix)
+    except ValueError:
+        tokens = command.split()
+    if not posix:
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
+                  for t in tokens]
+    return tokens
+
+
+def _interpreter_payload(stem: str, rest: list[str]) -> str | None:
+    """The command an interpreter invocation runs, or ``None`` if not one."""
+    lowered = [t.lower() for t in rest]
+    if stem == "cmd":
+        for flag in ("/c", "/k"):
+            if flag in lowered:
+                return " ".join(rest[lowered.index(flag) + 1:]) or None
+        return None
+    if stem in ("powershell", "pwsh"):
+        for i, token in enumerate(lowered):
+            if token in ("-command", "-c"):
+                return " ".join(rest[i + 1:]) or None
+            if token in ("-file", "-f", "-encodedcommand", "-e", "-ec"):
+                return None
+        return None
+    if stem == "wsl":
+        return None
+    if "-c" in lowered:
+        i = lowered.index("-c")
+        return rest[i + 1] if i + 1 < len(rest) else None
+    return None
+
+
+def build_windows_script(command: str) -> str:
+    """The ``.ps1`` text that runs *command* the way ``powershell -Command`` did.
+
+    ``-File`` exits 0 unless the script throws or calls ``exit``, while
+    ``-Command`` exited 1 when the last statement failed; the trailer keeps
+    the ``-Command`` behaviour. ``$?`` is read on the line straight after the
+    command, before the trailer's own statements reset it. The marker is
+    printed when any error record is a permission denial, independent of the
+    UI language and of the exit code.
+    """
+    return (
+        f"{command}\n"
+        "$__orbital_ok = $?\n"
+        "if ($Error | Where-Object { $_.CategoryInfo.Category -eq 'PermissionDenied' "
+        "-or $_.Exception -is [System.UnauthorizedAccessException] }) {\n"
+        f"    [Console]::Error.WriteLine('{ACCESS_DENIED_MARKER}')\n"
+        "}\n"
+        "if (-not $__orbital_ok) { exit 1 }\n"
+    )
+
+
+def _strip_marker(output: str) -> str:
+    """*output* without the wrapper's marker line(s)."""
+    if not output or ACCESS_DENIED_MARKER not in output:
+        return output
+    return "\n".join(
+        line for line in output.split("\n") if line.strip() != ACCESS_DENIED_MARKER
+    )
+
+
 def _sandbox_hint(exit_code: int, output: str,
                   denial: SandboxDenial | None = None) -> str:
     """The ``[sandbox]`` suffix for a failed command, or an empty string.
@@ -202,14 +317,11 @@ def _sandbox_hint(exit_code: int, output: str,
     Proxy blocks get their own ``[network-policy]`` hint at the call site and
     no ``[sandbox]`` line — unchanged from before the detector existed.
     """
-    if exit_code == 0:
-        return ""
-    lowered = output.lower()
-    if not any(marker in lowered for marker in _SANDBOX_DENIAL_MARKERS):
-        return ""
-    hint = _SANDBOX_HINT
     if denial is None:
         denial = detect_sandbox_denial(exit_code, output)
+    if denial is None or denial.kind == "proxy":
+        return ""
+    hint = _SANDBOX_HINT
     if denial is not None and denial.kind == "seatbelt" and denial.reason.startswith(
             "The sandbox denied "):
         hint += " The most recent sandbox denial was: " + denial.reason[
@@ -366,12 +478,34 @@ class ShellTool(Tool):
                     external.append(path)
         return external
 
-    def _build_cmd(self, command: str) -> list[str]:
-        """Build the shell command based on OS type."""
-        if self._os_type == "windows":
-            return ["powershell", "-NoProfile", "-Command", command]
-        else:
-            return ["bash", "-c", command]
+    def _build_cmd(self, command: str) -> tuple[list[str], str | None]:
+        """The argv for *command*, plus the script file to delete afterwards.
+
+        Windows runs the command from a UTF-8 ``.ps1`` in the workspace's
+        ``orbital/.tmp`` (readable by the sandbox worker): passed inline it
+        crossed two layers of quoting (``cmd /c "… -Command <cmd> …"``) that
+        dropped inner double quotes, and ``CreateProcessWithLogonW`` caps the
+        command line at 1024 characters (bench 2026-10-19, issue 8).
+        """
+        if self._os_type != "windows":
+            return ["bash", "-c", command], None
+        from agent_os.agent.project_paths import ProjectPaths
+
+        tmp_dir = ProjectPaths(self._workspace).tmp_dir
+        os.makedirs(tmp_dir, exist_ok=True)
+        script = os.path.join(tmp_dir, f"cmd_{uuid4().hex[:12]}.ps1")
+        with open(script, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write(build_windows_script(command))
+        return ["powershell", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-File", script], script
+
+    @staticmethod
+    def _remove_script(script: str | None) -> None:
+        if script:
+            try:
+                os.remove(script)
+            except OSError:
+                pass
 
     def _detect_network(self, command: str) -> dict:
         """Scan command for network-related tools and extract domains."""
@@ -438,7 +572,7 @@ class ShellTool(Tool):
 
     def _execute_via_provider(self, command: str, meta: dict) -> ToolResult:
         """Execute command via platform provider (sandbox isolation)."""
-        cmd = self._build_cmd(command)
+        cmd, script = self._build_cmd(command)
         shell = cmd[0]
         args = cmd[1:]
 
@@ -452,6 +586,8 @@ class ShellTool(Tool):
             ))
         except RuntimeError as e:
             return ToolResult(content=f"Error: {e}", meta=meta)
+        finally:
+            self._remove_script(script)
 
         if cmd_result.timed_out:
             output = cmd_result.stdout
@@ -467,6 +603,10 @@ class ShellTool(Tool):
         if cmd_result.stderr:
             output = output + cmd_result.stderr if output else cmd_result.stderr
 
+        # Detect on the raw output (the wrapper's marker), then hide the marker.
+        denial = detect_sandbox_denial(cmd_result.exit_code, output)
+        sandbox_hint = _sandbox_hint(cmd_result.exit_code, output, denial)
+        output = _strip_marker(output)
         output = self._truncate_output(output, self._workspace)
 
         if len(output) > _HARD_CAP:
@@ -476,8 +616,7 @@ class ShellTool(Tool):
         lowered = output.lower()
         if meta.get("network") and any(m in lowered for m in _PROXY_BLOCK_MARKERS):
             content += _NETWORK_POLICY_HINT
-        denial = detect_sandbox_denial(cmd_result.exit_code, output)
-        content += _sandbox_hint(cmd_result.exit_code, output, denial)
+        content += sandbox_hint
         if denial is not None and self._safe_mode_cb is not None:
             # Spec 117 D4: the daemon raises an ``unsandboxed_run`` approval
             # off this meta (agent_manager / autonomy). Only when the
@@ -496,7 +635,7 @@ class ShellTool(Tool):
         Seatbelt, no worker account, no portals. Also the dev-daemon path
         (no platform provider wired), under its old name below.
         """
-        cmd = self._build_cmd(command)
+        cmd, script = self._build_cmd(command)
         env = {
             k: v for k, v in os.environ.items()
             if k.upper() not in _PROXY_ENV_VARS
@@ -517,10 +656,13 @@ class ShellTool(Tool):
                 content=f"Error: command timed out after {_TIMEOUT} seconds",
                 meta=meta,
             )
+        finally:
+            self._remove_script(script)
 
-        output = proc.stdout
+        output = proc.stdout or ""
         if proc.stderr:
             output = output + proc.stderr if output else proc.stderr
+        output = _strip_marker(output)
 
         output = self._truncate_output(output, self._workspace)
 
@@ -537,24 +679,51 @@ class ShellTool(Tool):
     _execute_via_subprocess = _execute_unsandboxed
 
     @staticmethod
-    def executable_of(command: str) -> str:
-        """The command's first token, as recorded by "always allow" (D5).
+    def executable_of(command: str, _depth: int = 0) -> str:
+        """The program "always allow" records for *command* (spec 117 D5).
 
-        ``FOO=1 git push`` → ``git``; ``/usr/bin/git`` → ``git``. Falls back
-        to the raw first whitespace-separated word when the shell quoting is
-        unbalanced. Empty for an empty command.
+        ``FOO=1 git push`` → ``git``; ``/usr/bin/git`` → ``git``. Interpreter
+        wrappers are unwrapped to the program they run (``cmd /c curl.exe …``
+        → ``curl.exe``), because allowlisting ``cmd`` would allow everything
+        (bench 2026-10-19, issue 7).
+
+        Empty — nothing to allowlist — when the command is not one program:
+        chained, piped or carrying a sub-expression (``git status; X`` would
+        otherwise let ``X`` ride out of the sandbox on ``git``), a bare
+        interpreter, or a script file.
         """
-        try:
-            tokens = shlex.split(command, posix=True)
-        except ValueError:
-            tokens = command.split()
-        for token in tokens:
+        command = command.strip()
+        if not command or _depth > 3 or _is_compound(command):
+            return ""
+        tokens = _split_command(command)
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
             if "=" in token and not token.startswith("="):
                 name = token.split("=", 1)[0]
                 if name and all(c.isalnum() or c == "_" for c in name):
+                    index += 1
                     continue  # an environment assignment prefix
-            return os.path.basename(token.replace("\\", "/"))
-        return ""
+            break
+        if index >= len(tokens):
+            return ""
+        program = os.path.basename(tokens[index].replace("\\", "/"))
+        stem = program.lower().removesuffix(".exe")
+        if stem not in _INTERPRETERS:
+            return program
+        inner = _interpreter_payload(stem, tokens[index + 1:])
+        if inner is None:
+            return ""
+        return ShellTool.executable_of(inner, _depth + 1)
+
+    def _safe_mode_on(self) -> bool:
+        """The project's switch; on when unknown or unreadable (fails closed)."""
+        if self._safe_mode_cb is None:
+            return True
+        try:
+            return bool(self._safe_mode_cb())
+        except Exception:
+            return True
 
     def _runs_unsandboxed(self, command: str) -> bool:
         """Spec 117 §3.2 routing: open project, or an always-allowed executable."""
@@ -591,8 +760,11 @@ class ShellTool(Tool):
             else:
                 result = self._execute_unsandboxed(command, meta)
 
-            if external_paths:
-                # Spec 077 §4.7.2 — a focus rule, not a capability claim. Reads
+            if external_paths and self._safe_mode_on():
+                # Spec 077 §4.7.2 — a focus rule, not a capability claim.
+                # Safe mode only: an open project's agent runs with the
+                # user's permissions and was asked to go there (bench
+                # 2026-10-19, issue 6). Reads
                 # outside the workspace now succeed at the OS level, so telling
                 # the model they are "not accessible" would be a lie it can
                 # disprove in one command, and then it stops trusting the rest.

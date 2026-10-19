@@ -83,6 +83,38 @@ _PROJECT_REFRESH: dict[str, dict] = {}
 _EMPTY_RESPONSE_NUDGE_LIMIT = 2
 
 
+def maybe_raise_unsandboxed_run(interceptor, tool_call: dict, result,
+                                recent_activity, *,
+                                queue_state: str = "chat") -> str | None:
+    """Spec 117 D4 — after a tool result, raise the ``unsandboxed_run`` card
+    if the sandbox blocked it. Returns the new pending id, or ``None``.
+
+    The ONE post-execution check shared by the loop's tool-result path and
+    ``AgentManager.approve()`` (which executes an approved call itself, off
+    the loop) — keep both on this helper so they cannot diverge again (they
+    did: an approved shell call under check_in never raised the card).
+
+    ``result`` is a ``ToolResult``; a ``meta["sandbox_denial"]`` (the daemon's
+    own denial detection, safe mode only) triggers ``interceptor.on_sandbox_
+    denial``. ``recent_activity`` is a zero-arg callable, evaluated only when
+    a card is actually raised. Never under a queue run (``queue_state ==
+    "running"``) — there is no card to answer there. A hook that raises is
+    logged and treated as "no card" so the caller's normal path continues.
+    The caller pauses the session on a returned id.
+    """
+    meta = getattr(result, "meta", None) or {}
+    denial = meta.get("sandbox_denial") if isinstance(meta, dict) else None
+    if (not denial or interceptor is None or queue_state == "running"
+            or not hasattr(interceptor, "on_sandbox_denial")):
+        return None
+    try:
+        return interceptor.on_sandbox_denial(tool_call, denial, recent_activity())
+    except Exception:
+        logger.exception("on_sandbox_denial raised for tool_call_id=%s",
+                         (tool_call or {}).get("id"))
+        return None
+
+
 def normalize_tool_call(tc_raw: dict) -> dict:
     """Normalize tool call from nested/flat/string-args formats."""
     if "function" in tc_raw:
@@ -1537,27 +1569,20 @@ class AgentLoop:
                         # the turn pauses on it exactly like an intercepted
                         # call (the rest of the batch is CANCELLED below). Not
                         # under a queue run — there is no card to answer there.
-                        _denial = result.meta.get("sandbox_denial") if result.meta else None
-                        if (_denial and self._interceptor is not None
-                                and self._queue_state != "running"
-                                and hasattr(self._interceptor, "on_sandbox_denial")):
-                            try:
-                                _pending_id = self._interceptor.on_sandbox_denial(
-                                    tc, _denial, self._session.recent_activity(),
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "on_sandbox_denial raised for tool_call_id=%s",
-                                    tc.get("id"),
-                                )
-                                _pending_id = None
-                            if _pending_id:
-                                intercepted_tc_id = tc["id"]
-                                self._session._paused_for_approval = True
-                                self._session.pause()
-                                self._note_exit("approval_pause", iteration)
-                                exit_outer = True
-                                break
+                        # Shared with AgentManager.approve() (approved calls
+                        # run off the loop) via maybe_raise_unsandboxed_run.
+                        _pending_id = maybe_raise_unsandboxed_run(
+                            self._interceptor, tc, result,
+                            self._session.recent_activity,
+                            queue_state=self._queue_state,
+                        )
+                        if _pending_id:
+                            intercepted_tc_id = tc["id"]
+                            self._session._paused_for_approval = True
+                            self._session.pause()
+                            self._note_exit("approval_pause", iteration)
+                            exit_outer = True
+                            break
                     except Exception as e:
                         tool_content = f"Error executing tool: {e}"
                         self._session.append_tool_result(

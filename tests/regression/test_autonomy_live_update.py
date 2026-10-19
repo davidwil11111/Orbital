@@ -178,3 +178,33 @@ class TestPutEndpointTriggersUpdate:
             })
             assert resp.status_code == 200
             mock_mgr.update_autonomy.assert_called_once_with(pid, Autonomy.SUPERVISED)
+
+
+class TestUpdateAutonomyReachesEverySession:
+    """Bench 2026-10-19: a project switched to 需确认 (check_in) kept a second
+    live session running hands-off, because only one session's interceptor
+    was updated. Tightening autonomy must reach every live session."""
+
+    def test_every_live_session_of_the_project_is_updated(self):
+        from agent_os.daemon_v2.agent_manager import AgentManager, ProjectHandle
+        mgr = AgentManager(
+            project_store=MagicMock(), ws_manager=MagicMock(),
+            sub_agent_manager=MagicMock(), activity_translator=MagicMock(),
+            process_manager=MagicMock(),
+        )
+        interceptors = {}
+        for key in (("proj-1", "s_a"), ("proj-1", "s_b"), ("proj-2", "s_c")):
+            interceptors[key] = AutonomyInterceptor(Autonomy.HANDS_OFF, MagicMock(), key[0])
+            mgr._handles[key] = ProjectHandle(
+                session=MagicMock(), loop=MagicMock(), provider=MagicMock(),
+                registry=MagicMock(), context_manager=MagicMock(),
+                interceptor=interceptors[key], task=MagicMock(),
+            )
+
+        assert mgr.update_autonomy("proj-1", Autonomy.CHECK_IN) is True
+
+        shell_call = {"name": "shell", "arguments": {"command": "ls"}}
+        assert interceptors[("proj-1", "s_a")].should_intercept(shell_call) is True
+        assert interceptors[("proj-1", "s_b")].should_intercept(shell_call) is True
+        # Another project's session is untouched.
+        assert interceptors[("proj-2", "s_c")].should_intercept(shell_call) is False

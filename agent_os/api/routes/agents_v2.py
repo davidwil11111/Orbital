@@ -588,7 +588,14 @@ def _redact_project(project: dict) -> dict:
         result["safe_mode"] = True
     result["safe_mode"] = bool(result["safe_mode"])
     result["unsandboxed_executables"] = list(result.get("unsandboxed_executables") or [])
-    result["pending_unsandboxed_runs"] = list(result.get("pending_unsandboxed_runs") or [])
+    # Each parked run carries the program "always allow" would record ("" when
+    # the command cannot be allowlisted), so the UI never labels it ``cmd``.
+    from agent_os.agent.tools.shell import ShellTool
+    result["pending_unsandboxed_runs"] = [
+        {**run, "executable": ShellTool.executable_of(str(run.get("command") or ""))}
+        for run in (result.get("pending_unsandboxed_runs") or [])
+        if isinstance(run, dict)
+    ]
     # The provider's current portals for this project (Folder-access section):
     # live state, never persisted on the row.
     result["granted_folders"] = _granted_folders_for(result.get("project_id"))
@@ -1653,6 +1660,20 @@ async def inject_message(project_id: str, req: InjectRequest):
             except Exception:
                 logger.warning("could not record the dispatch failure in %s/%s",
                                project_id, mention_session_id, exc_info=True)
+            else:
+                # Same pattern as LifecycleObserver's terminal rows: persist
+                # the system row, then broadcast the session-scoped
+                # ``sub_agent.failed`` so the open chat refetches its history
+                # and renders the (translated) failure row live. Before this
+                # the row only appeared after a reload — the 404 below carries
+                # just the generic "failed to send" to the composer.
+                _ws_manager.broadcast(project_id, {
+                    "type": "sub_agent.failed",
+                    "project_id": project_id,
+                    "handle": req.target,
+                    "reason": result,
+                    "session_id": mention_session_id,
+                })
             raise HTTPException(status_code=404, detail=f"Failed to dispatch to {req.target}: {result}")
 
         # Broadcast acknowledgement so ChatView knows the message was sent

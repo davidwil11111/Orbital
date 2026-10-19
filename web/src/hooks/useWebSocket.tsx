@@ -16,6 +16,10 @@ import type { WebSocketEvent } from '../types';
 
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected';
 
+// Per-frame `[ws] received …` tracing. On in the Vite dev server only;
+// production bundles compile this to `false` and the log is dead code.
+const WS_FRAME_DEBUG: boolean = import.meta.env.DEV;
+
 type EventType = WebSocketEvent['type'];
 type ListenerFn = (event: WebSocketEvent) => void;
 
@@ -109,7 +113,12 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
           : parsed;
         if (event.type) {
           const seq = (event as unknown as Record<string, unknown>).seq;
-          if (event.type === 'chat.stream_delta' || event.type === 'agent.status') {
+          // Per-frame trace is dev-only: release builds must keep the
+          // console quiet (a streaming turn emits hundreds of deltas).
+          if (
+            WS_FRAME_DEBUG &&
+            (event.type === 'chat.stream_delta' || event.type === 'agent.status')
+          ) {
             console.log(`[ws] received type=${event.type} seq=${seq ?? ''}`);
           }
           dispatch(event);

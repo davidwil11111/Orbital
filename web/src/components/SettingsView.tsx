@@ -24,7 +24,7 @@ import BudgetSection from './BudgetSection';
 import ProjectConnectorToggles from './ProjectConnectorToggles';
 import BetaBadge from './BetaBadge';
 import { NetworkAccessSection } from './NetworkAccessSection';
-import { UnsandboxedRunsSection, commandExecutable } from './UnsandboxedRunsSection';
+import { UnsandboxedRunsSection, allowlistExecutable } from './UnsandboxedRunsSection';
 import { FolderAccessSection } from './FolderAccessSection';
 import SafeModeSwitch from './SafeModeSwitch';
 import type {
@@ -472,7 +472,7 @@ export default function SettingsView({
     );
     setPendingUnsandboxedRuns((prev) => prev.filter((r) => r.id !== run.id));
     if (decision === 'always') {
-      const exe = commandExecutable(run.command);
+      const exe = allowlistExecutable(run.command, run.executable);
       if (exe) {
         setUnsandboxedExecutables((prev) => (prev.includes(exe) ? prev : [...prev, exe]));
       }
