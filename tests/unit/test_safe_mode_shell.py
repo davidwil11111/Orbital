@@ -90,9 +90,15 @@ def test_listed_executable_matches_the_first_token_only(tmp_path):
 
 
 def test_listed_executable_matches_a_path_basename_and_env_prefix(tmp_path):
+    # A full path matches the listed name when it IS the program PATH runs
+    # for that name (test_honest_grants.py covers a path that is not).
+    from unittest.mock import patch
+
+    echo = os.path.join(os.path.abspath(os.sep), "bin", "echo")
     provider = _Provider(stdout="sandboxed")
     tool = _tool(tmp_path, provider, safe_mode=True, unsandboxed=["echo"])
-    tool.execute(command="/bin/echo via-path")
+    with patch("agent_os.agent.tools.shell.shutil.which", return_value=echo):
+        tool.execute(command=f'"{echo}" via-path')
     tool.execute(command="FOO=1 echo via-env")
     assert provider.calls == []
 

@@ -61,28 +61,37 @@ def test_an_ordinary_prefix_still_keys_on_the_program():
     assert ShellTool.executable_of("FOO=1 GIT_TRACE=1 git push") == "git"
 
 
+def _abs(*parts: str) -> str:
+    """An absolute path on whatever OS runs the test (``/usr/bin/git`` is not
+    absolute on Windows, where the key rightly stays the path as written)."""
+    return os.path.join(os.path.abspath(os.sep), *parts)
+
+
 def test_an_absolute_path_to_the_program_path_runs_keys_as_its_name():
-    with patch(_WHICH, return_value="/usr/bin/git"):
-        assert ShellTool.executable_of("/usr/bin/git status") == "git"
+    git = _abs("usr", "bin", "git")
+    with patch(_WHICH, return_value=git):
+        assert ShellTool.executable_of(f'"{git}" status') == "git"
     with patch(_WHICH, return_value="C:\\Program Files\\Git\\cmd\\git.exe"):
         assert ShellTool.executable_of(
             '"C:\\Program Files\\Git\\cmd\\git.exe" status') == "git.exe"
 
 
 def test_an_absolute_path_to_another_program_keys_as_the_path():
-    with patch(_WHICH, return_value="/usr/bin/git"):
-        assert ShellTool.executable_of("/tmp/evil/git status") == "/tmp/evil/git"
+    evil, tool = _abs("tmp", "evil", "git"), _abs("opt", "tool", "run")
+    with patch(_WHICH, return_value=_abs("usr", "bin", "git")):
+        assert ShellTool.executable_of(f'"{evil}" status') == evil
     with patch(_WHICH, return_value=None):
-        assert ShellTool.executable_of("/opt/tool/run x") == "/opt/tool/run"
+        assert ShellTool.executable_of(f'"{tool}" x') == tool
 
 
 def test_a_lookalike_interpreter_is_not_unwrapped():
     # ``./evil/bash`` is the agent's program, not bash: what it runs is
     # irrelevant, the key is the program itself.
     assert ShellTool.executable_of("./evil/bash -c 'ls'") == "./evil/bash"
-    with patch(_WHICH, return_value="/bin/bash"):
-        assert ShellTool.executable_of("/tmp/evil/bash -c ls") == "/tmp/evil/bash"
-        assert ShellTool.executable_of("/bin/bash -c 'npm test'") == "npm"
+    bash, evil = _abs("bin", "bash"), _abs("tmp", "evil", "bash")
+    with patch(_WHICH, return_value=bash):
+        assert ShellTool.executable_of(f'"{evil}" -c ls') == evil
+        assert ShellTool.executable_of(f'"{bash}" -c "npm test"') == "npm"
 
 
 def test_allowing_ls_does_not_allow_a_program_called_ls(tmp_path):
