@@ -73,6 +73,73 @@ certutil -hashfile orbital-1018\Orbital-Setup-0.17.0.exe SHA256
 - 116: npm-installed Claude Code 2.1.100 → "需要更新" + 更新 button → after update a pinned send answers.
   With `--ignore-scripts` (stub layout) the update failure notice names the manual npm command.
 
+## Windows bench results (2026-10-19, Win10 Home zh-CN 19045, done; no further Windows access)
+Full report: `docs/verification/1018-windows-bench-2026-10-19.md`. Ran the CI installer above (hash matched)
+as an upgrade over v0.16.0, found 9 issues, fixed them on this branch (`a6fd51b`, `041b18d`, `d7a976c`) and
+re-verified **from source** on the same machine (repo code against the installed app's data dir). The
+fixed build's CI run is **39192198023**; nobody has installed or run its `.exe` yet.
+
+What the 0.17.0 installer showed (before the fixes):
+- 114 core works: v0.16.0 `git status` as the worker fails; after the upgrade it succeeds; GIT_CONFIG_COUNT
+  set. But **`git remote add` / `git config --local` SUCCEEDED as the worker** (git renames `config.lock`
+  over `config`; the worker had delete-child on `.git`), so W3 did not protect config at all.
+- The NOTES expectation `(DENY)(WD,AD,WEA,WA)` is wrong for Win10: icacls prints both 0x116 and 0x100116 as
+  `(W)`, so the text classifier saw "stale" forever and re-applied the deny on every command.
+- 117: switch/settings/banner fine; but the Windows denial detector matched only cmd's "Access is
+  denied.", not PowerShell's "Access to the path … is denied." (most denials raised no card), and in 需确认
+  an approved command never raised the card (approve() skipped the check). Hands-off D6 3-min parking OK.
+- 116: 过旧 notice / 需要更新 / translated row OK; **更新 left Claude Code uninstalled** (`claude update`
+  died mid-npm on a slow network) while the card still said installed.
+
+What the fixes change (shared code, so **macOS behaviour changes too** — re-check on the Mac):
+- `ShellTool.executable_of` (the "always allow" key): unwraps `cmd /c`, `powershell -Command`, `bash -c`;
+  returns "" for chained/piped/sub-expression commands (`;` `&` `|` `( )` `{ }` `$(` backtick, newline), so
+  those never run unsandboxed via an allowlisted program and the card hides the "always" button
+  (backend now sends `executable`). On the Mac: `ls ~/.ssh` still keys as `ls`; `git log | head` no
+  longer matches an allowlisted `git`.
+- `[sandbox]` hint text reworded (no "credential stores"; says the sandbox, not the file, blocked it);
+  `[focus]` warning and the FOCUS prompt rule only apply in safe mode; the `[Unsandboxed run]` row is
+  worded as the user's own decision. Mac item 2 (open project) should now be easier: before this, the
+  model (deepseek) refused every out-of-workspace command even with safe mode off.
+- `approve()` raises the sandbox card for an approved command that then hits the sandbox (Mac item 3 in
+  需确认 goes: shell approval card, then the sandbox card).
+- `update_autonomy` now updates every live session of the project (one was left hands-off).
+- Claude Code 更新 on an npm install runs `npm install -g @anthropic-ai/claude-code@latest` (15-min
+  budget) instead of `claude update`; every update re-probes; a vanished CLI ends as
+  `cli_missing_after_update` with the manual command. Native installs still use `claude update`.
+  Mac item 7: expect npm, not `claude update`, in the progress lines.
+- A dispatch failing on auth ("OAuth session expired") shows 登录已过期 + Login on the card. No auth
+  probes for agents that are not installed.
+- UI: card rehydrates after Settings round-trip; pinned-send failure row arrives live; release build no
+  longer logs every WS frame; 监督模式 copy changed (no 安全模式); not-detected PATH hint is per-OS.
+- Windows only: W3 denies delete/change-permissions/take-ownership on config+hooks and
+  delete-child/change-permissions/take-ownership on `.git` and the repo root (this folder only); writable
+  roots get user + OWNER RIGHTS inheritable entries; classifier reads ACE masks via Win32
+  (`platform/windows/acl.py`); commands run from a UTF-8 `.ps1` in `orbital/.tmp` (fixes lost double quotes,
+  the 1024-char cap) whose trailer prints `[orbital:access-denied]` for any permission error record.
+
+Verified live from source on Windows: worker `git add`+`commit` OK; remote add / config --local / renaming
+`.git\hooks` or `.git` denied; one-time stale migration then no rewrites; PowerShell denials and exit-0
+compound commands raise the card; 需确认 approve → card; open project runs out-of-workspace commands as the
+user; card label "本项目始终允许 echo" for `cmd /c "echo …"` and no "always" for a chained command;
+`Write-Output "a b"` → `a b`; card survives Settings round-trip; failure row live; console quiet.
+
+**Still needs a Windows machine (cannot be done from the Mac):**
+1. Install the `.exe` from run 39192198023 over 0.17.0 (UAC): startup log shows one "Rewriting stale W3
+   deny ACE … (config)" per repo, then none; `icacls <repo>\.git\config` now reads
+   `AgentOS-Worker:(DENY)(W,D,WDAC,WO)` (that is the new mask; `(W)` alone is the old one).
+2. Update success path: npm on the bench machine died ~34 s into unpacking `claude-code-win32-x64` from any
+   shell (rc 127, no output, not Orbital), so only the failure path was seen (it reported
+   `cli_missing_after_update` correctly). Needs a Windows box where npm works.
+3. 登录已过期 card (unit-tested only); fresh install on a clean machine; Git ≥ 2.35.2 "dubious ownership"
+   (bench had Git 2.35.1, so `safe.directory=*` was set but not exercised).
+
+Known leftovers: the workspace-grant icacls `/C` success check matches en+zh summary lines only; telemetry
+buckets `cli_missing_after_update` as `unknown` (a new reason changes the server schema); commit `041b18d`
+alone does not type-check (an i18n key moves in `d7a976c`). Bench machine state: test projects `bench114`
+/ `open117` under `D:\orbital-1018-bench`, the installed app is still 0.17.0 (it will put the old deny
+shape back on those two test repos), global npm Claude Code restored to 2.1.100 from npm's backup.
+
 ## Known / not verified
 - Linux auto_detect additions (115) unverified. The spec-116 "finding 7" (why a 2.1.302 probe failed on the
   reporter's machine) is still open; the new auth-probe WARNING in daemon.log is the instrument.
