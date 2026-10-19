@@ -214,6 +214,13 @@ class TestProtectedControlFiles:
                 f'(deny file-write* (subpath "{target}")' in profile
             ), f"{rel} unprotected in the workspace"
 
+    def test_commondir_cannot_be_planted_in_the_workspace(self):
+        # A top-level .git/commondir redirects where git reads config from:
+        # the user's next `git status` would run what the agent chose.
+        ws = "/Users/testuser/project"
+        target = os.path.join(ws, ".git", "commondir")
+        assert f'(deny file-write* (subpath "{target}")' in generate_profile(ws)
+
     def test_emitted_under_each_read_write_portal(self):
         ws = "/Users/testuser/project"
         rw = "/Users/testuser/other-repo"

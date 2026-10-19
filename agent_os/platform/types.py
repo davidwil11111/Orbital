@@ -69,6 +69,10 @@ CREDENTIAL_READ_DENY_MACOS: tuple[str, ...] = (
 PROTECTED_CONTROL_FILES: tuple[str, ...] = (
     ".git/hooks",
     ".git/config",
+    # Redirects where git reads the config from: planting one points the
+    # user's next ``git status`` at a config the agent wrote. Git itself only
+    # writes ``commondir`` under ``.git/worktrees/<name>/``, never here.
+    ".git/commondir",
     ".bashrc",
     ".zshrc",
     ".profile",

@@ -318,3 +318,36 @@ def test_provider_hardens_the_root_before_protecting_it(tmp_path):
     provider._permission_manager = pmock
     provider._protect_control_files(str(tmp_path))
     assert order == ["harden", "protect"]
+
+
+# --- a planted .git/commondir (review of the 1018 bench fixes) -----------------
+#
+# A top-level ``.git/commondir`` redirects where git reads the repository's
+# config from, so a worker that writes one (plus a config of its own) makes
+# the user's next ``git status`` run a program the worker chose, with the real
+# ``.git/config`` untouched. Git only ever writes ``commondir`` inside
+# ``.git/worktrees/<name>/``, never at the top, so removing a top-level one
+# never breaks a real repository. Windows cannot deny a file that does not
+# exist yet, so the per-command pass removes it; macOS denies the write.
+
+
+def test_a_planted_commondir_is_removed_by_the_protection_pass(pm, repo):
+    planted = repo / ".git" / "commondir"
+    planted.write_text("../../elsewhere\n")
+    with patch.object(PermissionManager, "deny_state", return_value="current"):
+        pm.protect_control_files(USER, str(repo))
+    assert not planted.exists()
+
+
+def test_a_worktree_commondir_is_left_alone(pm, repo):
+    linked = repo / ".git" / "worktrees" / "feature"
+    linked.mkdir(parents=True)
+    (linked / "commondir").write_text("../..\n")
+    with patch.object(PermissionManager, "deny_state", return_value="current"):
+        pm.protect_control_files(USER, str(repo))
+    assert (linked / "commondir").exists()
+
+
+def test_commondir_is_never_an_acl_target(repo):
+    (repo / ".git" / "commondir").write_text("x\n")
+    assert all(os.path.basename(p) != "commondir" for p, _ in w3_targets(str(repo)))

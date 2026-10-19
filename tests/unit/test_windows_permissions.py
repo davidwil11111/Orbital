@@ -82,10 +82,11 @@ def test_protect_control_files_skips_a_workspace_with_no_repository(pm, tmp_path
     deny.assert_not_called()
 
 
-def test_protected_control_files_are_the_git_pair():
+def test_protected_control_files_are_the_git_entries():
     # ntpath.basename, not os.path: the helper emits Windows paths on every host.
+    # commondir is listed so it is removed when planted (never ACL-denied).
     names = [ntpath.basename(p) for p in windows_protected_control_files(r"C:\\ws")]
-    assert sorted(names) == ["config", "hooks"]
+    assert sorted(names) == ["commondir", "config", "hooks"]
     # Shell rc files and .gitconfig live in the user's profile on Windows,
     # which the worker never gets access to in the first place.
     assert not any(n.startswith(".bashrc") or n == ".gitconfig" for n in names)

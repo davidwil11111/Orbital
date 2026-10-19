@@ -248,6 +248,9 @@ class PermissionManager:
         is re-run after commands that could have created a repository.
         """
         results: list[PermissionResult] = []
+        removed = _remove_planted_commondir(root)
+        if removed is not None:
+            results.append(removed)
         for target, kind in w3_targets(root):
             state = self.deny_state(username, target, kind=kind)
             if state == "current":
@@ -568,10 +571,34 @@ def w3_targets(root: str) -> list[tuple[str, W3Kind]]:
     targets: list[tuple[str, W3Kind]] = [(root, "repo_root"), (git_dir, "git_dir")]
     for entry in windows_protected_control_files(root):
         name = os.path.basename(entry.replace("\\", "/"))
+        if name == "commondir":
+            continue  # never kept and denied: removed (_remove_planted_commondir)
         path = os.path.join(git_dir, name)
         if os.path.exists(path):
             targets.append((path, "hooks" if name == "hooks" else "config"))
     return targets
+
+
+def _remove_planted_commondir(root: str) -> PermissionResult | None:
+    """Delete a top-level ``.git/commondir`` under *root*, if one exists.
+
+    It redirects where git reads the repository's config from, so a worker
+    that plants one (and a config of its own) makes the user's next
+    ``git status`` run a program it chose, with ``.git\\config`` untouched.
+    A deny cannot be placed on a file that does not exist yet, so this pass
+    — run at start and after every command — removes it. Git only writes
+    ``commondir`` inside ``.git\\worktrees\\<name>\\``, never at the top.
+    """
+    path = os.path.join(root, ".git", "commondir")
+    if not os.path.isdir(os.path.join(root, ".git")) or not os.path.lexists(path):
+        return None
+    try:
+        os.remove(path)
+    except OSError as exc:
+        logger.warning("could not remove planted %s: %s", path, exc)
+        return PermissionResult(success=False, path=path, error=str(exc))
+    logger.warning("Removed a planted %s (it redirects git's config)", path)
+    return PermissionResult(success=True, path=path)
 
 
 def classify_deny_aces(aces: list[acl.Ace], sid: str, kind: str) -> DenyState:
