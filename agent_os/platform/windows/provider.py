@@ -131,6 +131,13 @@ class WindowsPlatformProvider(PlatformProvider):
         except Exception:
             return
         try:
+            # Once per root (a DACL read when already done): lets the daemon
+            # re-permission what the worker creates, and stops the worker's
+            # owner rights from lifting a deny (bench 2026-10-19, issue 1).
+            self._permission_manager.harden_writable_root(root)
+        except Exception as exc:
+            logger.warning("root hardening failed under %s: %s", root, exc)
+        try:
             roots = [root, *self._permission_manager.find_repository_roots(root)]
             for repo_root in dict.fromkeys(roots):
                 self._permission_manager.protect_control_files(username, repo_root)

@@ -20,25 +20,46 @@ from agent_os.platform.types import (
     windows_toolchain_roots,
     windows_worker_home,
 )
+from agent_os.platform.windows import acl
 from agent_os.utils.subprocess_flags import win_no_window_flags
 
 logger = logging.getLogger("agent_os.platform.windows.permissions")
 
-#: Spec 114 D1 — the rights a W3 deny names, i.e. generic-write minus
-#: ``SYNCHRONIZE``: write data / add file, append data / add subdirectory,
-#: write extended attributes, write attributes. The writer and the classifier
-#: both render from this tuple so they cannot drift.
-W3_DENY_RIGHTS: tuple[str, ...] = ("WD", "AD", "WEA", "WA")
+#: The write rights by name, i.e. generic-write minus ``SYNCHRONIZE`` (spec
+#: 114 D1): write data / add file, append data / add subfolder, write
+#: extended attributes, write attributes.
+_WRITE_RIGHTS: tuple[str, ...] = ("WD", "AD", "WEA", "WA")
+#: Delete, change permissions, take ownership. Windows lets a holder of
+#: delete replace a file by renaming another over it (git writes
+#: ``config.lock`` then renames it), and a holder of change-permissions lift
+#: any deny — so a write-only deny does not protect a file (bench
+#: 2026-10-19, issue 1).
+_REPLACE_RIGHTS: tuple[str, ...] = ("DE", "WDAC", "WO")
 
-#: Classification of what an ``icacls`` listing already holds for the worker.
+W3Kind = Literal["repo_root", "git_dir", "hooks", "config"]
+
+#: What each W3 target denies the worker. Reads (and ``SYNCHRONIZE``) are
+#: never denied: the worker keeps using git. ``git_dir`` and ``repo_root``
+#: are this-folder-only, so files git rewrites keep their own delete right.
+W3_TARGET_RIGHTS: dict[str, tuple[str, ...]] = {
+    "config": _WRITE_RIGHTS + _REPLACE_RIGHTS,
+    "hooks": _WRITE_RIGHTS + _REPLACE_RIGHTS + ("DC",),
+    # Not renamed away (which would let a fresh ``.git`` take its place),
+    # no child replaced through the folder, no permission change.
+    "git_dir": ("DE", "DC", "WDAC", "WO"),
+    # ``.git`` cannot be replaced through its parent; no permission change.
+    "repo_root": ("DC", "WDAC", "WO"),
+}
+
+#: ``OWNER RIGHTS``: an ACE for it replaces an owner's implicit rights.
+OWNER_RIGHTS_SID = "S-1-3-4"
+_FULL_CONTROL = 0x1F01FF
+_MODIFY = 0x1301BF
+
+#: Classification of what a target already holds for the worker.
 DenyState = Literal["none", "current", "stale"]
 
 _ACE_GROUP_RE = re.compile(r"\(([^()]*)\)")
-
-
-def w3_deny_rights_string() -> str:
-    """``(WD,AD,WEA,WA)`` — the rights group icacls takes and prints."""
-    return "(" + ",".join(W3_DENY_RIGHTS) + ")"
 
 
 class PermissionManager:
@@ -82,12 +103,22 @@ class PermissionManager:
             perm = f"{username}:(OI)(CI)R"
         else:
             perm = f"{username}:(OI)(CI)F"
+            # Before the worker grant, so the inheritable user entry exists
+            # by the time the worker creates anything (bench 2026-10-19).
+            self.harden_writable_root(resolved)
 
-        result = self._run_icacls([resolved, "/grant", perm, "/T", "/Q"])
+        # /C: one file the user cannot re-permission (a worker-owned file on a
+        # drive where the user holds no change-permissions) must not stop the
+        # walk over the rest of the tree.
+        result = self._run_icacls([resolved, "/grant", perm, "/T", "/C", "/Q"])
         if result.returncode != 0:
             err = result.stderr.strip() or result.stdout.strip()
-            logger.error("icacls grant failed for %s on %s: %s", username, resolved, err)
-            return PermissionResult(success=False, path=resolved, error=err)
+            if _processed_some(result.stdout):
+                logger.warning("icacls grant for %s on %s skipped some entries: %s",
+                               username, resolved, err)
+            else:
+                logger.error("icacls grant failed for %s on %s: %s", username, resolved, err)
+                return PermissionResult(success=False, path=resolved, error=err)
 
         logger.info("Granted %s access (%s) to %s", username, mode, resolved)
         return PermissionResult(success=True, path=resolved)
@@ -120,39 +151,33 @@ class PermissionManager:
     # Spec 077 W1/W2/W3 — toolchain grants, worker home, deny ACEs
     # ------------------------------------------------------------------
 
-    def deny_access(self, username: str, path: str) -> PermissionResult:
-        """Add a deny-write ACE for *username* on *path* (spec 077 W3, 114 D1).
+    def deny_access(self, username: str, path: str,
+                    kind: W3Kind | None = None) -> PermissionResult:
+        """Add the W3 deny ACE for *username* on *path* (spec 077 W3, 114 D1).
 
-        Deny ACEs precede allows in Windows access evaluation, so the
-        read-write grant on the enclosing workspace cannot override this. The
-        inheritance flags ``(OI)(CI)`` are only valid on a directory, so a file
-        target (``.git\\config``) gets the rights group alone.
+        *kind* picks the rights (:data:`W3_TARGET_RIGHTS`); when omitted it is
+        inferred from the name (``config`` / ``hooks``). Deny ACEs precede
+        allows in Windows access evaluation, so the read-write grant on the
+        enclosing workspace cannot override them.
 
-        The rights are the four write rights **by name** —
-        :data:`W3_DENY_RIGHTS`, rendered ``(WD,AD,WEA,WA)`` — never the ``W``
-        shorthand. ``W`` expands to the generic-write mask, which carries
-        ``SYNCHRONIZE`` next to the write bits, and Windows evaluates a deny
-        bit by bit: every synchronous ``CreateFile`` (every normal open,
-        read-only included) asks for ``SYNCHRONIZE``, so a ``W`` deny failed
-        *reads* of ``.git\\config`` and with them every git command the worker
-        ran (issue #58). .NET strips ``Synchronize`` from deny rules for the
-        same reason.
+        Rights are always named one by one, never the ``W`` shorthand: ``W``
+        carries ``SYNCHRONIZE``, which every synchronous open asks for, so a
+        ``W`` deny failed *reads* of ``.git\\config`` (issue #58).
 
-        What stays blocked for the worker: writing or creating files under
-        ``.git\\hooks`` and rewriting ``.git\\config`` — ``git remote add``,
-        ``git config --local``, hook edits. What works: reads, and every git
-        command that leaves those two alone (``status``, ``log``, ``diff``,
-        ``add``, ``commit``, ``checkout``). Delete was never part of ``W`` and
-        is not added.
+        Only ``hooks`` is inheritable (``(OI)(CI)`` + ``/T``), so files created
+        in it inherit the deny. The ``.git`` folder and the repository root are
+        this-folder-only: an inheritable delete-deny there would reach every
+        file git rewrites (index, refs, lock files) and break commits.
         """
         resolved = self._resolve_path(path)
         if resolved is None:
             return PermissionResult(success=False, path=path, error="Path does not exist")
+        kind = kind or _infer_kind(resolved)
 
-        rights = w3_deny_rights_string()
-        flags = f"(OI)(CI){rights}" if os.path.isdir(resolved) else rights
+        rights = "(" + ",".join(W3_TARGET_RIGHTS[kind]) + ")"
+        flags = f"(OI)(CI){rights}" if kind == "hooks" else rights
         args = [resolved, "/deny", f"{username}:{flags}", "/Q"]
-        if os.path.isdir(resolved):
+        if kind == "hooks":
             args.insert(-1, "/T")
 
         result = self._run_icacls(args)
@@ -161,21 +186,25 @@ class PermissionManager:
             logger.error("icacls deny failed for %s on %s: %s", username, resolved, err)
             return PermissionResult(success=False, path=resolved, error=err)
 
-        logger.info("Denied write for %s on %s", username, resolved)
+        logger.info("Denied %s rights for %s on %s", kind, username, resolved)
         return PermissionResult(success=True, path=resolved)
 
-    def remove_deny(self, username: str, path: str) -> PermissionResult:
+    def remove_deny(self, username: str, path: str,
+                    kind: W3Kind | None = None) -> PermissionResult:
         """Drop the deny ACE added by :meth:`deny_access`.
 
         Teardown must call this: a deny ACE left on the user's own repository
-        after uninstall outlives the account it names (spec 077 §8).
+        after uninstall outlives the account it names (spec 077 §8). Recursive
+        only for ``hooks``: a recursive ``/remove:d`` on the repository root
+        would strip every deny in the workspace, nested repositories included.
         """
         resolved = self._resolve_path(path)
         if resolved is None:
             return PermissionResult(success=False, path=path, error="Path does not exist")
+        kind = kind or _infer_kind(resolved)
 
         args = [resolved, "/remove:d", username, "/Q"]
-        if os.path.isdir(resolved):
+        if kind == "hooks":
             args.insert(-1, "/T")
 
         result = self._run_icacls(args)
@@ -185,66 +214,113 @@ class PermissionManager:
             return PermissionResult(success=False, path=resolved, error=err)
         return PermissionResult(success=True, path=resolved)
 
-    def deny_state(self, username: str, path: str) -> DenyState:
-        """What *path* already carries for *username* (spec 114 D2).
+    def deny_state(self, username: str, path: str,
+                   kind: W3Kind | None = None) -> DenyState:
+        """What *path* already carries for *username*.
 
-        ``"current"`` — the D1 rights group; ``"stale"`` — any other deny for
-        the account (in practice the v0.16.0 ``(W)`` shape, which must be
-        rewritten); ``"none"`` — no deny, or the query failed.
+        Read from the ACE masks (:func:`acl.read_dacl`), never from ``icacls``
+        text, which prints different masks identically (``0x116`` and
+        ``0x100116`` are both ``(W)`` on Windows 10). ``"current"`` — exactly
+        the deny for this *kind*; ``"stale"`` — any other explicit deny for
+        the account (v0.16.0's ``W``, spec 114's write-only mask); ``"none"``
+        — no deny, or the DACL could not be read.
         """
         resolved = self._resolve_path(path)
         if resolved is None:
             return "none"
-        result = self._run_icacls([resolved])
-        if result.returncode != 0:
+        kind = kind or _infer_kind(resolved)
+        sid = self._sid_for(username)
+        aces = acl.read_dacl(resolved)
+        if sid is None or aces is None:
             return "none"
-        return _classify_deny_ace(result.stdout, username)
+        return classify_deny_aces(aces, sid, kind)
 
-    def has_deny(self, username: str, path: str) -> bool:
-        """True when *username* carries the **current** W3 deny on *path*.
-
-        A stale deny (the pre-114 ``W`` shape) reads as "not protected yet":
-        :meth:`protect_control_files` has to rewrite it, not skip it.
-        """
-        return self.deny_state(username, path) == "current"
+    def has_deny(self, username: str, path: str, kind: W3Kind | None = None) -> bool:
+        """True when *username* carries the **current** W3 deny on *path*."""
+        return self.deny_state(username, path, kind=kind) == "current"
 
     def protect_control_files(self, username: str, root: str) -> list[PermissionResult]:
-        """Apply the W3 deny ACEs to every control file that exists under *root*.
+        """Apply the W3 denies to every target of the repository at *root*.
 
-        Idempotent and cheap: an ``icacls`` query per candidate, and a write
-        only when the ACE is missing. Windows ACLs need a real path — there is
-        no Seatbelt-style pattern for a not-yet-existing file — which is why
-        this is re-run after commands that could have created a repository.
+        Idempotent and cheap: a DACL read per target, a write only when the
+        deny is missing or stale. Windows ACLs need a real path — there is no
+        Seatbelt-style pattern for a not-yet-existing file — which is why this
+        is re-run after commands that could have created a repository.
         """
         results: list[PermissionResult] = []
-        for target in windows_protected_control_files(root):
-            if not os.path.exists(target):
-                continue
-            state = self.deny_state(username, target)
+        for target, kind in w3_targets(root):
+            state = self.deny_state(username, target, kind=kind)
             if state == "current":
                 continue
             if state == "stale":
-                # Spec 114 D2: an install that carries the v0.16.0 ``W`` deny
-                # heals here, on the worker's first command in the workspace.
-                # ``/remove:d`` clears every deny shape, so the old ACE and
-                # the new one never coexist. The ACE itself is the state —
-                # no version marker, no installer step.
-                logger.info(
-                    "Rewriting stale W3 deny ACE for %s on %s (spec 114: "
-                    "W carried SYNCHRONIZE and blocked git reads)",
-                    username, target,
-                )
-                self.remove_deny(username, target)
-            results.append(self.deny_access(username, target))
+                # An older deny shape heals here, on the worker's next command.
+                # ``/remove:d`` clears every deny for the account on this
+                # object, so the old ACE and the new one never coexist.
+                logger.info("Rewriting stale W3 deny ACE for %s on %s (%s)",
+                            username, target, kind)
+                self.remove_deny(username, target, kind=kind)
+            results.append(self.deny_access(username, target, kind=kind))
         return results
 
     def unprotect_control_files(self, username: str, root: str) -> list[PermissionResult]:
         """Reverse :meth:`protect_control_files` (teardown)."""
-        results: list[PermissionResult] = []
-        for target in windows_protected_control_files(root):
-            if os.path.exists(target):
-                results.append(self.remove_deny(username, target))
-        return results
+        return [self.remove_deny(username, target, kind=kind)
+                for target, kind in w3_targets(root)]
+
+    def harden_writable_root(self, root: str) -> PermissionResult | None:
+        """Make sure the daemon can always re-permission what the worker creates.
+
+        Adds, once, two inheritable entries on a writable root:
+
+        * the current user, full control. Files the worker creates are owned by
+          the worker, and without an inherited grant the user can lack
+          change-permissions on them (seen on a ``D:\\`` workspace), so W3
+          could not be applied to a repository the worker initialised;
+        * ``OWNER RIGHTS`` (``S-1-3-4``), modify. An owner otherwise holds
+          change-permissions implicitly, whatever the DACL denies, so the
+          worker could lift a deny on a repository it created.
+
+        Returns ``None`` when both are already present (the common case).
+        """
+        resolved = self._resolve_path(root)
+        if resolved is None:
+            return PermissionResult(success=False, path=root, error="Path does not exist")
+        if self._root_hardening_present(resolved):
+            return None
+        user = _current_user_principal()
+        args = [resolved, "/grant", f"{user}:(OI)(CI)F",
+                f"*{OWNER_RIGHTS_SID}:(OI)(CI)M", "/Q"]
+        result = self._run_icacls(args)
+        if result.returncode != 0:
+            err = result.stderr.strip() or result.stdout.strip()
+            logger.warning("root hardening failed on %s: %s", resolved, err)
+            return PermissionResult(success=False, path=resolved, error=err)
+        logger.info("Hardened writable root %s (user and OWNER RIGHTS entries)", resolved)
+        return PermissionResult(success=True, path=resolved)
+
+    def _root_hardening_present(self, resolved: str) -> bool:
+        aces = acl.read_dacl(resolved)
+        principal = _current_user_principal()
+        user_sid = principal[1:] if principal.startswith("*") else self._sid_for(principal)
+        if aces is None or user_sid is None:
+            return False
+        inherit = acl.OBJECT_INHERIT_ACE | acl.CONTAINER_INHERIT_ACE
+
+        def has(sid: str, mask: int) -> bool:
+            return any(
+                a.type == acl.ACCESS_ALLOWED_ACE_TYPE and a.sid == sid
+                and not a.flags & acl.INHERITED_ACE
+                and a.flags & inherit == inherit and a.mask & mask == mask
+                for a in aces
+            )
+
+        return has(user_sid, _FULL_CONTROL) and has(OWNER_RIGHTS_SID, _MODIFY)
+
+    def _sid_for(self, username: str) -> str | None:
+        cache = self.__dict__.setdefault("_sid_cache", {})
+        if username not in cache:
+            cache[username] = acl.account_sid(username)
+        return cache[username]
 
     def find_repository_roots(self, root: str, max_depth: int = 3) -> list[str]:
         """Directories under *root* that contain a ``.git`` folder.
@@ -480,43 +556,78 @@ class PermissionManager:
             )
 
 
-def _classify_deny_ace(output: str, username: str) -> DenyState:
-    """Classify the deny ACEs *username* has in ``icacls`` output (spec 114 D2).
+def w3_targets(root: str) -> list[tuple[str, W3Kind]]:
+    """The W3 targets of the repository at *root*, or ``[]`` without one.
 
-    icacls renders a specific-rights deny as
-    ``DESKTOP-ABC\\AgentOS-Worker:(DENY)(WD,AD,WEA,WA)`` for a file and
-    ``...:(DENY)(OI)(CI)(WD,AD,WEA,WA)`` for a directory; inherited copies
-    under ``.git\\hooks`` carry a leading ``(I)``; the pre-114 shape is
-    ``(DENY)(W)`` / ``(DENY)(OI)(CI)(W)``. The rights group is always the last
-    parenthesised group on the line and is compared as a *set*, so icacls'
-    ordering of the rights is irrelevant. Any deny for the account whose
-    rights are not exactly :data:`W3_DENY_RIGHTS` is ``"stale"``, and one
-    stale line outranks any number of current ones — the rewrite must run.
+    Only a real ``.git`` folder counts: a ``.git`` *file* is a worktree or
+    submodule pointer whose control files live elsewhere.
     """
-    username_lower = username.lower() + ":"
-    expected = {r.lower() for r in W3_DENY_RIGHTS}
+    git_dir = os.path.join(root, ".git")
+    if not os.path.isdir(git_dir):
+        return []
+    targets: list[tuple[str, W3Kind]] = [(root, "repo_root"), (git_dir, "git_dir")]
+    for entry in windows_protected_control_files(root):
+        name = os.path.basename(entry.replace("\\", "/"))
+        path = os.path.join(git_dir, name)
+        if os.path.exists(path):
+            targets.append((path, "hooks" if name == "hooks" else "config"))
+    return targets
+
+
+def classify_deny_aces(aces: list[acl.Ace], sid: str, kind: str) -> DenyState:
+    """``current`` / ``stale`` / ``none`` for the worker's denies on a target.
+
+    Only explicit (non-inherited) deny ACEs for *sid* count. ``current``
+    needs the exact mask and inheritance for *kind*; any other explicit deny
+    is ``stale`` and outranks a current one — the rewrite must run.
+    """
+    expected_mask = acl.rights_mask(W3_TARGET_RIGHTS[kind])
+    inherit = acl.OBJECT_INHERIT_ACE | acl.CONTAINER_INHERIT_ACE
+    expected_flags = inherit if kind == "hooks" else 0
     state: DenyState = "none"
-    for line in output.splitlines():
-        line_lower = line.lower()
-        at = line_lower.find(username_lower)
-        if at < 0:
+    for ace in aces:
+        if ace.type != acl.ACCESS_DENIED_ACE_TYPE or ace.sid != sid:
             continue
-        # The account name must end right at the colon and start after a
-        # separator — ``AgentOS-Worker2:`` contains ``AgentOS-Worker`` but
-        # is not it, and ``DOMAIN\\AgentOS-Worker`` is.
-        if at > 0 and line_lower[at - 1] not in " \\\t":
+        if ace.flags & acl.INHERITED_ACE:
             continue
-        entry = line_lower[at + len(username_lower):]
-        groups = _ACE_GROUP_RE.findall(entry)
-        if "deny" not in groups:
-            continue
-        rights = {r.strip() for r in groups[-1].split(",") if r.strip()}
-        if rights == expected:
+        flags = ace.flags & (inherit | acl.INHERIT_ONLY_ACE | acl.NO_PROPAGATE_INHERIT_ACE)
+        if ace.mask == expected_mask and flags == expected_flags:
             if state == "none":
                 state = "current"
         else:
             return "stale"
     return state
+
+
+_PROCESSED_RE = re.compile(
+    r"Successfully processed (\d+) files|已成功处理\s*(\d+)\s*个文件", re.IGNORECASE)
+
+
+def _processed_some(stdout: str) -> bool:
+    """True when an icacls summary line reports at least one processed file."""
+    m = _PROCESSED_RE.search(stdout or "")
+    return bool(m and int(m.group(1) or m.group(2)) > 0)
+
+
+def _infer_kind(path: str) -> W3Kind:
+    name = os.path.basename(os.path.normpath(path)).lower()
+    if name == "hooks":
+        return "hooks"
+    if name == ".git":
+        return "git_dir"
+    if name == "config":
+        return "config"
+    return "repo_root"
+
+
+def _current_user_principal() -> str:
+    """The account the daemon runs as, in a form icacls accepts."""
+    domain = os.environ.get("USERDOMAIN", "")
+    user = os.environ.get("USERNAME") or ""
+    if not user:
+        import getpass
+        user = getpass.getuser()
+    return f"{domain}\\{user}" if domain else user
 
 
 def _has_explicit_entry(output: str, username: str) -> bool:

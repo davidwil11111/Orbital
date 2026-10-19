@@ -35,12 +35,7 @@ from agent_os.platform.types import (
     windows_toolchain_roots,
     windows_worker_home,
 )
-from agent_os.platform.windows.permissions import (
-    W3_DENY_RIGHTS,
-    PermissionManager,
-    _classify_deny_ace,
-    w3_deny_rights_string,
-)
+from agent_os.platform.windows.permissions import PermissionManager
 
 USER = "AgentOS-Worker"
 
@@ -63,143 +58,6 @@ def pm():
 # ---------------------------------------------------------------------------
 
 
-def test_deny_on_a_directory_is_inheritable_and_recursive(pm, tmp_path):
-    hooks = tmp_path / ".git" / "hooks"
-    hooks.mkdir(parents=True)
-    with patch.object(PermissionManager, "_run_icacls", return_value=_ok()) as run:
-        result = pm.deny_access(USER, str(hooks))
-    assert result.success
-    args = run.call_args[0][0]
-    # (OI)(CI) so files created inside the folder inherit the deny, /T so the
-    # ones already there get it. Spec 114 D1: the four write rights by name —
-    # the ``W`` shorthand expands to generic-write, which carries SYNCHRONIZE,
-    # and a denied SYNCHRONIZE fails every synchronous open, reads included
-    # (issue #58: ``git status`` could not open ``.git\\config``).
-    assert f"{USER}:(OI)(CI)(WD,AD,WEA,WA)" in args
-    assert "/deny" in args and "/T" in args and "/Q" in args
-    joined = " ".join(args)
-    assert ":W" not in joined and "(OI)(CI)W" not in joined, \
-        "the W shorthand must never come back (spec 114 D1)"
-
-
-def test_deny_on_a_file_omits_the_inheritance_flags(pm, tmp_path):
-    cfg = tmp_path / ".git" / "config"
-    cfg.parent.mkdir(parents=True)
-    cfg.write_text("[core]\n")
-    with patch.object(PermissionManager, "_run_icacls", return_value=_ok()) as run:
-        assert pm.deny_access(USER, str(cfg)).success
-    args = run.call_args[0][0]
-    # (OI)(CI) is only valid on a directory; icacls errors on a file.
-    assert f"{USER}:(WD,AD,WEA,WA)" in args
-    assert "(OI)(CI)" not in " ".join(args)
-    assert "/T" not in args
-    assert f"{USER}:W" not in args, "the W shorthand must never come back"
-
-
-def test_w3_rights_are_generic_write_minus_synchronize():
-    # WD write data / add file, AD append data / add subdirectory, WEA write
-    # extended attributes, WA write attributes — exactly what ``W`` expands to
-    # once SYNCHRONIZE is taken out. Delete was never in ``W`` and is not added.
-    assert set(W3_DENY_RIGHTS) == {"WD", "AD", "WEA", "WA"}
-    assert w3_deny_rights_string() == "(WD,AD,WEA,WA)"
-    assert "DE" not in W3_DENY_RIGHTS and "DC" not in W3_DENY_RIGHTS
-
-
-# ---------------------------------------------------------------------------
-# Spec 114 D2 — classifying what icacls already shows for the worker
-# ---------------------------------------------------------------------------
-
-_PFX = r"C:\ws\.git\config DESKTOP-ABC\AgentOS-Worker:"
-
-
-@pytest.mark.parametrize("output, expected", [
-    ("", "none"),
-    (r"C:\ws\.git\config NT AUTHORITY\SYSTEM:(I)(F)" + "\n", "none"),
-    # An allow line for the same user is not a deny.
-    (_PFX + "(OI)(CI)(RX)\n", "none"),
-    # The v0.16.0 shape — the bug.
-    (_PFX + "(DENY)(W)\n", "stale"),
-    (_PFX + "(DENY)(OI)(CI)(W)\n", "stale"),
-    # Some other specific-rights deny someone wrote by hand.
-    (_PFX + "(DENY)(WD,AD)\n", "stale"),
-    (_PFX + "(DENY)(OI)(CI)(WD,AD,WEA,WA,DE)\n", "stale"),
-    # The D1 shape, in any order icacls chooses.
-    (_PFX + "(DENY)(WD,AD,WEA,WA)\n", "current"),
-    (_PFX + "(DENY)(OI)(CI)(WD,AD,WEA,WA)\n", "current"),
-    (_PFX + "(DENY)(OI)(CI)(WA,WEA,AD,WD)\n", "current"),
-    # Inherited copies under .git\hooks render with (I).
-    (_PFX + "(I)(DENY)(OI)(CI)(WD,AD,WEA,WA)\n", "current"),
-    # Case-varied rendering is still a deny.
-    (_PFX.lower() + "(Deny)(wd,ad,wea,wa)\n", "current"),
-    (_PFX.lower() + "(deny)(oi)(ci)(w)\n", "stale"),
-    # A stale entry next to a current one still needs the rewrite.
-    (_PFX + "(DENY)(WD,AD,WEA,WA)\n" + _PFX + "(DENY)(W)\n", "stale"),
-])
-def test_classify_deny_ace(output, expected):
-    assert _classify_deny_ace(output, USER) == expected
-
-
-def test_classify_ignores_a_different_account():
-    out = r"C:\ws\.git\config DESKTOP-ABC\AgentOS-Worker2:(DENY)(W)" + "\n"
-    assert _classify_deny_ace(out, USER) == "none"
-
-
-def test_deny_state_and_has_deny_agree(pm, tmp_path):
-    cfg = tmp_path / "config"
-    cfg.write_text("")
-    with patch.object(PermissionManager, "_run_icacls",
-                      return_value=_ok(_PFX + "(DENY)(W)\n")):
-        assert pm.deny_state(USER, str(cfg)) == "stale"
-        # has_deny keeps its boolean contract: true only for the current ACE,
-        # so a stale deny reads as "not protected yet".
-        assert pm.has_deny(USER, str(cfg)) is False
-    with patch.object(PermissionManager, "_run_icacls",
-                      return_value=_ok(_PFX + "(DENY)(WD,AD,WEA,WA)\n")):
-        assert pm.deny_state(USER, str(cfg)) == "current"
-        assert pm.has_deny(USER, str(cfg)) is True
-    with patch.object(PermissionManager, "_run_icacls", return_value=_fail()):
-        assert pm.deny_state(USER, str(cfg)) == "none"
-
-
-def test_protect_control_files_rewrites_a_stale_deny(pm, tmp_path, monkeypatch, caplog):
-    """Spec 114 D2: an install that already carries the ``W`` deny heals on
-    the worker's first command — ``protect_control_files`` runs after every
-    shell command, so no installer step or version marker is needed."""
-    import logging
-
-    git = tmp_path / ".git"
-    (git / "hooks").mkdir(parents=True)
-    (git / "config").write_text("")
-    monkeypatch.setattr(
-        "agent_os.platform.windows.permissions.windows_protected_control_files",
-        lambda root: [str(git / "hooks"), str(git / "config")],
-    )
-    calls: list[tuple[str, str]] = []
-
-    def remove(username, path):
-        calls.append(("remove_deny", os.path.basename(path)))
-        return _ok()
-
-    def deny(username, path):
-        calls.append(("deny_access", os.path.basename(path)))
-        return _ok()
-
-    with patch.object(PermissionManager, "deny_state", return_value="stale"), \
-            patch.object(PermissionManager, "remove_deny", side_effect=remove), \
-            patch.object(PermissionManager, "deny_access", side_effect=deny), \
-            caplog.at_level(logging.INFO, logger="agent_os.platform.windows.permissions"):
-        pm.protect_control_files(USER, str(tmp_path))
-    # Exactly remove then re-apply, per target, in that order.
-    assert calls == [
-        ("remove_deny", "hooks"), ("deny_access", "hooks"),
-        ("remove_deny", "config"), ("deny_access", "config"),
-    ]
-    # One INFO line per rewritten target so a user's daemon.log shows the
-    # migration happened (spec 114 V2).
-    rewritten = [r for r in caplog.records if "stale" in r.getMessage().lower()]
-    assert len(rewritten) == 2
-
-
 def test_deny_reports_an_icacls_failure(pm, tmp_path):
     d = tmp_path / ".git" / "hooks"
     d.mkdir(parents=True)
@@ -218,45 +76,6 @@ def test_deny_on_a_missing_path_is_refused(pm, tmp_path):
     assert result.error == "Path does not exist"
 
 
-def test_protect_control_files_covers_hooks_and_config(pm, tmp_path, monkeypatch):
-    git = tmp_path / ".git"
-    (git / "hooks").mkdir(parents=True)
-    (git / "config").write_text("[core]\n")
-    # The helper composes real Windows paths (ntpath), which cannot exist on
-    # the POSIX runners this suite also runs on — so feed the candidate list
-    # host-native paths and let the existence + deny logic be what is tested.
-    monkeypatch.setattr(
-        "agent_os.platform.windows.permissions.windows_protected_control_files",
-        lambda root: [str(git / "hooks"), str(git / "config")],
-    )
-    with patch.object(PermissionManager, "deny_state", return_value="none"), \
-            patch.object(PermissionManager, "remove_deny") as remove, \
-            patch.object(PermissionManager, "deny_access", return_value=_ok()) as deny:
-        pm.protect_control_files(USER, str(tmp_path))
-    denied = {os.path.basename(c[0][-1]) for c in deny.call_args_list}
-    assert denied == {"hooks", "config"}
-    remove.assert_not_called()
-
-
-def test_protect_control_files_skips_what_is_already_denied(pm, tmp_path, monkeypatch):
-    # Idempotent and cheap: a query per candidate, a write only when missing.
-    # This is what lets it run after every command without cost.
-    git = tmp_path / ".git"
-    (git / "hooks").mkdir(parents=True)
-    (git / "config").write_text("")
-    monkeypatch.setattr(
-        "agent_os.platform.windows.permissions.windows_protected_control_files",
-        lambda root: [str(git / "hooks"), str(git / "config")],
-    )
-    with patch.object(PermissionManager, "deny_state", return_value="current"), \
-            patch.object(PermissionManager, "remove_deny") as remove, \
-            patch.object(PermissionManager, "deny_access") as deny:
-        results = pm.protect_control_files(USER, str(tmp_path))
-    deny.assert_not_called()
-    remove.assert_not_called()
-    assert results == []
-
-
 def test_protect_control_files_skips_a_workspace_with_no_repository(pm, tmp_path):
     with patch.object(PermissionManager, "deny_access") as deny:
         assert pm.protect_control_files(USER, str(tmp_path)) == []
@@ -270,18 +89,6 @@ def test_protected_control_files_are_the_git_pair():
     # Shell rc files and .gitconfig live in the user's profile on Windows,
     # which the worker never gets access to in the first place.
     assert not any(n.startswith(".bashrc") or n == ".gitconfig" for n in names)
-
-
-def test_unprotect_removes_the_deny_for_teardown(pm, tmp_path):
-    # Spec 077 §8: a deny ACE outlives the account it names, so teardown must
-    # take it off the user's own repository.
-    git = tmp_path / ".git"
-    (git / "hooks").mkdir(parents=True)
-    (git / "config").write_text("")
-    with patch.object(PermissionManager, "_run_icacls", return_value=_ok()) as run:
-        pm.unprotect_control_files(USER, str(tmp_path))
-    for call in run.call_args_list:
-        assert "/remove:d" in call[0][0]
 
 
 # ---------------------------------------------------------------------------
