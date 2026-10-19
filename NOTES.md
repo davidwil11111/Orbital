@@ -77,7 +77,10 @@ certutil -hashfile orbital-1018\Orbital-Setup-0.17.0.exe SHA256
 Full report: `docs/verification/1018-windows-bench-2026-10-19.md`. Ran the CI installer above (hash matched)
 as an upgrade over v0.16.0, found 9 issues, fixed them on this branch (`a6fd51b`, `041b18d`, `d7a976c`) and
 re-verified **from source** on the same machine (repo code against the installed app's data dir). The
-fixed build's CI run is **39192198023**; nobody has installed or run its `.exe` yet.
+fixed build's CI run is **39192198023** (`d7a976c`): frontend green; backend red only on the known
+`test_browser_live::test_route_is_mounted_on_the_app` (windows-latest 4930 passed, macos-14 5033 passed);
+both installer jobs green. Nobody has installed or run its `.exe` or `.dmg` yet; artifacts:
+`gh run download 39192198023 -R zqiren/Orbital -n Orbital-Windows-installer` / `-n Orbital-macOS-dmg`.
 
 What the 0.17.0 installer showed (before the fixes):
 - 114 core works: v0.16.0 `git status` as the worker fails; after the upgrade it succeeds; GIT_CONFIG_COUNT
