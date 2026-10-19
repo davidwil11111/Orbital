@@ -84,6 +84,7 @@ interface Entry {
   update_needed?: boolean;
   min_version?: string | null;
   supports_update?: boolean;
+  auth_expired?: boolean;
 }
 
 function makeEntry(overrides: Partial<Entry> = {}): Entry {
@@ -626,6 +627,130 @@ describe('SubAgentSettings — version floor / Update (spec 116)', () => {
     await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
     expect(screen.queryByTestId('sub-agent-update-claude-code')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^login$/i })).toBeInTheDocument();
+  });
+});
+
+describe('SubAgentSettings — update removed the CLI (1018 bench item 5)', () => {
+  const goneClaude = (): Entry => makeEntry({
+    installed: false, binary_path: null, version: null, ready: false,
+    update_needed: false, supports_update: true,
+  });
+
+  async function renderAndFailUpdate() {
+    api.mockResolvedValue([makeEntry({
+      version: '2.1.100 (Claude Code)', ready: false, update_needed: true,
+      min_version: '2.1.114', supports_update: true,
+    })]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    // The daemon dropped its cached detection; the refetch reads "not installed".
+    api.mockClear();
+    api.mockResolvedValue([goneClaude()]);
+    emit('login.failed', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 1,
+      reason: 'cli_missing_after_update', verified: false,
+      manual_command: 'npm install -g @anthropic-ai/claude-code@latest',
+    });
+  }
+
+  it('says the CLI is gone, names the npm command, and refetches at once', async () => {
+    await renderAndFailUpdate();
+    await waitFor(() => expect(api).toHaveBeenCalledWith('/api/v2/settings/sub-agents'));
+    // The refetched entry is not installed, so the update block is gone, but
+    // the notice must stay: it is the only thing telling the user why.
+    await waitFor(() => expect(screen.getByTestId('sub-agent-not-detected-claude-code')).toBeInTheDocument());
+    const notice = screen.getByTestId('sub-agent-update-missing-claude-code');
+    expect(notice).toHaveTextContent(/no longer installed/i);
+    expect(notice).toHaveTextContent('npm install -g @anthropic-ai/claude-code@latest');
+    expect(screen.queryByTestId('sub-agent-update-claude-code')).not.toBeInTheDocument();
+  });
+
+  it('the notice stays through a still-missing refetch and clears once the CLI is back', async () => {
+    await renderAndFailUpdate();
+    await screen.findByTestId('sub-agent-not-detected-claude-code');
+    expect(screen.getByTestId('sub-agent-update-missing-claude-code')).toBeInTheDocument();
+    // The user reinstalls by hand and clicks Refresh.
+    api.mockResolvedValue([makeEntry({ version: '2.1.302', update_needed: false })]);
+    fireEvent.click(screen.getByRole('button', { name: /^refresh$/i }));
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-agent-update-missing-claude-code')).not.toBeInTheDocument();
+    });
+  });
+
+  it('renders the missing-CLI notice in Simplified Chinese', async () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    api.mockResolvedValue([makeEntry({
+      version: '2.1.100', ready: false, update_needed: true,
+      min_version: '2.1.114', supports_update: true,
+    })]);
+    render(
+      <LocaleProvider>
+        <SubAgentSettings />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    api.mockResolvedValue([goneClaude()]);
+    emit('login.failed', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 1,
+      reason: 'cli_missing_after_update', verified: false,
+    });
+    const notice = await screen.findByTestId('sub-agent-update-missing-claude-code');
+    expect(notice).toHaveTextContent('已不在本机');
+    expect(notice).toHaveTextContent('npm install -g @anthropic-ai/claude-code@latest');
+  });
+
+  it('an ordinary update failure still shows the did-not-complete notice', async () => {
+    api.mockResolvedValue([makeEntry({
+      version: '2.1.100', ready: false, update_needed: true,
+      min_version: '2.1.114', supports_update: true,
+    })]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    emit('login.failed', {
+      slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 1, reason: 'nonzero_exit',
+    });
+    expect(screen.getByTestId('sub-agent-update-notice-claude-code')).toHaveTextContent(/did not complete/i);
+    expect(screen.queryByTestId('sub-agent-update-missing-claude-code')).not.toBeInTheDocument();
+  });
+});
+
+describe('SubAgentSettings — expired sign-in (1018 bench item 9)', () => {
+  const expired = (overrides: Partial<Entry> = {}): Entry => makeEntry({
+    version: '2.1.302', credentials_configured: true, missing_credentials: [],
+    auth_expired: true, ...overrides,
+  });
+
+  it('shows "Sign-in expired", a note and the Login button instead of Logged in', async () => {
+    api.mockResolvedValue([expired()]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.getByText('Sign-in expired')).toBeInTheDocument();
+    expect(screen.queryByText('Logged in')).not.toBeInTheDocument();
+    expect(screen.getByTestId('sub-agent-auth-expired-claude-code')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^login$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^logout$/i })).not.toBeInTheDocument();
+  });
+
+  it('renders in Simplified Chinese', async () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    api.mockResolvedValue([expired()]);
+    render(
+      <LocaleProvider>
+        <SubAgentSettings />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.getByText('登录已过期')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument();
+  });
+
+  it('a signed-in agent without the record keeps Logged in and Logout', async () => {
+    api.mockResolvedValue([expired({ auth_expired: false })]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.getByText('Logged in')).toBeInTheDocument();
+    expect(screen.queryByTestId('sub-agent-auth-expired-claude-code')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^logout$/i })).toBeInTheDocument();
   });
 });
 

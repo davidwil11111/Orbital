@@ -78,6 +78,10 @@ interface SubAgentEntry {
   update_needed?: boolean;
   min_version?: string | null;
   supports_update?: boolean;
+  /** A dispatch failed with an authentication error while the CLI's status
+   *  probe still says signed in (it reads the local token file and cannot see
+   *  expiry). The card says "Sign-in expired" and offers Login. */
+  auth_expired?: boolean;
   setup_actions: Array<{ action: string; label: string; command: string | null; blocking: boolean }>;
   config: Record<string, string>;
   param_schema: Record<string, ParamSchemaEntry>;
@@ -116,6 +120,25 @@ const HOST_NOTE_KEY: Record<string, StringKey> = {
 const MANUAL_UPDATE_COMMAND: Record<string, string> = {
   'claude-code': 'npm install -g @anthropic-ai/claude-code@latest',
 };
+
+/** An Update terminal whose re-probe found no runnable CLI (1018 bench item
+ *  5). `reason` / `manual_command` are additive on `login.failed`; older
+ *  daemons send neither, so this is false for them. */
+function isCliMissingEvent(event: WebSocketEvent): event is WebSocketEvent & {
+  slug: string; reason: string; manual_command?: string;
+} {
+  if (event.type !== 'login.failed' || event.kind !== 'update') return false;
+  return (event as { reason?: string }).reason === 'cli_missing_after_update';
+}
+
+/** What a missing-CLI notice is waiting for: the recovery command, and
+ *  whether a refetch has shown the agent gone yet (only a gone → back
+ *  transition clears it, so the stale row on screen when the event lands
+ *  cannot). */
+interface CliMissing {
+  command: string | null;
+  seenGone: boolean;
+}
 
 /** The dotted number out of a `--version` line ("2.1.100 (Claude Code)" →
  *  "2.1.100") for the floor notice; the raw line stays on the version pill. */
@@ -231,6 +254,8 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const ws = useWebSocket();
+  const [cliMissing, setCliMissing] = useState<Record<string, CliMissing>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -247,6 +272,43 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  // 1018 bench item 5: an update that took the CLI with it. Held here, not in
+  // the card, because the refetched "not installed" entry may render as the
+  // not-detected row instead of a card. The daemon already dropped its cached
+  // detection, so refetch at once rather than waiting for Refresh.
+  useEffect(() => {
+    const onFailed = (event: WebSocketEvent) => {
+      if (!isCliMissingEvent(event)) return;
+      setCliMissing(m => ({
+        ...m,
+        [event.slug]: { command: event.manual_command ?? null, seenGone: false },
+      }));
+      void load();
+    };
+    ws.on('login.failed', onFailed);
+    return () => { ws.off('login.failed', onFailed); };
+  }, [ws, load]);
+
+  useEffect(() => {
+    if (entries === null) return;
+    setCliMissing(m => {
+      let changed = false;
+      const next: Record<string, CliMissing> = { ...m };
+      for (const [slug, state] of Object.entries(m)) {
+        const entry = entries.find(e => e.slug === slug);
+        if (!entry) continue;
+        if (!entry.installed && !state.seenGone) {
+          next[slug] = { ...state, seenGone: true };
+          changed = true;
+        } else if (entry.installed && state.seenGone) {
+          delete next[slug];
+          changed = true;
+        }
+      }
+      return changed ? next : m;
+    });
+  }, [entries]);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -341,13 +403,27 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
       {visibleEntries !== null && visibleEntries.length > 0 && (
         <div className="flex flex-col gap-4">
           {visibleEntries.map(entry => (
-            isNotDetectedEntry(entry)
-              ? <NotDetectedRow key={entry.slug} slug={entry.slug} name={entry.name} />
-              : <SubAgentCard
-                key={entry.slug}
-                entry={entry}
-                onChanged={load}
-              />
+            <div key={entry.slug} className="flex flex-col gap-2">
+              {isNotDetectedEntry(entry)
+                ? <NotDetectedRow slug={entry.slug} name={entry.name} />
+                : <SubAgentCard entry={entry} onChanged={load} />}
+              {cliMissing[entry.slug] && (
+                <p
+                  data-testid={`sub-agent-update-missing-${entry.slug}`}
+                  className="text-xs text-error px-1"
+                >
+                  {t('subAgentCard.updateCliMissing', {
+                    name: entry.name,
+                    command: cliMissing[entry.slug].command
+                      ?? MANUAL_UPDATE_COMMAND[entry.slug]
+                      ?? entry.setup_actions.find(a => a.action === 'install_agent')?.command
+                      ?? '',
+                  })}
+                  {' '}
+                  <SendDiagnosticsLink context={{ kind: 'dispatch_failed', agent: entry.slug, detail: 'update_failed' }} />
+                </p>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -412,6 +488,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
 
   const paramKeys = Object.keys(entry.param_schema);
   const updateNeeded = entry.update_needed === true;
+  const authExpired = entry.auth_expired === true && entry.credentials_configured;
   const supportsUpdate = entry.supports_update !== false;
   const isApiKeyFlow = API_KEY_LOGIN_SLUGS.has(entry.slug);
   // Hide the Login button when the daemon reports the agent has no interactive
@@ -513,7 +590,17 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
       if (event.slug !== entry.slug) return;
       if (event.kind === 'update') {
         setUpdating(false);
+        // 1018 bench item 5: an update that left no runnable CLI is reported
+        // by the list (the refetched entry reads "not installed", which can
+        // swap this card for the not-detected row), and it refetches itself.
+        if (isCliMissingEvent(event)) {
+          setUpdateNotice(null);
+          return;
+        }
         setUpdateNotice('failed');
+        // The daemon re-probed and dropped its cached detection on every
+        // update terminal; show what is on disk now, not the pre-update row.
+        void onChanged();
         return;
       }
       setLoginBusy(false);
@@ -676,8 +763,10 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
               <StatusPill
                 label={usesManagedCredentials
                   ? (entry.credentials_configured ? t('subAgentCard.keySaved') : t('subAgentCard.keyNeeded'))
-                  : (entry.credentials_configured ? t('subAgentCard.loggedIn') : t('subAgentCard.notLoggedIn'))}
-                variant={entry.credentials_configured ? 'success' : 'warning'}
+                  : authExpired
+                    ? t('subAgentCard.authExpired')
+                    : (entry.credentials_configured ? t('subAgentCard.loggedIn') : t('subAgentCard.notLoggedIn'))}
+                variant={entry.credentials_configured && !authExpired ? 'success' : 'warning'}
               />
             )}
             {entry.version && (
@@ -764,6 +853,15 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
         </div>
       )}
 
+      {authExpired && supportsLogin && (
+        <p
+          data-testid={`sub-agent-auth-expired-${entry.slug}`}
+          className="text-xs text-warning mt-2"
+        >
+          {t('subAgentCard.authExpiredNote', { name: entry.name })}
+        </p>
+      )}
+
       {/* Orbital-managed install */}
       {!entry.installed && canInstall && (
         <div
@@ -836,7 +934,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
 
       {/* Login / Logout */}
       <div className="flex flex-wrap items-center gap-2 mt-3 mb-3">
-        {!entry.credentials_configured && supportsLogin && !updateNeeded && (
+        {(!entry.credentials_configured || authExpired) && supportsLogin && !updateNeeded && (
           <button
             onClick={handleLogin}
             disabled={loginBusy || !entry.installed}
@@ -856,7 +954,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
         )}
         {/* Logout drives the agent's own CLI logout command; agents whose key
             Orbital holds have a per-credential Remove instead. */}
-        {entry.credentials_configured && !usesManagedCredentials && !credentialState && (
+        {entry.credentials_configured && !authExpired && !usesManagedCredentials && !credentialState && (
           <button
             onClick={handleLogout}
             disabled={logoutBusy}

@@ -105,6 +105,13 @@ class ManifestSetup:
     min_version: str | None = None        # "2.1.114"
     update_command: str | None = None     # "claude update"
     update_label: str | None = None       # "Update Claude Code"
+    # The npm package an npm-method install came from. When the resolved
+    # binary is an npm install, the Update runs ``npm install -g
+    # <package>@latest`` directly instead of ``update_command`` (whose own npm
+    # step gave up after 39 s on a slow network and left the package
+    # half-removed — 1018 bench item 5). The same string names the manual
+    # recovery command. None = always use ``update_command``.
+    npm_package: str | None = None        # "@anthropic-ai/claude-code"
 
 
 @dataclass
@@ -288,6 +295,7 @@ class ManifestLoader:
             min_version=setup_data.get("min_version"),
             update_command=setup_data.get("update_command"),
             update_label=setup_data.get("update_label"),
+            npm_package=setup_data.get("npm_package"),
         )
 
         # Capabilities

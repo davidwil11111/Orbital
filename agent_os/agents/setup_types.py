@@ -40,3 +40,9 @@ class AgentSetupStatus:
     # when the version could not be read or the manifest declares no floor.
     update_needed: bool = False
     min_version: str | None = None
+    # A dispatch of this agent failed with an authentication error ("Failed
+    # to authenticate", "OAuth token has expired", "could not be refreshed")
+    # while its status probe still says signed in: the probe reads the local
+    # token file and cannot see the expiry (1018 bench item 9). The card asks
+    # the user to sign in again. Not a dispatch gate.
+    auth_expired: bool = False

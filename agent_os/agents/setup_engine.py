@@ -54,6 +54,26 @@ class StaleOkView:
         return self._engine.check_all(allow_stale=True)
 
 
+# What an agent's dispatch prints when its sign-in no longer works. Claude
+# Code: "Failed to authenticate. API Error: 401 … authentication_error …
+# OAuth token has expired", "OAuth session expired", "… could not be
+# refreshed", "Invalid API key · Please run /login". Matched against error
+# text only, never against a successful turn's output.
+_AUTH_FAILURE_RE = re.compile(
+    r"failed to authenticate"
+    r"|authentication_error"
+    r"|oauth (?:session|token) (?:has )?expired"
+    r"|could not be refreshed"
+    r"|please run /login",
+    re.IGNORECASE,
+)
+
+
+def is_auth_failure_text(text: str | None) -> bool:
+    """Whether a failed dispatch's error text says the sign-in is no good."""
+    return bool(text) and _AUTH_FAILURE_RE.search(text) is not None
+
+
 def _json_field(data, path: str):
     """Value at ``path`` in ``data``: a top-level key, or a dotted path.
 
@@ -138,6 +158,42 @@ class SetupEngine:
         # so a dispatch refused for "not signed in" can carry structured
         # diagnostics without re-running the probe. Enums and ints only.
         self._last_auth_probe: dict[str, dict] = {}
+        # Slugs whose last dispatch failed with an authentication error
+        # (see ``note_auth_failure``). In-memory: a restart forgets it, and
+        # the next failing dispatch records it again.
+        self._auth_failures: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Expired sign-in record (1018 bench item 9)
+    # ------------------------------------------------------------------
+
+    def note_auth_failure(self, slug: str, text: str | None) -> bool:
+        """Record that ``slug``'s dispatch failed with an authentication
+        error, when ``text`` says so. Returns whether it was recorded.
+
+        The ``oauth_cli`` probe reads the CLI's local token file, so an
+        expired token still probes as signed in; the failed dispatch is the
+        only evidence, and no network call is added to the probe. Drops the
+        cached sweep so the card turns on its next read.
+        """
+        if not is_auth_failure_text(text):
+            return False
+        if slug not in self._auth_failures:
+            self._auth_failures.add(slug)
+            self.invalidate_cache()
+            logger.info("%s: dispatch failed with an authentication error; "
+                        "marking its sign-in as expired", slug)
+        return True
+
+    def clear_auth_failure(self, slug: str) -> None:
+        """Forget the expired-sign-in record: a turn succeeded, a login was
+        confirmed, or the user logged out."""
+        if slug in self._auth_failures:
+            self._auth_failures.discard(slug)
+            self.invalidate_cache()
+
+    def auth_expired(self, slug: str) -> bool:
+        return slug in self._auth_failures
 
     def set_sub_agent_config_store(self, store) -> None:
         """Late-bind the sub-agent config store (called by app factory)."""
@@ -197,9 +253,20 @@ class SetupEngine:
         # Dependencies
         deps_met, missing_deps = self.check_dependencies(manifest)
 
-        # Credentials
-        missing_creds, credential_state = self._evaluate_credentials(manifest, binary)
+        # Credentials. A CLI that is not installed is not probed: the bare
+        # command can only fail, and it logged an "auth probe failed" WARNING
+        # per absent agent on every sweep (1018 bench item 9).
+        missing_creds, credential_state = self._evaluate_credentials(
+            manifest, binary, probe_cli_auth=installed)
         creds_ok = not missing_creds
+
+        # A dispatch already failed with an authentication error. A probe
+        # that now says signed-out supersedes the record (that state speaks
+        # for itself, and a later sign-in must read as signed in); one that
+        # still says signed in cannot see the expiry, so it does not clear it.
+        if manifest.slug in self._auth_failures and installed and not creds_ok:
+            self.clear_auth_failure(manifest.slug)
+        auth_expired = installed and creds_ok and manifest.slug in self._auth_failures
 
         # Build setup actions
         actions = self._build_actions(manifest, installed, missing_deps, missing_creds,
@@ -219,6 +286,7 @@ class SetupEngine:
             credential_state=credential_state,
             update_needed=update_needed,
             min_version=min_version,
+            auth_expired=auth_expired,
         )
 
     @classmethod
@@ -419,11 +487,15 @@ class SetupEngine:
         return (len(missing) == 0, missing)
 
     def _evaluate_credentials(self, manifest: AgentManifest,
-                              resolved_binary: str | None) -> tuple[list[str], str | None]:
+                              resolved_binary: str | None, *,
+                              probe_cli_auth: bool = True) -> tuple[list[str], str | None]:
         """Missing required credential keys, plus the ``model_provider`` state.
 
         The state is None unless the manifest declares a ``model_provider``
         credential; only its "missing" answer counts as a missing key.
+
+        ``probe_cli_auth=False`` (the agent is not installed) reports every
+        probed ``oauth_cli`` credential missing without spawning its probe.
         """
         missing: list[str] = []
         state: str | None = None
@@ -444,6 +516,9 @@ class SetupEngine:
                     # credential that would read as "not logged in"; the
                     # spawn surfaces the CLI's own auth error if it is.
                     state = state or "unknown"
+                    continue
+                if not probe_cli_auth:
+                    missing.append(cred.key)
                     continue
                 if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary,
                                             slug=manifest.slug):

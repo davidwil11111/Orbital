@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from uuid import uuid4
@@ -63,6 +64,17 @@ LOGIN_JOB_TAIL_LINES = 5
 # has to be generous. What it actually stops is an abandoned flow leaking a
 # subprocess for the daemon's lifetime.
 LOGIN_IDLE_TIMEOUT_SECONDS = 300.0
+
+# Wall-clock budget for an Update job. npm prints almost nothing while it
+# downloads, and on a slow network a global reinstall took 3 min on the 1018
+# bench (``claude update``'s own npm step gave up after 39 s and left the
+# package half-removed), so the login idle timeout would kill it mid-install.
+UPDATE_TIMEOUT_SECONDS = 15 * 60
+
+# An update whose re-probe finds no runnable CLI afterwards (1018 bench item
+# 5): the job reports this instead of its exit-code reason, so the card can
+# say the CLI is gone and name the recovery command.
+CLI_MISSING_AFTER_UPDATE = "cli_missing_after_update"
 
 # OSC (Operating System Command) sequences, terminated by BEL or ST. The
 # claude CLI prints its login URL as an OSC-8 terminal hyperlink
@@ -684,6 +696,10 @@ def _build_sub_agent_status_entry(s) -> dict:
                   and not update_needed),
         "update_needed": update_needed,
         "min_version": getattr(s, "min_version", None),
+        # A dispatch failed with an authentication error while the probe
+        # still says signed in (1018 bench item 9): the card shows Login and
+        # "Sign-in expired". Not part of ``ready`` — it is a hint, not a gate.
+        "auth_expired": bool(getattr(s, "auth_expired", False)),
         "supports_update": bool(manifest is not None
                                 and manifest.setup.update_command),
         "dependencies_met": s.dependencies_met,
@@ -906,6 +922,51 @@ async def refresh_sub_agent_status():
     ])
 
 
+def _find_npm(binary: str | None) -> str | None:
+    """The npm to update an npm-method install with: the one next to the CLI
+    first (an nvm / fnm layout keeps ``bin/claude`` beside ``bin/npm``, and
+    PATH's npm may belong to another node), then PATH. ``shutil.which``
+    applies PATHEXT, so Windows gets ``npm.cmd``."""
+    names = ("npm.cmd", "npm.exe", "npm") if os.name == "nt" else ("npm",)
+    if binary:
+        directory = os.path.dirname(binary)
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return shutil.which("npm")
+
+
+def _npm_update_command(manifest, binary: str | None) -> str | None:
+    """``npm install -g <package>@latest`` for an npm-method install, or None
+    (native / unknown install, no ``npm_package`` declared, npm not found).
+
+    1018 bench item 5: ``claude update`` on an npm install gave up after 39 s
+    with the package half-removed. npm run directly, under
+    ``UPDATE_TIMEOUT_SECONDS``, finishes the reinstall instead. The npm path
+    is quoted for the shell the job runs through (``C:\\Program Files\\...``).
+    """
+    package = getattr(manifest.setup, "npm_package", None)
+    if not package or install_kind_of(binary) != "npm":
+        return None
+    npm = _find_npm(binary)
+    if not npm:
+        return None
+    argv = [npm, "install", "-g", f"{package}@latest"]
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    import shlex
+    return shlex.join(argv)
+
+
+def _manual_update_command(slug: str) -> str | None:
+    """The command a user can run by hand when the in-app update left them
+    without the CLI, or None when the manifest names no npm package."""
+    manifest = _registry_manifest(slug)
+    package = getattr(getattr(manifest, "setup", None), "npm_package", None)
+    return f"npm install -g {package}@latest" if package else None
+
+
 def _resolve_setup_command(slug: str, action: str) -> str | None:
     """Find the manifest's command string for a setup action.
 
@@ -931,6 +992,9 @@ def _resolve_setup_command(slug: str, action: str) -> str | None:
         cmd = manifest.setup.update_command
         if not cmd:
             return None
+        npm_cmd = _npm_update_command(manifest, binary)
+        if npm_cmd:
+            return npm_cmd
         if binary and manifest.runtime.command:
             return _setup_engine._substitute_binary(
                 cmd, manifest.runtime.command, binary)
@@ -1128,6 +1192,68 @@ async def _run_login_job(slug: str, job_id: str, command: str,
         else:
             telemetry.emit(f"{kind}_failed", fields)
 
+    is_update = kind == "update"
+    # An update runs against a wall-clock budget (npm is silent while it
+    # downloads); a login against an idle timeout (the user is in a browser).
+    deadline = started + UPDATE_TIMEOUT_SECONDS if is_update else None
+
+    def _drop_cached_detection() -> None:
+        # Re-check status now that the auth state / the install may have
+        # changed. This has to come before the re-check below so the list the
+        # UI refetches and the verdict we broadcast read the same fresh state.
+        if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
+            _setup_engine.invalidate_cache()
+        if is_update and _setup_engine is not None                 and hasattr(_setup_engine, "invalidate_resolved_path"):
+            # The updater may have moved the binary (npm → native migration
+            # into ~/.local/bin) or removed it; the next probe must find the
+            # new one, or none (116 D3, 1018 bench item 5).
+            _setup_engine.invalidate_resolved_path(slug)
+
+    async def _reprobe_update():
+        """Every update terminal re-probes the CLI (1018 bench item 5: a
+        failed npm step can take the CLI with it). Returns
+        ``(verified, cli_missing)``; a probe that could not run is neither."""
+        nonlocal diagnostics
+        _drop_cached_detection()
+        verified, after = await _update_now_sufficient(slug)
+        if after is None:
+            return False, False
+        diagnostics = {
+            "cli_version": clean_version(getattr(after, "version", None)),
+            "install_kind": install_kind_of(getattr(after, "binary_path", None)),
+        }
+        missing = not (getattr(after, "installed", False) and getattr(after, "version", None))
+        return verified, missing
+
+    def _fail(reason: str, *, return_code: int | None, timed_out: bool = False,
+              exc: BaseException | None = None, cli_missing: bool = False,
+              **extra) -> None:
+        if cli_missing:
+            reason = CLI_MISSING_AFTER_UPDATE
+        _finish("failed", reason=reason, return_code=return_code,
+                timed_out=timed_out, verified=False if is_update else None, exc=exc)
+        if _ws_manager is None:
+            return
+        event = {
+            "type": "login.failed",
+            "job_id": job_id,
+            "slug": slug,
+            "kind": kind,
+            "reason": reason,
+            **extra,
+        }
+        if return_code is not None:
+            event["return_code"] = return_code
+        if timed_out:
+            event["timed_out"] = True
+        if is_update:
+            event["verified"] = False
+        if cli_missing:
+            manual = _manual_update_command(slug)
+            if manual:
+                event["manual_command"] = manual
+        _ws_manager.broadcast_global(event)
+
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -1137,27 +1263,28 @@ async def _run_login_job(slug: str, job_id: str, command: str,
         )
     except OSError as exc:
         tail.append(_redact_urls(str(exc)))
-        _finish("failed", reason="spawn_error", return_code=None, exc=exc)
-        if _ws_manager is not None:
-            _ws_manager.broadcast_global({
-                "type": "login.failed",
-                "job_id": job_id,
-                "slug": slug,
-                "kind": kind,
-                "error": str(exc),
-            })
+        missing = (await _reprobe_update())[1] if is_update else False
+        _fail("spawn_error", return_code=None, exc=exc, cli_missing=missing,
+              error=str(exc))
         return
 
     job["pid"] = proc.pid
     assert proc.stdout is not None
     timed_out = False
     while True:
+        if deadline is not None:
+            wait = deadline - time.monotonic()
+            if wait <= 0:
+                timed_out = True
+                break
+        else:
+            wait = LOGIN_IDLE_TIMEOUT_SECONDS
         try:
-            raw = await asyncio.wait_for(proc.stdout.readline(),
-                                         timeout=LOGIN_IDLE_TIMEOUT_SECONDS)
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
         except asyncio.TimeoutError:
-            # Idle too long: the user walked away mid-OAuth. Kill it rather
-            # than hold the subprocess for the daemon's lifetime.
+            # Login: idle too long, the user walked away mid-OAuth. Update:
+            # past its budget. Kill it rather than hold the subprocess for
+            # the daemon's lifetime.
             timed_out = True
             break
         if not raw:
@@ -1181,58 +1308,38 @@ async def _run_login_job(slug: str, job_id: str, command: str,
         # `claude auth login` running (and holding the pipe open, so this
         # wait blocked until it exited on its own).
         await kill_spawned_tree(proc, label=f"{slug} {kind}")
-        _finish("failed", reason="timeout", return_code=None, timed_out=True,
-                exc=asyncio.TimeoutError())
-        if _ws_manager is not None:
-            _ws_manager.broadcast_global({
-                "type": "login.failed",
-                "job_id": job_id,
-                "slug": slug,
-                "kind": kind,
-                "timed_out": True,
-                "error": (
-                    f"{kind} timed out after "
-                    f"{int(LOGIN_IDLE_TIMEOUT_SECONDS)}s with no activity"
-                ),
-            })
+        if is_update:
+            missing = (await _reprobe_update())[1]
+            error = f"update timed out after {int(UPDATE_TIMEOUT_SECONDS)}s"
+        else:
+            missing = False
+            error = (f"{kind} timed out after "
+                     f"{int(LOGIN_IDLE_TIMEOUT_SECONDS)}s with no activity")
+        _fail("timeout", return_code=None, timed_out=True,
+              exc=asyncio.TimeoutError(), cli_missing=missing, error=error)
         return
 
     rc = await proc.wait()
     job["return_code"] = rc
 
-    # Re-check status now that the auth state may have changed. This has to
-    # come before the re-check below so the list the UI refetches and the
-    # verdict we broadcast are reading the same (fresh) state.
-    if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
-    if kind == "update" and _setup_engine is not None \
-            and hasattr(_setup_engine, "invalidate_resolved_path"):
-        # The updater may have moved the binary (npm → native migration into
-        # ~/.local/bin); the next probe must find the new one (116 D3).
-        _setup_engine.invalidate_resolved_path(slug)
+    if is_update:
+        verified, missing = await _reprobe_update()
+        if missing:
+            _fail("nonzero_exit" if rc != 0 else "unverified", return_code=rc,
+                  cli_missing=True)
+            return
+    else:
+        _drop_cached_detection()
 
     if rc != 0:
-        _finish("failed", reason="nonzero_exit", return_code=rc)
-        if _ws_manager is not None:
-            _ws_manager.broadcast_global({
-                "type": "login.failed",
-                "job_id": job_id,
-                "slug": slug,
-                "kind": kind,
-                "return_code": rc,
-            })
+        _fail("nonzero_exit", return_code=rc)
         return
 
-    if kind == "update":
-        verified, after = await _update_now_sufficient(slug)
-        if after is not None:
-            diagnostics = {
-                "cli_version": clean_version(getattr(after, "version", None)),
-                "install_kind": install_kind_of(getattr(after, "binary_path", None)),
-            }
-    else:
+    if not is_update:
         _forget_quota(slug)
         verified = await _credentials_now_configured(slug)
+        if verified:
+            _clear_auth_failure(slug)
     _finish("complete" if verified else "unverified",
             reason=None if verified else "unverified", return_code=rc,
             verified=verified)
@@ -1246,6 +1353,14 @@ async def _run_login_job(slug: str, job_id: str, command: str,
             "return_code": rc,
             "verified": verified,
         })
+
+
+def _clear_auth_failure(slug: str) -> None:
+    """Drop the engine's expired-sign-in record for ``slug`` (a confirmed
+    login or a logout); a no-op on engines without one."""
+    clear = getattr(_setup_engine, "clear_auth_failure", None)
+    if callable(clear):
+        clear(slug)
 
 
 def _now_iso() -> str:
@@ -1412,6 +1527,8 @@ async def trigger_sub_agent_logout(slug: str):
     if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
     _forget_quota(slug)
+    if result.returncode == 0:
+        _clear_auth_failure(slug)
 
     return {
         "slug": slug,

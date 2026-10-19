@@ -50,6 +50,12 @@ setup:
   # code (a pre-2.1.288 npm updater reports success with only the stub).
   update_command: "claude update"
   update_label: "Update Claude Code"
+  # An npm-method install is updated with npm itself, `npm install -g
+  # @anthropic-ai/claude-code@latest`, under a 15-minute budget: `claude
+  # update`'s own npm step gave up after 39 s on a slow network and left the
+  # package half-removed (1018 bench item 5). Native installs keep
+  # `update_command`. Also the manual recovery command the card names.
+  npm_package: "@anthropic-ai/claude-code"
   credentials:
     - key: "claude_auth"
       label: "Claude Account"

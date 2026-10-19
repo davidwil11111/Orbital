@@ -1469,6 +1469,70 @@ class SubAgentManager:
                     project_id, handle,
                 )
 
+    # Causes after which the turn's own error text is checked for an expired
+    # sign-in (1018 bench item 9), and the read budget for that check.
+    _AUTH_CHECK_CAUSES = ("error", "stream_ended", "consumer_exception")
+    _AUTH_TAIL_BYTES = 64 * 1024
+
+    def _track_auth_outcome(self, key: tuple, cause: str | None) -> None:
+        """Tell the setup engine whether this turn proved the agent's
+        sign-in good (a successful turn) or expired (an error turn whose
+        text is an authentication failure). The probe reads the CLI's local
+        token file and cannot see expiry; this is the only evidence. Never
+        raises — it must not disturb the FIFO advance below it."""
+        engine = self._setup_engine
+        handle = key[2]
+        try:
+            if cause == "success":
+                clear = getattr(engine, "clear_auth_failure", None)
+                if callable(clear):
+                    clear(handle)
+            elif cause in self._AUTH_CHECK_CAUSES:
+                note = getattr(engine, "note_auth_failure", None)
+                if callable(note):
+                    text = self._turn_tail_text(self._transcripts.get(key))
+                    if text:
+                        note(handle, text)
+        except Exception:
+            logger.warning("auth outcome tracking failed for %s", handle,
+                           exc_info=True)
+
+    @classmethod
+    def _turn_tail_text(cls, transcript) -> str:
+        """The text rows of the transcript's LAST turn (after the previous
+        turn boundary), read from the file's tail only."""
+        path = getattr(transcript, "filepath", None)
+        if not path:
+            return ""
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - cls._AUTH_TAIL_BYTES))
+                raw = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        rows = []
+        for line in raw.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # the partial first line of a seek, or junk
+            if isinstance(row, dict):
+                rows.append(row)
+        # Drop the closing boundary of THIS turn, then stop at the previous.
+        while rows and rows[-1].get("chunk_type") == "turn_complete":
+            rows.pop()
+        texts: list[str] = []
+        for row in reversed(rows):
+            if row.get("chunk_type") == "turn_complete":
+                break
+            if row.get("chunk_type") in ("error", "response", "message", None):
+                content = row.get("content")
+                if isinstance(content, str) and content:
+                    texts.append(content)
+        return "\n".join(reversed(texts))
+
     async def _on_prompt_turn_closed(
         self, project_id: str, handle: str, *, session_id: str | None = None,
         cause: str | None = None,
@@ -1476,6 +1540,7 @@ class SubAgentManager:
         """Advance a handle FIFO after its provider reports a real boundary."""
         session_id = self._resolve_session_id(session_id)
         key = (project_id, session_id, handle)
+        self._track_auth_outcome(key, cause)
         sk = make_session_key(project_id, session_id)
         lock = self._get_lock(project_id, session_id=session_id)
         async with lock:
