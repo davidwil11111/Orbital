@@ -137,7 +137,8 @@ def test_the_marker_never_reaches_the_agent(tmp_path):
     ('powershell -NoProfile -Command "git log -1"', "git"),
     ("bash -c 'npm test'", "npm"),
     ("FOO=1 git push", "git"),
-    ('"C:\\Program Files\\Git\\cmd\\git.exe" status', "git.exe"),
+    # A full path keys as its name only when PATH resolves that name to it:
+    # tests/unit/test_honest_grants.py.
 ])
 def test_allowlist_key_is_the_program_that_runs(command, key):
     assert ShellTool.executable_of(command) == key

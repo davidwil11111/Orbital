@@ -5,11 +5,14 @@
 """ShellTool — OS-aware command execution with output truncation and network meta."""
 
 import asyncio
+import ntpath
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Callable
 from uuid import uuid4
@@ -218,6 +221,37 @@ _INTERPRETERS = frozenset({
     "cmd", "powershell", "pwsh", "bash", "sh", "zsh", "dash", "fish", "wsl",
 })
 _COMPOUND_CHARS = frozenset(";&|(){}\n\r")
+#: Prefix assignments that change which program runs, or load code into it.
+#: ``PATH=./evil ls`` runs the agent's ``ls``, not the one the user allowed.
+_PROGRAM_CHANGING_VARS = frozenset({"PATH", "PATHEXT"})
+_PROGRAM_CHANGING_PREFIXES = ("LD_", "DYLD_")
+
+
+def _changes_program(name: str) -> bool:
+    upper = name.upper()
+    return upper in _PROGRAM_CHANGING_VARS or upper.startswith(_PROGRAM_CHANGING_PREFIXES)
+
+
+def _same_file(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _program_key(token: str) -> str:
+    """The allowlist key for the program *token* names.
+
+    A bare name keys as itself. A path keys as the bare name only when it is
+    the program that name runs (``/usr/bin/git`` when PATH's ``git`` is it);
+    otherwise as written, so the card names the program that runs:
+    ``./evil/ls`` is not ``ls``.
+    """
+    name = os.path.basename(token.replace("\\", "/"))
+    if name == token:
+        return token
+    if os.path.isabs(token) or ntpath.isabs(token):
+        found = shutil.which(name)
+        if found and _same_file(found, token):
+            return name
+    return token
 
 
 def _is_compound(command: str) -> bool:
@@ -478,23 +512,35 @@ class ShellTool(Tool):
                     external.append(path)
         return external
 
-    def _build_cmd(self, command: str) -> tuple[list[str], str | None]:
+    def _build_cmd(self, command: str, *,
+                   as_user: bool = False) -> tuple[list[str], str | None]:
         """The argv for *command*, plus the script file to delete afterwards.
 
-        Windows runs the command from a UTF-8 ``.ps1`` in the workspace's
-        ``orbital/.tmp`` (readable by the sandbox worker): passed inline it
+        Windows runs the command from a UTF-8 ``.ps1``: passed inline it
         crossed two layers of quoting (``cmd /c "… -Command <cmd> …"``) that
         dropped inner double quotes, and ``CreateProcessWithLogonW`` caps the
         command line at 1024 characters (bench 2026-10-19, issue 8).
+
+        A sandboxed run's script goes in the workspace's ``orbital/.tmp``,
+        where the worker can read it. A run *as the user* (``as_user``) uses
+        the user's own temp folder instead: the worker can write the
+        workspace, and a background worker process could swap the script
+        between this write and PowerShell reading it, running its own code
+        with the user's rights in place of the command the user approved.
         """
         if self._os_type != "windows":
             return ["bash", "-c", command], None
-        from agent_os.agent.project_paths import ProjectPaths
+        if as_user:
+            fd, script = tempfile.mkstemp(prefix="orbital_cmd_", suffix=".ps1")
+            f = os.fdopen(fd, "w", encoding="utf-8-sig", newline="\r\n")
+        else:
+            from agent_os.agent.project_paths import ProjectPaths
 
-        tmp_dir = ProjectPaths(self._workspace).tmp_dir
-        os.makedirs(tmp_dir, exist_ok=True)
-        script = os.path.join(tmp_dir, f"cmd_{uuid4().hex[:12]}.ps1")
-        with open(script, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            tmp_dir = ProjectPaths(self._workspace).tmp_dir
+            os.makedirs(tmp_dir, exist_ok=True)
+            script = os.path.join(tmp_dir, f"cmd_{uuid4().hex[:12]}.ps1")
+            f = open(script, "w", encoding="utf-8-sig", newline="\r\n")
+        with f:
             f.write(build_windows_script(command))
         return ["powershell", "-NoProfile", "-NonInteractive",
                 "-ExecutionPolicy", "Bypass", "-File", script], script
@@ -635,7 +681,7 @@ class ShellTool(Tool):
         Seatbelt, no worker account, no portals. Also the dev-daemon path
         (no platform provider wired), under its old name below.
         """
-        cmd, script = self._build_cmd(command)
+        cmd, script = self._build_cmd(command, as_user=True)
         env = {
             k: v for k, v in os.environ.items()
             if k.upper() not in _PROXY_ENV_VARS
@@ -682,10 +728,14 @@ class ShellTool(Tool):
     def executable_of(command: str, _depth: int = 0) -> str:
         """The program "always allow" records for *command* (spec 117 D5).
 
-        ``FOO=1 git push`` → ``git``; ``/usr/bin/git`` → ``git``. Interpreter
-        wrappers are unwrapped to the program they run (``cmd /c curl.exe …``
-        → ``curl.exe``), because allowlisting ``cmd`` would allow everything
-        (bench 2026-10-19, issue 7).
+        ``FOO=1 git push`` → ``git``; ``/usr/bin/git`` → ``git`` when that is
+        PATH's ``git``. Interpreter wrappers are unwrapped to the program they
+        run (``cmd /c curl.exe …`` → ``curl.exe``), because allowlisting
+        ``cmd`` would allow everything (bench 2026-10-19, issue 7).
+
+        The key names the program that actually runs, so the card never says
+        ``ls`` for the agent's own ``./evil/ls`` (keyed as ``./evil/ls``), and
+        a ``PATH=`` / ``LD_*`` / ``DYLD_*`` prefix gets no key at all.
 
         Empty — nothing to allowlist — when the command is not one program:
         chained, piped or carrying a sub-expression (``git status; X`` would
@@ -702,12 +752,14 @@ class ShellTool(Tool):
             if "=" in token and not token.startswith("="):
                 name = token.split("=", 1)[0]
                 if name and all(c.isalnum() or c == "_" for c in name):
+                    if _changes_program(name):
+                        return ""
                     index += 1
                     continue  # an environment assignment prefix
             break
         if index >= len(tokens):
             return ""
-        program = os.path.basename(tokens[index].replace("\\", "/"))
+        program = _program_key(tokens[index])
         stem = program.lower().removesuffix(".exe")
         if stem not in _INTERPRETERS:
             return program

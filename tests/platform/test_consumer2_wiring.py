@@ -206,20 +206,24 @@ class TestShellToolParamMapping:
         assert len(provider._calls) == 1
         assert provider._calls[0]["project_id"] == "my_project"
 
-    def test_maps_working_dir_to_workspace(self):
-        """run_command() receives workspace as working_dir."""
+    def test_maps_working_dir_to_workspace(self, tmp_path):
+        """run_command() receives workspace as working_dir.
+
+        A real folder: a Windows command is written to a script under the
+        workspace before it runs, so a made-up path fails before the provider.
+        """
         provider = _make_mock_provider(
             return_value=CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
         )
 
         tool = _make_shell_tool(
-            workspace="/my/workspace",
+            workspace=str(tmp_path),
             platform_provider=provider,
         )
         tool.execute(command="echo hello")
 
         assert len(provider._calls) == 1
-        assert provider._calls[0]["working_dir"] == "/my/workspace"
+        assert provider._calls[0]["working_dir"] == str(tmp_path)
 
     def test_maps_command_for_windows(self):
         """On windows, run_command() receives 'powershell' as command with args."""
