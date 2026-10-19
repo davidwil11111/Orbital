@@ -96,7 +96,7 @@ describe('ChatMessage — flat avatar-log layout (Design §5)', () => {
     // uncapped right-aligned "ok" would sit ~1200px from the reply it answers
     // on a maximised window. Notch flips tl→tr to point back at the label.
     const content = screen.getByText('hello world');
-    expect(content.className).toContain('bg-sidebar');
+    expect(content.className).toContain('bg-bubble');
     expect(content.className).toContain('max-w-[min(70%,680px)]');
     expect(content.className).toContain('rounded-tr-sm');
     expect(container.querySelector('.border.rounded-lg')).toBeNull();

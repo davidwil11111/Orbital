@@ -469,7 +469,7 @@ function TreeItem({ node, depth, selectedPath, onToggle, onFileClick, onReveal }
         className={`
           group relative flex items-center gap-1.5 w-full text-left py-1 px-2 rounded-md
           text-sm cursor-pointer select-none transition-colors duration-150
-          ${isSelected ? 'bg-card-hover text-primary' : 'text-primary hover:bg-card-hover'}
+          ${isSelected ? 'bg-selected text-selected-text' : 'text-primary hover:bg-card-hover'}
         `}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >

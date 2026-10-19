@@ -9,7 +9,8 @@ import { useAutosave } from '../hooks/useAutosave';
 import { api } from '../config';
 import BetaBadge from './BetaBadge';
 import SettingsSection, { SettingsGroup, LabelWithHint } from './SettingsSection';
-import SettingsBackButton from './SettingsBackButton';
+import SettingsToolbar from './SettingsToolbar';
+import AppearanceSection from './AppearanceSection';
 import AutosaveStatusPill from './AutosaveStatusPill';
 import CredentialCards from './CredentialCards';
 import FallbackModelsEditor from './FallbackModelsEditor';
@@ -61,6 +62,7 @@ interface GlobalSettingsPatch {
  */
 export const GLOBAL_SETTINGS_SECTIONS: SettingsRailSection[] = [
   { id: 'language', labelKey: 'global.language', groupKey: 'settings.group.general' },
+  { id: 'appearance', labelKey: 'appearance.title', groupKey: 'settings.group.general' },
   { id: 'about-you', labelKey: 'global.aboutYou.label', groupKey: 'settings.group.general' },
   { id: 'user-memory', labelKey: 'global.userMemory.label', groupKey: 'settings.group.general' },
   { id: 'quick-tasks-workspace', labelKey: 'global.scratch.label', groupKey: 'settings.group.general' },
@@ -129,30 +131,14 @@ export default function GlobalSettings({ onBack, onTakeTour, canTakeTour }: Glob
 
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-background">
-      {/* Header band — mirrors SettingsModalPage's exactly, because the two
-          settings surfaces are one design and used to disagree about it. This
-          page previously opened with an h1 + a text "Back" link floating
-          INSIDE the scrolling column, while project settings had a ruled band
-          with a back arrow, a title and a subtitle. Same track (rail-width
-          spacer + the same 720px column, same inner padding), same
-          justification, so the title lands on the left edge of the fields
-          under it. */}
-      <div className="pt-5 pb-4 border-b border-border">
-        <div className="flex justify-start pl-6 max-md:pl-0 max-md:block">
-          <div className="w-44 shrink-0 max-lg:hidden" aria-hidden="true" />
-          <div className="flex flex-col gap-1 max-w-[720px] w-full min-w-0 px-6 max-md:px-4">
-            <SettingsBackButton
-              label={t('global.back')}
-              onClick={onBack}
-              testId="global-settings-back-button"
-            />
-            <h1 className="text-lg font-semibold text-primary mt-2" data-testid="global-settings-title">
-              {t('global.title')}
-            </h1>
-            <p className="text-sm text-secondary">{t('global.subtitle')}</p>
-          </div>
-        </div>
-      </div>
+      {/* Same toolbar as project settings — the two settings surfaces are one
+          design. No parent crumb: global settings belongs to no project. */}
+      <SettingsToolbar
+        title={t('global.title')}
+        onBack={onBack}
+        backTestId="global-settings-back-button"
+        titleTestId="global-settings-title"
+      />
 
       {/* Scrollable body */}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto min-h-0">
@@ -183,6 +169,10 @@ export default function GlobalSettings({ onBack, onTakeTour, canTakeTour }: Glob
                     <option key={l.code} value={l.code}>{l.label}</option>
                   ))}
                 </Select>
+              </SettingsSection>
+
+              <SettingsSection id="appearance" title={t('appearance.title')}>
+                <AppearanceSection />
               </SettingsSection>
 
               <SettingsSection

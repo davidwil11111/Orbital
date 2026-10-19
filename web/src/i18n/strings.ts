@@ -506,7 +506,6 @@ export const STRINGS = {
   "global.scratch.hint": { en: "Where Quick Tasks stores files", zh: "快速任务存储文件的位置" },
   "global.scratch.label": { en: "Quick Tasks Workspace", zh: "快速任务工作目录" },
   "global.scratch.placeholder": { en: "Default: ~/orbital/scratch/", zh: "默认：~/orbital/scratch/" },
-  "global.subtitle": { en: "Defaults and connected services shared by every project on this device.", zh: "所有项目空间共享的默认设置服务。" },
   "global.subAgents.heading": { en: "Sub-agents", zh: "子Agent" },
   "global.title": { en: "Global Settings", zh: "全局设置" },
   "global.userMemory.hint": { en: "Facts your agents noted when you told them about yourself, shared with every project. Edit or delete lines here — each line shows which project saved it.", zh: "当你向Agent介绍自己时，它们记下的事实，供所有项目空间共享。可在此编辑或删除，每行都标注了来源项目。" },
@@ -1008,9 +1007,9 @@ export const STRINGS = {
   "settings.unsandboxed.removeAria": { en: "Remove {exe}", zh: "移除 {exe}" },
   "settings.unsandboxed.resolveError": { en: "Couldn't apply that answer. Please try again.", zh: "操作失败，请重试。" },
   "settingsIcon.aria": { en: "Project settings", zh: "项目空间设置" },
-  "settingsModal.back": { en: "Back to {project}", zh: "返回 {project}" },
-  "settingsModal.subtitle": { en: "Configure agent behaviour, LLM provider, autonomy, and more for this project.", zh: "配置该项目空间的Agent行为模式、模型商、权限级别等。" },
-  "settingsModal.title": { en: "Project settings — {project}", zh: "项目空间设置 — {project}" },
+  "settingsModal.crumb": { en: "Settings", zh: "设置" },
+  "settingsToolbar.back": { en: "Back", zh: "返回" },
+  "settingsToolbar.breadcrumb": { en: "Location", zh: "当前位置" },
   // --- settingsRail: settings index rail (spec 011 §0.8, Task D1). Section
   // labels reuse each group's existing heading key; only rail-specific
   // strings and labels for groups WITHOUT a stable heading key live here. ---
@@ -1381,6 +1380,12 @@ export const STRINGS = {
   "trigger.sched.dow.4": { en: "Thursday", zh: "周四" },
   "trigger.sched.dow.5": { en: "Friday", zh: "周五" },
   "trigger.sched.dow.6": { en: "Saturday", zh: "周六" },
+  // --- appearance: theme picker in Global Settings (Graphite dark mode). ---
+  "appearance.title": { en: "Appearance", zh: "外观" },
+  "appearance.option.system": { en: "System", zh: "跟随系统" },
+  "appearance.option.light": { en: "Light", zh: "浅色" },
+  "appearance.option.dark": { en: "Dark", zh: "深色" },
+  "appearance.hint": { en: "System follows your computer's light or dark setting. Saved on this device.", zh: "跟随电脑的浅色或深色设置，仅保存在此设备上。" },
 } as const satisfies Record<string, StringEntry>;
 
 export type StringKey = keyof typeof STRINGS;

@@ -302,7 +302,7 @@ describe('SessionListItem — active highlight', () => {
     expect(row.className).not.toContain('font-medium');
   });
 
-  it('applies white background style when selected', () => {
+  it('applies the card surface (white in light mode) when selected', () => {
     render(
       <SessionListItem
         session={makeSession({ session_id: 'sess-bg' })}
@@ -311,7 +311,7 @@ describe('SessionListItem — active highlight', () => {
       />,
     );
     const row = screen.getByTestId('session-list-item-sess-bg');
-    expect(row).toHaveStyle({ background: '#fff' });
+    expect(row.style.background).toBe('var(--color-session-selected)');
   });
 });
 

@@ -243,7 +243,7 @@ export default function SettingsRail({ sections, containerRef }: SettingsRailPro
                   // fainter than every other selection in the app.
                   className={`block w-full text-left text-[13px] leading-5 rounded-md px-2.5 py-1.5 transition-colors duration-150 truncate ${
                     activeId === s.id
-                      ? 'text-primary bg-card-hover font-medium'
+                      ? 'text-selected-text bg-selected font-medium'
                       : 'text-secondary hover:text-primary hover:bg-card-hover/50'
                   }`}
                 >

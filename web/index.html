@@ -8,6 +8,25 @@
     <!-- Fonts are self-hosted via @font-face in src/index.css (web/public/fonts).
          No Google Fonts CDN dependency. -->
     <link rel="manifest" href="/manifest.json">
+    <!-- Theme stamp, before first paint, so a dark user never sees a white
+         frame. Mirrors src/hooks/useTheme.ts: localStorage['orbital.theme'] is
+         'system' | 'light' | 'dark' (default 'system'). While 'system', it
+         also follows live OS appearance changes. -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var mql = null;
+        try { mql = window.matchMedia('(prefers-color-scheme: dark)'); } catch (e) {}
+        function apply() {
+          var pref = 'system';
+          try { pref = localStorage.getItem('orbital.theme') || 'system'; } catch (e) {}
+          var dark = pref === 'dark' || (pref !== 'light' && !!(mql && mql.matches));
+          root.dataset.theme = dark ? 'dark' : 'light';
+        }
+        apply();
+        if (mql && mql.addEventListener) mql.addEventListener('change', apply);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -41,7 +41,7 @@ export function WorkspacePanelBar({
         onClick={() => onViewChange(key)}
         className={`text-[11px] font-medium px-2.5 py-1 rounded-md transition-colors duration-150 ${
           active
-            ? 'bg-card text-primary shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
+            ? 'bg-segment-on text-segment-on-text shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
             : 'text-secondary hover:text-primary'
         }`}
       >

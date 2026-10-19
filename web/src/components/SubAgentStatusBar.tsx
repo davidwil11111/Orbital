@@ -16,9 +16,10 @@
 // process tree and cannot be guaranteed stopped (accepted limitation, see
 // REPORT-piece3-child-classification.md).
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { api } from '../config';
 import { useT } from '../i18n/useT';
+import { agentTint } from '../utils/agentIcons';
 import {
   useSubAgentStatus,
   type SubAgentInfo,
@@ -98,9 +99,12 @@ export default function SubAgentStatusBar({ projectId, sessionId, live }: Props)
         <div
           key={a.handle}
           data-testid={`sub-agent-chip-${a.handle}`}
-          className="flex items-center gap-1.5 shrink-0 rounded-full border border-zinc-700 bg-zinc-800/80 pl-2 pr-1 py-0.5"
+          // Dark mode tints each chip with the agent's brand colour (palette
+          // 1a), so Claude Code and Codex are told apart before reading.
+          style={{ '--agent-color': agentTint(a.handle) } as CSSProperties}
+          className="flex items-center gap-1.5 shrink-0 rounded-full border border-zinc-700 bg-zinc-800/80 pl-2 pr-1 py-0.5 dark:border-transparent dark:bg-[color-mix(in_srgb,var(--agent-color)_16%,transparent)]"
         >
-          <span className="text-zinc-300 max-w-[96px] truncate">{a.display_name}</span>
+          <span className="text-zinc-300 max-w-[96px] truncate dark:text-[color-mix(in_srgb,var(--agent-color)_45%,white)]">{a.display_name}</span>
           <span
             data-testid={`sub-agent-badge-${a.handle}`}
             data-status={a.status}

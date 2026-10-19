@@ -275,7 +275,7 @@ export default function Sidebar({
         data-tour={project.is_scratch ? 'quick-tasks-row' : undefined}
         onClick={() => onSelectProject(project.project_id)}
         className={`flex-1 min-w-0 text-left px-3 py-2 rounded-sm flex items-center gap-2.5 transition-all duration-150 max-md:min-h-[44px] ${
-          isActive ? 'bg-nav-hover' : 'hover:bg-nav-hover/50'
+          isActive ? 'bg-nav-selected' : 'hover:bg-nav-hover/50'
         }`}
       >
         {/* The dot rides in a 14px box — the width of the Calendar and
@@ -358,7 +358,7 @@ export default function Sidebar({
           onClick={onSelectCalendar}
           aria-current={route.name === 'calendar' ? 'page' : undefined}
           className={`w-full text-left px-3 py-2 rounded-sm flex items-center gap-2.5 transition-all duration-150 max-md:min-h-[44px] ${
-            route.name === 'calendar' ? 'bg-nav-hover' : 'hover:bg-nav-hover/50'
+            route.name === 'calendar' ? 'bg-nav-selected' : 'hover:bg-nav-hover/50'
           }`}
         >
           <Calendar size={14} className="shrink-0 text-secondary" aria-hidden="true" />
@@ -372,7 +372,7 @@ export default function Sidebar({
           aria-current={route.name === 'workbench' ? 'page' : undefined}
           aria-label={t(workbenchCount === 1 ? 'workbench.badge.aria.one' : 'workbench.badge.aria.other', { n: workbenchCount })}
           className={`w-full text-left px-3 py-2 rounded-sm flex items-center gap-2.5 transition-all duration-150 max-md:min-h-[44px] ${
-            route.name === 'workbench' ? 'bg-nav-hover' : 'hover:bg-nav-hover/50'
+            route.name === 'workbench' ? 'bg-nav-selected' : 'hover:bg-nav-hover/50'
           }`}
         >
           <Inbox size={14} className="shrink-0 text-secondary" aria-hidden="true" />
@@ -484,7 +484,7 @@ export default function Sidebar({
           aria-current={route.name === 'settings' ? 'page' : undefined}
           className={`w-full text-sm px-3 py-1.5 text-left rounded-lg transition-all duration-150 max-md:min-h-[44px] ${
             route.name === 'settings'
-              ? 'bg-nav-hover text-primary'
+              ? 'bg-nav-selected text-selected-text'
               : 'text-secondary hover:text-primary'
           }`}
         >
