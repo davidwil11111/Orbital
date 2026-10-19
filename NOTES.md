@@ -172,6 +172,18 @@ still runs as the user (approved script now in %TEMP%); `.\evil\x.exe` gets its 
 `echo x > .git\commondir` as the worker → the file is gone after the command and daemon.log says
 "Removed a planted …commondir".
 
+## Windows bench of run 39208656981 (2026-10-20, same Win10 machine)
+Full report: `docs/verification/1018-windows-bench-2026-10-20.md`. Installed over 0.17.0. Pass: W3 stale
+rewrite once per repo at startup then none (also none on the next start); config deny `(W,D,WDAC,WO)`
+(`0xD0116`); worker git status/log OK, remote add denied; planted `.git\commondir` removed + logged;
+allowlisted `whoami` runs as the user from `%TEMP%\orbital_cmd_*.ps1`; `.\evil\whoami.exe` stays
+sandboxed; `.\evil\icacls.exe` card parks with `executable: .\evil\icacls.exe`; open project runs as
+the user (fresh session). Not verifiable here: npm update success (machine's npm 9.4.1 dies silently
+on the 2.1.303 tarball from any shell; npm 10.9.2 works), 登录已过期 (credentials gone, not expired),
+dubious ownership (Git 2.35.1). New, pre-existing on main: all non-ASCII shell output becomes `?`
+(PowerShell writes the OEM code page into the redirected file). Fixed: UTF-8 OutputEncoding preamble in
+the `.ps1` + UTF-8 decode on the run-as-user path; verified live from source in both project kinds.
+
 ## Known / not verified
 - Linux auto_detect additions (115) unverified. The spec-116 "finding 7" (why a 2.1.302 probe failed on the
   reporter's machine) is still open; the new auth-probe WARNING in daemon.log is the instrument.
