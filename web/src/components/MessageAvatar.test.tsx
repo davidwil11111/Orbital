@@ -14,7 +14,7 @@ describe('MessageAvatar', () => {
     expect(box?.getAttribute('data-variant')).toBe('user');
     expect(box?.textContent).toBe('ME');
     expect(box?.className).toContain('bg-primary');
-    expect(box?.className).toContain('text-white');
+    expect(box?.className).toContain('text-card');
     expect(box?.className).toContain('w-[26px]');
     expect(box?.className).toContain('h-[26px]');
     expect(box?.className).toContain('rounded-md');

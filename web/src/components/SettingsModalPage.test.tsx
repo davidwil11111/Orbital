@@ -34,7 +34,7 @@ const baseRoute: Extract<Route, { name: 'project' }> = {
 };
 
 describe('SettingsModalPage', () => {
-  it('renders the back band with project name', () => {
+  it('renders a toolbar with a Back button and a "project / Settings" breadcrumb', () => {
     render(
       <SettingsModalPage
         project={mockProject}
@@ -45,26 +45,13 @@ describe('SettingsModalPage', () => {
       />,
     );
     const backBtn = screen.getByTestId('settings-back-button');
-    expect(backBtn).toBeInTheDocument();
-    expect(backBtn.textContent).toContain('Back to My Test Project');
-  });
-
-  it('renders the page title with the project name and does NOT render the redundant "Project · this project only" chip', () => {
-    render(
-      <SettingsModalPage
-        project={mockProject}
-        route={baseRoute}
-        setRoute={vi.fn()}
-        onSave={vi.fn()}
-        onDelete={vi.fn()}
-      />,
-    );
-    // The h1 carries the project name unambiguously — the mono chip that
-    // previously stacked above it ("Project · this project only") was
-    // redundant with both the back button and the h1, and has been removed.
-    const title = screen.getByTestId('settings-modal-title');
-    expect(title.textContent).toContain('Project settings — My Test Project');
-    expect(screen.queryByText(/project · this project only/i)).not.toBeInTheDocument();
+    expect(backBtn.tagName).toBe('BUTTON');
+    expect(backBtn.textContent).toBe('Back');
+    // The breadcrumb names where you are: the project, then the page.
+    const crumbs = screen.getByRole('navigation', { name: 'Location' });
+    expect(crumbs.textContent).toBe('My Test Project/Settings');
+    expect(screen.getByTestId('settings-modal-title').textContent).toBe('Settings');
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Settings');
   });
 
   it('renders the embedded SettingsView', () => {

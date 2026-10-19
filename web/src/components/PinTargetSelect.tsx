@@ -111,7 +111,7 @@ const MENU_ROW =
   'w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-primary text-left ' +
   'hover:bg-card-hover/50 max-md:min-h-[52px]';
 
-const ELEVATED = 'bg-card border border-border rounded-[10px] ' +
+const ELEVATED = 'bg-elevated border border-border rounded-[10px] ' +
   'shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)]';
 
 /** Agents whose subscription quota Orbital can read (spec 099 §2.1). */
@@ -184,8 +184,8 @@ interface Line { text: string; tone: LineTone }
 
 const LINE_CLASS: Record<LineTone, string> = {
   ok: 'text-secondary',
-  low: 'text-[#B45309]',
-  out: 'text-[#DC2626]',
+  low: 'text-warning-text',
+  out: 'text-error-text',
   muted: 'text-muted',
 };
 

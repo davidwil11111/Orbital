@@ -20,8 +20,8 @@ export interface EventColor {
 
 const NEUTRAL: EventColor = {
   border: 'hsl(220 9% 58%)',
-  bg: 'hsl(220 9% 58% / 0.10)',
-  text: 'hsl(220 12% 32%)',
+  bg: 'hsl(220 9% 58% / var(--event-fill-a, 0.10))',
+  text: 'hsl(220 12% var(--event-text-l, 32%))',
 };
 
 // A small fixed hue set spread around the wheel — enough variety without a
@@ -43,13 +43,17 @@ function hashString(s: string): number {
  * survives desaturation perfectly well; the chips still tell projects apart,
  * they just stop shouting. The fill alpha dropped with it (0.15 -> 0.09) so a
  * chip reads as a tint rather than a block of colour.
+ *
+ * Fill alpha and text lightness read through CSS vars that only the dark
+ * (Graphite) theme defines (index.css): a 34%-lightness label is unreadable on
+ * a dark chip. Unset, the fallbacks are the light values, unchanged.
  */
 export function eventColor(projectId: string | null): EventColor {
   if (!projectId) return NEUTRAL;
   const hue = HUES[hashString(projectId) % HUES.length];
   return {
     border: `hsl(${hue} 38% 52%)`,
-    bg: `hsl(${hue} 38% 52% / 0.09)`,
-    text: `hsl(${hue} 30% 34%)`,
+    bg: `hsl(${hue} 38% 52% / var(--event-fill-a, 0.09))`,
+    text: `hsl(${hue} 30% var(--event-text-l, 34%))`,
   };
 }

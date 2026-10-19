@@ -72,6 +72,32 @@
   --color-error: #EF4444;
   --color-idle: #8A8A94;
 
+  /* ------------------------------------------------------------- role tokens
+     Named for WHAT a surface is doing rather than its depth, so a theme can
+     restyle one role (e.g. tint selection with the accent) without touching
+     every other use of the base token. In light mode each one is EXACTLY the
+     base token or literal its call sites used before, so light renders
+     unchanged; the dark block below sets them all explicitly. */
+  --color-selected: var(--color-card-hover);       /* selected row on canvas/sidebar */
+  --color-nav-selected: var(--color-nav-hover);    /* selected row on the nav column */
+  --color-session-selected: var(--color-card);     /* selected session row (raised) */
+  --color-selected-text: var(--color-primary);
+  --color-segment-on: var(--color-card);           /* segmented control "on" chip */
+  --color-segment-on-text: var(--color-primary);
+  --color-tab-active: var(--color-primary);        /* underline tab: text + rule */
+  --color-bubble: var(--color-sidebar);            /* user chat bubble */
+  --color-bubble-text: var(--color-primary);
+  --color-send: var(--color-accent);               /* composer send glyph */
+  --color-link: var(--color-accent);               /* link text in markdown */
+  --color-soft-button: var(--color-card-hover);    /* filled secondary button (settings Back) */
+  --color-soft-button-hover: var(--color-nav-hover);
+  --color-warning-surface: #FFFBF0;                /* tinted warning panel */
+  --color-warning-text: #B45309;                   /* small warning text */
+  --color-error-surface: #FEF2F2;                  /* tinted error row/hover */
+  --color-error-text: #DC2626;                     /* small error text */
+  --color-qr-surface: var(--color-background);     /* QR quiet zone; must stay light */
+  --color-logo-ink: #1a1a2e;                       /* logo stem + leaf; applied on dark only */
+
   /* ------------------------------------------------------------------ radius
      One ladder, slightly softer than Tailwind's default, replacing the five
      competing scales (`rounded-lg` ×147, `md` ×35, `[6px]` ×18, `[10px]` ×4,
@@ -134,6 +160,88 @@
      offline and in China, consistent with the self-hosted-Latin approach. */
   --font-sans: 'Geist', 'Inter', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', 'Source Han Sans SC', 'Noto Sans SC', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', 'Source Han Sans SC', 'Noto Sans SC', ui-monospace, monospace;
+}
+
+/* ------------------------------------------------------------ dark: Graphite
+   The theme is `data-theme="dark"` on <html>, stamped before first paint by
+   the inline script in index.html and kept in step by hooks/useTheme.ts
+   (System / Light / Dark, per device in localStorage['orbital.theme']).
+
+   Dark mode is only a re-definition of the tokens above — every `bg-card`,
+   `text-primary`, `border-border` themes itself. EVERY dark colour lives in the
+   block below — components carry no dark literals; where a component needs a
+   colour that differs only on dark it uses a role token (`--color-selected`,
+   `--color-bubble`, …), so retuning the palette is an edit to this block
+   alone. The `dark:` variant keys off the same attribute, not the media
+   query, so a user who picked Light on a dark OS gets light everywhere.
+
+   The depth ladder is preserved and inverted the way dark UIs layer: surfaces
+   get LIGHTER as they come forward (nav < sidebar < canvas < card <
+   elevated), so `card` and `elevated` finally diverge here, as the comment
+   above anticipated. The R < G < B slate cast is kept on every surface. */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-nav: #111317;
+  --color-sidebar: #16191D;
+  --color-background: #1A1D22;
+  --color-card: #1E2126;
+  --color-elevated: #262A30;
+  --color-card-hover: #2A2E35;
+  --color-nav-hover: #23272E;
+  --color-border: #2D3138;
+
+  --color-primary: #E8EAED;
+  --color-secondary: #A3A7AF;
+  --color-muted: #7F848D;
+  --color-idle: #7F848D;
+
+  /* Accent stays the same FILL; status hues are unchanged and read on these
+     surfaces at >= 4.3:1. */
+
+  /* Role tokens (see the light definitions in @theme). Palette "1a —
+     Graphite + accent states": the surfaces above stay neutral and colour
+     goes only where it carries meaning — selection, the active tab, your own
+     messages, links and inline code take an azure tint; agents carry their
+     brand colour (SubAgentStatusBar chips, the author line in ChatMessage).
+     Plain grey Graphite read as dull in review; this keeps long reading
+     calm while the state of the screen is visible at a glance. */
+  --color-selected: rgb(83 154 248 / 0.16);
+  --color-nav-selected: rgb(83 154 248 / 0.16);
+  --color-session-selected: rgb(83 154 248 / 0.16);
+  --color-selected-text: #D6E7FF;
+  --color-segment-on: rgb(83 154 248 / 0.22);
+  --color-segment-on-text: #D6E7FF;
+  --color-tab-active: #539AF8;
+  --color-bubble: rgb(83 154 248 / 0.14);
+  --color-bubble-text: #E8EAED;
+  --color-send: #6FAEFB;
+  --color-link: #7DB4FB;
+  --color-code-surface: rgb(83 154 248 / 0.12);
+  --color-code-text: #A9CCFF;
+  /* nav-hover is DARKER than card-hover here, so the light pairing would
+     dim the button on hover; step up to the border tone instead. */
+  --color-soft-button: #2A2E35;
+  --color-soft-button-hover: #2D3138;
+  --color-warning-surface: rgb(245 158 11 / 0.10);
+  --color-warning-text: #FBBF24;
+  --color-error-surface: rgb(239 68 68 / 0.12);
+  --color-error-text: #F87171;
+  --color-qr-surface: #FFFFFF;
+  --color-logo-ink: #E8EAED;
+
+  /* Calendar / Workbench event chips (components/calendar/color.ts): a
+     lighter label and a stronger tint. Light mode leaves these unset and the
+     inline fallbacks apply. */
+  --event-text-l: 74%;
+  --event-fill-a: 0.16;
+
+  /* Light-mode shadows (black at 10–13%) vanish against a dark canvas. */
+  --shadow-panel: -1px 0 14px -4px rgb(0 0 0 / 0.5);
+  --shadow-well: inset 7px 0 8px -8px rgb(0 0 0 / 0.45),
+    inset -7px 0 8px -8px rgb(0 0 0 / 0.35);
 }
 
 /* Self-hosted fonts (woff2, latin subset). Bundled under web/public/fonts so
@@ -349,6 +457,13 @@ body {
     --color-secondary: #45454E;
     --color-muted: #52525B;
   }
+
+  /* The same push, toward the light end, for Graphite. */
+  :root[data-theme="dark"] {
+    --color-border: #5A606A;
+    --color-secondary: #C4C8CF;
+    --color-muted: #A3A7AF;
+  }
 }
 
 /* Markdown content styles for agent messages */
@@ -406,7 +521,10 @@ body {
 .markdown-content code {
   font-family: var(--font-mono);
   font-size: 0.85em;
-  background: var(--color-sidebar);
+  /* code-surface / code-text are set on dark only (palette 1a); light keeps
+     the sidebar fill and inherited text. */
+  background: var(--color-code-surface, var(--color-sidebar));
+  color: var(--color-code-text, inherit);
   padding: 0.15em 0.35em;
   border-radius: 4px;
 }
@@ -422,6 +540,7 @@ body {
 
 .markdown-content pre code {
   background: none;
+  color: inherit;
   padding: 0;
   font-size: 0.8125rem;
   line-height: 1.5;
@@ -453,7 +572,7 @@ body {
 }
 
 .markdown-content a {
-  color: var(--color-accent);
+  color: var(--color-link);
   text-decoration: underline;
 }
 
@@ -462,4 +581,59 @@ body {
   padding-left: 0.75em;
   color: var(--color-secondary);
   margin-bottom: 0.5em;
+}
+
+/* ------------------------------------------- chat <-> settings transition
+   Opening project settings morphs the project header into the settings
+   toolbar instead of cutting to a page with a bar of its own: both carry
+   `vt-project-header`, the project title and the toolbar's parent crumb both
+   carry `vt-project-title`, and `withViewTransition` (utils/viewTransition.ts)
+   wraps the route change. The header group shrinks from the full header
+   (title row + triggers + tabs) to the 52px toolbar, clipping as it goes, the
+   title glides into the crumb and Back slides in. The page bodies share
+   `vt-project-body` so they swap in sequence — old out, then new up — rather
+   than cross-dissolving two screens of text into each other; naming them also
+   keeps the rest of the app (the root group) still.
+   Where the API is missing the switch stays instant; reduced motion skips it
+   in JS. */
+.vt-project-header { view-transition-name: project-header; }
+.vt-project-title { view-transition-name: project-title; }
+.vt-settings-back { view-transition-name: settings-back; }
+.vt-project-body { view-transition-name: project-body; }
+
+::view-transition-group(*) {
+  animation-duration: 280ms;
+  animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 220ms;
+}
+::view-transition-group(project-header),
+::view-transition-group(project-body) {
+  overflow: clip;
+}
+::view-transition-old(project-body) {
+  animation: vt-fade-out 120ms ease-out both;
+}
+::view-transition-new(project-body) {
+  animation: vt-rise-in 220ms cubic-bezier(0.2, 0, 0, 1) 90ms both;
+}
+@keyframes vt-fade-out {
+  to { opacity: 0; }
+}
+@keyframes vt-rise-in {
+  from { opacity: 0; transform: translateY(10px); }
+}
+::view-transition-new(settings-back):only-child {
+  animation: vt-back-in 280ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+::view-transition-old(settings-back):only-child {
+  animation: vt-back-out 180ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+@keyframes vt-back-in {
+  from { opacity: 0; transform: translateX(-8px); }
+}
+@keyframes vt-back-out {
+  to { opacity: 0; transform: translateX(-8px); }
 }

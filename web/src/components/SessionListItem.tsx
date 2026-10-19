@@ -188,12 +188,12 @@ function SessionListItemBase({
       onMouseLeave={() => setHovered(false)}
       style={
         selected
-          ? { background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.04)' }
+          ? { background: 'var(--color-session-selected)', boxShadow: '0 1px 2px rgba(0,0,0,0.04)' }
           : undefined
       }
       className={[
         'relative flex items-center gap-1.5 px-2.5 py-[7px] rounded-md cursor-pointer select-none transition-colors',
-        selected ? 'font-medium' : 'hover:bg-card-hover',
+        selected ? 'font-medium text-selected-text' : 'hover:bg-card-hover',
       ].join(' ')}
     >
       {/* Status glyph — only differentiating states (running/waiting/blocked/
@@ -368,7 +368,7 @@ function SessionListItemBase({
                   setMenuOpen(false);
                   setConfirmingDelete(true);
                 }}
-                className="w-full text-left px-3 py-1.5 text-sm text-red-600 hover:bg-red-50"
+                className="w-full text-left px-3 py-1.5 text-sm text-error-text hover:bg-error-surface"
               >
                 {t('sessionItem.delete')}
               </button>

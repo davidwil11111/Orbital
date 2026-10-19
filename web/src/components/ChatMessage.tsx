@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 import type { DisplayItem } from '../utils/chatTransform';
 import { parseAttachmentsBlock } from '../lib/attachment-parsing';
 import { splitQuotesBlock } from '../utils/annotations';
@@ -11,6 +11,7 @@ import MarkdownContent from './MarkdownContent';
 import MessageAvatar from './MessageAvatar';
 import CopyButton from './CopyButton';
 import { useT } from '../i18n/useT';
+import { agentTint, MAIN_AGENT_HANDLE } from '../utils/agentIcons';
 
 type MessageItem = Extract<
   DisplayItem,
@@ -132,7 +133,7 @@ export default function ChatMessage({ message, agentName, workspace, onOpenPath 
             it answers. `min()` keeps it proportional on narrow/mobile panes and
             bounded on wide ones. The corner notch flips tl→tr to point back at
             the label above it, the way it used to point at the avatar. */}
-        <div className="inline-block max-w-[min(70%,680px)] rounded-lg rounded-tr-sm bg-sidebar px-3 py-2 text-[13px] leading-[1.55] text-primary whitespace-pre-wrap break-words">
+        <div className="inline-block max-w-[min(70%,680px)] rounded-lg rounded-tr-sm bg-bubble px-3 py-2 text-[13px] leading-[1.55] text-bubble-text whitespace-pre-wrap break-words">
           {hasChips && (
             <div className="flex flex-wrap gap-2 mb-2">
               {attachments.map((a, i) => (
@@ -198,7 +199,14 @@ export default function ChatMessage({ message, agentName, workspace, onOpenPath 
       <MessageAvatar variant="agent" agentHandle={isSubAgent ? message.source : undefined} />
       <div className="flex-1 min-w-0">
         <div className="group font-mono text-[11px] mb-1 flex items-center gap-1.5">
-          <span className="text-secondary">{senderLabel}</span>
+          {/* Dark mode names the agent in its brand colour, lifted toward white
+              so it reads on Graphite (palette 1a); light keeps text-secondary. */}
+          <span
+            className="text-secondary dark:text-[color-mix(in_srgb,var(--agent-color)_55%,white)]"
+            style={{ '--agent-color': agentTint(isSubAgent ? message.source : MAIN_AGENT_HANDLE) } as CSSProperties}
+          >
+            {senderLabel}
+          </span>
           {time && <span className="text-muted">· {time}</span>}
           {/* Header-only rows are an anchor for the capsule that follows and
               carry no body — a copy button there would copy nothing. */}

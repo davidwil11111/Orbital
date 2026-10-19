@@ -13,6 +13,11 @@
  * do not nudge, restyle or approximate it here. If the logo changes, it
  * changes in the generator, and these four shapes are re-copied from its
  * output.
+ *
+ * The one exception is colour on Graphite (dark): the black stem and navy leaf
+ * would vanish into the canvas, so they take `--color-logo-ink` there.
+ * A CSS `fill`/`stroke` outranks the presentation attribute, so light mode is
+ * untouched. The disc and the red bud keep their colours in both themes.
  */
 export default function OrbitalMark({ className }: { className?: string }) {
   return (
@@ -27,11 +32,13 @@ export default function OrbitalMark({ className }: { className?: string }) {
         d="M 385.000 127.000 A 252.000 252.000 0 0 1 133.000 379.000"
         fill="none"
         stroke="#000000"
+        className="dark:stroke-logo-ink"
         strokeWidth="12"
       />
       <path
         d="M 79.000 325.000 L 79.000 379.000 A 54.000 54.000 0 0 0 133.000 433.000 L 187.000 433.000 A 108.000 108.000 0 0 0 79.000 325.000 Z"
         fill="#1a1a2e"
+        className="dark:fill-logo-ink"
       />
       <path
         d="M 385.000 86.500 A 40.500 40.500 0 1 0 425.500 127.000 A 64.036 64.036 0 0 0 385.000 86.500 Z"

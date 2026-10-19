@@ -10,6 +10,7 @@ import AutomationsList from './AutomationsList';
 import StatusBadge from './StatusBadge';
 import TriggerStrip from './TriggerStrip';
 import SettingsIcon from './SettingsIcon';
+import { withViewTransition } from '../utils/viewTransition';
 import BudgetCorner from './BudgetCorner';
 import FilePreviewDrawer from './FilePreviewDrawer';
 import { OpenPathContext } from './filePreviewContext';
@@ -202,12 +203,14 @@ export default function ProjectDetail({
   }
 
   function handleSettingsClick() {
-    setRoute({ ...route, settings: true, previewPath: undefined });
+    withViewTransition(() => setRoute({ ...route, settings: true, previewPath: undefined }));
   }
 
   // Budget corner → open settings scrolled to the Budget section.
   function handleOpenBudgetSettings() {
-    setRoute({ ...route, settings: true, settingsAnchor: 'budget', previewPath: undefined });
+    withViewTransition(() =>
+      setRoute({ ...route, settings: true, settingsAnchor: 'budget', previewPath: undefined }),
+    );
   }
 
   // Trigger strip → the Automations pane of the Tasks tab (one management home).
@@ -235,6 +238,10 @@ export default function ProjectDetail({
 
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-card">
+      {/* Everything above the tab content, as one unit: opening settings folds
+          it into the SettingsToolbar (both carry `vt-project-header`, so the
+          View Transition morphs one into the other — see index.css). */}
+      <div className="vt-project-header shrink-0 bg-card">
       {/* Header */}
       <div className="flex items-center justify-between gap-2 px-6 pt-5 pb-4 max-md:px-4">
         {/* Left cluster keeps a readable minimum so a long budget pill on the
@@ -244,7 +251,7 @@ export default function ProjectDetail({
               tour spotlights it, and a half-screen-wide box around a short
               name points at nothing. */}
           <div data-tour="project-header" className="flex items-center gap-3 min-w-0">
-          <h1 className="text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">{projectDisplayName(project, t)}</h1>
+          <h1 className="vt-project-title text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">{projectDisplayName(project, t)}</h1>
           {/* Spec 102: Active while a pinned worker runs with the manager idle;
               a manager error/approval/waiting state is shown as-is. */}
           <StatusBadge status={displayRunStatus(agentStatus, subAgentsRunning)} />
@@ -315,7 +322,7 @@ export default function ProjectDetail({
               onClick={() => handleTabChange(tab.key)}
               className={`text-xs font-medium px-3 py-2 -mb-px transition-all duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center gap-1.5 ${
                 activeTab === tab.key
-                  ? 'text-primary border-b-2 border-primary'
+                  ? 'text-primary border-b-2 border-tab-active'
                   : 'text-secondary hover:text-primary'
               }`}
             >
@@ -329,12 +336,13 @@ export default function ProjectDetail({
           );
         })}
       </div>
+      </div>
 
       {/* Tab content. `relative` so the file-preview drawer (absolute) overlays
           only this content area, not the header/tab bar. The OpenPathContext
           hands the drawer-open handler down to the chat's MarkdownContent. */}
       <div
-        className={`flex-1 overflow-hidden min-h-0 relative ${
+        className={`vt-project-body flex-1 overflow-hidden min-h-0 relative ${
           activeTab === 'queue' ? 'bg-background' : ''
         }`}
       >
@@ -373,7 +381,7 @@ export default function ProjectDetail({
                         }
                         className={`text-[11px] font-medium px-3 py-1 rounded-md transition-colors duration-150 max-md:min-h-[40px] ${
                           active
-                            ? 'bg-card text-primary shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
+                            ? 'bg-segment-on text-segment-on-text shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
                             : 'text-secondary hover:text-primary'
                         }`}
                       >

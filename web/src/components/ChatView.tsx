@@ -4052,7 +4052,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             Reuses executeNewSession verbatim: the offer is the same /new flow
             the slash command runs, not a parallel path. */}
         <ContextStrip usage={contextUsage} onNewSession={executeNewSession} />
-        <div className="relative flex flex-col gap-2 bg-card border border-border rounded-lg shadow-[0_1px_2px_rgba(0,0,0,0.04)] px-3 py-2 transition-[border-color,box-shadow] duration-150 focus-within:border-accent focus-within:shadow-[0_0_0_3px_color-mix(in_oklab,var(--color-accent)18%,transparent)] motion-reduce:transition-none">
+        <div className="relative flex flex-col gap-2 bg-elevated border border-border rounded-lg shadow-[0_1px_2px_rgba(0,0,0,0.04)] px-3 py-2 transition-[border-color,box-shadow] duration-150 focus-within:border-accent focus-within:shadow-[0_0_0_3px_color-mix(in_oklab,var(--color-accent)18%,transparent)] motion-reduce:transition-none">
           {showCommandDropdown && filteredCommands.length > 0 && (
             <div className="absolute bottom-full left-0 mb-1 w-64 bg-zinc-800 border border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50">
               {filteredCommands.map((cmd, i) => (
@@ -4213,7 +4213,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                 title={disabledReason || undefined}
                 className={`shrink-0 p-1.5 rounded-lg transition-colors duration-150 cursor-pointer max-md:min-h-[44px] max-md:min-w-[44px] max-md:flex max-md:items-center max-md:justify-center ${
                   canSend
-                    ? 'text-accent hover:bg-accent/10'
+                    ? 'text-send hover:bg-send/10'
                     : 'text-secondary opacity-40'
                 }`}
               >

@@ -21,6 +21,11 @@ export interface AgentIcon {
   src?: string;
   monogram: string;
   color: string;
+  /**
+   * The vendor mark is single-colour black ink. It would vanish on the dark
+   * (Graphite) theme, so MessageAvatar inverts it there.
+   */
+  mono?: boolean;
 }
 
 /**
@@ -35,15 +40,15 @@ const ICONS: Record<string, AgentIcon> = {
   [MAIN_AGENT_HANDLE]: { src: '/icon-192.png', monogram: 'OR', color: '#D9694A' },
   'claude-code': { src: '/agents/claude-code.svg', monogram: 'CC', color: '#D97757' },
   claude: { src: '/agents/claude-code.svg', monogram: 'CC', color: '#D97757' },
-  codex: { src: '/agents/codex.svg', monogram: 'CX', color: '#10A37F' },
+  codex: { src: '/agents/codex.svg', monogram: 'CX', color: '#10A37F', mono: true },
   codebuddy: { src: '/agents/codebuddy.svg', monogram: 'CB', color: '#0052D9' },
-  cursor: { src: '/agents/cursor.svg', monogram: 'CU', color: '#1A1A1A' },
+  cursor: { src: '/agents/cursor.svg', monogram: 'CU', color: '#1A1A1A', mono: true },
   dsh: { src: '/agents/dsh.svg', monogram: 'DS', color: '#4D6BFE' },
   gemini: { src: '/agents/gemini.svg', monogram: 'GM', color: '#4285F4' },
-  grok: { src: '/agents/grok.svg', monogram: 'GK', color: '#000000' },
-  kimi: { src: '/agents/kimi.svg', monogram: 'KM', color: '#000000' },
+  grok: { src: '/agents/grok.svg', monogram: 'GK', color: '#000000', mono: true },
+  kimi: { src: '/agents/kimi.svg', monogram: 'KM', color: '#000000', mono: true },
   minimax: { src: '/agents/minimax.svg', monogram: 'MM', color: '#E2167E' },
-  pi: { src: '/agents/pi.svg', monogram: 'PI', color: '#111111' },
+  pi: { src: '/agents/pi.svg', monogram: 'PI', color: '#111111', mono: true },
 };
 
 export function getAgentIcon(handle: string): AgentIcon {
@@ -58,4 +63,17 @@ export function getAgentIcon(handle: string): AgentIcon {
   }
 
   return { monogram: (h || '?').slice(0, 2).toUpperCase(), color: '#6B7280' };
+}
+
+/**
+ * The colour to tint an agent's chrome with in dark mode (chips in the
+ * sub-agent bar, the author line on a message). Its brand colour, except
+ * near-black brands (Cursor, Grok, Kimi, Pi), which vanish as a tint on a dark
+ * surface and fall back to a neutral grey.
+ */
+export function agentTint(handle: string): string {
+  const { color } = getAgentIcon(handle);
+  const n = parseInt(color.slice(1), 16);
+  const brightness = ((n >> 16) & 0xff) + ((n >> 8) & 0xff) + (n & 0xff);
+  return brightness < 120 ? '#A3A7AF' : color;
 }

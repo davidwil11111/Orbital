@@ -149,8 +149,8 @@ describe('Sidebar routing', () => {
     // `nav-hover` tint rather than `card-hover`, because card-hover sits only
     // ~3 levels off the nav surface and would be invisible against it.
     const buttons = container.querySelectorAll('nav button');
-    expect(buttons[0].className).toContain('bg-nav-hover');
-    expect(buttons[1].className).not.toMatch(/\bbg-nav-hover\b(?!\/)/);
+    expect(buttons[0].className).toContain('bg-nav-selected');
+    expect(buttons[1].className).not.toContain('bg-nav-selected');
   });
 });
 

@@ -214,7 +214,7 @@ export default function PairPhone() {
 
               {/* Right: QR code */}
               <div className="flex-shrink-0 p-6 flex flex-col items-center justify-center border-l border-border bg-[var(--bg-primary,#111)] max-md:border-l-0 max-md:border-t">
-                <div className="bg-background p-3 rounded-xl shadow-lg shadow-black/20 max-md:max-w-full">
+                <div className="bg-qr-surface p-3 rounded-xl shadow-lg shadow-black/20 max-md:max-w-full">
                   <QRCodeSVG
                     value={lanUrl}
                     size={176}
@@ -332,7 +332,7 @@ export default function PairPhone() {
 
             {/* Right: QR code */}
             <div className="flex-shrink-0 p-6 flex flex-col items-center justify-center border-l border-border bg-[var(--bg-primary,#111)] max-md:border-l-0 max-md:border-t">
-              <div className="bg-background p-3 rounded-xl shadow-lg shadow-black/20 max-md:max-w-full">
+              <div className="bg-qr-surface p-3 rounded-xl shadow-lg shadow-black/20 max-md:max-w-full">
                 <QRCodeSVG
                   value={qrValue}
                   size={176}
