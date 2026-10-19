@@ -143,6 +143,35 @@ alone does not type-check (an i18n key moves in `d7a976c`). Bench machine state:
 / `open117` under `D:\orbital-1018-bench`, the installed app is still 0.17.0 (it will put the old deny
 shape back on those two test repos), global npm Claude Code restored to 2.1.100 from npm's backup.
 
+## Review follow-up (2026-10-19, Mac) — CURRENT INSTALLER: run 39208656981 @ 3843884
+Supersedes 39192198023 (never installed). Commits on top of the bench fixes:
+- `357ce1d` "Always allow X" is keyed on the program that actually runs: `./evil/ls`, `PATH=./evil:$PATH ls`
+  and `./evil/bash -c ls` no longer count as `ls` (the agent could run its own program as the user, no
+  card). Plain `ls`/`git`, `FOO=1 git push`, and a full path that is PATH's program key as before.
+  Windows: a command run as the user reads its `.ps1` from the user's %TEMP%, not the worker-writable
+  `orbital\.tmp` (a background worker process could swap it before PowerShell read it).
+- `bffe826` a top-level `.git/commondir` (redirects where git reads config; planted, it made the user's
+  `git status` run the agent's program) is denied on macOS and deleted by the per-command W3 pass on Windows.
+- `3843884` tests only (Windows path handling in the new tests).
+
+Mac daemon smoke (safe mode, `ls` allowlisted): `ls ~/.ssh` ran as the user, no card; `./evil/ls ~/.ssh`
+sandboxed + card keyed `./evil/ls`; `PATH=./evil:$PATH ls ~/.ssh` sandboxed + card without "always";
+`echo … > .git/commondir` denied, `git add/commit/log` in the same session fine. Local pytest 5275 passed.
+CI 39208656981: Windows backend only the known test_browser_live red; macOS also
+`test_event_loop_stalls_101::test_hydrate_on_inject_loads_off_the_loop` (0.33–0.43 s vs 0.3 s, 3 runs in a row
+since 357ce1d, never before; same runner image; locally 0.005–0.011 s on both old and new code — unexplained).
+
+Artifacts (Mac drop ~/Desktop/orbital-test-installers/batch-1018-3843884/, SHA256SUMS there):
+- `Orbital-0.17.0-macOS.dmg` sha256 68800a0d…5ed5; app accepted, source=Notarized Developer ID; ticket
+  stapled to the DMG; app CDHash 3b1ca2fb4893323178b68a253070b889ab8d207b.
+- `Orbital-Setup-0.17.0.exe` sha256 e217042e…db93:
+  `gh run download 39208656981 -R zqiren/Orbital -n Orbital-Windows-installer -D orbital-1018`
+
+Windows checks for this build, on top of "Still needs a Windows machine" above: an always-allowed command
+still runs as the user (approved script now in %TEMP%); `.\evil\x.exe` gets its own "always" label;
+`echo x > .git\commondir` as the worker → the file is gone after the command and daemon.log says
+"Removed a planted …commondir".
+
 ## Known / not verified
 - Linux auto_detect additions (115) unverified. The spec-116 "finding 7" (why a 2.1.302 probe failed on the
   reporter's machine) is still open; the new auth-probe WARNING in daemon.log is the instrument.
