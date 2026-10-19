@@ -56,6 +56,28 @@ def test_script_keeps_the_command_exit_semantics_and_emits_the_marker():
     assert "exit 1" in script
 
 
+def test_script_writes_its_output_as_utf8_before_the_command_runs():
+    # Bench 2026-10-20: redirected PowerShell 5.1 output is encoded in the
+    # OEM code page (437 on an en-US system locale), so CJK arrived as ``?``.
+    lines = build_windows_script("Write-Output x").splitlines()
+    assert "[Console]::OutputEncoding" in lines[0] and "UTF8Encoding" in lines[0]
+    assert lines.index("Write-Output x") > 0
+
+
+def test_unsandboxed_output_is_decoded_as_utf8(tmp_path):
+    # ``text=True`` alone decodes with the locale code page (cp1252/cp936).
+    tool = ShellTool(workspace=str(tmp_path), os_type="windows")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="中文\n", stderr="")
+
+    with patch("agent_os.agent.tools.shell.subprocess.run", side_effect=fake_run):
+        tool._execute_unsandboxed("Write-Output 中文", {"network": False, "domains": []})
+    assert seen.get("encoding") == "utf-8" and seen.get("errors") == "replace"
+
+
 def test_windows_build_cmd_runs_a_script_file(tmp_path):
     tool = ShellTool(workspace=str(tmp_path), os_type="windows")
     cmd, script_path = tool._build_cmd('Write-Output "a b"')
@@ -203,7 +225,8 @@ def test_safe_mode_projects_keep_the_focus_warning(tmp_path):
     ("Get-Item C:\\definitely_not_here_x", 1, None),
     ("Get-Item C:\\definitely_not_here_x; Write-Output x", 0, "x"),
     ("exit 7", 7, None),
-    ("Write-Output 中文", 0, None),
+    ("Write-Output 中文", 0, "中文"),
+    ('cmd /c "echo 中文测试 ®"', 0, "中文测试 ®"),
 ])
 def test_live_script_matches_powershell_command_semantics(tmp_path, command, code, expect):
     tool = ShellTool(workspace=str(tmp_path), os_type="windows")
@@ -211,6 +234,23 @@ def test_live_script_matches_powershell_command_semantics(tmp_path, command, cod
     assert result.content.startswith(f"Exit code: {code}\n"), result.content
     if expect is not None:
         assert expect in result.content.splitlines()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real PowerShell")
+def test_live_sandboxed_wrapper_output_is_utf8(tmp_path):
+    # The worker path: ``WindowsProcessManager.run_command`` redirects the
+    # script's output to files through ``cmd /c`` and reads them as UTF-8.
+    tool = ShellTool(workspace=str(tmp_path), os_type="windows")
+    cmd, script = tool._build_cmd(
+        'Write-Output "中文测试 ®"; cmd /c "echo 剪映专业版"')
+    out_path = tmp_path / "out.txt"
+    try:
+        line = subprocess.list2cmdline(cmd)
+        subprocess.run(f'cmd /c "{line} > "{out_path}" 2>&1"', cwd=str(tmp_path))
+    finally:
+        os.remove(script)
+    out = out_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    assert "中文测试 ®" in out and "剪映专业版" in out
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real ACLs")

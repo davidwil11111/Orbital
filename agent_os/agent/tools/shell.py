@@ -322,9 +322,14 @@ def build_windows_script(command: str) -> str:
     the ``-Command`` behaviour. ``$?`` is read on the line straight after the
     command, before the trailer's own statements reset it. The marker is
     printed when any error record is a permission denial, independent of the
-    UI language and of the exit code.
+    UI language and of the exit code. The first line makes the redirected
+    output UTF-8: PowerShell 5.1 otherwise encodes it in the OEM code page
+    (437 on an en-US system locale), where CJK becomes ``?`` (bench
+    2026-10-20). It also covers native programs the command runs.
     """
     return (
+        "try { $OutputEncoding = [Console]::OutputEncoding = "
+        "New-Object System.Text.UTF8Encoding $false } catch {}\n"
         f"{command}\n"
         "$__orbital_ok = $?\n"
         "if ($Error | Where-Object { $_.CategoryInfo.Category -eq 'PermissionDenied' "
@@ -693,6 +698,8 @@ class ShellTool(Tool):
                 cwd=self._workspace,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=_TIMEOUT,
                 env=env,
                 creationflags=win_no_window_flags(),

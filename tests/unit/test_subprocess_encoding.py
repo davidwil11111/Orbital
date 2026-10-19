@@ -38,12 +38,6 @@ _ASYNCIO_SPAWNERS = {"create_subprocess_exec", "create_subprocess_shell"}
 #: Files permitted to keep text-mode sites without explicit encoding/errors,
 #: mapped to ``(exact number of exempt sites, why)``.
 _ALLOWLIST: dict[str, tuple[int, str]] = {
-    "agent_os/agent/tools/shell.py": (
-        1,
-        "Shell tool runs arbitrary user commands; locale decoding of their "
-        "output is a deliberate policy question, and the call sits in a "
-        "broad `except Exception` that degrades to an error string.",
-    ),
     "agent_os/platform/null.py": (
         1,
         "NullProvider run_command executes arbitrary commands; same locale "
