@@ -3517,8 +3517,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
           ) : (
             <div className="mx-auto mt-10 flex w-full max-w-[460px] flex-col items-center px-2 text-center">
               {/* The mark, quietly: this is the agent you are about to talk to
-                  (the same logo MessageAvatar gives its replies). */}
-              <OrbitalMark className="h-14 w-14 opacity-90" />
+                  (the same logo MessageAvatar gives its replies). On Graphite
+                  it sits on a light tile like the app icon, in its own colours. */}
+              <div className="flex h-14 w-14 items-center justify-center dark:rounded-[14px] dark:bg-logo-tile">
+                <OrbitalMark keepColours className="h-14 w-14 opacity-90 dark:h-12 dark:w-12 dark:opacity-100" />
+              </div>
               <p className="mt-3 text-sm text-secondary">{t('chat.empty')}</p>
               {onboardingError && (
                 <p data-testid="onboarding-error" className="mt-2 text-sm text-error" role="alert">

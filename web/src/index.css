@@ -97,6 +97,7 @@
   --color-error-text: #DC2626;                     /* small error text */
   --color-qr-surface: var(--color-background);     /* QR quiet zone; must stay light */
   --color-logo-ink: #1a1a2e;                       /* logo stem + leaf; applied on dark only */
+  --color-logo-tile: #FFFFFF;                      /* tile behind logo + agent marks; dark only */
 
   /* ------------------------------------------------------------------ radius
      One ladder, slightly softer than Tailwind's default, replacing the five
@@ -231,6 +232,7 @@
   --color-error-text: #F87171;
   --color-qr-surface: #FFFFFF;
   --color-logo-ink: #E8EAED;
+  --color-logo-tile: #FFFFFF;
 
   /* Calendar / Workbench event chips (components/calendar/color.ts): a
      lighter label and a stronger tint. Light mode leaves these unset and the
