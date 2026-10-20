@@ -321,19 +321,20 @@ class TestContextBudgetReflection:
 
 class TestLessonsInstructionUpdate:
 
-    def test_append_mid_session_instruction(self):
-        """Normal project prompt says agent updates LESSONS.md proactively mid-session.
+    def test_write_at_run_end_instruction(self):
+        """Normal project prompt says the daemon asks at the end of every run.
 
-        The Layer-1 redesign replaced the explicit "You may append mid-session"
-        line with the unified instruction to update the memory files (including
-        LESSONS.md) proactively with the write/edit tools as work happens, plus
-        the trigger to add a lesson on error-recovery. Same intent: the agent
-        writes lessons during the session, not only at session end.
+        Spec 112 A6b / 124 §3.8 replaced "update them proactively as you
+        work" with a single, deterministic write point: the daemon asks what
+        to record at run end (and before compaction) and hands over the
+        current file text; the trigger to add a lesson on error-recovery
+        stays.
         """
         builder = PromptBuilder()
         ctx = make_context(is_scratch=False)
         _, semi_stable, _ = builder.build(ctx)
-        assert "Update them proactively with the write/edit tools as you work" in semi_stable
+        assert "Do not update the memory files during a run." in semi_stable
+        assert "Update them proactively" not in semi_stable
         assert "LESSONS.md" in semi_stable
         assert "Add a lesson when you" in semi_stable
 

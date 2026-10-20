@@ -245,8 +245,11 @@ async def test_session_end_routine_applies_editor_choices_by_id(tmp_path):
     assert out == "edited"
     state = ws.read("state")
     assert "- Old launch plan." not in state and "- Current focus." in state
-    assert "[archived " in state and f"id:{old_id}] old launch plan → PROJECT_STATE_ARCHIVE.md" in state
-    assert "- Old launch plan." in ws.read("state_archive")
+    assert "[archived " not in state and f"id:{old_id}" not in state
+    archive = ws.read("state_archive")
+    assert "- Old launch plan." in archive and f"id:{old_id}" in archive
+    assert f"- id:{old_id} · archived " in archive        # contents table
+    assert "PROJECT_STATE_ARCHIVE.md — 1 archived entry" in ws.read("index")
     assert "session_log" not in FILE_NAMES
 
 

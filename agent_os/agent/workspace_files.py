@@ -11,8 +11,11 @@ Manages the agent-maintained Layer-1 files in {workspace}/orbital/:
 
 Provides:
   - WorkspaceFileManager: read/write/append workspace files, build cold resume context
+  - prepass / postpass_conservation: the deterministic halves of a tidy pass
+    (spec 124 §3.7): normalise + stamp + archive contents tables + INDEX
+    archive lines before, id conservation after
   - run_session_end_routine: the memory editor (choices by id, see
-    memory_editor.py) followed by the deterministic, age-based size floor
+    memory_editor.py) between those two steps; the size floor only logs
 
 The active model (MiniMax-M3) has a 1,000,000-token window; bounds here exist for
 attention and a clean, non-contradictory project identity, NOT context pressure.
@@ -25,6 +28,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from agent_os.agent import memory_entries as _mem
@@ -440,26 +444,66 @@ class WorkspaceFileManager:
         except OSError:
             return None
 
-    def write(self, file_key: str, content: str) -> None:
-        """Write (overwrite) a workspace file atomically. Creates orbital/ if needed."""
-        if file_key not in FILE_NAMES:
-            raise ValueError(f"Unknown file_key: {file_key!r}. Must be one of {list(FILE_NAMES)}")
-        # Self-heal the in-file format contract on every system write (the
-        # agent-tool write path does the same in process_on_write). Archives
-        # keep their own header convention and are skipped.
+    def prepare(self, file_key: str, content: str, *, today: str | None = None) -> tuple[str, list[str]]:
+        """What ``write`` would put on disk for ``file_key``, without writing.
+
+        Entry files (PROJECT_STATE / DECISIONS / LESSONS) get the format
+        header, rule N1–N5 normalisation, ids and dates — the same chokepoint
+        the agent's write/edit tools go through. Legacy pointer lines whose
+        ids are not in the archive are folded INTO the archive here (archive
+        first — spec 124 §3.2 N5), so a caller that then writes the returned
+        text keeps the move ordered. Archives get their contents table
+        regenerated. Returns ``(text, warnings)``.
+        """
+        today = today or date.today().isoformat()
+        if file_key in _mem.ARCHIVE_KEYS:
+            return _mem.with_contents_table(content), []
         if file_key in _mem.FORMAT_HEADERS:
             content = _mem.ensure_format_header(content, file_key)
+        if file_key not in _mem.ENTRY_KEYS:
+            return content, []
+        res = _mem.normalise(content, file_key)
+        archive_key = _mem.ARCHIVE_OF[file_key]
+        if res.pointers:
+            ids_in_archive = _mem.archive_ids(self.read(archive_key))
+            unresolved = [
+                p for p in res.pointers
+                if not (p.ids and all(i in ids_in_archive for i in p.ids))
+            ]
+            if unresolved:
+                _append_archive_section(
+                    self, archive_key, f"## [pointers folded {today}]",
+                    "\n".join(p.line for p in unresolved),
+                )
+        content = res.text
+        warnings = list(res.warnings)
         if file_key == "state":
-            # Daemon-side PROJECT_STATE writes (memory editor, size floor)
-            # run through the same chokepoint as the agent tool path so every
-            # bullet keeps (or gets) its id and dates.
             from agent_os.agent import flag_chokepoint
-            prev = self.read("state")
-            content, _reconcile_warns = flag_chokepoint.reconcile_flags(
-                prev, content, date.today().isoformat(), None
+            content, reconcile_warns = flag_chokepoint.reconcile_flags(
+                self.read("state"), content, today, None,
             )
-            for _w in _reconcile_warns:
-                logger.info("reconcile_flags(state): %s", _w)
+            warnings.extend(reconcile_warns)
+        else:
+            content, stamp_warns = _mem.stamp(
+                content, self.read(file_key), file_key, today=today,
+                archive_ids=_mem.archive_ids(self.read(archive_key)),
+            )
+            warnings.extend(stamp_warns)
+        return content, warnings
+
+    def write(self, file_key: str, content: str) -> None:
+        """Write (overwrite) a workspace file atomically. Creates orbital/ if needed.
+
+        Every daemon-side write of an entry file goes through the same
+        chokepoint as the agent tool path (``prepare``): format header,
+        normalisation into the one entry shape, ids and dates. Archives get
+        their contents table regenerated.
+        """
+        if file_key not in FILE_NAMES:
+            raise ValueError(f"Unknown file_key: {file_key!r}. Must be one of {list(FILE_NAMES)}")
+        content, warnings = self.prepare(file_key, content)
+        for _w in warnings:
+            logger.info("memory write (%s): %s", file_key, _w)
         self.ensure_dir()
         filepath = self._file_path(file_key)
         tmp_path = filepath + ".tmp"
@@ -586,7 +630,9 @@ async def run_session_end_routine(
         result = await memory_editor.run_editor(
             workspace_files, llm, list_sessions=list_sessions, project_id=project_id,
         )
-        # The deterministic floor ALWAYS runs, editor or not; never an LLM call.
+        # The size floor never moves an entry (spec 124 §3.5): it only logs
+        # what is still past its hard cap. The existing over-budget trigger
+        # stays armed: the next change to a memory file is a delta again.
         _apply_hard_caps(workspace_files)
         if result.ok and not result.skipped_files:
             # Only a pass whose editor ran — over every file it chose to edit
@@ -676,111 +722,141 @@ def _occ_unchanged(
 def _append_archive_section(
     workspace_files: "WorkspaceFileManager", archive_key: str, heading: str, text: str,
 ) -> None:
-    """Append ``heading`` + ``text`` to an archive (created if missing).
+    """Append ``heading`` + ``text`` to an archive (created if missing), and
+    regenerate its contents table (spec 124 §3.6).
 
     Raises OSError on failure: every caller writes the archive BEFORE it
     shrinks the live file, so a failure here must stop the move.
     """
     archive_filename = FILE_NAMES[archive_key]
-    section = f"{heading}\n\n{text.strip(chr(10))}\n"
-    existing = workspace_files.read(archive_key) or ""
-    if existing.strip():
-        new_archive = existing.rstrip() + "\n\n" + section
-    else:
-        new_archive = f"# {archive_filename} (archived entries, read-on-demand)\n\n" + section
+    new_archive = _mem.append_archive_section(
+        workspace_files.read(archive_key), archive_filename, heading, text,
+    )
     workspace_files.write(archive_key, new_archive)
 
 
-def _ensure_index_archive_pointer(workspace_files: "WorkspaceFileManager", archive_filename: str) -> None:
-    """Make sure INDEX points to an archive file after a demotion."""
+def refresh_index_archive_lines(workspace_files: "WorkspaceFileManager") -> bool:
+    """INDEX gets one daemon-maintained line per existing archive (spec 124
+    §3.6): count + date range recomputed, the subject kept (or the
+    placeholder until a Memory session describes it). Returns True when
+    INDEX changed."""
+    archives = {
+        FILE_NAMES[k]: workspace_files.read(k) or ""
+        for k in _mem.ARCHIVE_KEYS if workspace_files.exists(k)
+    }
+    if not archives:
+        return False
     index = workspace_files.read("index") or ""
-    if archive_filename in index:
-        return
-    pointer = f"\n- {archive_filename} — older entries demoted from the live file (read on demand).\n"
-    workspace_files.write("index", (index.rstrip() + "\n" + pointer) if index.strip() else f"# INDEX\n{pointer}")
+    refreshed = _mem.refresh_index_archive_lines(index, archives)
+    if refreshed != index:
+        workspace_files.write("index", refreshed)
+        return True
+    return False
 
 
-def _apply_hard_caps(workspace_files: "WorkspaceFileManager") -> None:
-    """Deterministic size floor. Moves, never deletes, never an LLM call.
+# Kept under its old name for the callers that run after an archive write.
+_ensure_index_archive_pointer = refresh_index_archive_lines
 
-    Fires only on a file over its SOFT budget (the same measure as the
-    hygiene flag), cutting toward ``consolidation_target``. Every move leaves
-    an ``[archived DATE id:X] … → ARCHIVE`` pointer and writes the archive
-    before the live file shrinks.
 
-    - DECISIONS/LESSONS: stamp ids on any unstamped entry (so an unstamped
-      NEW entry is not mistaken for the coldest one), then demote the
-      coldest-``touched`` entries (oldest 3 and ``pinned`` are protected).
-    - PROJECT_STATE: age-based — only lines older than
-      ``STATE_PROBATION_DAYS``, oldest first; old pointers simply expire. When
-      what is left is all recent, the file stays over budget and that is
-      logged: over budget beats losing current work.
-    - INDEX: tail trim; archive-pointer lines are pinned.
+@dataclass
+class PrepassResult:
+    touched: list[str] = field(default_factory=list)       # file keys rewritten
+    pointer_paths: list[str] = field(default_factory=list)  # named by folded pointers
+    warnings: dict[str, list[str]] = field(default_factory=dict)
+
+
+def prepass(workspace_files: "WorkspaceFileManager", *, today: str | None = None) -> PrepassResult:
+    """The deterministic step before a tidy pass (spec 124 §3.7): normalise
+    (N1–N5, legacy pointers folded into the archive), stamp ids, give every
+    existing archive its contents table, refresh the INDEX archive lines.
+
+    Idempotent: a conforming project is left byte-identical. Returns what
+    was rewritten and the paths the folded pointers named (the Memory
+    session's task message lists them; nothing else consumes them yet).
     """
-    from agent_os.agent import memory_editor
-
-    today = date.today().isoformat()
-    for key in _mem.DURABLE_KEYS:
+    today = today or date.today().isoformat()
+    result = PrepassResult()
+    for key in _mem.ENTRY_KEYS:
         content = workspace_files.read(key)
-        if not content or not _mem.over_soft_budget(content, key):
+        if content is None:
             continue
-        memory_editor.normalise_ids(workspace_files, today=today)
-        content = workspace_files.read(key) or ""
-        archive_key = _mem.ARCHIVE_OF[key]
-        archive_filename = FILE_NAMES[archive_key]
-        kept, demoted, ids = _mem.demote_with_pointers(
-            content, key, _mem.consolidation_target(key), today, archive_filename,
-        )
-        if not demoted:
+        res = _mem.normalise(content, key)
+        for path in res.pointer_paths:
+            if path not in result.pointer_paths:
+                result.pointer_paths.append(path)
+        prepared, warnings = workspace_files.prepare(key, content, today=today)
+        if prepared != content:
+            workspace_files.write(key, prepared)
+            result.touched.append(key)
+            if warnings:
+                result.warnings[key] = warnings
+    for archive_key in _mem.ARCHIVE_KEYS:
+        archive = workspace_files.read(archive_key)
+        if archive is None:
             continue
-        try:
-            _append_archive_section(workspace_files, archive_key, f"## [archived {today}]", demoted)
-            workspace_files.write(key, kept)
-            _ensure_index_archive_pointer(workspace_files, archive_filename)
-        except OSError as e:
-            logger.warning(
-                "size backstop: could not demote %s to %s (%s); leaving the "
-                "live file intact — over budget beats losing entries",
-                key, archive_key, e,
-            )
-            continue
+        tabled = _mem.with_contents_table(archive)
+        if tabled != archive:
+            workspace_files.write(archive_key, tabled)
+            result.touched.append(archive_key)
+    if refresh_index_archive_lines(workspace_files):
+        result.touched.append("index")
+    if result.touched:
         logger.info(
-            "size backstop: demoted %d %s entries to %s by id: %s",
-            len(ids), key, archive_key, ", ".join(ids),
+            "memory prepass: rewrote %s%s", ", ".join(result.touched),
+            f"; folded pointers named {len(result.pointer_paths)} path(s)" if result.pointer_paths else "",
         )
+    return result
 
-    state = workspace_files.read("state")
-    if state and _mem.over_soft_budget(state, "state"):
-        memory_editor.normalise_ids(workspace_files, today=today)
-        state = workspace_files.read("state") or ""
-        archive_filename = FILE_NAMES["state_archive"]
-        floor = _mem.floor_state(state, _mem.consolidation_target("state"), today, archive_filename)
-        if floor.archived or floor.dropped_pointers:
-            try:
-                if floor.archived:
-                    _append_archive_section(
-                        workspace_files, "state_archive", f"## [trimmed {today}]", floor.archived)
-                workspace_files.write("state", floor.content)
-                if floor.archived:
-                    _ensure_index_archive_pointer(workspace_files, archive_filename)
-                logger.info(
-                    "size backstop: PROJECT_STATE moved %d line(s) to %s by id (%s), "
-                    "removed %d expired pointer(s)",
-                    len(floor.moved_ids), archive_filename, ", ".join(floor.moved_ids),
-                    floor.dropped_pointers,
-                )
-            except OSError as e:
-                logger.warning(
-                    "size backstop: could not archive PROJECT_STATE lines (%s); "
-                    "leaving the live file intact", e,
-                )
-        if floor.over_by:
-            logger.info(
-                "size backstop: PROJECT_STATE still over target by %d tok — every "
-                "remaining line is younger than %d days or not a bullet; leaving "
-                "it (over budget beats losing current work)",
-                floor.over_by, _mem.STATE_PROBATION_DAYS,
+
+def postpass_conservation(
+    workspace_files: "WorkspaceFileManager", snapshot: dict[str, str], keys=None,
+) -> list[str]:
+    """Id conservation after a pass (spec 124 §3.5): every id ``snapshot``
+    had must still be in the live file or in its archive, else the entry
+    comes back verbatim. Returns the restored ids (logged as ``restored=``)."""
+    restored_all: list[str] = []
+    for key in (keys if keys is not None else _mem.ENTRY_KEYS):
+        before = snapshot.get(key)
+        if not before:
+            continue
+        current = workspace_files.read(key) or ""
+        in_archive = _mem.archive_ids(workspace_files.read(_mem.ARCHIVE_OF[key]))
+        text, restored = _mem.restore_missing(before, current, in_archive)
+        if restored:
+            workspace_files.write(key, text)
+            logger.warning(
+                "memory pass: %s lost %d entr%s that never reached the archive; "
+                "restored=%s", FILE_NAMES[key], len(restored),
+                "y" if len(restored) == 1 else "ies", restored,
             )
+            restored_all.extend(restored)
+    return restored_all
+
+
+def _apply_hard_caps(workspace_files: "WorkspaceFileManager") -> list[str]:
+    """The size floor (spec 124 §3.5): never moves an entry, never an LLM call.
+
+    Archiving is a judgement ("superseded or finished"), never a matter of
+    age or size, so the daemon no longer demotes anything. The entry files
+    are only measured here: a file past its hard cap is logged and reported;
+    the injected view already folds it by section, and the existing
+    over-budget trigger runs the next pass once a memory file changes again.
+    INDEX keeps its tail trim (no entries, no archive).
+    Returns the file keys still past their hard cap.
+    """
+    over: list[str] = []
+    for key in _mem.ENTRY_KEYS:
+        content = workspace_files.read(key)
+        if not content or not _mem.over_hard_budget(content, key):
+            continue
+        over.append(key)
+        logger.info(
+            "size floor: %s is ~%d tok over its hard cap (%d); leaving it — the "
+            "injected view folds it by section and the next tidy pass is armed",
+            FILE_NAMES[key],
+            int(_mem.est_tokens(_mem.strip_format_header(content)) - _mem.FILE_BUDGETS[key]["hard"]),
+            _mem.FILE_BUDGETS[key]["hard"],
+        )
 
     index = workspace_files.read("index")
     if index and _mem.over_soft_budget(index, "index"):
@@ -789,3 +865,4 @@ def _apply_hard_caps(workspace_files: "WorkspaceFileManager") -> None:
         if trimmed != index:
             workspace_files.write("index", trimmed)
             logger.info("size backstop: trimmed INDEX to <= %d tok", target)
+    return over

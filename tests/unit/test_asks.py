@@ -764,7 +764,7 @@ class TestPromptRules:
 
     def test_rules_follow_the_memory_section(self):
         semi = self._semi()
-        assert semi.index("PROJECT_STATE.md: your current-state scratchpad") < semi.index("## Asks")
+        assert semi.index("PROJECT_STATE.md: what is true NOW") < semi.index("## Asks")
 
     def test_scratch_projects_get_no_asks_rules(self):
         assert "ASKS.md" not in self._semi(is_scratch=True)

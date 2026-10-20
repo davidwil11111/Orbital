@@ -60,13 +60,13 @@ def _seed(ws) -> dict:
     """Four Layer-1 files, each with one entry the editor will archive."""
     ws.write("state", "## Now\n- state entry to archive\n- state entry to keep\n")
     ws.write("decisions", (
-        "## Keep A <!--mem id:keep-a created:2026-08-01 touched:2026-08-01-->\nx\n\n"
-        "## Keep B <!--mem id:keep-b created:2026-08-01 touched:2026-08-01-->\nx\n\n"
-        "## Archive me <!--mem id:dec-go created:2026-08-01 touched:2026-08-01-->\nold\n\n"
+        "- Keep A\n  <!--mem id:keep-a created:2026-08-01 touched:2026-08-01-->\n  x\n\n"
+        "- Keep B\n  <!--mem id:keep-b created:2026-08-01 touched:2026-08-01-->\n  x\n\n"
+        "- Archive me\n  <!--mem id:dec-go created:2026-08-01 touched:2026-08-01-->\n  old\n\n"
     ))
     ws.write("lessons", (
-        "1. Keep this. <!--mem id:les-keep created:2026-08-01 touched:2026-08-01-->\n"
-        "2. Archive this. <!--mem id:les-go created:2026-08-01 touched:2026-08-01-->\n"
+        "- Keep this.\n  <!--mem id:les-keep created:2026-08-01 touched:2026-08-01-->\n"
+        "- Archive this.\n  <!--mem id:les-go created:2026-08-01 touched:2026-08-01-->\n"
     ))
     ws.write("index", "# INDEX\n- a.md — a\n")
     state_id = ws.read("state").split("id:")[1].split()[0]
@@ -117,8 +117,8 @@ async def test_clean_baseline_writes_all_layer1_files(tmp_path):
     choices = _seed(ws)
     out = await _run(ws, _provider_that(payload=choices), "sess_clean", "proj_clean")
     assert out == "edited"
-    assert "state entry to archive" not in ws.read("state").split("[archived")[0]
-    assert "## Archive me" not in ws.read("decisions")
+    assert "state entry to archive" not in ws.read("state")
+    assert "- Archive me" not in ws.read("decisions")
     assert "Archive this." not in ws.read("lessons")
     assert "- b.md — b" in ws.read("index")
 
@@ -164,7 +164,7 @@ async def test_one_file_aborts_others_still_write(tmp_path, caplog):
     ws = WorkspaceFileManager(str(tmp_path))
     choices = _seed(ws)
     lessons_path = ws._file_path("lessons")
-    user_lessons = ws.read("lessons") + "3. user-additional-lesson-during-llm\n"
+    user_lessons = ws.read("lessons") + "- user-additional-lesson-during-llm\n"
 
     async def _llm_side_effect(*args, **kwargs):
         with open(lessons_path, "w", encoding="utf-8") as f:
@@ -176,7 +176,7 @@ async def test_one_file_aborts_others_still_write(tmp_path, caplog):
         await _run(ws, _provider_that(side_effect=_llm_side_effect), "sess_multi", "proj_multi")
 
     assert ws.read("lessons") == user_lessons
-    assert "## Archive me" not in ws.read("decisions")
+    assert "- Archive me" not in ws.read("decisions")
     assert "- b.md — b" in ws.read("index")
     aborts = [r for r in caplog.records if "OCC abort" in r.message]
     assert len(aborts) == 1

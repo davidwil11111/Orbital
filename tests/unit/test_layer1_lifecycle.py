@@ -11,20 +11,19 @@ them. What survived was::
     - [user] **选方案 A / B / C**（默认 A）？
 
 and what was destroyed was the briefing that made it answerable. The fix then
-was section-level flag protection; spec 089 replaced it with something simpler
-that covers the same failure without the flag: the floor is AGE-based. It only
-ever moves a bullet older than 14 days (with its continuation lines, leaving a
-pointer), never prose or headings, and nothing recent — so a briefing written
-alongside its questions can only leave together with them, and only once all
-of it is old.
+was section-level flag protection; spec 089 replaced it with an age-based
+floor; spec 124 removed the floor altogether: the daemon never moves an
+entry, only a Memory session does, by judgement. The injected view folds
+what does not fit instead.
 
-  1. Recent content is never cut; old bullets MOVE, never delete.
-  2. PROJECT_STATE demotes to a Layer-2 ``PROJECT_STATE_ARCHIVE.md`` — never
-     injected, never budgeted, read on demand.
+  1. Nothing is ever cut by the daemon, whatever its age.
+  2. PROJECT_STATE's archive is ``PROJECT_STATE_ARCHIVE.md`` — never
+     injected, never budgeted, read on demand — and INDEX carries one line
+     per archive.
 
-Plus: INDEX carries the pointers that make every archive discoverable, and its
-``LESSONS_ARCHIVE`` pointer was the LAST line of the file — first to go under a
-tail-dropping trim, which would strand the archive on disk. Pointer lines are
+Plus: INDEX's archive lines make every archive discoverable, and its
+``LESSONS_ARCHIVE`` line was the LAST line of the file — first to go under a
+tail-dropping trim, which would strand the archive on disk. Those lines are
 pinned.
 """
 
@@ -68,20 +67,28 @@ def _old_bullets(n: int, created: str = "2026-01-01") -> str:
 # 1. A recent briefing is never cut — nor is prose, whatever its age
 # ---------------------------------------------------------------------------
 
-def test_recent_briefing_and_its_questions_survive_the_floor(tmp_path):
+def test_recent_briefing_and_its_questions_survive_the_floor(tmp_path, monkeypatch):
     """The exact regression shape, written today: the floor may not touch it,
     however far over target the file is."""
+    monkeypatch.setitem(_mem.FILE_BUDGETS, "state", {"soft": 5, "hard": 8})
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", BRIEFED_SECTION)       # the chokepoint stamps created=today
     content = ws.read("state")
-    r = _mem.floor_state(content, 5, _mem._today())
-    assert r.content is content
-    assert r.over_by > 0
+    from agent_os.agent import workspace_files as wsf
+    assert wsf._apply_hard_caps(ws) == ["state"]
+    assert ws.read("state") == content
+    assert "pick option A / B / C" in content
 
 
-def test_prose_and_headings_are_never_floor_candidates():
-    content = "# S\n\n## Old\n" + "".join(f"filler {i}\n" for i in range(400))
-    assert _mem.floor_state(content, 5, "2026-09-19").content is content
+def test_old_bullets_prose_and_headings_are_never_floor_candidates(tmp_path, monkeypatch):
+    monkeypatch.setitem(_mem.FILE_BUDGETS, "state", {"soft": 5, "hard": 8})
+    ws = WorkspaceFileManager(str(tmp_path))
+    ws.write("state", "# S\n\n## Old\n" + _old_bullets(20))
+    content = ws.read("state")
+    from agent_os.agent import workspace_files as wsf
+    wsf._apply_hard_caps(ws)
+    assert ws.read("state") == content
+    assert not ws.exists("state_archive")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +107,7 @@ def test_archives_are_layer2_never_injected():
         assert archive_key not in _mem.FILE_BUDGETS
 
 
-def test_state_overflow_moves_old_bullets_to_archive_instead_of_deleting(tmp_path):
+def test_state_overflow_only_folds_the_view_and_moves_nothing(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
     doomed = "UNIQUE-SENTINEL-OLD-BULLET-THAT-MUST-SURVIVE " + "d" * 300
@@ -111,18 +118,22 @@ def test_state_overflow_moves_old_bullets_to_archive_instead_of_deleting(tmp_pat
     from agent_os.agent import workspace_files as wsf
     wsf._apply_hard_caps(ws)
 
-    assert "- " + doomed not in (ws.read("state") or ""), "should have been moved out"
-    assert "id:dm0001" in (ws.read("state") or ""), "a pointer must be left"
-    assert doomed in (ws.read("state_archive") or ""), "must be MOVED, not deleted"
+    live = ws.read("state") or ""
+    assert "- " + doomed in live and "id:dm0001" in live
+    assert not ws.exists("state_archive")
+    view = _mem.inject_view(live, "state", _mem.FILE_BUDGETS["state"]["hard"])
+    assert "more entries in this section not shown" in view
+    assert "## Old" in view
 
 
-def test_state_archive_gets_an_index_pointer(tmp_path):
+def test_state_archive_gets_an_index_line(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
-    ws.write("state", "# S\n\n## Old\n" + _old_bullets(20))
     from agent_os.agent import workspace_files as wsf
-    wsf._apply_hard_caps(ws)
-    assert "PROJECT_STATE_ARCHIVE.md" in (ws.read("index") or "")
+    wsf._append_archive_section(ws, "state_archive", "## [archived 2026-09-19]", _old_bullets(1))
+    wsf.refresh_index_archive_lines(ws)
+    index = ws.read("index") or ""
+    assert "- orbital/PROJECT_STATE_ARCHIVE.md — 1 archived entry, 2026-09-19 to 2026-09-19: to be described." in index
 
 
 # ---------------------------------------------------------------------------

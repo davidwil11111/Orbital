@@ -174,10 +174,11 @@ class TestSystemPromptContextInstructions:
 
     def test_index_md_proactive_update_language(self, tmp_path):
         _cached, semi, _dyn = PromptBuilder(str(tmp_path)).build(_base_ctx(str(tmp_path)))
-        # 4C: agent maintains these proactively as it works, not only at a
-        # checkpoint boundary.
-        assert "proactively" in semi.lower()
-        assert "as you work" in semi.lower()
+        # Spec 112 A6b / 124 §3.8: the daemon asks at the end of every run,
+        # with the current file text in hand; INDEX is updated then too.
+        assert "at the end of every run" in semi.lower()
+        assert "including index.md whenever the set of" in semi.lower()
+        assert "proactively" not in semi.lower()
 
     def test_scratch_project_has_no_index_md_instruction(self, tmp_path):
         _cached, semi, _dyn = PromptBuilder(str(tmp_path)).build(

@@ -1,0 +1,33 @@
+<!--format PROJECT_STATE is what is true NOW: current focus, in-progress work, blockers, next steps. Overwrite stale lines; never append dated history. Every line must be understandable without this session's context: concrete names, no unexplained shorthand, no cross-references by list number. One fact = one entry, never duplicated into another section. A dated fact is `[due:YYYY-MM-DD]` right after the list marker (shows on the calendar). Write timeless ("due Jul 28", never "tomorrow"). Things waiting on the user (their decision, their action, something they said they will do) do NOT go here: they are asks in orbital/ASKS.md (see that file's header); a `[user]` line written here is moved there automatically. Never auto-decide: spending money, sending external messages as the user, or irreversible/destructive acts always go to the user, whatever the autonomy setting. Machine attributes (id, created, touched) live in a daemon-managed mem-comment on the next line — never write or edit these comments; leave them exactly where they are.-->
+# PROJECT_STATE.md
+- 焦点：「触发器视频画布」已从调研推进到可测原型 v2，并对齐用户提供的引擎「首期机制」触发器总表（6 类：本地时间 A01 / 天气 A05 / 开机解锁 H05·H01 / 空闲 H03 / 应用遮挡 D01 / 壁纸互动 G01·G02·G07·G09）。交付：原型 pr…
+  <!--mem id:34e1b9 created:2026-10-16 touched:2026-10-16-->
+<!--format PROJECT_STATE is what is true NOW: current focus, in-progress work, blockers, next steps. Overwrite stale lines; never append dated history. Every line must be understandable without this session's context: concrete names, no unexplained shorthand, no cross-references by list number. One fact = one entry, never duplicated into another section. A dated fact is `[due:YYYY-MM-DD]` right after the list marker (shows on the calendar). Write timeless ("due Jul 28", never "tomorrow"). Things waiting on the user (their decision, their action, something they said they will do themselves) do NOT go here — they are asks in orbital/ASKS.md (see that file's header).-->
+- 可交互壁纸「引擎型技术栈」选型调研已交付：报告 docs/research/2026-10-13-可交互壁纸引擎-游戏引擎型技术栈调研.md。背景：用户现有引擎是 CEF 封装（视频底+精灵中+特效顶三层合成），视频素材一致性难、被称"带触发器的视频播放器"；诉求=更像游戏引…
+  <!--mem id:92697e created:2026-10-14 touched:2026-10-14-->
+- 焦点任务：为静态壁纸「风景」线产出生产线方法。已交付第一层（单点「一景多貌」）：调研报告 docs/research/2026-10-08-精品风景壁纸生产线调研.md、模板 docs/design/wallpaper-landscape/风景壁纸-地标系列-生产模板.jso…
+  <!--mem id:2fde46 created:2026-10-08 touched:2026-10-08-->
+- AI 生图「提示词来源」调研已交付：报告 docs/research/2026-10-10-AI生图提示词来源调研.md。结论：国际主力 Lexica（每图带完整 prompt、已验证可开）+ Civitai 图片库（prompt/模型可见，需人工浏览器，直连 500）、Mi…
+  <!--mem id:426141 created:2026-10-10 touched:2026-10-10-->
+- 风景壁纸素材/信号调研已交付：报告 docs/research/2026-10-08-风景壁纸素材与用户信号来源调研.md + 批量探测脚本 prototypes/tools/landmark-source-probe.mjs。结论：素材源首选 Pixabay（有下载/点赞/…
+  <!--mem id:597595 created:2026-10-08 touched:2026-10-08-->
+- 风景壁纸关键结论（已查证）：不复刻任何具体受版权保护的摄影师作品（衍生作品侵权），素材限公有领域/CC0/官方公开图/自拍；商用避开埃菲尔铁塔夜间灯光秀等有灯光/建筑版权或商标限制的地标；Google 街景影像不可商用。生产以「地标锚点卡 + 机位/时段/天气/季节矩阵」为单…
+  <!--mem id:1d7f3b created:2026-10-08 touched:2026-10-08-->
+- 原型E遗留：用户确认可打开后，已完成日常动作与小遥扩展：5张新生图PNG、窗边看景/阅读/手冲/纸花/朋友来访、约4分钟自动轮换、手动预览和生活手记；30项新增检查与30项原玩法回归通过。说明及Canvas诊断图见 docs/design/assets/catgirl-sto…
+  <!--mem id:ddc662 created:2026-10-08 touched:2026-10-08-->
+- 用户核心反馈：角色必须漂亮精致的二次元图像，不要程序化简笔画。路线改为内置生图产出精美素材：角色分层立绘（表情/眼型/口型差分）+ 咖啡厅高清插画背景，Canvas 分层合成，程序化驱动呼吸/眨眼/口型/尾巴。
+  <!--mem id:f43173 created:2026-10-08 touched:2026-10-08-->
+- 原型 E 定位（已与用户三轮对齐确认）：全屏桌面壁纸、独立于农场/鱼池，非经营游戏性，核心是情感陪伴；猫娘莓在猫娘咖啡厅打工（供情绪价值的设定），有朋友、有奋斗目标，故事碎片渐进解锁（53 段，docs/design/assets/catgirl-story/story-fr…
+  <!--mem id:1d7dd2 created:2026-10-08 touched:2026-10-08-->
+- 玩法骨架（v1 已实现，v2 保留逻辑）：好感度只随陪伴时间自然增长；每天首开解锁 1 段故事，陪伴满 1 小时解锁第 2 段；四时段光影（真实时钟驱动）；点击身体/摸头/请她喝一杯（1h 冷却）；离开 6h/2 天/7 天分级问候；安静模式开关；存档键 tsukiyomi-…
+  <!--mem id:127ed6 created:2026-10-08 touched:2026-10-08-->
+- v2 已修复头身透明拼接缝、宽屏外侧时段光影和安静模式的强制到店/离开问候；53段故事、原存档键与解锁/咖啡规则保留。原v1的每日+5、摸头每日前10次+1羁绊仍保留，和“仅时间增长”文字存在差异，验收文档已注明。
+  <!--mem id:11b7b5 created:2026-10-08 touched:2026-10-08-->
+- claude-code 子代理额度已耗尽（TokenDance 余额为零，用户需到 tokendance.space 充值），对它派发一律 402；gemini-cli 未派发，用户明确本项目只许用 codex。
+  <!--mem id:9f5d13 created:2026-10-08 touched:2026-10-08-->
+- codex 已在恢复后续做v2；当前阻塞为沙箱拒绝Chromium的MachPortRendezvous系统端口，备用Chrome界面控制亦未获自动审批。需在允许启动浏览器的环境运行 prototypes/tests/catgirl-cafe-browser.mjs；v2/b…
+  <!--mem id:a765cb created:2026-10-08 touched:2026-10-08-->
+- 上一任务遗留：鱼池原型 D 真实画面、性能与浏览器交互验收仍未复跑（无头 Chrome 在沙箱内启动失败），脚本在 prototypes/tests/koi-pond-browser.mjs。
+  <!--mem id:d18db5 created:2026-10-08 touched:2026-10-08-->
+- 背景知识：项目已完成鱼池（proto-d）、农场（proto-b）、桌面舞台（proto-c）、像素小庭（jingyu-pixel）等原型；产品铁律五条（轻便/不打架/不打扰/放置可达/必须养成）在 docs/research/产品铁律-交互约束.md，新玩法先过五条。
+  <!--mem id:3f092b created:2026-10-08 touched:2026-10-08-->

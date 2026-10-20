@@ -13,11 +13,12 @@ regenerated files from a size-capped view and silently lost what it never saw.
 The pipeline now:
 
   P1 EDITOR  (LLM, read-only tools) chooses entries to archive or merge BY ID;
-                                    the daemon moves the exact bytes and leaves
-                                    a pointer. The reply is a short id list.
-  P2 FLOOR   (deterministic, always last) demote/trim toward target — age-based
-                                    for PROJECT_STATE, coldest-first for
-                                    DECISIONS/LESSONS, pointers every time.
+                                    the daemon moves the exact bytes into the
+                                    archive and leaves nothing behind (spec
+                                    124). The reply is a short id list.
+  P2 FLOOR   (deterministic, always last) measures and logs; it never moves
+                                    an entry (spec 124 §3.5). INDEX only is
+                                    tail-trimmed.
 """
 
 from __future__ import annotations
@@ -68,9 +69,9 @@ def _entries(n, *, key="decisions", pad=1100, tag=""):
     for i in range(1, n + 1):
         meta = f'<!--mem id:e{i:02d} created:2026-07-{i:02d} touched:2026-07-{i:02d}{" tag:" + tag if tag else ""}-->'
         if key == "decisions":
-            out.append(f"## 2026-07-{i:02d}: Decision {i} {meta}\n**Chose:** {'x' * pad}\n\n")
+            out.append(f"- 2026-07-{i:02d}: Decision {i}\n  {meta}\n  **Chose:** {'x' * pad}\n\n")
         else:
-            out.append(f"{i}. **Lesson {i}.** {'y' * pad} {meta}\n")
+            out.append(f"- Lesson {i}. {'y' * pad}\n  {meta}\n")
     return "".join(out)
 
 
@@ -84,9 +85,7 @@ def _over_budget_ws(tmp_path) -> WorkspaceFileManager:
 
 def _archive(*ids, key="decisions"):
     name = {"decisions": "DECISIONS.md", "lessons": "LESSONS.md"}[key]
-    return json.dumps({"archive": [
-        {"file": name, "id": i, "pointer": f"cold {i}"} for i in ids
-    ]})
+    return json.dumps({"archive": [{"file": name, "id": i} for i in ids]})
 
 
 @pytest.fixture(autouse=True)
@@ -120,18 +119,21 @@ async def test_editor_moves_bytes_exactly(tmp_path):
     await run_session_end_routine(_session("s_bytes"), provider, ws, session_uuid="s_bytes")
 
     archive = ws.read("decisions_archive") or ""
-    entry = "## 2026-07-05: Decision 5" + before.split("## 2026-07-05: Decision 5", 1)[1].split("## 2026-07-06", 1)[0]
+    entry = "- 2026-07-05: Decision 5" + before.split("- 2026-07-05: Decision 5", 1)[1].split("- 2026-07-06", 1)[0]
     assert entry.rstrip("\n") in archive, "archived text must be byte-identical"
 
 
 @pytest.mark.asyncio
-async def test_editor_pointer_with_id_is_left_behind(tmp_path):
+async def test_editor_leaves_nothing_in_the_live_file_and_names_the_archive_in_index(tmp_path):
     ws = _over_budget_ws(tmp_path)
     provider = _scripted_provider(json.dumps({"archive": [
-        {"file": "DECISIONS.md", "id": "e05", "pointer": "early naming decisions — read before a rebrand"}
+        {"file": "DECISIONS.md", "id": "e05", "pointer": "a legacy pointer field is ignored"}
     ]}))
     await run_session_end_routine(_session("s_stub"), provider, ws, session_uuid="s_stub")
-    assert "id:e05] early naming decisions — read before a rebrand → DECISIONS_ARCHIVE.md" in ws.read("decisions")
+    live = ws.read("decisions")
+    assert "id:e05" not in live and "[archived" not in live and "legacy pointer" not in live
+    assert "- id:e05 · archived " in ws.read("decisions_archive")
+    assert "- orbital/DECISIONS_ARCHIVE.md — 1 archived entry" in ws.read("index")
 
 
 @pytest.mark.asyncio
@@ -141,17 +143,17 @@ async def test_editor_never_archives_a_pinned_entry(tmp_path):
     ws.write("decisions", _entries(26, tag="pinned"))
     provider = _scripted_provider(_archive("e05"))
     await run_session_end_routine(_session("s_pin"), provider, ws, session_uuid="s_pin")
-    assert "Decision 5 <!--mem id:e05" in (ws.read("decisions") or ""), "pinned must stay live"
+    assert "- 2026-07-05: Decision 5\n  <!--mem id:e05" in (ws.read("decisions") or ""), "pinned must stay live"
 
 
 @pytest.mark.asyncio
 async def test_unknown_id_is_ignored_and_nothing_is_lost(tmp_path):
     ws = _over_budget_ws(tmp_path)
-    before_entries = ws.read("decisions").count("## 2026-07-")
+    before_entries = ws.read("decisions").count("- 2026-07-")
     provider = _scripted_provider(_archive("does-not-exist"))
     await run_session_end_routine(_session("s_bad"), provider, ws, session_uuid="s_bad")
-    live = (ws.read("decisions") or "").count("## 2026-07-")
-    archived = (ws.read("decisions_archive") or "").count("## 2026-07-")
+    live = (ws.read("decisions") or "").count("- 2026-07-")
+    archived = (ws.read("decisions_archive") or "").count("- 2026-07-")
     assert live + archived == before_entries, "an unmatched id must not lose entries"
 
 
@@ -165,23 +167,25 @@ async def test_malformed_payload_is_ignored(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# P2: the floor is the guarantee
+# P2: the floor measures; it never moves an entry
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_editor_failure_falls_through_to_the_floor(tmp_path):
+async def test_editor_failure_leaves_the_file_whole(tmp_path):
     ws = _over_budget_ws(tmp_path)
+    before = ws.read("decisions")
     provider = _scripted_provider(*(["not json at all"] * memory_editor.EDITOR_MAX_CALLS))
     outcome = await run_session_end_routine(
         _session("s_fail"), provider, ws, session_uuid="s_fail")
-    after = _mem.est_tokens(_mem._budget_text(ws.read("decisions"), "decisions"))
-    assert after <= _mem.consolidation_target("decisions")
     assert outcome == "backstop_only"
+    assert ws.read("decisions") == before
+    assert not ws.exists("decisions_archive")
 
 
 @pytest.mark.asyncio
-async def test_all_four_land_under_target_with_headroom(tmp_path):
-    """With nothing recent in the way, every file reaches its target."""
+async def test_only_the_editors_choices_move_and_index_is_trimmed(tmp_path):
+    """The editor's archive choices land; the floor moves nothing else (the
+    old state bullets stay, however old); INDEX alone is tail-trimmed."""
     ws = _over_budget_ws(tmp_path)
     ws.write("state", "# S\n\n## Old\n" + "".join(
         f"- old item {i} " + "o" * 600
@@ -189,13 +193,20 @@ async def test_all_four_land_under_target_with_headroom(tmp_path):
         for i in range(20)
     ))
     ws.write("index", "# INDEX\n" + "".join(f"- f{i}.md — x\n" for i in range(900)))
+    state_before = ws.read("state")
 
     provider = _scripted_provider(_archive(*[f"e{i:02d}" for i in range(4, 12)]))
     await run_session_end_routine(_session("s_e2e"), provider, ws, session_uuid="s_e2e")
 
-    for key in ("state", "decisions", "lessons", "index"):
-        now = _mem.est_tokens(_mem._budget_text(ws.read(key) or "", key))
-        assert now <= _mem.consolidation_target(key), f"{key} still over target"
+    live = ws.read("decisions")
+    for i in range(4, 12):
+        assert f"id:e{i:02d}" not in live
+    assert ws.read("decisions_archive").count("- 2026-07-") == 8
+    assert ws.read("state") == state_before
+    assert not ws.exists("state_archive")
+    index = ws.read("index")
+    assert _mem.est_tokens(index) <= _mem.consolidation_target("index") + 60
+    assert "DECISIONS_ARCHIVE.md" in index
 
 
 @pytest.mark.asyncio
@@ -218,6 +229,6 @@ async def test_archive_write_failure_does_not_crash_or_lose_content(tmp_path, mo
         _session("s_oserr"), provider, ws, session_uuid="s_oserr")
     assert outcome in ("no_change", "edited")
     after = ws.read("decisions") or ""
+    assert after.count("- 2026-07-") == before.count("- 2026-07-")
     for i in range(1, 27):
-        assert f"Decision {i} <!--mem id:e{i:02d}" in after or f"id:e{i:02d}]" not in after
-    assert after.count("## 2026-07-") == before.count("## 2026-07-")
+        assert f"id:e{i:02d}" in after

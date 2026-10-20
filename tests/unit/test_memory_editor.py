@@ -2,13 +2,16 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""The memory editor (spec 089 §4.2) — choices by id, never whole files.
+"""The memory editor (spec 089 §4.2, spec 124 interim) — choices by id,
+never whole files.
 
 What it must guarantee, because it edits real users' memory automatically:
 every line it removes from a live file exists verbatim in an archive with its
-id and a pointer carrying that id is left behind; the four files are backed up
-first (rolling, last 5); a file written while the editor ran is skipped (OCC);
-the watermark advances only on success; one run per project at a time.
+id (nothing is left in the live file — INDEX and the archive's contents table
+are the route back); the four files are backed up first (rolling, last 5);
+a file written while the editor ran is skipped (OCC); the watermark advances
+only on success; one run per project at a time; an id that left a live file
+without reaching the archive is restored.
 """
 
 import asyncio
@@ -37,7 +40,8 @@ def _bullet(text, eid, created="2026-09-01"):
 
 
 def _decision(title, eid, body="**Chose:** A.\n**Reason:** B."):
-    return f"## {title} <!--mem id:{eid} created:2026-08-01 touched:2026-08-01-->\n{body}\n\n"
+    detail = "".join("  " + ln + "\n" for ln in body.split("\n"))
+    return f"- {title}\n  <!--mem id:{eid} created:2026-08-01 touched:2026-08-01-->\n{detail}\n"
 
 
 STATE = "## Now\n" + "\n".join([
@@ -51,11 +55,10 @@ DECISIONS = (
     "# DECISIONS\n\n"
     + _decision("TabTin → watchlist", "tabtin")
     + _decision("PenguinHarness → watchlist", "penguin")
-    + "[archived 2026-07-28] Old stance → DECISIONS_ARCHIVE.md\n\n"
     + _decision("Pinned rule", "pinrule").replace("touched:2026-08-01", "touched:2026-08-01 tag:pinned")
 )
 
-LESSONS = "# LESSONS\n\n1. Curl beats the browser for GitHub. <!--mem id:curl created:2026-08-01 touched:2026-08-01-->\n\n"
+LESSONS = "# LESSONS\n\n- Curl beats the browser for GitHub.\n  <!--mem id:curl created:2026-08-01 touched:2026-08-01-->\n\n"
 INDEX = "# INDEX\n\n- agent_output/ — reports\n- DECISIONS_ARCHIVE.md — older decisions (read on demand)\n"
 
 
@@ -159,17 +162,22 @@ def test_auto_run_due_needs_a_change_and_an_old_enough_watermark(wf):
     assert E.auto_run_due(wf.dir, now=now + timedelta(hours=1))  # changed, and old enough
 
 
-def test_normalise_ids_stamps_unstamped_entries_only(tmp_path):
+def test_prepass_normalises_and_stamps_unstamped_entries_only(tmp_path):
     w = WorkspaceFileManager(str(tmp_path))
     os.makedirs(w.dir)
     with open(w._file_path("state"), "w") as f:     # an external writer
         f.write("## Now\n- written by an external agent\n")
-    w.write("decisions", "# D\n\n## New decision\nbody\n\n" + _decision("Old", "old01"))
-    E.normalise_ids(w, today=TODAY)
+    with open(w._file_path("decisions"), "w") as f:  # legacy heading shape, one unstamped
+        f.write("# D\n\n## New decision\nbody\n\n"
+                "## Old <!--mem id:old01 created:2026-08-01 touched:2026-08-01-->\n**Chose:** A.\n")
+    result = WF.prepass(w, today=TODAY)
+    assert set(result.touched) == {"state", "decisions"}
     assert state_blocks.parse(w.read("state"))[1][0].id
     d = w.read("decisions")
-    assert "## New decision <!--mem id:new-decision created:2026-09-19" in d
-    assert _decision("Old", "old01").strip() in d
+    assert "- New decision\n  <!--mem id:new-decision created:2026-09-19 touched:2026-09-19-->\n  body" in d
+    assert "- Old\n  <!--mem id:old01 created:2026-08-01 touched:2026-08-01-->\n  **Chose:** A." in d
+    # a second prepass is a no-op
+    assert WF.prepass(w, today=TODAY).touched == []
 
 
 # ---------------------------------------------------------------------------
@@ -208,64 +216,64 @@ def test_parse_choices_rejects_non_objects():
 # planning (pure)
 # ---------------------------------------------------------------------------
 
-def test_plan_state_archive_moves_the_block_byte_exact_and_leaves_an_id_pointer(wf):
+def test_plan_archive_moves_the_block_byte_exact_and_leaves_nothing(wf):
     content = wf.read("state")
-    plan = E.plan_state(content, [{"_kind": "archive", "id": "cdm001", "pointer": "cold-DM pause"}],
-                        today=TODAY, archive_filename="PROJECT_STATE_ARCHIVE.md")
+    plan = E.plan_entries("state", content, [{"_kind": "archive", "id": "cdm001"}], today=TODAY)
     block = _bullet("Cold-DM automation paused since 08-15", "cdm001", "2026-08-10")
-    assert plan.archived == block
+    assert plan.archived == [(f"## [archived {TODAY}]", block)]
     assert block not in plan.content
-    assert "[archived 2026-09-19 id:cdm001] cold-DM pause → PROJECT_STATE_ARCHIVE.md" in plan.content
+    assert "[archived" not in plan.content and "cdm001" not in plan.content
 
 
-def test_plan_state_merge_condenses_and_archives_originals(wf):
+def test_plan_merge_condenses_and_archives_originals(wf):
     content = wf.read("state")
-    plan = E.plan_state(content, [{
+    plan = E.plan_entries("state", content, [{
         "_kind": "merge", "ids": ["news18", "news17"],
-        "text": "- Newsjack radar 9/17–18: no new target", "pointer": "daily radar notes",
-    }], today=TODAY, archive_filename="PROJECT_STATE_ARCHIVE.md")
-    assert "- Newsjack radar 9/17–18: no new target" in plan.content
-    assert "[archived 2026-09-19 id:news18 id:news17] daily radar notes" in plan.content
+        "text": "- Newsjack radar 9/17–18: no new target",
+    }], today=TODAY)
+    assert "- Newsjack radar 9/17–18: no new target\n  <!--mem id:" in plan.content
     assert "Newsjack radar 9/18: no new target" not in plan.content
+    assert "[archived" not in plan.content
+    heading, text = plan.archived[0]
+    new_id = re.search(r"into id:(\S+)\]", heading).group(1)
+    assert new_id not in ("news18", "news17") and f"id:{new_id}" in plan.content
     for eid in ("news18", "news17"):
-        assert f"id:{eid}" in plan.archived
-    assert plan.archived.startswith("[merged 2026-09-19 into:")
+        assert f"id:{eid}" in text
 
 
-def test_plan_state_rejects_unknown_ids_and_padded_merges(wf):
+def test_plan_rejects_unknown_ids_and_padded_merges(wf):
     content = wf.read("state")
-    plan = E.plan_state(content, [
+    plan = E.plan_entries("state", content, [
         {"_kind": "archive", "id": "nope00"},
         {"_kind": "merge", "ids": ["news18", "news17"], "text": "- " + "x" * 500},
-    ], today=TODAY, archive_filename="PROJECT_STATE_ARCHIVE.md")
-    assert plan.archived == "" and plan.content == content
+    ], today=TODAY)
+    assert plan.archived == [] and plan.content == content
     assert len(plan.rejected) == 2
 
 
-def test_plan_durable_archive_keeps_pointer_lines_of_the_chunk(wf):
+def test_plan_durable_archive_takes_the_whole_entry(wf):
     content = wf.read("decisions")
-    plan = E.plan_durable("decisions", content, [{"_kind": "archive", "id": "penguin", "pointer": "harness call"}],
-                          today=TODAY, archive_filename="DECISIONS_ARCHIVE.md")
-    assert "## PenguinHarness" not in plan.content
-    assert "[archived 2026-09-19 id:penguin] harness call → DECISIONS_ARCHIVE.md" in plan.content
-    assert "[archived 2026-07-28] Old stance → DECISIONS_ARCHIVE.md" in plan.content
-    assert "[archived 2026-07-28]" not in plan.archived
-    assert "## PenguinHarness → watchlist <!--mem id:penguin" in plan.archived
+    plan = E.plan_entries("decisions", content, [{"_kind": "archive", "id": "penguin"}], today=TODAY)
+    assert "PenguinHarness" not in plan.content
+    assert "[archived" not in plan.content
+    assert "- PenguinHarness → watchlist\n  <!--mem id:penguin" in plan.archived[0][1]
+    assert "  **Chose:** A." in plan.archived[0][1]
+    assert "- TabTin → watchlist" in plan.content and "- Pinned rule" in plan.content
 
 
 def test_plan_durable_refuses_pinned_and_merges_into_a_new_id(wf):
     content = wf.read("decisions")
-    plan = E.plan_durable("decisions", content, [
+    plan = E.plan_entries("decisions", content, [
         {"_kind": "archive", "id": "pinrule"},
         {"_kind": "merge", "ids": ["tabtin", "penguin"],
-         "text": "## Watchlist calls\n**Chose:** both.", "pointer": "two watchlist calls"},
-    ], today=TODAY, archive_filename="DECISIONS_ARCHIVE.md")
+         "text": "- Watchlist calls\n  **Chose:** both."},
+    ], today=TODAY)
     assert any("pinrule" in r for r in plan.rejected)
-    assert "## Pinned rule" in plan.content
-    m = re.search(r"## Watchlist calls <!--mem id:(\S+) created:2026-09-19", plan.content)
+    assert "- Pinned rule" in plan.content
+    m = re.search(r"- Watchlist calls\n  <!--mem id:(\S+) created:2026-09-19", plan.content)
     assert m and m.group(1) not in ("tabtin", "penguin")
-    assert "[archived 2026-09-19 id:tabtin id:penguin] two watchlist calls" in plan.content
-    assert f"[merged 2026-09-19 into id:{m.group(1)}]" in plan.archived
+    assert "[archived" not in plan.content
+    assert plan.archived[0][0] == f"## [merged 2026-09-19 into id:{m.group(1)}]"
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +282,11 @@ def test_plan_durable_refuses_pinned_and_merges_into_a_new_id(wf):
 
 CHOICES = {
     "archive": [
-        {"file": "PROJECT_STATE.md", "id": "cdm001", "pointer": "cold-DM pause (Aug)"},
-        {"file": "DECISIONS.md", "id": "penguin", "pointer": "PenguinHarness call"},
+        {"file": "PROJECT_STATE.md", "id": "cdm001", "pointer": "ignored since spec 124"},
+        {"file": "DECISIONS.md", "id": "penguin"},
     ],
     "merge": [{"file": "PROJECT_STATE.md", "ids": ["news18", "news17"],
-               "text": "- Newsjack radar 9/17–18: no new target", "pointer": "radar notes"}],
+               "text": "- Newsjack radar 9/17–18: no new target"}],
 }
 
 
@@ -299,16 +307,22 @@ async def test_run_uses_readonly_tools_then_applies_choices(wf):
     # the write attempt was refused, as a tool result
     tool_rows = [m for m in llm.calls[1]["messages"] if m["role"] == "tool"]
     assert any("not available to the memory editor" in m["content"] for m in tool_rows)
-    # every removed line is verbatim in an archive, with a pointer carrying its id
+    # every removed line is verbatim in an archive with its id; the live
+    # file keeps nothing of it (no pointer), and the archive has a table
     archives = (wf.read("state_archive") or "") + (wf.read("decisions_archive") or "")
     for key in ("state", "decisions"):
         now_lines = set(wf.read(key).split("\n"))
         for line in before[key].split("\n"):
             if line.strip() and line not in now_lines:
                 assert line in archives, line
+    live = wf.read("state") + wf.read("decisions")
+    assert "[archived" not in live
     for eid in ("cdm001", "news18", "news17", "penguin"):
-        assert re.search(rf"\[archived {TODAY} [^\]]*id:{eid}\b", wf.read("state") + wf.read("decisions"))
+        assert f"id:{eid}" not in live
         assert f"id:{eid}" in archives
+        assert f"- id:{eid} · " in archives            # contents-table row
+    assert result.restored == []
+    assert "DECISIONS_ARCHIVE.md — 1 archived entry" in wf.read("index")
     # backup + audit record
     assert os.path.isfile(os.path.join(result.backup_dir, "PROJECT_STATE.md"))
     with open(os.path.join(result.backup_dir, "editor-run.json")) as f:
@@ -326,7 +340,7 @@ async def test_agent_write_during_the_run_makes_the_editor_skip_that_file(wf):
     assert "Cold-DM automation paused since 08-15" in wf.read("state")
     assert not wf.exists("state_archive")
     # the other file still went through
-    assert "## PenguinHarness" not in wf.read("decisions")
+    assert "PenguinHarness" not in wf.read("decisions")
 
 
 @pytest.mark.asyncio
@@ -490,13 +504,30 @@ async def test_an_occ_skip_leaves_the_pass_unfinished_so_it_retries(wf):
     assert WF._has_cleanup_delta(wf)                         # so it will run again
 
 
-def test_pointer_text_never_repeats_the_arrow_and_archive_name():
-    assert E._clean_pointer("old plan → PROJECT_STATE_ARCHIVE.md", "x") == "old plan"
-    assert E._clean_pointer("old plan -> DECISIONS_ARCHIVE.md", "x") == "old plan"
-    assert E._clean_pointer("keep → this arrow", "x") == "keep → this arrow"
-
-
-def test_prompt_keeps_source_of_truth_lines():
+def test_prompt_keeps_source_of_truth_lines_and_never_mentions_pointers():
     p = E.build_prompt({k: "" for k in E.LIVE_KEYS}, today=TODAY, since=None, sessions=[])
     assert "source of truth" in p
-    assert "pointer text only" in p
+    assert "pointer" not in p.lower()
+    assert "nothing is ever deleted" in p.lower()
+    assert "never because it is old" in p
+
+
+@pytest.mark.asyncio
+async def test_an_entry_the_pass_drops_without_archiving_is_restored(wf, caplog):
+    """Id conservation (spec 124 §3.5): the pass snapshot's ids must all be
+    live or archived afterwards; a dropped one comes back and is logged."""
+    class _Dropper(ScriptedLLM):
+        async def complete(self, messages, tools=None, **_kw):
+            # an outside writer deletes a line mid-run without archiving it
+            with open(wf._file_path("decisions"), "w", encoding="utf-8") as f:
+                f.write(wf.read("decisions").replace(_decision("TabTin → watchlist", "tabtin"), ""))
+            return await super().complete(messages, tools=tools)
+
+    llm = _Dropper([_resp(json.dumps({"archive": [{"file": "DECISIONS.md", "id": "penguin"}]}))])
+    with caplog.at_level("WARNING"):
+        result = await E.run_editor(wf, llm, today=TODAY)
+    # OCC: decisions changed under the editor, so the editor skipped it and
+    # conservation only guards files the editor wrote — tabtin is simply
+    # outside this pass. Now the editor's own file:
+    assert "DECISIONS.md" in result.skipped_files
+    assert result.restored == []

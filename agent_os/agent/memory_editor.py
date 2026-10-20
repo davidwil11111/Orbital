@@ -2,7 +2,8 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""The memory editor (spec 089 §4.2): tidies Layer-1 memory by id.
+"""The memory editor (spec 089 §4.2, interim until spec 124 §3.7's Memory
+session replaces it): tidies Layer-1 memory by id.
 
 It replaced the whole-file LLM merge, which regenerated PROJECT_STATE /
 DECISIONS / LESSONS from a size-capped view and so silently dropped whatever
@@ -10,11 +11,18 @@ it never saw. The editor never writes a file whole (INDEX, small and
 regenerable, is the one exception). It is a short read-only agent loop on the
 project's utility model that returns CHOICES by id:
 
-- ``archive`` — move one entry, byte-exact, to the file's archive and leave
-  ``[archived DATE id:X] <pointer> → ARCHIVE`` in its place;
+- ``archive`` — move one entry, byte-exact, to the file's archive; nothing
+  is left in the live file (spec 124 §3.5 — file-level pointers in INDEX
+  and the archive's contents table are the route back);
 - ``merge`` — replace several entries with one condensed entry; the originals
-  go to the archive byte-exact, with a pointer naming their ids;
+  go to the archive byte-exact under ``## [merged DATE into id:<new>]``;
 - ``index`` — a complete new INDEX.md.
+
+All three files share one entry shape (``state_blocks``), so one planner
+serves them. Before the editor looks, ``workspace_files.prepass`` has
+normalised the files and stamped every entry; after it applied,
+``postpass_conservation`` puts back any id that left a live file without
+reaching the archive.
 
 Sessions since the last run are evidence of whether a line is still live,
 done or replaced — never a source of new facts. Nothing is deleted.
@@ -40,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from agent_os.agent import memory_entries as _mem
-from agent_os.agent import state_blocks
+from agent_os.agent import state_blocks, user_flags
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +74,9 @@ WATERMARK_KEY = "editor_last_run"
 _MARKER_FILE = ".memory_cleanup.json"
 _SESSIONS_FALLBACK_DAYS = 7
 _MAX_SESSIONS_LISTED = 30
+# PROJECT_STATE bullets younger than this are "recent" in the prompt: the
+# editor archives one only when a session shows it is done (never by age).
+_RECENT_DAYS = 14
 # Quote-backed ask closes (spec 089 v2 §6): the quote must be the user's own
 # words, verbatim in a user message of the session the editor cites.
 _MAX_QUOTE_CHARS = 500
@@ -258,39 +269,6 @@ def backup_live_files(orbital_dir: str, *, now: datetime | None = None) -> str |
 
 
 # ---------------------------------------------------------------------------
-# Ids everywhere before the editor looks
-# ---------------------------------------------------------------------------
-
-def normalise_ids(workspace_files, *, today: str) -> list[str]:
-    """Give every entry an id so it can be chosen, archived and recalled.
-
-    PROJECT_STATE: a system write runs the chokepoint, which stamps every
-    bullet (lines written outside the tools — external agents, pinned
-    workers — arrive unstamped). DECISIONS/LESSONS: ``stamp`` fills in ids
-    for unstamped entries and leaves stamped ones byte-identical. A new stamp
-    carries today's date, so an unstamped line counts as recent. Returns the
-    keys it rewrote.
-    """
-    touched: list[str] = []
-    state = workspace_files.read("state")
-    if state and any(not b.id for b in state_blocks.parse(state)[1]):
-        workspace_files.write("state", state)
-        touched.append("state")
-    for key in ("decisions", "lessons"):
-        content = workspace_files.read(key)
-        if not content:
-            continue
-        _pre, raws = _mem._split_entries(content, _mem.ENTRY_MARKERS[key])
-        if all(_mem.entry_id(r) for r in raws):
-            continue
-        stamped, _warns = _mem.stamp(content, content, key, today=today)
-        if stamped != content:
-            workspace_files.write(key, stamped)
-            touched.append(key)
-    return touched
-
-
-# ---------------------------------------------------------------------------
 # The prompt
 # ---------------------------------------------------------------------------
 
@@ -320,18 +298,6 @@ def _size_lines(contents: dict[str, str]) -> list[str]:
     return out
 
 
-def _pointer_summary(contents: dict[str, str]) -> list[str]:
-    out = []
-    for key in EDITABLE_KEYS:
-        n = sum(
-            1 for ln in (contents.get(key) or "").split("\n")
-            if state_blocks.pointer_date(ln)
-        )
-        if n:
-            out.append(f"- {FILE_BY_KEY[key]}: {n} pointer line(s) to archived entries")
-    return out
-
-
 def build_prompt(
     contents: dict[str, str],
     *,
@@ -350,17 +316,12 @@ def build_prompt(
     else:
         session_lines = "(none)"
     cutoff = (
-        datetime.fromisoformat(today) - timedelta(days=_mem.STATE_PROBATION_DAYS)
+        datetime.fromisoformat(today) - timedelta(days=_RECENT_DAYS)
     ).date().isoformat()
     files = []
     for key in LIVE_KEYS:
         raw = _mem.strip_format_header(contents.get(key) or "").strip()
         files.append(f"=== {FILE_BY_KEY[key]} ===\n{raw or '(empty)'}")
-    pointers = _pointer_summary(contents)
-    pointer_block = (
-        "\nEXISTING POINTERS (already archived — not entries, leave them):\n"
-        + "\n".join(pointers) + "\n"
-    ) if pointers else ""
     # INDEX is the one file the editor may rewrite, so its format drift rides
     # along here (report-only lint; never a trigger of its own).
     drift = _mem.shape_report(contents.get("index"), "index")
@@ -388,33 +349,29 @@ session and ignores the close if it is not there. If unsure, leave it open.
     return f"""Today is {today}. Tidy this project's memory so each file gets back toward its target.
 
 HOW EDITS WORK
-The daemon moves the exact bytes by id; you only choose. Every choice leaves a
-pointer line `[archived {today} id:<id>] <your pointer> → <ARCHIVE_FILE>` in the
-live file, so nothing is lost and a future session can recall the entry by id.
-Ids: PROJECT_STATE bullets carry `<!--mem id:… created:…-->` on the line under
-them; DECISIONS/LESSONS entries carry `<!--mem id:…-->` on their title line.
+The daemon moves the exact bytes by id; you only choose. An archived entry
+keeps its full text and id in the archive file; the live file keeps nothing
+of it (INDEX names what each archive holds, and the archive has a contents
+table at its top). Ids: every entry carries `<!--mem id:… created:…-->` on
+the line under its bullet, in all three files.
 
-SIZES (exact counts, do not estimate):
+SIZES (bullet lines only, exact counts, do not estimate):
 {chr(10).join(_size_lines(contents))}
-{pointer_block}{formatting_block}
+{formatting_block}
 RULES
 1. Archive what is no longer live: finished work, superseded status, dormant
-   threads, decisions long superseded in practice. Keep what a future session
-   needs now — including every line that names a file as the source of truth
-   for a kind of output that is still produced.
+   threads, decisions superseded in practice — never because it is old. Keep
+   what a future session needs now — including every line that names a file
+   as the source of truth for a kind of output that is still produced.
 2. The sessions below are EVIDENCE of whether a line is still live, done, or
    replaced. They are never a source of new facts: add nothing that is not
    already written in these files.
-3. Nothing is ever deleted — every removal is an archive move with a pointer.
-   A pointer is one short line telling a future reader what left and when it
-   is worth going back for (e.g. "v0.6 signing decisions — read before
-   installer work"). Give the pointer text only; the daemon adds the date,
-   the id and the archive file.
+3. Nothing is ever deleted — archived entries keep their full text and id in
+   the archive file.
 4. merge: only for entries that say the same thing twice or where one
    supersedes another. The merged text may only condense what the originals
-   say and must be shorter than them combined. For PROJECT_STATE it is one
-   bullet (`- …`); for DECISIONS one `## …` entry; for LESSONS one `N. …`
-   entry.
+   say and must be shorter than them combined. It is one bullet (`- …`) with
+   optional indented detail, for every file.
 5. PROJECT_STATE bullets created on or after {cutoff} are recent: archive or
    merge one only when a session shows it is done or replaced.
 6. Never choose an entry tagged `tag:pinned`.
@@ -437,8 +394,8 @@ SESSIONS ACTIVE SINCE THEN (newest first):
 {session_lines}
 
 OUTPUT — ONLY this JSON (omit keys you do not use):
-{{"archive": [{{"file": "PROJECT_STATE.md", "id": "…", "pointer": "…"}}],
- "merge": [{{"file": "DECISIONS.md", "ids": ["…", "…"], "text": "…", "pointer": "…"}}],
+{{"archive": [{{"file": "PROJECT_STATE.md", "id": "…"}}],
+ "merge": [{{"file": "DECISIONS.md", "ids": ["…", "…"], "text": "…"}}],
  "close_asks": [{{"id": "…", "session": "…", "quote": "…"}}],
  "index": "<complete INDEX.md>"}}
 
@@ -608,18 +565,10 @@ def parse_choices(text: str | None) -> dict | None:
 class FilePlan:
     key: str
     content: str                       # new live content
-    archived: str                      # text appended to the archive ("" = none)
+    # (heading, text) sections appended to the archive, in order
+    archived: list[tuple[str, str]] = field(default_factory=list)
     applied: list[dict] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
-
-
-# Models echo the pointer format back: "<text> → PROJECT_STATE_ARCHIVE.md".
-_TRAILING_ARCHIVE_RE = re.compile(r"\s*(?:→|->)\s*[A-Z_]+_ARCHIVE\.md\s*$")
-
-
-def _clean_pointer(pointer, fallback: str) -> str:
-    text = _TRAILING_ARCHIVE_RE.sub("", " ".join(str(pointer or "").split()))[:200]
-    return text or _mem.pointer_summary(fallback)
 
 
 def _as_list(value) -> list:
@@ -651,22 +600,30 @@ def group_choices(choices: dict) -> tuple[dict[str, list[dict]], list[str]]:
     return per_key, rejected
 
 
-def _state_merge_lines(text: str, prefix: str) -> list[str]:
+def _merge_lines(text: str, prefix: str, comment: str) -> list[str]:
+    """The merged entry as lines: one bullet, its mem-comment, indented detail."""
     lines = [ln.rstrip() for ln in str(text).strip().split("\n") if ln.strip()]
     first = lines[0].lstrip()
     if not re.match(r"^(?:-|\d+[.)])\s+\S", first):
         first = prefix + first
     rest = [ln if ln[:1] in (" ", "\t") else "  " + ln.lstrip() for ln in lines[1:]]
-    return [first, *rest]
+    return [first, state_blocks.COMMENT_INDENT + comment, *rest]
 
 
-def plan_state(content: str, items: list[dict], *, today: str, archive_filename: str) -> FilePlan:
+def plan_entries(key: str, content: str, items: list[dict], *, today: str,
+                 archive_ids: set[str] | None = None) -> FilePlan:
+    """Plan archive / merge choices against ``content`` for any entry file.
+
+    The live file keeps nothing of an archived entry; a merge leaves the
+    merged bullet (fresh id) where the first original was. Pinned entries
+    and unknown ids are rejected, never moved.
+    """
     lines, blocks = state_blocks.parse(content)
     by_id = {b.id: b for b in blocks if b.id}
-    plan = FilePlan("state", content, "")
+    plan = FilePlan(key, content)
     claimed: set[str] = set()
     replaced: dict[int, tuple[int, list[str]]] = {}
-    archived_parts: list[tuple[int, str]] = []
+    taken = set(by_id) | set(archive_ids or ())
 
     for item in sorted(items, key=lambda c: c["_kind"] != "merge"):
         if item["_kind"] == "merge":
@@ -677,39 +634,49 @@ def plan_state(content: str, items: list[dict], *, today: str, archive_filename:
                     or len(set(ids)) != len(ids):
                 plan.rejected.append(f"merge {ids}: unknown, repeated or already-used id, or empty text")
                 continue
+            if any(b.fields.get("tag") == "pinned" for b in origs):
+                plan.rejected.append(f"merge {ids}: a pinned entry never moves")
+                continue
             total = sum(len(b.text) for b in origs)
             if len(" ".join(text.split())) > total * 1.1 + 20:
                 plan.rejected.append(f"merge {ids}: merged text is longer than the originals")
                 continue
+            merged_blocks = state_blocks.parse(text)[1]
+            if len(merged_blocks) > 1:
+                plan.rejected.append(f"merge {ids}: text is not exactly one entry")
+                continue
             origs.sort(key=lambda b: b.start)
-            ptr = _mem.pointer_line(
-                today, [b.id for b in origs],
-                _clean_pointer(item.get("pointer"), "merged into the line above"),
-                archive_filename,
-            )
             first = origs[0]
-            replaced[first.start] = (first.end, [*_state_merge_lines(text, first.prefix), ptr])
+            title = " ".join(text.split("\n", 1)[0].split())
+            new_id = (
+                _mem.new_entry_id(title, taken) if key != "state"
+                else _fresh_state_id(taken)
+            )
+            taken.add(new_id)
+            comment = user_flags.render_comment(
+                {"id": new_id, "created": today, "touched": today})
+            replaced[first.start] = (first.end, _merge_lines(text, first.prefix, comment))
             for b in origs[1:]:
                 replaced[b.start] = (b.end, [])
-            summary = _mem.pointer_summary(text, 80)
-            archived_parts.append((
-                first.start,
-                f"[merged {today} into: {summary}]\n" + "\n".join(b.raw for b in origs),
+            plan.archived.append((
+                f"## [merged {today} into id:{new_id}]",
+                "\n".join(b.raw for b in origs),
             ))
             claimed.update(ids)
-            plan.applied.append({"kind": "merge", "file": FILE_BY_KEY["state"], "ids": ids})
+            plan.applied.append({"kind": "merge", "file": FILE_BY_KEY[key], "ids": ids, "new_id": new_id})
         else:
             eid = str(item.get("id") or "")
             b = by_id.get(eid)
             if b is None or eid in claimed:
                 plan.rejected.append(f"archive {eid!r}: unknown or already-used id")
                 continue
-            ptr = _mem.pointer_line(
-                today, [eid], _clean_pointer(item.get("pointer"), b.text), archive_filename)
-            replaced[b.start] = (b.end, [ptr])
-            archived_parts.append((b.start, b.raw))
+            if b.fields.get("tag") == "pinned":
+                plan.rejected.append(f"archive {eid!r}: a pinned entry never moves")
+                continue
+            replaced[b.start] = (b.end, [])
+            plan.archived.append((f"## [archived {today}]", b.raw))
             claimed.add(eid)
-            plan.applied.append({"kind": "archive", "file": FILE_BY_KEY["state"], "id": eid})
+            plan.applied.append({"kind": "archive", "file": FILE_BY_KEY[key], "id": eid})
 
     if not replaced:
         return plan
@@ -724,104 +691,22 @@ def plan_state(content: str, items: list[dict], *, today: str, archive_filename:
         out.append(lines[i])
         i += 1
     plan.content = "\n".join(out)
-    archived_parts.sort(key=lambda p: p[0])
-    plan.archived = "\n".join(t for _pos, t in archived_parts)
+    # Consecutive "archived" sections collapse into one.
+    merged_sections: list[tuple[str, str]] = []
+    for heading, text in plan.archived:
+        if merged_sections and merged_sections[-1][0] == heading:
+            merged_sections[-1] = (heading, merged_sections[-1][1] + "\n" + text)
+        else:
+            merged_sections.append((heading, text))
+    plan.archived = merged_sections
     return plan
 
 
-def _fresh_durable_id(title: str, key: str, taken: set[str]) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", _mem._norm_title(title, key)).strip("-")[:32] or "entry"
+def _fresh_state_id(taken: set[str]) -> str:
     while True:
-        eid = f"{base}-m{secrets.token_hex(2)}"
+        eid = user_flags.new_entry_id()
         if eid not in taken:
             return eid
-
-
-def plan_durable(key: str, content: str, items: list[dict], *, today: str,
-                 archive_filename: str) -> FilePlan:
-    marker = _mem.ENTRY_MARKERS[key]
-    pre, raws = _mem._split_entries(content, marker)
-    plan = FilePlan(key, content, "")
-    by_id: dict[str, int] = {}
-    pinned: set[str] = set()
-    for i, raw in enumerate(raws):
-        first_line, _rest = _mem._first_line_split(raw)
-        _title, meta = _mem._parse_meta(first_line)
-        if meta.get("id"):
-            by_id[meta["id"]] = i
-            if meta.get("tag") == "pinned":
-                pinned.add(meta["id"])
-    new_raws = list(raws)
-    claimed: set[str] = set()
-    archived_parts: list[tuple[int, str]] = []
-
-    def _leave(i: int, head_lines: list[str]) -> str:
-        """Put ``head_lines`` (+ the chunk's own pointer lines) where entry
-        ``i`` was; return the entry's body for the archive."""
-        body, pointers = _mem.split_out_pointer_lines(raws[i])
-        trailing = raws[i][len(raws[i].rstrip("\n")):] or "\n"
-        new_raws[i] = "\n".join([*head_lines, *[p for p in pointers if p.strip()]]) + trailing
-        return body.rstrip("\n") + "\n"
-
-    for item in sorted(items, key=lambda c: c["_kind"] != "merge"):
-        if item["_kind"] == "merge":
-            ids = [str(i) for i in _as_list(item.get("ids"))]
-            text = str(item.get("text") or "").strip()
-            idxs = [by_id.get(i) for i in ids]
-            if not ids or not text or any(x is None for x in idxs) or claimed & set(ids) \
-                    or pinned & set(ids) or len(set(ids)) != len(ids):
-                plan.rejected.append(f"merge {ids}: unknown, pinned, repeated or already-used id, or empty text")
-                continue
-            m_pre, m_raws = _mem._split_entries(text + "\n", marker)
-            if m_pre.strip() or len(m_raws) != 1:
-                plan.rejected.append(f"merge {ids}: text is not exactly one {FILE_BY_KEY[key]} entry")
-                continue
-            total = sum(len(_mem.split_out_pointer_lines(raws[x])[0]) for x in idxs)
-            if len(text) > total * 1.1 + 20:
-                plan.rejected.append(f"merge {ids}: merged text is longer than the originals")
-                continue
-            idxs.sort()
-            first_line, rest = _mem._first_line_split(m_raws[0].rstrip("\n") + "\n")
-            clean, _meta = _mem._parse_meta(first_line)
-            if key == "lessons":
-                num = re.match(r"^(\d+)\.", raws[idxs[0]])
-                if num:
-                    clean = re.sub(r"^\d+\.", f"{num.group(1)}.", clean)
-            new_id = _fresh_durable_id(clean, key, set(by_id))
-            header = f"{clean} " + _mem._meta_comment(
-                {"id": new_id, "created": today, "touched": today})
-            merged_entry = (header + rest).rstrip("\n")
-            ptr = _mem.pointer_line(
-                today, ids, _clean_pointer(item.get("pointer"), "merged into the entry above"),
-                archive_filename,
-            )
-            bodies = [_leave(idxs[0], [merged_entry, "", ptr])]
-            bodies += [_leave(x, []) for x in idxs[1:]]
-            archived_parts.append((
-                idxs[0],
-                f"[merged {today} into id:{new_id}]\n\n" + "\n".join(bodies),
-            ))
-            claimed.update(ids)
-            plan.applied.append({"kind": "merge", "file": FILE_BY_KEY[key], "ids": ids, "new_id": new_id})
-        else:
-            eid = str(item.get("id") or "")
-            i = by_id.get(eid)
-            if i is None or eid in claimed or eid in pinned:
-                plan.rejected.append(f"archive {eid!r}: unknown, pinned or already-used id")
-                continue
-            title = _mem._parse_meta(_mem._first_line_split(raws[i])[0])[0]
-            ptr = _mem.pointer_line(
-                today, [eid], _clean_pointer(item.get("pointer"), title), archive_filename)
-            archived_parts.append((i, _leave(i, [ptr])))
-            claimed.add(eid)
-            plan.applied.append({"kind": "archive", "file": FILE_BY_KEY[key], "id": eid})
-
-    if not archived_parts:
-        return plan
-    plan.content = pre + "".join(new_raws)
-    archived_parts.sort(key=lambda p: p[0])
-    plan.archived = "\n".join(t for _pos, t in archived_parts)
-    return plan
 
 
 def _index_ok(new_index, old_index: str) -> bool:
@@ -857,6 +742,8 @@ class EditorResult:
     applied: list[dict] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
     skipped_files: list[str] = field(default_factory=list)
+    written: list[str] = field(default_factory=list)      # file keys the editor wrote
+    restored: list[str] = field(default_factory=list)     # ids put back by conservation
     backup_dir: str | None = None
     error: str | None = None
 
@@ -882,18 +769,15 @@ def apply_choices(
         if not per_key[key]:
             continue
         archive_key = _mem.ARCHIVE_OF[key]
-        archive_filename = _wf.FILE_NAMES[archive_key]
-        if key == "state":
-            plan = plan_state(snapshot.get(key) or "", per_key[key],
-                              today=today, archive_filename=archive_filename)
-        else:
-            plan = plan_durable(key, snapshot.get(key) or "", per_key[key],
-                                today=today, archive_filename=archive_filename)
+        plan = plan_entries(
+            key, snapshot.get(key) or "", per_key[key], today=today,
+            archive_ids=_mem.archive_ids(workspace_files.read(archive_key)),
+        )
         result.rejected.extend(plan.rejected)
         if plan.archived:
             plans.append(plan)
 
-    # INDEX first: the moves below append archive pointers to INDEX, and a
+    # INDEX first: the moves below refresh the archive lines in INDEX, and a
     # rewrite checked after them would read the editor's own write as a
     # concurrent one.
     new_index = choices.get("index")
@@ -906,10 +790,7 @@ def apply_choices(
         else:
             workspace_files.write("index", _keep_archive_lines(
                 new_index, snapshot.get("index") or ""))
-            for archive_key in ("decisions_archive", "lessons_archive", "state_archive"):
-                if workspace_files.exists(archive_key):
-                    _wf._ensure_index_archive_pointer(
-                        workspace_files, _wf.FILE_NAMES[archive_key])
+            _wf.refresh_index_archive_lines(workspace_files)
             result.applied.append({"kind": "index", "file": FILE_BY_KEY["index"]})
 
     for plan in plans:
@@ -919,14 +800,15 @@ def apply_choices(
             continue
         archive_key = _mem.ARCHIVE_OF[plan.key]
         try:
-            _wf._append_archive_section(
-                workspace_files, archive_key, f"## [archived {today}]", plan.archived)
+            for heading, text in plan.archived:
+                _wf._append_archive_section(workspace_files, archive_key, heading, text)
             workspace_files.write(plan.key, plan.content)
         except OSError as e:
             logger.warning("memory editor: could not apply %s (%s)", plan.key, e)
             result.skipped_files.append(FILE_BY_KEY[plan.key])
             continue
-        _wf._ensure_index_archive_pointer(workspace_files, _wf.FILE_NAMES[archive_key])
+        result.written.append(plan.key)
+        _wf.refresh_index_archive_lines(workspace_files)
         result.applied.extend(plan.applied)
 
     if result.applied:
@@ -1064,9 +946,9 @@ async def run_editor(
     backup_dir = backup_live_files(orbital_dir, now=now)
     if backup_dir is None and any(workspace_files.exists(k) for k in LIVE_KEYS):
         return EditorResult(ok=False, outcome="failed", error="backup failed")
-    normalise_ids(workspace_files, today=today)
-
     from agent_os.agent import workspace_files as _wf
+    _wf.prepass(workspace_files, today=today)
+
     snapshot = {k: workspace_files.read(k) or "" for k in LIVE_KEYS}
     baselines = {k: _wf._stat_mtime_ns(workspace_files._file_path(k)) for k in LIVE_KEYS}
     since = watermark(orbital_dir)
@@ -1141,6 +1023,9 @@ async def run_editor(
 
     result = apply_choices(workspace_files, choices, baselines=baselines,
                            snapshot=snapshot, today=today, project_id=project_id)
+    # Id conservation (spec 124 §3.5): every id the pass started with is still
+    # live or in its archive, else its entry comes back from the snapshot.
+    result.restored = _wf.postpass_conservation(workspace_files, snapshot, result.written)
     closes, close_rejects = apply_ask_closes(
         workspace_files.workspace, orbital_dir, choices.get("close_asks"), today=today)
     result.applied.extend(closes)
@@ -1150,9 +1035,9 @@ async def run_editor(
     result.calls = calls
     result.backup_dir = backup_dir
     logger.info(
-        "memory editor: %s in %d call(s) — applied=%s rejected=%s skipped=%s",
+        "memory editor: %s in %d call(s) — applied=%s rejected=%s skipped=%s restored=%s",
         result.outcome, calls, json.dumps(result.applied, ensure_ascii=False),
-        result.rejected, result.skipped_files,
+        result.rejected, result.skipped_files, result.restored,
     )
     _write_run_record(backup_dir, result)
     return result
@@ -1171,6 +1056,7 @@ def _write_run_record(backup_dir: str | None, result: EditorResult) -> None:
                 "applied": result.applied,
                 "rejected": result.rejected,
                 "skipped_files": result.skipped_files,
+                "restored": result.restored,
             }, f, ensure_ascii=False, indent=2)
     except OSError:
         pass

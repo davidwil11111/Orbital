@@ -42,9 +42,12 @@ def test_never_cite_an_unread_source():
 
 
 def test_archive_recall_by_id_then_topic_never_whole():
+    # Spec 124: no per-entry pointer lines; recall goes INDEX line → the
+    # archive's contents table → grep id:<id>.
     text = _memory()
-    assert "[archived" in text and "id:X" in text
-    assert "grep" in text and "offset/limit" in text
+    assert "[archived" not in text
+    assert "contents table at the top" in text and "grep it for `id:<id>`" in text
+    assert "offset/limit" in text
     assert "Never read an archive file whole" in text
     assert "PROJECT_STATE_ARCHIVE.md" in text
 
