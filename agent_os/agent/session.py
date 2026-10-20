@@ -275,6 +275,14 @@ class Session:
         # them). Fault-isolated at the call site; None → no-op.
         self.on_queue_drained = None
 
+        # Spec 112 A6: while set, every appended row that does not already
+        # carry ``_kind`` is stamped with it. The loop sets
+        # ``"memory_record"`` for the duration of the end-of-run record turn
+        # so the chat renders those rows as a collapsed activity line and the
+        # recap / reply badge / manager handoff skip them. Stamped BEFORE
+        # ``on_append`` fires so the observer can filter on it.
+        self.row_kind: str | None = None
+
         # Deferred session_start meta record. A session is a file on disk; the
         # file is not created until the first message. ``Session.new`` stashes
         # the session_start meta here, and the first physical write flushes it
@@ -533,6 +541,8 @@ class Session:
             # F2 storage stem — debug-only field, never read by the frontend
             # for UI logic. Stamped for forensic clarity on the JSONL.
             message["session_uuid"] = self.session_uuid
+        if self.row_kind is not None and "_kind" not in message:
+            message["_kind"] = self.row_kind
 
         self._messages.append(message)
 
@@ -936,16 +946,20 @@ class Session:
     # ------------------------------------------------------------------
 
     def defer_message(self, content: str, role: str = "system",
-                      source: str = "daemon", meta: dict | None = None) -> None:
+                      source: str = "daemon", meta: dict | None = None,
+                      kind: str | None = None) -> None:
         """Queue a message for insertion after the current tool batch completes.
 
-        Used for lifecycle notifications that must not interrupt tool execution."""
+        Used for lifecycle notifications that must not interrupt tool execution.
+        ``kind`` (spec 112) pre-stamps ``_kind`` on the row, since the append
+        happens later, outside the record turn that owns the tag."""
         self._deferred_messages.append({
             "role": role,
             "content": content,
             "source": source,
             "timestamp": _now(),
             **({"_meta": meta} if meta else {}),
+            **({"_kind": kind} if kind else {}),
         })
 
     def pop_deferred_messages(self) -> list[dict]:

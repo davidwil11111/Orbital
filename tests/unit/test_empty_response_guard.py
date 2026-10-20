@@ -102,6 +102,9 @@ def _make_loop(tmp_path, provider, session_id: str) -> tuple[AgentLoop, Session]
         session, provider, SimpleToolRegistry(), context_mgr,
         project_dir=str(tmp_path),
         max_iterations=10,
+        # The call counts below assume one response per turn: no spec 112
+        # end-of-run record turn here.
+        memory_record_enabled=False,
     )
     return loop, session
 

@@ -108,8 +108,11 @@ class TestLessonsLayer1Injection:
         # No "[LESSONS.md]" header should appear
         assert "[LESSONS.md]" not in layer1_content
 
-    def test_lessons_md_updates_visible_next_iteration(self, tmp_path):
-        """Write LESSONS.md between two prepare() calls -> second sees new content."""
+    def test_lessons_md_updates_visible_next_run(self, tmp_path):
+        """Write LESSONS.md between two prepare() calls of the SAME run -> the
+        injected row stays the run-start snapshot (spec 112 A1; the tail names
+        the drift instead); the next run (``begin_run()``) sees the new
+        content."""
         agent_os_dir = tmp_path / "orbital"
         agent_os_dir.mkdir()
 
@@ -118,6 +121,7 @@ class TestLessonsLayer1Injection:
         ctx = _make_base_prompt_context(str(tmp_path))
         cm = ContextManager(session, builder, ctx)
 
+        cm.begin_run()
         msgs1 = cm.prepare()
         content1 = " ".join(m["content"] for m in msgs1 if m["role"] == "system")
         assert "Avoid eval" not in content1
@@ -128,7 +132,12 @@ class TestLessonsLayer1Injection:
 
         msgs2 = cm.prepare()
         content2 = " ".join(m["content"] for m in msgs2 if m["role"] == "system")
-        assert "Avoid eval" in content2
+        assert "Avoid eval" not in content2
+
+        cm.begin_run()
+        msgs3 = cm.prepare()
+        content3 = " ".join(m["content"] for m in msgs3 if m["role"] == "system")
+        assert "Avoid eval" in content3
 
 
 class TestLiveSubAgentDeploymentInstructions:

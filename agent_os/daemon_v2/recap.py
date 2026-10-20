@@ -106,6 +106,12 @@ def recap_scope(messages: list[dict], handle: str, *, fresh: bool) -> list[dict]
 
 
 def _visible_line(row: dict, handle: str, *, fresh: bool) -> str | None:
+    # Spec 112 A6: the memory record turn (the daemon's [MEMORY] ask, the
+    # model's edits and its "nothing to record", a pinned worker's reminder
+    # and its reply) is bookkeeping, not conversation. The reply before it
+    # is what the chat said.
+    if row.get("_kind") == "memory_record":
+        return None
     role = row.get("role")
     content = row.get("content")
     if role == "user":

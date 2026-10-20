@@ -104,6 +104,8 @@ def _build_loop(tmp_path, *, budget_config, on_budget_event):
         get_budget_config=lambda: budget_config,
         on_budget_event=on_budget_event,
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     return loop
 

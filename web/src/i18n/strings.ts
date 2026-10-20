@@ -214,6 +214,7 @@ export const STRINGS = {
   "chat.cancelTimeout": { en: "Cancel took longer than expected — try again if needed.", zh: "取消耗时超出预期——如有需要请重试。" },
   "chat.cancelling": { en: "Cancelling", zh: "取消中" },
   "chat.capsule.agentStep": { en: "agent step", zh: "Agent步骤" },
+  "chat.capsule.memoryRecord": { en: "memory update", zh: "记忆更新" },
   "chat.capsule.stoppedAtError": { en: "· stopped at error", zh: "· 出错停止" },
   "chat.capsule.thinking": { en: "thinking", zh: "思考中…" },
   "chat.compacted": { en: "Summarized earlier messages", zh: "已总结较早的消息" },

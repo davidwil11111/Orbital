@@ -222,8 +222,12 @@ def _start_real_turn(manager, tmp_path, llm, tools=None):
     tools = tools or _SlowTool()
     ctx = ContextManager(session, _PromptBuilder(),
                          _prompt_context(str(tmp_path)))
+    # The subject here is the wake, not spec 112's end-of-run record turn
+    # (which would add one LLM call to every normally ending run; its own
+    # ordering with the deferred wake is pinned in test_memory_record_turn.py).
     loop = AgentLoop(session, llm, tools, ctx,
-                     project_dir=str(tmp_path), max_iterations=10)
+                     project_dir=str(tmp_path), max_iterations=10,
+                     memory_record_enabled=False)
     persist_user_row(session, "hello")
     handle = ProjectHandle(
         session=session, loop=loop, provider=llm, registry=tools,

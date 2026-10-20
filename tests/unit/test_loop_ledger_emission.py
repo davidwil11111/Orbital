@@ -115,6 +115,8 @@ async def test_one_ledger_line_per_response(tmp_path):
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     persist_user_row(loop._session, "hi")
     await loop.run()
@@ -153,12 +155,16 @@ async def test_ledger_is_the_sole_spend_record(tmp_path):
             project_dir=str(tmp_path),
             on_cost_update=lambda d, t: None,
             max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
         )
 
     loop = AgentLoop(
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     persist_user_row(loop._session, "hi")
     await loop.run()
@@ -181,7 +187,8 @@ async def test_no_project_dir_no_ledger_no_crash(tmp_path):
     context_mgr = ContextManager(session, builder, ctx)
     registry = SimpleToolRegistry()
 
-    loop = AgentLoop(session, provider, registry, context_mgr, max_iterations=5)
+    loop = AgentLoop(session, provider, registry, context_mgr, max_iterations=5,
+                     memory_record_enabled=False)
     persist_user_row(loop._session, "hi")
     await loop.run()
 
@@ -216,6 +223,8 @@ async def test_ledger_append_failure_does_not_break_loop(tmp_path, monkeypatch):
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     # Must not raise even though append_event blows up.
     persist_user_row(loop._session, "hi")
