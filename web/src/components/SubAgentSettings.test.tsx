@@ -250,6 +250,12 @@ describe('SubAgentSettings', () => {
     ]);
     render(<SubAgentSettings />);
     await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    // The card subscribes to login.* in an effect that runs after the text
+    // is on screen. An event emitted before that effect has run is simply
+    // dropped, which is how `reports a failed login` went red on CI while
+    // passing locally. The list itself holds one login.failed handler (the
+    // CLI-missing watcher), so two means the card is listening.
+    await waitFor(() => expect(wsHandlers.get('login.failed')?.size ?? 0).toBeGreaterThanOrEqual(2));
   }
 
   it('renders the streamed sign-in URL as a link', async () => {
@@ -311,8 +317,10 @@ describe('SubAgentSettings', () => {
 
     emit('login.failed', { slug: 'claude-code', job_id: 'job-1', return_code: 1 });
 
-    expect(screen.getByTestId('sub-agent-login-notice-claude-code')).toHaveTextContent(
-      /did not complete/i,
+    await waitFor(() =>
+      expect(screen.getByTestId('sub-agent-login-notice-claude-code')).toHaveTextContent(
+        /did not complete/i,
+      ),
     );
   });
 
