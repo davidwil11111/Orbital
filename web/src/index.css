@@ -627,8 +627,41 @@ body {
 @keyframes vt-rise-in {
   from { opacity: 0; transform: translateY(10px); }
 }
+/* The title's two renderings differ in size, weight and colour (18px bold
+   h1 vs 13px crumb), so the default cross-dissolve shows a bold ghost
+   sliding under the Back button and a double exposure where the two text
+   images overlap. Swap them in sequence instead: the old rendering drops
+   out as the group starts moving, the new one fades in as it arrives. The
+   group's size/position still animate, so the crumb reads as the title
+   having moved, and `mix-blend-mode: normal` keeps the brief overlap from
+   additively brightening the text. */
+::view-transition-old(project-title),
+::view-transition-new(project-title) {
+  mix-blend-mode: normal;
+}
+::view-transition-group(project-title) {
+  /* Slow start: the bold rendering has all but faded before the group has
+     moved more than a few pixels, so the title dissolves in place and the
+     crumb is what travels. */
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+::view-transition-old(project-title) {
+  animation: vt-fade-out 90ms ease-in both;
+}
+::view-transition-new(project-title) {
+  animation: vt-fade-in 170ms ease-out 70ms both;
+}
+/* The old header's badge, trigger strip and tabs clear out early instead
+   of ghosting beside the crumb for the whole fold. */
+::view-transition-old(project-header) {
+  animation: vt-fade-out 130ms ease-out both;
+}
+@keyframes vt-fade-in {
+  from { opacity: 0; }
+}
+/* Back lands after the title has cleared the spot it occupies. */
 ::view-transition-new(settings-back):only-child {
-  animation: vt-back-in 280ms cubic-bezier(0.2, 0, 0, 1) both;
+  animation: vt-back-in 180ms cubic-bezier(0.2, 0, 0, 1) 100ms both;
 }
 ::view-transition-old(settings-back):only-child {
   animation: vt-back-out 180ms cubic-bezier(0.2, 0, 0, 1) both;
