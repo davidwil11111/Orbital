@@ -63,13 +63,16 @@ export default function MessageAvatar({ variant, label, agentHandle }: MessageAv
         data-testid="message-avatar"
         data-variant="agent"
         data-agent-handle={agentHandle}
-        className={`${AVATAR_BOX} bg-card border border-border/60 p-[3px] overflow-hidden`}
+        // On Graphite every mark sits on a white tile, app-icon style, in its
+        // vendor colours — Orbital's PNG already carries one, and black marks
+        // (Codex, Cursor, Kimi, Pi) and dark blues would sink into the card.
+        className={`${AVATAR_BOX} bg-card border border-border/60 p-[3px] overflow-hidden dark:bg-logo-tile dark:border-transparent`}
       >
         <img
           src={icon.src}
           alt={agentHandle ?? 'Orbital'}
           onError={() => setImageFailed(true)}
-          className={`w-full h-full object-contain${icon.mono ? ' dark:invert' : ''}`}
+          className="w-full h-full object-contain"
         />
       </div>
     );

@@ -21,11 +21,6 @@ export interface AgentIcon {
   src?: string;
   monogram: string;
   color: string;
-  /**
-   * The vendor mark is single-colour black ink. It would vanish on the dark
-   * (Graphite) theme, so MessageAvatar inverts it there.
-   */
-  mono?: boolean;
 }
 
 /**
@@ -40,15 +35,15 @@ const ICONS: Record<string, AgentIcon> = {
   [MAIN_AGENT_HANDLE]: { src: '/icon-192.png', monogram: 'OR', color: '#D9694A' },
   'claude-code': { src: '/agents/claude-code.svg', monogram: 'CC', color: '#D97757' },
   claude: { src: '/agents/claude-code.svg', monogram: 'CC', color: '#D97757' },
-  codex: { src: '/agents/codex.svg', monogram: 'CX', color: '#10A37F', mono: true },
+  codex: { src: '/agents/codex.svg', monogram: 'CX', color: '#10A37F' },
   codebuddy: { src: '/agents/codebuddy.svg', monogram: 'CB', color: '#0052D9' },
-  cursor: { src: '/agents/cursor.svg', monogram: 'CU', color: '#1A1A1A', mono: true },
+  cursor: { src: '/agents/cursor.svg', monogram: 'CU', color: '#1A1A1A' },
   dsh: { src: '/agents/dsh.svg', monogram: 'DS', color: '#4D6BFE' },
   gemini: { src: '/agents/gemini.svg', monogram: 'GM', color: '#4285F4' },
-  grok: { src: '/agents/grok.svg', monogram: 'GK', color: '#000000', mono: true },
-  kimi: { src: '/agents/kimi.svg', monogram: 'KM', color: '#000000', mono: true },
+  grok: { src: '/agents/grok.svg', monogram: 'GK', color: '#000000' },
+  kimi: { src: '/agents/kimi.svg', monogram: 'KM', color: '#000000' },
   minimax: { src: '/agents/minimax.svg', monogram: 'MM', color: '#E2167E' },
-  pi: { src: '/agents/pi.svg', monogram: 'PI', color: '#111111', mono: true },
+  pi: { src: '/agents/pi.svg', monogram: 'PI', color: '#111111' },
 };
 
 export function getAgentIcon(handle: string): AgentIcon {
