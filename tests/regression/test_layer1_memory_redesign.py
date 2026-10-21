@@ -297,18 +297,13 @@ def test_session_log_removed_from_roster():
     assert "session_log" not in WF.FILE_NAMES
     assert "index" in WF.FILE_NAMES
     assert "decisions_archive" in WF.FILE_NAMES
-    assert WF._RESUME_ORDER == ["state", "decisions", "lessons", "index"]
+    assert not hasattr(WF, "_RESUME_ORDER")  # cold resume removed 2026-10-20
     assert not hasattr(WF, "_truncate_session_log")
     assert not hasattr(WF, "_get_session_log_lock")
 
 
-def test_cold_resume_has_no_session_log(tmp_path):
-    wf = _wf(tmp_path)
-    wf.write("state", "current state")
-    wf.write("index", "the map")
-    ctx = wf.build_cold_resume_context()
-    assert "current state" in ctx and "the map" in ctx
-    assert "Session Log" not in ctx
+def test_cold_resume_builder_is_gone(tmp_path):
+    assert not hasattr(_wf(tmp_path), "build_cold_resume_context")
 
 
 def test_sub_agent_prompt_omits_session_log(tmp_path):

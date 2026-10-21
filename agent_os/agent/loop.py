@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -81,6 +82,133 @@ _PROJECT_REFRESH: dict[str, dict] = {}
 # so a persistently misbehaving model becomes a declared error, not a spend
 # loop.
 _EMPTY_RESPONSE_NUDGE_LIMIT = 2
+
+# ---------------------------------------------------------------------------
+# Spec 112 A6 — the end-of-run memory record turn.
+#
+# Every run that ends normally (final text, or mark_task_complete) and every
+# run about to compact gets ONE daemon row asking the model whether anything
+# durable happened, with the current PROJECT_STATE text and the three append
+# anchors in hand, and then a short, bounded continuation. The reply to the
+# user is already persisted and broadcast by then; every row the record turn
+# produces carries ``_kind: MEMORY_RECORD_KIND`` so it never replaces it.
+# ---------------------------------------------------------------------------
+from agent_os.agent.context import MEMORY_RECORD_KIND  # noqa: E402 — re-exported
+MEMORY_RECORD_MAX_LLM_CALLS = 3
+MEMORY_RECORD_MAX_TOOL_CALLS = 6
+# The four Layer-1 files, by on-disk name (agent_os.agent.context._LAYER1_FILES
+# carries the same list keyed for WorkspaceFileManager).
+_MEMORY_FILE_NAMES = ("PROJECT_STATE.md", "DECISIONS.md", "LESSONS.md", "INDEX.md")
+# The only tools the record turn may run, on the four files only. Mirrors the
+# pre-compaction flush precedent: scoped to memory persistence, so it runs
+# without the approval interceptor (FO-1).
+_MEMORY_RECORD_TOOLS = frozenset({"read", "edit", "write"})
+
+_MEMORY_RECORD_BODY = (
+    "If so, update orbital/PROJECT_STATE.md so the next session starts from what is\n"
+    "true after this run: current focus, what just finished, what is next, blockers.\n"
+    "Overwrite stale lines in place; one fact per line; no dated history.\n"
+    "Only if this run settled a decision, add one line to DECISIONS.md. Only if it\n"
+    "taught a non-obvious lesson, one line to LESSONS.md. Only if a new file matters\n"
+    "later, one line to INDEX.md.\n"
+    "\n"
+    "Write only what you already know from this run. Do not read sessions, do not\n"
+    "tidy or trim anything, do not reply to the user. Edit with the exact text\n"
+    "below as old_text; to add a line to DECISIONS / LESSONS / INDEX, anchor on the\n"
+    "last line shown. One or two edits, then stop.\n"
+    "If nothing durable happened, reply exactly: nothing to record\n"
+)
+
+_MEMORY_RECORD_OPENING = {
+    "run_end": "[MEMORY] This run is ending. Decide whether anything durable happened in it.",
+    "compaction": (
+        "[MEMORY] This run is about to compact its history. Decide whether "
+        "anything durable happened in it so far."
+    ),
+}
+
+_WORKER_MEMORY_RECORD_TEXT = (
+    "[Orbital memory] Your last turn is ending. Decide whether anything durable\n"
+    "happened in it. Files this turn changed: {files}\n"
+    "If so, update orbital/PROJECT_STATE.md so the next session starts from what is\n"
+    "true after your work: overwrite stale lines in place, one fact per line, no\n"
+    "dated history. Add one line to orbital/DECISIONS.md or orbital/LESSONS.md only\n"
+    "if this turn settled a decision or taught a non-obvious lesson. Edit only those\n"
+    "files, write only what you already know, then stop without further reply.\n"
+    "If nothing durable happened, reply exactly: nothing to record"
+)
+
+_MISSING_FILE_NOTE = "(the file does not exist yet — write it if there is something to record)"
+
+
+def classify_written_path(workspace: str, path) -> str | None:
+    """``"memory"`` for one of the four Layer-1 files, ``"workspace"`` for a
+    file outside ``orbital/``, None for anything else (other orbital/ files,
+    empty or non-string paths). Relative paths resolve against the workspace
+    the way the edit/write tools resolve them."""
+    if not workspace or not isinstance(path, str) or not path.strip():
+        return None
+    raw = path.strip()
+    full = raw if os.path.isabs(raw) else os.path.join(workspace, raw)
+    full = os.path.normpath(full)
+    orbital = os.path.normpath(os.path.join(workspace, "orbital"))
+    if os.path.dirname(full) == orbital and os.path.basename(full) in _MEMORY_FILE_NAMES:
+        return "memory"
+    if full == orbital or full.startswith(orbital + os.sep):
+        return None
+    return "workspace"
+
+
+def _read_memory_file(workspace: str, name: str) -> str | None:
+    try:
+        with open(os.path.join(workspace, "orbital", name), "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _last_line(text: str | None) -> str:
+    if text is None:
+        return _MISSING_FILE_NOTE
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line
+    return "(the file is empty)"
+
+
+def build_memory_record_text(workspace: str, changed_files: list[str],
+                             sub_agent_results: list[str], *,
+                             trigger: str = "run_end") -> str:
+    """The ``[MEMORY]`` row (spec 112 A6). Fixed wording; only the changed-file
+    line (omitted when none), the sub-agent line and the file excerpts are
+    filled from facts. ``trigger`` picks the opening sentence (run end vs
+    before a compaction)."""
+    lines = [_MEMORY_RECORD_OPENING.get(trigger, _MEMORY_RECORD_OPENING["run_end"])]
+    if changed_files:
+        lines.append("Files this run changed: " + ", ".join(changed_files))
+    lines.append("Sub-agent results received: "
+                 + (", ".join(sub_agent_results) if sub_agent_results else "none"))
+    head = "\n".join(lines) + "\n\n" + _MEMORY_RECORD_BODY
+    state = _read_memory_file(workspace, "PROJECT_STATE.md")
+    state_text = state.rstrip("\n") if state is not None else _MISSING_FILE_NOTE
+    if state is not None and not state.strip():
+        state_text = "(the file is empty)"
+    parts = [
+        head,
+        "--- orbital/PROJECT_STATE.md as on disk now ---",
+        state_text,
+    ]
+    for name in ("DECISIONS.md", "LESSONS.md", "INDEX.md"):
+        parts.append(f"--- last line of orbital/{name} ---")
+        parts.append(_last_line(_read_memory_file(workspace, name)))
+    return "\n".join(parts)
+
+
+def build_worker_memory_record_text(changed_files: list[str]) -> str:
+    """The pinned direct-chat worker's variant of the record row (spec 112
+    A6): sent as the worker's next turn on its resumed session."""
+    return _WORKER_MEMORY_RECORD_TEXT.format(
+        files=", ".join(changed_files) if changed_files else "none")
 
 
 def maybe_raise_unsandboxed_run(interceptor, tool_call: dict, result,
@@ -156,6 +284,7 @@ class AgentLoop:
         project_dir: str | None = None,
         on_budget_event=None,
         on_credential_error=None,
+        memory_record_enabled: bool = True,
     ):
         self._session = session
         self._provider = provider
@@ -275,6 +404,17 @@ class AgentLoop:
         # to the context manager so the hygiene flag + status line can tell
         # the agent whether the async consolidation actually worked.
         self._last_refresh_outcome: str | None = None
+
+        # Spec 112 A6 — end-of-run memory record turn. ``memory_record_enabled``
+        # is the construction-time switch (spec 124's Memory session passes
+        # False; a session whose origin is "memory" is skipped regardless).
+        # The per-run fields are reset at every run() entry and after each
+        # compaction (which begins a new snapshot segment).
+        self._memory_record_enabled = memory_record_enabled
+        self._run_changed_files: list[str] = []
+        self._run_memory_written: bool = False
+        self._memory_record_done: bool = False
+        self._memory_record_active: bool = False
 
         # Queue integration (Phase 2 — exit_reason; Phase 3 — queue_state)
         # Reset to defaults at the start of every run().
@@ -868,6 +1008,10 @@ class AgentLoop:
         self._loop_exit_path = None
         rows_at_run_start = None  # set before the while; guarded in finally
         iteration = 0  # bound here so the except-backstop can always report it
+        # Spec 112: a run is one snapshot segment. The Layer-1 rendering and
+        # the media-pruning horizon are taken here, before the first build,
+        # and again right after a compaction.
+        self._begin_snapshot_segment()
         try:
             # Resolve pending if not resuming from approval pause
             if self._session._paused_for_approval:
@@ -1346,6 +1490,14 @@ class AgentLoop:
                     # whose target was fetched again later in this session.
                     archive_and_supersede_tool_results(self._session, iteration)
                     self._note_exit("text_complete", iteration)
+                    # Spec 112 A6: the reply is persisted (and broadcast by
+                    # the session observer); the record turn runs INSIDE the
+                    # run, before anything hooked on "run ended".
+                    if self._memory_record_wanted():
+                        await self._memory_record_turn(
+                            active_provider, iteration, trigger="run_end",
+                            rows_at_run_start=rows_at_run_start,
+                        )
                     break
 
                 # Extract status
@@ -1542,6 +1694,7 @@ class AgentLoop:
                         tool_content = result.content
                         # Store result for observation-aware hash
                         _exec_result = result
+                        self._note_written_path(tc, tool_content)
 
                         # yield_turn: a dispatch tool that delivered a task to a
                         # sub-agent ends the management turn immediately so the
@@ -1741,6 +1894,12 @@ class AgentLoop:
                             "payload": {"summary": summary},
                         })
                         self._note_exit("task_complete", iteration)
+                        # Spec 112 A6: a declared completion is a normal end.
+                        if self._memory_record_wanted():
+                            await self._memory_record_turn(
+                                active_provider, iteration, trigger="run_end",
+                                rows_at_run_start=rows_at_run_start,
+                            )
                     else:  # mark_task_blocked
                         reason = (_signal_tc["arguments"] or {}).get("reason", "")
                         reason = reason.strip() if isinstance(reason, str) else ""
@@ -1770,130 +1929,20 @@ class AgentLoop:
                 # Check compaction (on the prompt size the provider reported
                 # for this iteration's call; see _record_prompt_tokens)
                 if self._context_manager.should_compact():
-                    from agent_os.agent import compaction as compaction_mod
-
-                    # Pre-flight budget guard (Budget Piece 2): the
-                    # pre-compaction flush is a real management-LLM call that
-                    # spends. Evaluate the SAME single guard before it fires so a
-                    # tripped budget stops here rather than buying one more flush
-                    # response. On trip, exit with ``budget_blocked`` without
-                    # compacting (compaction is a no-spend local op, but the loop
-                    # is ending anyway — the next resume re-evaluates).
-                    _flush_budget = self._budget_tripped()
-                    if _flush_budget is not None:
-                        self._trip_budget(_flush_budget, iteration)
-                        break
-
-                    # No memory consolidation here (the old blocking
-                    # token_pressure refresh is gone): consolidation is
-                    # scheduled by memory-file budget, and the flush turn below
-                    # is the agent's chance to save working state first.
-
-                    # Pre-compaction memory flush: give agent one turn to save state
+                    # Spec 112 A6: a compaction is a deterministic boundary
+                    # in a long autonomous run — ask what to record first
+                    # (while the history is still intact), then compact, then
+                    # begin a fresh snapshot segment (A1/A5).
                     _fits = getattr(self._context_manager, "flush_fits", None)
-                    try:
-                        if callable(_fits) and not _fits():
-                            # The step that crossed the threshold also overflows
-                            # the window: the flush prompt would lose its oldest
-                            # rows. Same outcome as a flush that overflows.
-                            raise ContextOverflowError("flush prompt would be trimmed")
-                        self._session.append_system(compaction_mod.MEMORY_FLUSH_PROMPT)
-                        flush_llm = self._utility_provider or self._provider
-                        flush_context = self._context_manager.prepare()
-                        flush_response = await flush_llm.complete(flush_context)
-                        # Token ledger (Budget Piece 1): the pre-compaction
-                        # flush is a real management-LLM response with real
-                        # spend. It is served by flush_llm (the utility
-                        # provider when configured, else the primary) — NOT
-                        # the rotated active_provider — so attribute to
-                        # flush_llm. Purely additive: the legacy budget path
-                        # deliberately does not count the flush, and that
-                        # stays unchanged.
-                        if getattr(flush_response, "usage", None):
-                            self._emit_ledger_event(
-                                flush_llm, flush_response.usage,
-                            )
-                        flush_text = flush_response.text or ""
-                        if not compaction_mod.is_silent_response(flush_text):
-                            # Agent wants to save state — execute any tool calls.
-                            # FO-1 invariant (audit 2026-06-03): this flush executor is
-                            # intentionally NOT interceptor-gated, and is scoped to project-state
-                            # persistence only (MEMORY_FLUSH_PROMPT directs PROJECT_STATE.md writes;
-                            # the flush completion is given no tool schemas). Do not repurpose it to
-                            # run arbitrary approval-required tools without routing through the
-                            # interceptor.
-                            if flush_response.tool_calls:
-                                raw_msg = dict(flush_response.raw_message)
-                                raw_msg["source"] = "management"
-                                self._session.append(raw_msg)
-                                for tc_raw in flush_response.tool_calls:
-                                    try:
-                                        tc = normalize_tool_call(tc_raw)
-                                        if not tc["id"]:
-                                            tc["id"] = uuid4().hex
-                                        if not tc["name"]:
-                                            self._session.append_tool_result(
-                                                tc["id"],
-                                                "Error: tool call has no function name",
-                                            )
-                                            continue
-                                        if self._tool_registry.is_async(tc["name"]):
-                                            result = await self._tool_registry.execute_async(
-                                                tc["name"], tc["arguments"],
-                                            )
-                                        else:
-                                            result = await asyncio.to_thread(
-                                                self._tool_registry.execute,
-                                                tc["name"], tc["arguments"],
-                                            )
-                                        self._session.append_tool_result(tc["id"], result.content)
-                                    except Exception as e:
-                                        tc_id = tc.get("id") if isinstance(tc, dict) else tc_raw.get("id", uuid4().hex)
-                                        self._session.append_tool_result(
-                                            tc_id, f"Error: {e}",
-                                        )
-                            else:
-                                flush_msg = {
-                                    "role": "assistant",
-                                    "content": flush_text,
-                                    "source": "management",
-                                }
-                                # Carry reasoning through (same omission as the
-                                # main text-only persist). Reasoning lives on the
-                                # flush response's raw_message when present.
-                                _reasoning = (
-                                    flush_response.raw_message or {}
-                                ).get("reasoning_content")
-                                if _reasoning:
-                                    flush_msg["reasoning_content"] = _reasoning
-                                self._session.append(flush_msg)
-                    except (ContextOverflowError, LLMError):
-                        # Context too full for flush — skip and proceed to compaction
-                        pass
-                    except Exception:
-                        # Any other error during flush — don't crash, just compact
-                        logger.warning("Pre-compaction flush failed, proceeding to compaction")
-
-                    # Append-only: the summary lands as a marker row and the
-                    # kept tail is sized to the window (compaction.run).
-                    _keep = getattr(self._context_manager, "compaction_keep_tokens", None)
-                    await compaction_mod.run(
-                        self._session,
-                        self._provider,
-                        utility_provider=self._utility_provider,
-                        keep_tokens=_keep() if callable(_keep) else None,
-                    )
-                    _note = getattr(self._context_manager, "note_compacted", None)
-                    if callable(_note):
-                        _note()
-
-                    # Post-compaction reorientation
-                    workspace = getattr(
-                        getattr(self._context_manager, "_base_ctx", None),
-                        "workspace", None,
-                    )
-                    if workspace:
-                        compaction_mod.inject_reorientation(workspace, self._session)
+                    if self._memory_record_wanted() and (
+                            not callable(_fits) or _fits()):
+                        await self._memory_record_turn(
+                            active_provider, iteration, trigger="compaction",
+                            rows_at_run_start=rows_at_run_start,
+                        )
+                    if await self._compact_now(iteration):
+                        break
+                    self._begin_snapshot_segment()
 
                 # Bottom of the loop body: no named branch broke out, so this
                 # iteration is continuing to the next. Classify as tool_continue
@@ -1996,6 +2045,385 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # State refresh helpers
     # ------------------------------------------------------------------
+
+    async def _compact_now(self, iteration: int) -> bool:
+        """Pre-compaction flush + compaction + reorientation (moved out of
+        ``run()`` verbatim so spec 112's record turn can precede it). Returns
+        True when the pre-flight budget guard tripped and the run must end.
+        """
+        from agent_os.agent import compaction as compaction_mod
+
+        # Pre-flight budget guard (Budget Piece 2): the
+        # pre-compaction flush is a real management-LLM call that
+        # spends. Evaluate the SAME single guard before it fires so a
+        # tripped budget stops here rather than buying one more flush
+        # response. On trip, exit with ``budget_blocked`` without
+        # compacting (compaction is a no-spend local op, but the loop
+        # is ending anyway — the next resume re-evaluates).
+        _flush_budget = self._budget_tripped()
+        if _flush_budget is not None:
+            self._trip_budget(_flush_budget, iteration)
+            return True
+
+        # No memory consolidation here (the old blocking
+        # token_pressure refresh is gone): consolidation is
+        # scheduled by memory-file budget, and the flush turn below
+        # is the agent's chance to save working state first.
+
+        # Pre-compaction memory flush: give agent one turn to save state
+        _fits = getattr(self._context_manager, "flush_fits", None)
+        try:
+            if callable(_fits) and not _fits():
+                # The step that crossed the threshold also overflows
+                # the window: the flush prompt would lose its oldest
+                # rows. Same outcome as a flush that overflows.
+                raise ContextOverflowError("flush prompt would be trimmed")
+            self._session.append_system(compaction_mod.MEMORY_FLUSH_PROMPT)
+            flush_llm = self._utility_provider or self._provider
+            flush_context = self._context_manager.prepare()
+            flush_response = await flush_llm.complete(flush_context)
+            # Token ledger (Budget Piece 1): the pre-compaction
+            # flush is a real management-LLM response with real
+            # spend. It is served by flush_llm (the utility
+            # provider when configured, else the primary) — NOT
+            # the rotated active_provider — so attribute to
+            # flush_llm. Purely additive: the legacy budget path
+            # deliberately does not count the flush, and that
+            # stays unchanged.
+            if getattr(flush_response, "usage", None):
+                self._emit_ledger_event(
+                    flush_llm, flush_response.usage,
+                )
+            flush_text = flush_response.text or ""
+            if not compaction_mod.is_silent_response(flush_text):
+                # Agent wants to save state — execute any tool calls.
+                # FO-1 invariant (audit 2026-06-03): this flush executor is
+                # intentionally NOT interceptor-gated, and is scoped to project-state
+                # persistence only (MEMORY_FLUSH_PROMPT directs PROJECT_STATE.md writes;
+                # the flush completion is given no tool schemas). Do not repurpose it to
+                # run arbitrary approval-required tools without routing through the
+                # interceptor.
+                if flush_response.tool_calls:
+                    raw_msg = dict(flush_response.raw_message)
+                    raw_msg["source"] = "management"
+                    self._session.append(raw_msg)
+                    for tc_raw in flush_response.tool_calls:
+                        try:
+                            tc = normalize_tool_call(tc_raw)
+                            if not tc["id"]:
+                                tc["id"] = uuid4().hex
+                            if not tc["name"]:
+                                self._session.append_tool_result(
+                                    tc["id"],
+                                    "Error: tool call has no function name",
+                                )
+                                continue
+                            if self._tool_registry.is_async(tc["name"]):
+                                result = await self._tool_registry.execute_async(
+                                    tc["name"], tc["arguments"],
+                                )
+                            else:
+                                result = await asyncio.to_thread(
+                                    self._tool_registry.execute,
+                                    tc["name"], tc["arguments"],
+                                )
+                            self._session.append_tool_result(tc["id"], result.content)
+                        except Exception as e:
+                            tc_id = tc.get("id") if isinstance(tc, dict) else tc_raw.get("id", uuid4().hex)
+                            self._session.append_tool_result(
+                                tc_id, f"Error: {e}",
+                            )
+                else:
+                    flush_msg = {
+                        "role": "assistant",
+                        "content": flush_text,
+                        "source": "management",
+                    }
+                    # Carry reasoning through (same omission as the
+                    # main text-only persist). Reasoning lives on the
+                    # flush response's raw_message when present.
+                    _reasoning = (
+                        flush_response.raw_message or {}
+                    ).get("reasoning_content")
+                    if _reasoning:
+                        flush_msg["reasoning_content"] = _reasoning
+                    self._session.append(flush_msg)
+        except (ContextOverflowError, LLMError):
+            # Context too full for flush — skip and proceed to compaction
+            pass
+        except Exception:
+            # Any other error during flush — don't crash, just compact
+            logger.warning("Pre-compaction flush failed, proceeding to compaction")
+
+        # Append-only: the summary lands as a marker row and the
+        # kept tail is sized to the window (compaction.run).
+        _keep = getattr(self._context_manager, "compaction_keep_tokens", None)
+        await compaction_mod.run(
+            self._session,
+            self._provider,
+            utility_provider=self._utility_provider,
+            keep_tokens=_keep() if callable(_keep) else None,
+        )
+        _note = getattr(self._context_manager, "note_compacted", None)
+        if callable(_note):
+            _note()
+
+        # Post-compaction reorientation
+        workspace = getattr(
+            getattr(self._context_manager, "_base_ctx", None),
+            "workspace", None,
+        )
+        if workspace:
+            compaction_mod.inject_reorientation(workspace, self._session)
+        return False
+
+    # ------------------------------------------------------------------
+    # Spec 112 A6 — end-of-run memory record turn
+    # ------------------------------------------------------------------
+
+    def _begin_snapshot_segment(self) -> None:
+        """Run start / post-compaction: refresh the Layer-1 snapshot and the
+        media-pruning horizon (spec 112 A1/A5) and reset the per-segment
+        record-turn bookkeeping."""
+        begin = getattr(self._context_manager, "begin_run", None)
+        if callable(begin):
+            try:
+                begin()
+            except Exception:  # noqa: BLE001 — a snapshot bug must not break a turn
+                logger.warning("begin_run failed", exc_info=True)
+        self._run_changed_files = []
+        self._run_memory_written = False
+        self._memory_record_done = False
+
+    def _workspace(self) -> str | None:
+        base = getattr(self._context_manager, "_base_ctx", None)
+        return getattr(base, "workspace", None) or None
+
+    def _note_written_path(self, tc: dict, tool_content) -> None:
+        """Track what edit/write touched this run: the four memory files make
+        the run self-recorded (no record turn); anything outside orbital/ is
+        listed on the [MEMORY] row."""
+        if tc.get("name") not in ("edit", "write"):
+            return
+        if isinstance(tool_content, str) and tool_content.startswith("Error"):
+            return
+        args = tc.get("arguments") or {}
+        path = args.get("path") if isinstance(args, dict) else None
+        kind = classify_written_path(self._workspace() or "", path)
+        if kind == "memory":
+            self._run_memory_written = True
+        elif kind == "workspace":
+            shown = path.strip()
+            ws = self._workspace() or ""
+            if os.path.isabs(shown) and ws:
+                try:
+                    shown = os.path.relpath(shown, ws)
+                except ValueError:
+                    pass
+            if shown not in self._run_changed_files:
+                self._run_changed_files.append(shown)
+
+    def _memory_record_wanted(self) -> bool:
+        """Deterministic trigger gate (spec 112 A6). Skips only what cannot
+        be meaningful: a run that already wrote a memory file, the Memory
+        session itself, a scratch project, a loop without a workspace, and a
+        second ask in the same segment."""
+        if not self._memory_record_enabled:
+            return False
+        if self._memory_record_done or self._memory_record_active:
+            return False
+        if self._run_memory_written:
+            return False
+        if getattr(self._session, "origin", None) == "memory":
+            return False
+        if getattr(self._session, "source", None) == "memory":
+            return False
+        base = getattr(self._context_manager, "_base_ctx", None)
+        if base is None or getattr(base, "is_scratch", False):
+            return False
+        return bool(getattr(base, "workspace", None))
+
+    def _sub_agent_results_this_run(self, rows_at_run_start) -> list[str]:
+        """Terminal rows that reached this run: the rows that triggered it
+        (everything after the previous assistant row) plus what was appended
+        during it."""
+        rows = self._session.get_messages()
+        start = rows_at_run_start if rows_at_run_start is not None else len(rows)
+        start = min(start, len(rows))
+        while start > 0 and rows[start - 1].get("role") != "assistant":
+            start -= 1
+        found: list[str] = []
+        for row in rows[start:]:
+            meta = row.get("_meta") or {}
+            if not isinstance(meta, dict) or meta.get("event") != "sub_agent_terminal":
+                continue
+            handle = meta.get("handle")
+            if not handle:
+                display = meta.get("display_content") or row.get("content") or ""
+                if isinstance(display, str) and display.startswith("[Sub-agent] "):
+                    handle = display[len("[Sub-agent] "):].split(" ", 1)[0]
+            label = f"{handle or 'sub-agent'} ({meta.get('kind') or 'terminal'})"
+            if label not in found:
+                found.append(label)
+        return found
+
+    def _record_turn_tool_allowed(self, tc: dict) -> bool:
+        if tc.get("name") not in _MEMORY_RECORD_TOOLS:
+            return False
+        args = tc.get("arguments") or {}
+        path = args.get("path") if isinstance(args, dict) else None
+        return classify_written_path(self._workspace() or "", path) == "memory"
+
+    async def _stream_quiet(self, provider, context, tool_schemas) -> LLMResponse:
+        """``_stream_response_internal`` without the per-chunk stream
+        notification: the record turn's text is never shown live."""
+        accumulator = StreamAccumulator()
+        self._stream_accumulator = accumulator
+        async for chunk in provider.stream(context, tools=tool_schemas):
+            accumulator.add(chunk)
+        return accumulator.finalize()
+
+    async def _memory_record_turn(self, provider, iteration: int, *,
+                                  trigger: str, rows_at_run_start) -> None:
+        """Append the ``[MEMORY]`` row and run the bounded record turn.
+
+        Bounds hold by construction: at most ``MEMORY_RECORD_MAX_LLM_CALLS``
+        calls and ``MEMORY_RECORD_MAX_TOOL_CALLS`` executed tools; only
+        read/edit/write on the four memory files run (the rest get an error
+        result); the turn ends on the first text-only reply. Every row is
+        tagged ``_kind: memory_record`` through ``session.row_kind``; queued
+        user messages and deferred lifecycle rows are NOT drained here — they
+        follow the turn, exactly as they followed the run before. Never
+        raises into the run: a failing record turn is logged and the run
+        ends as it would have.
+        """
+        workspace = self._workspace() or ""
+        self._memory_record_active = True
+        self._memory_record_done = True
+        llm_calls = 0
+        tool_calls = 0
+        outcome = "nothing"
+        try:
+            # The record turn's own rows are its conversation: in the window
+            # now, dropped from every later call (context.py).
+            self._context_manager.include_memory_record_rows = True
+            text = build_memory_record_text(
+                workspace, list(self._run_changed_files),
+                self._sub_agent_results_this_run(rows_at_run_start),
+                trigger=trigger,
+            )
+            self._session.row_kind = MEMORY_RECORD_KIND
+            self._session.append({
+                "role": "system",
+                "content": text,
+                "source": "daemon",
+                "_meta": {"event": "memory_record", "trigger": trigger},
+            })
+            while llm_calls < MEMORY_RECORD_MAX_LLM_CALLS:
+                llm_calls += 1
+                context = self._context_manager.prepare()
+                tool_schemas = self._tool_registry.schemas()
+                self._inflight_stream = asyncio.create_task(
+                    self._stream_quiet(provider, context, tool_schemas),
+                    name=f"memory-record-{self._session.session_uuid}-{llm_calls}",
+                )
+                try:
+                    response = await self._inflight_stream
+                except asyncio.CancelledError:
+                    self._inflight_stream = None
+                    if self._session.is_stopped():
+                        raise
+                    outcome = "cancelled"
+                    break
+                except (LLMError, ContextOverflowError) as e:
+                    self._inflight_stream = None
+                    logger.warning("memory record turn: LLM call failed (%s)", e)
+                    outcome = "llm_error"
+                    break
+                self._inflight_stream = None
+                if response.usage:
+                    self._prompt_input_tokens_total += response.usage.input_tokens
+                    self._cache_read_tokens_total += response.usage.cache_read_tokens
+                    self._llm_call_count += 1
+                    self._emit_ledger_event(provider, response.usage)
+                self._record_prompt_tokens(provider, response.usage, tool_schemas)
+                if not response.has_tool_calls:
+                    self._session.append({
+                        "role": "assistant",
+                        "content": response.text,
+                        "source": "management",
+                        **({"reasoning_content": (response.raw_message or {}).get("reasoning_content")}
+                           if (response.raw_message or {}).get("reasoning_content") else {}),
+                    })
+                    break
+                raw_msg = dict(response.raw_message)
+                raw_msg["source"] = "management"
+                self._session.append(raw_msg)
+                for tc_raw in response.tool_calls:
+                    tc = normalize_tool_call(tc_raw)
+                    if not tc["id"]:
+                        tc["id"] = uuid4().hex
+                    if tool_calls >= MEMORY_RECORD_MAX_TOOL_CALLS:
+                        self._session.append_tool_result(
+                            tc["id"],
+                            "Skipped: the memory record turn's tool budget is "
+                            "used up. Stop now.",
+                        )
+                        continue
+                    tool_calls += 1
+                    if not self._record_turn_tool_allowed(tc):
+                        self._session.append_tool_result(
+                            tc["id"],
+                            "Error: only read, edit and write on "
+                            "orbital/PROJECT_STATE.md, DECISIONS.md, LESSONS.md "
+                            "and INDEX.md are available in the memory record "
+                            "turn. Do not do other work here.",
+                        )
+                        continue
+                    try:
+                        if self._tool_registry.is_async(tc["name"]):
+                            result = await self._tool_registry.execute_async(
+                                tc["name"], tc["arguments"])
+                        else:
+                            result = await asyncio.to_thread(
+                                self._tool_registry.execute,
+                                tc["name"], tc["arguments"])
+                        content = dispatch_prefilter(
+                            tc["name"], tc["arguments"], result.content)
+                        self._session.append_tool_result(
+                            tc["id"], content, meta=result.meta,
+                            context_limit=self._context_manager.model_context_limit,
+                        )
+                        if tc["name"] in ("edit", "write") and not (
+                                isinstance(content, str) and content.startswith("Error")):
+                            outcome = "edited"
+                    except Exception as e:  # noqa: BLE001 — a tool failure ends nothing here
+                        self._session.append_tool_result(
+                            tc["id"], f"Error executing tool: {e}")
+                if tool_calls >= MEMORY_RECORD_MAX_TOOL_CALLS:
+                    if outcome == "nothing":
+                        outcome = "tool_cap"
+                    break
+            else:
+                if outcome == "nothing":
+                    outcome = "llm_cap"
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the record turn must never fail the run
+            logger.warning("memory record turn failed", exc_info=True)
+            outcome = "error"
+        finally:
+            self._session.row_kind = None
+            self._memory_record_active = False
+            try:
+                self._context_manager.include_memory_record_rows = False
+            except AttributeError:
+                pass
+            self._diag(
+                "memory_record", iteration=iteration, trigger=trigger,
+                llm_calls=llm_calls, tool_calls=tool_calls, outcome=outcome,
+                changed_files=len(self._run_changed_files),
+            )
 
     async def _run_refresh(self, trigger_name: str, iteration: int) -> None:
         """Execute a state refresh and update checkpoint metadata.
@@ -2303,6 +2731,9 @@ class AgentLoop:
         # on-cancel exit means nothing else writes to the session after
         # this synchronous append before the task completes, so marker
         # position is trivially correct under the current design.
+        # A Stop during the memory record turn (spec 112) ends it; the
+        # marker itself stays a visible row.
+        self._session.row_kind = None
         self._persist_cancellation_marker_inner()
 
         inflight.cancel()

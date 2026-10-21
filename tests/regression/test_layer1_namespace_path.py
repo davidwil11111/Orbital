@@ -101,14 +101,14 @@ class TestLayer1NamespacedPath:
         result = ctx_mgr.prepare()
 
         # Collect messages that are specifically Layer 1 (have the bracketed
-        # filename header). Cold-resume uses a different header
-        # ("[WORKSPACE MEMORY — Resume Context]") so we can distinguish them.
+        # filename header; spec 112 appends the snapshot note inside the
+        # brackets, so match the opening only).
         layer1_blob = " ".join(
             m.get("content", "")
             for m in result
             if m.get("role") == "system"
             and any(
-                f"[{name}]" in m.get("content", "")
+                m.get("content", "").startswith(f"[{name}")
                 for name in ("PROJECT_STATE.md", "DECISIONS.md", "LESSONS.md")
             )
         )

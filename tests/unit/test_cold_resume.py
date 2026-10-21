@@ -2,10 +2,10 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Unit tests for cold resume injection (ContextManager) and session-end loop wiring (AgentLoop).
+"""Unit tests for the Layer-1 resume context (ContextManager) and session-end loop wiring (AgentLoop).
 
-Tests the workspace files integration added by the workspace-files feature:
-- Cold resume context injection into ContextManager.prepare()
+- The Layer-1 rows are the resume context; the separate first-call-only
+  cold-resume row is gone (2026-10-20).
 - on_session_end callback in AgentLoop.run() finally block
 """
 
@@ -111,102 +111,52 @@ class MockToolRegistry:
 # Cold Resume: ContextManager + WorkspaceFileManager
 # ===========================================================================
 
-class TestColdResumeInjection:
+class TestNoColdResumeInjection:
+    """The first-call-only "[WORKSPACE MEMORY — Resume Context]" row was
+    removed 2026-10-20: it re-injected the full, unbudgeted text of the same
+    four Layer-1 files that are injected every turn anyway, then vanished on
+    the second call and broke the prefix cache in every session."""
 
-    def test_cold_resume_injected_on_first_prepare(self, tmp_path):
-        """When workspace files exist, first prepare() includes resume context as system message."""
-        # Set up workspace files — new layout uses the 5 standard keys via WorkspaceFileManager.
+    def test_no_resume_row_on_any_call(self, tmp_path):
         wfm = WorkspaceFileManager(str(tmp_path))
         wfm.ensure_dir()
-        wfm.write("lessons", "# Lessons\n\nRefactor the auth module.")
-        wfm.write("state", "# Project State\n\nWorking on token refresh.")
-
+        wfm.write("state", "Project is in phase 2.")
+        wfm.write("decisions", "Chose PostgreSQL.")
         session = Session.new("cold1", str(tmp_path))
-        builder = MockPromptBuilder()
-        ctx = _make_base_prompt_context(str(tmp_path))
-        cm = ContextManager(session, builder, ctx, workspace_files=wfm)
+        session.append({"role": "user", "content": "hi", "source": "user"})
+        cm = ContextManager(session, MockPromptBuilder(),
+                            _make_base_prompt_context(str(tmp_path)),
+                            workspace_files=wfm)
+        for _ in range(2):
+            messages = cm.prepare()
+            assert not [m for m in messages if "WORKSPACE MEMORY" in m.get("content", "")]
+            layer1 = " ".join(m["content"] for m in messages if m["role"] == "system")
+            assert "Project is in phase 2." in layer1   # the Layer-1 rows ARE the resume context
+            assert "Chose PostgreSQL." in layer1
+        assert not hasattr(cm, "_cold_resume_injected")
+        assert not hasattr(wfm, "build_cold_resume_context")
 
-        messages = cm.prepare()
-
-        # Find the resume context message
-        resume_msgs = [m for m in messages
-                       if m.get("role") == "system"
-                       and "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume_msgs) == 1
-        content = resume_msgs[0]["content"]
-        assert "Refactor the auth module" in content
-        assert "Project State" in content
-        assert "token refresh" in content
-
-    def test_cold_resume_not_re_injected(self, tmp_path):
-        """Second prepare() call should NOT include resume context again."""
+    def test_second_call_extends_the_first_byte_for_byte(self, tmp_path):
+        """What the removal buys: the second call's prefix is the first's."""
         wfm = WorkspaceFileManager(str(tmp_path))
         wfm.ensure_dir()
-        wfm.write("state", "# Project State\n\nDo stuff.")
-
+        wfm.write("state", "Project is in phase 2.")
         session = Session.new("cold2", str(tmp_path))
-        builder = MockPromptBuilder()
-        ctx = _make_base_prompt_context(str(tmp_path))
-        cm = ContextManager(session, builder, ctx, workspace_files=wfm)
+        session.append({"role": "user", "content": "hi", "source": "user"})
+        cm = ContextManager(session, MockPromptBuilder(),
+                            _make_base_prompt_context(str(tmp_path)),
+                            workspace_files=wfm)
+        cm.begin_run()
+        first = cm.prepare()
+        session.append({"role": "assistant", "content": "ok", "source": "management"})
+        session.append({"role": "user", "content": "more", "source": "user"})
+        second = cm.prepare()
+        import json as _json
+        assert [_json.dumps(m, sort_keys=True) for m in second[:len(first) - 1]] == \
+            [_json.dumps(m, sort_keys=True) for m in first[:-1]]
 
-        # First call: should inject
-        msgs1 = cm.prepare()
-        resume1 = [m for m in msgs1
-                    if "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume1) == 1
-
-        # Second call: should NOT inject again
-        msgs2 = cm.prepare()
-        resume2 = [m for m in msgs2
-                    if "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume2) == 0
-
-    def test_cold_resume_no_files(self, tmp_path):
-        """Empty workspace (no files) should produce no injection and no error."""
-        wfm = WorkspaceFileManager(str(tmp_path))
-        wfm.ensure_dir()
-        # No files written
-
-        session = Session.new("cold3", str(tmp_path))
-        builder = MockPromptBuilder()
-        ctx = _make_base_prompt_context(str(tmp_path))
-        cm = ContextManager(session, builder, ctx, workspace_files=wfm)
-
-        messages = cm.prepare()
-
-        resume_msgs = [m for m in messages
-                       if "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume_msgs) == 0
-
-    def test_cold_resume_partial_files(self, tmp_path):
-        """Only PROJECT_STATE exists. Only that section is included in resume context."""
-        wfm = WorkspaceFileManager(str(tmp_path))
-        wfm.ensure_dir()
-        wfm.write("state", "# State\n\nWidget is 50% done.")
-        # decisions, lessons, context, session_log are NOT written
-
-        session = Session.new("cold4", str(tmp_path))
-        builder = MockPromptBuilder()
-        ctx = _make_base_prompt_context(str(tmp_path))
-        cm = ContextManager(session, builder, ctx, workspace_files=wfm)
-
-        messages = cm.prepare()
-
-        resume_msgs = [m for m in messages
-                       if "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume_msgs) == 1
-        content = resume_msgs[0]["content"]
-        assert "Widget is 50% done" in content
-        # Should NOT contain sections for missing files
-        assert "Decisions" not in content
-        assert "Lessons Learned" not in content
-        assert "External Context" not in content
-        assert "Session Log" not in content
-
-    def test_context_budget_with_resume(self, tmp_path):
+    def test_context_budget_with_large_layer1_file(self, tmp_path):
         """Large workspace files should reduce sliding window proportionally."""
-        # Two separate workspaces: one populated, one empty. Comparing usage
-        # across these isolates the effect of workspace file content on budget.
         ws_with = tmp_path / "with_files"
         ws_with.mkdir()
         ws_without = tmp_path / "without_files"
@@ -214,48 +164,31 @@ class TestColdResumeInjection:
 
         wfm_with = WorkspaceFileManager(str(ws_with))
         wfm_with.ensure_dir()
-        # Write a very large project state to consume budget
-        large_content = "X" * 100_000
-        wfm_with.write("state", large_content)
+        wfm_with.write("state", "X" * 100_000)
 
         builder = MockPromptBuilder()
-
-        # cm_with: workspace has a large state file
         session_with = Session.new("cold5_with", str(ws_with))
-        ctx_with = _make_base_prompt_context(str(ws_with))
         cm_with = ContextManager(
-            session_with, builder, ctx_with,
+            session_with, builder, _make_base_prompt_context(str(ws_with)),
             model_context_limit=50_000, response_reserve=5_000,
             workspace_files=wfm_with,
         )
-
-        # cm_without: separate empty workspace, no state file
         session_without = Session.new("cold5_without", str(ws_without))
-        ctx_without = _make_base_prompt_context(str(ws_without))
         cm_without = ContextManager(
-            session_without, builder, ctx_without,
+            session_without, builder, _make_base_prompt_context(str(ws_without)),
             model_context_limit=50_000, response_reserve=5_000,
         )
-
         cm_with.prepare()
         cm_without.prepare()
-
-        # The version with large workspace files should have higher usage percentage
         assert cm_with.usage_percentage > cm_without.usage_percentage
 
-    def test_cold_resume_none_workspace_files(self, tmp_path):
-        """When workspace_files=None (default), prepare() works normally without injection."""
+    def test_none_workspace_files(self, tmp_path):
+        """When workspace_files=None (default), prepare() works normally."""
         session = Session.new("cold6", str(tmp_path))
-        builder = MockPromptBuilder()
-        ctx = _make_base_prompt_context(str(tmp_path))
-        cm = ContextManager(session, builder, ctx)  # workspace_files defaults to None
-
+        cm = ContextManager(session, MockPromptBuilder(),
+                            _make_base_prompt_context(str(tmp_path)))
         messages = cm.prepare()
-
-        resume_msgs = [m for m in messages
-                       if "WORKSPACE MEMORY" in m.get("content", "")]
-        assert len(resume_msgs) == 0
-        # Should still have at least the system prompt
+        assert not [m for m in messages if "WORKSPACE MEMORY" in m.get("content", "")]
         assert len(messages) >= 1
         assert messages[0]["role"] == "system"
 

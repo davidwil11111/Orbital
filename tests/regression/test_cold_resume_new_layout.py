@@ -69,31 +69,9 @@ class TestColdResumeNewLayout:
         # CONTEXT.md was renamed to INDEX.md ("context" key → "index").
         assert wfm.read("index") is not None
 
-    def test_cold_resume_context_contains_memory_content(self, workspace):
-        """build_cold_resume_context() returns content from all Layer-1 files.
-
-        Roster is state/decisions/lessons/index — no SESSION_LOG special-case
-        (SESSION_LOG was retired) and CONTEXT is now INDEX.
-        """
-        wfm = WorkspaceFileManager(workspace)
-        ctx = wfm.build_cold_resume_context()
-
-        assert ctx is not None and ctx.strip(), "Cold resume context must not be empty"
-        assert "feature-X" in ctx, "PROJECT_STATE content must appear in resume context"
-        assert "async IO" in ctx, "DECISIONS content must appear in resume context"
-        assert "validate input" in ctx, "LESSONS content must appear in resume context"
-        assert "ACME Corp" in ctx, "INDEX content must appear in resume context"
-        # SESSION_LOG was retired — its history role is redundant with the
-        # always-injected Layer-1 files. Cold resume must not surface it.
-        assert "Session Log" not in ctx, "Cold resume must not contain a Session Log section"
-
-    def test_cold_resume_does_not_show_onboarding(self, workspace):
-        """Cold resume must NOT inject ONBOARDING MODE (files exist so it should resume)."""
-        wfm = WorkspaceFileManager(workspace)
-        ctx = wfm.build_cold_resume_context()
-
-        assert "ONBOARDING MODE" not in (ctx or ""), \
-            "ONBOARDING MODE must not appear when memory files exist"
+    # test_cold_resume_context_contains_memory_content / _does_not_show_onboarding:
+    # DELETED 2026-10-20 with build_cold_resume_context (the Layer-1 rows injected
+    # every turn are the resume context).
 
     def test_project_goals_readable_at_new_path(self, workspace):
         """project_goals.md is readable at ProjectPaths.project_goals."""

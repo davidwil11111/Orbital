@@ -21,7 +21,13 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from agent_os.agent.context import ContextManager
-from agent_os.agent.loop import AgentLoop, maybe_raise_unsandboxed_run
+from agent_os.agent.loop import (
+    AgentLoop,
+    MEMORY_RECORD_KIND,
+    build_worker_memory_record_text,
+    classify_written_path,
+    maybe_raise_unsandboxed_run,
+)
 from agent_os.agent.prompt_builder import PromptBuilder, PromptContext
 from agent_os.agent.providers.openai_compat import LLMProvider
 from agent_os.agent.session import Session, persist_user_row
@@ -55,6 +61,81 @@ from agent_os.daemon_v2.models import (
 # alongside the sub-agent terminals of spec 091 §4: the result of a command
 # the user let run outside the sandbox is an answer the agent is waiting on.
 _WAKE_EVENTS = frozenset({"sub_agent_terminal", "unsandboxed_run"})
+
+# Spec 112 A6 (pinned workers): transports whose event stream reports tool
+# names AND paths, so the daemon can list what the turn changed. Pipe / PTY
+# transports only yield parsed text and are deliberately absent. Matched by
+# class name so this module never imports the SDK-gated transport modules.
+_WORKER_RECORD_TRANSPORTS = frozenset({
+    "SDKTransport",      # claude-code SDK stream (Edit/Write/MultiEdit file_path)
+    "CodexTransport",    # codex app-server (fileChange changes[].path)
+    "ACPSDKTransport",   # ACP agents (raw_input path)
+    "PiRPCTransport",    # pi --mode rpc (edit/write path)
+})
+_WORKER_FILE_TOOL_HINTS = ("edit", "write", "patch", "filechange", "create_file", "save_file")
+
+
+def _worker_tool_paths(name: str, arguments) -> list[str]:
+    """Paths an edit-like worker tool call targeted, across transport shapes."""
+    lowered = (name or "").lower()
+    if not any(h in lowered for h in _WORKER_FILE_TOOL_HINTS):
+        return []
+    if not isinstance(arguments, dict):
+        return []
+    paths: list[str] = []
+    for key in ("file_path", "filePath", "path", "notebook_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+    changes = arguments.get("changes")
+    if isinstance(changes, list):
+        for c in changes:
+            if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip():
+                paths.append(c["path"].strip())
+    return paths
+
+
+def worker_turn_changed_files(tool_rows: list[dict], workspace: str) -> tuple[list[str], bool]:
+    """``(changed workspace files, wrote a memory file)`` for one worker turn,
+    from the transcript's tool rows (``name`` + ``arguments``; ``tool_name``
+    accepted too). Paths are shown relative to the workspace; duplicates
+    collapse; anything under orbital/ is never listed."""
+    changed: list[str] = []
+    wrote_memory = False
+    for row in tool_rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name") or row.get("tool_name") or ""
+        for path in _worker_tool_paths(name, row.get("arguments")):
+            kind = classify_written_path(workspace, path)
+            if kind == "memory":
+                wrote_memory = True
+                continue
+            if kind != "workspace":
+                continue
+            shown = path
+            if os.path.isabs(shown) and workspace:
+                try:
+                    shown = os.path.relpath(shown, workspace)
+                except ValueError:
+                    pass
+            if shown not in changed:
+                changed.append(shown)
+    return changed, wrote_memory
+
+
+def _terminal_handle(meta: dict, content) -> str | None:
+    """The worker a lifecycle row is about: ``_meta.handle`` when stamped,
+    else the second token of its ``[Sub-agent] <handle> …`` marker text."""
+    handle = meta.get("handle")
+    if isinstance(handle, str) and handle:
+        return handle
+    display = meta.get("display_content") or content or ""
+    if isinstance(display, str) and display.startswith("[Sub-agent] "):
+        token = display[len("[Sub-agent] "):].split(" ", 1)[0]
+        if token and token != "Message":
+            return token
+    return None
 from agent_os.queue.dispatcher import QueueDispatcher
 from agent_os.queue.store import QueueStore
 
@@ -163,6 +244,16 @@ class AgentManager:
         # can render a persistent warning glyph across WS disconnects and
         # page reloads. See TASK-state-model-alignment-fixes.md §2.4.
         self._last_terminal_events: dict[SessionKey, dict] = {}
+        # Spec 112 A6 (pinned workers): ``(project_id, session_id, handle)``
+        # whose NEXT dispatch is the daemon's memory reminder. Its dispatch
+        # marker and its terminal row get ``_kind: memory_record`` and the
+        # terminal clears the key, so the reminder never asks again.
+        self._worker_memory_records: set[tuple[str, str | None, str]] = set()
+        # Strong references for fire-and-forget tasks this manager starts
+        # (the event loop only holds tasks weakly — an unreferenced task can
+        # be garbage-collected mid-flight with "Task was destroyed but it is
+        # pending"). Entries remove themselves on completion.
+        self._background_tasks: set[asyncio.Task] = set()
         self._sleep_handle: object | None = None
         # Queue infrastructure (per project)
         self._queue_stores: dict[str, QueueStore] = {}
@@ -2078,6 +2169,10 @@ class AgentManager:
         """
         session_id = self._resolve_session_id(session_id)
         suppress_wake = bool(meta and meta.get("suppress_wake"))
+        # Spec 112 A6: rows of a pinned worker's memory reminder turn (its
+        # dispatch marker, its terminal) are tagged like the manager's own
+        # record rows; the terminal also releases the key.
+        row_kind = self._worker_memory_record_kind(project_id, session_id, meta, content)
         handle = self._handles.get(make_session_key(project_id, session_id))
         if handle is None:
             # Piece 3 Part C (wake-if-awaited): the handle being gone (e.g.
@@ -2106,13 +2201,17 @@ class AgentManager:
                 "disk for terminal sub-agent event",
                 project_id, loaded.session_uuid,
             )
-            loaded.append({
+            row = {
                 "role": "system",
                 "content": content,
                 "source": "daemon",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 **({"_meta": meta} if meta else {}),
-            })
+                **({"_kind": row_kind} if row_kind else {}),
+            }
+            loaded.append(row)
+            self._maybe_schedule_worker_memory_record(
+                project_id, session_id, loaded, row)
             if suppress_wake:
                 # Pinned dispatch (spec 074): the row is durably on disk; the
                 # management LLM takes ZERO turns — no start_agent.
@@ -2135,13 +2234,17 @@ class AgentManager:
 
         # If loop is idle, append directly (safe — no pending tool calls) and wake
         if handle.task is None or handle.task.done():
-            handle.session.append({
+            row = {
                 "role": "system",
                 "content": content,
                 "source": "daemon",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 **({"_meta": meta} if meta else {}),
-            })
+                **({"_kind": row_kind} if row_kind else {}),
+            }
+            handle.session.append(row)
+            self._maybe_schedule_worker_memory_record(
+                project_id, session_id, handle.session, row)
             if suppress_wake:
                 # Pinned dispatch (spec 074): append only, never start a
                 # management turn.
@@ -2163,7 +2266,7 @@ class AgentManager:
 
         # Loop is running — defer for safe insertion after tool batch
         handle.session.defer_message(content, role="system", source="daemon",
-                                     meta=meta)
+                                     meta=meta, kind=row_kind)
         if (meta and meta.get("event") in _WAKE_EVENTS
                 and not suppress_wake):
             # Decide the wake now (spec 091 §4): by the time _on_loop_done
@@ -2210,6 +2313,124 @@ class AgentManager:
         if f1:
             session.session_id = f1
         return session
+
+    # ── Spec 112 A6: pinned worker memory reminder ─────────────────────────
+
+    def _worker_memory_record_kind(self, project_id: str, session_id: str | None,
+                                   meta: dict | None, content) -> str | None:
+        """``MEMORY_RECORD_KIND`` for the dispatch marker and the terminal
+        row of a reminder turn in flight for this worker, else None."""
+        if not self._worker_memory_records or not isinstance(meta, dict):
+            return None
+        handle = _terminal_handle(meta, content)
+        if not handle:
+            return None
+        key = (project_id, session_id, handle)
+        if key not in self._worker_memory_records:
+            return None
+        if meta.get("event") == "sub_agent_terminal":
+            self._worker_memory_records.discard(key)
+            return MEMORY_RECORD_KIND
+        if meta.get("dispatch_id"):
+            return MEMORY_RECORD_KIND
+        return None
+
+    def _worker_record_transport_eligible(self, project_id: str, session_id: str | None,
+                                          handle: str) -> bool:
+        adapters = getattr(self._sub_agent_manager, "_adapters", None)
+        if not isinstance(adapters, dict):
+            return False
+        adapter = adapters.get(make_session_key(project_id, session_id), {}).get(handle)
+        transport = getattr(adapter, "_transport", None) if adapter is not None else None
+        return transport is not None and type(transport).__name__ in _WORKER_RECORD_TRANSPORTS
+
+    def _worker_last_turn_tool_rows(self, project_id: str, session_id: str | None,
+                                    handle: str) -> list[dict] | None:
+        transcripts = getattr(self._sub_agent_manager, "_transcripts", None)
+        if not isinstance(transcripts, dict):
+            return None
+        transcript = transcripts.get((project_id, session_id, handle))
+        path = getattr(transcript, "filepath", None) if transcript is not None else None
+        if not path:
+            return None
+        from agent_os.daemon_v2.sub_agent_transcript import read_sub_agent_summary
+        try:
+            turns = read_sub_agent_summary(path)
+        except Exception:
+            logger.warning("memory reminder: cannot read %s", path, exc_info=True)
+            return None
+        completed = [t for t in (turns or []) if not t.get("in_flight")]
+        if not completed:
+            return None
+        return list(completed[-1].get("tool_rows") or [])
+
+    def _maybe_schedule_worker_memory_record(self, project_id: str,
+                                             session_id: str | None,
+                                             session, row: dict) -> None:
+        """After a pinned direct-chat worker's turn completes, send it the
+        worker variant of the record row as its next turn (spec 112 A6).
+
+        Only for the worker the session is pinned to (``pinned_target``): a
+        worker the manager dispatched is not asked — the manager records on
+        its wake run. Only on transports that report tool names and paths.
+        Not for the reminder's own completion, not for error/stop terminals,
+        and not when the turn itself already wrote a memory file. Never
+        raises: the completion row is already persisted.
+        """
+        try:
+            meta = row.get("_meta") or {}
+            if (not isinstance(meta, dict)
+                    or meta.get("event") != "sub_agent_terminal"
+                    or meta.get("kind") != "completed"
+                    or row.get("_kind") == MEMORY_RECORD_KIND):
+                return
+            handle = _terminal_handle(meta, row.get("content"))
+            if not handle or getattr(session, "pinned_target", None) != handle:
+                return
+            if not self._worker_record_transport_eligible(project_id, session_id, handle):
+                return
+            project = (self._project_store.get_project(project_id)
+                       if self._project_store else None)
+            workspace = (project or {}).get("workspace", "") if isinstance(project, dict) else ""
+            tool_rows = self._worker_last_turn_tool_rows(project_id, session_id, handle)
+            changed, wrote_memory = worker_turn_changed_files(tool_rows or [], workspace)
+            if wrote_memory:
+                return
+            text = build_worker_memory_record_text(changed)
+            task = asyncio.ensure_future(self._send_worker_memory_record(
+                project_id, session_id, handle, text))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception:  # noqa: BLE001 — a reminder must never break a completion
+            logger.warning("memory reminder scheduling failed for %s/%s",
+                           project_id, session_id, exc_info=True)
+
+    async def _send_worker_memory_record(self, project_id: str, session_id: str | None,
+                                         handle: str, text: str) -> None:
+        key = (project_id, session_id, handle)
+        try:
+            row = {
+                "role": "user",
+                "content": text,
+                "source": "daemon",
+                "target": handle,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "_kind": MEMORY_RECORD_KIND,
+            }
+            resolved = await self.persist_mention_message(project_id, session_id, row)
+            key = (project_id, resolved, handle)
+            self._worker_memory_records.add(key)
+            dispatch_id = f"{resolved}:{uuid4().hex[:8]}"
+            result = await self._sub_agent_manager.send(
+                project_id, handle, text, session_id=resolved,
+                dispatch_id=dispatch_id, initiator="user_pinned",
+            )
+            if isinstance(result, str) and result.startswith("Error"):
+                self._worker_memory_records.discard(key)
+                logger.warning("memory reminder to %s not sent: %s", handle, result)
+        except Exception:  # noqa: BLE001
+            self._worker_memory_records.discard(key)
+            logger.warning("memory reminder to %s failed", handle, exc_info=True)
 
     async def persist_mention_message(self, project_id: str, session_id: str | None,
                                       user_msg: dict) -> str:
@@ -5206,8 +5427,6 @@ class AgentManager:
         cm = handle.context_manager
         if hasattr(cm, "_session"):
             cm._session = new_session
-        if hasattr(cm, "_cold_resume_injected"):
-            cm._cold_resume_injected = False
         if hasattr(cm, "_recovery_injected"):
             cm._recovery_injected = False
         if hasattr(cm, "_window_factor"):
@@ -5543,6 +5762,14 @@ class AgentManager:
         races with holder resolution.
         """
         def callback(msg):
+            # Spec 112 A6: the end-of-run memory record turn is silent live.
+            # Its rows are persisted (tagged ``_kind: memory_record``) and the
+            # chat's idle catch-up refetch renders the ones that edited a
+            # file as a collapsed activity line; nothing streams or
+            # broadcasts while it runs, so the reply the user already has
+            # stays the reply.
+            if msg.get("_kind") == "memory_record":
+                return
             self._activity_translator.on_message(msg, project_id, session_id=session_id)
         return callback
 

@@ -171,17 +171,6 @@ FILE_NAMES: dict[str, str] = {
     "state_archive": "PROJECT_STATE_ARCHIVE.md",
 }
 
-# Layer-1 files injected every turn (excludes archives). Order for cold resume.
-_RESUME_ORDER = ["state", "decisions", "lessons", "index"]
-
-# Section headers for cold resume context
-_SECTION_HEADERS: dict[str, str] = {
-    "state": "Project State",
-    "decisions": "Decisions",
-    "lessons": "Lessons Learned",
-    "index": "Project Index (navigation map)",
-}
-
 # Entry-boundary regexes per sanity-checked file. The session-end prompt
 # instructs the LLM to emit entries in these formats; the code-side sanity
 # checks (_dedupe_exact + _cap_entries) use these patterns to split the
@@ -540,25 +529,6 @@ class WorkspaceFileManager:
             raise ValueError(f"Unknown file_key: {file_key!r}. Must be one of {list(FILE_NAMES)}")
         filepath = self._file_path(file_key)
         return os.path.isfile(filepath)
-
-    def build_cold_resume_context(self) -> str:
-        """Assemble cold resume context from the Layer-1 files.
-
-        Standard Layer-1 read (PROJECT_STATE, DECISIONS, LESSONS, INDEX) with no
-        special-casing. SESSION_LOG was retired; cross-session history is no
-        longer kept separately (the Layer-1 files are injected every turn anyway).
-
-        Returns assembled markdown string with section headers.
-        """
-        sections: list[str] = []
-        for key in _RESUME_ORDER:
-            content = self.read(key)
-            if content is None:
-                continue
-            header = _SECTION_HEADERS[key]
-            sections.append(f"## {header}\n\n{content.strip()}")
-        return "\n\n---\n\n".join(sections)
-
 
 async def run_session_end_routine(
     session,

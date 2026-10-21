@@ -99,6 +99,13 @@ export type DisplayItem =
        * See FE-A3 / FE-2.
        */
       defaultExpanded?: boolean;
+      /**
+       * Spec 112 A6: the capsule holds the tool calls of the daemon's
+       * end-of-run memory record turn (rows tagged `_kind: "memory_record"`).
+       * Rendered as a collapsed grey activity line labelled as a memory
+       * update; it never carries a bubble or an agent header of its own.
+       */
+      memory_record?: boolean;
     }
   | { type: 'session_separator'; timestamp: string }
   | {
@@ -527,6 +534,8 @@ interface OpenCapsule {
   startedAtMs: number;
   endedAtMs: number;
   defaultExpanded: boolean;
+  /** Spec 112: opened by a `_kind: "memory_record"` tool turn. */
+  memoryRecord?: boolean;
 }
 
 // [Sub-agent] lifecycle markers persisted to JSONL by the lifecycle observer.
@@ -850,6 +859,7 @@ export function transformChatHistory(
         started_at: currentCapsule.startedAtMs,
         ended_at: status === 'running' ? null : currentCapsule.endedAtMs,
         ...(currentCapsule.defaultExpanded ? { defaultExpanded: true } : {}),
+        ...(currentCapsule.memoryRecord ? { memory_record: true } : {}),
       });
     }
     currentCapsule = null;
@@ -872,6 +882,96 @@ export function transformChatHistory(
       items.push({ type: 'compaction_marker', timestamp: msg.timestamp });
       i++;
       continue;
+    }
+
+    // Spec 112 A6: the end-of-run memory record turn. The reply the user
+    // already saw is the reply; what follows it is bookkeeping. The [MEMORY]
+    // ask (system), a pinned worker's reminder (user) and its lifecycle rows
+    // (system) render as nothing. The model's tool calls render as ONE
+    // collapsed capsule flagged `memory_record` — no bubble, no agent
+    // header — and its text ("nothing to record", "Done.") is dropped, so a
+    // record turn that edited nothing leaves no trace in the chat.
+    if (msg._kind === 'memory_record') {
+      if (msg.role === 'system' || msg.role === 'user') {
+        i++;
+        continue;
+      }
+      if (msg.source === 'sub_agent') {
+        // A pinned worker's record turn (the /chat endpoint's synthetic run
+        // summary): only its tool rows, as a memory capsule under the worker.
+        finalizeCapsule();
+        const handle = msg.sub_agent_handle ?? 'sub-agent';
+        const streamTools = (msg.sub_agent_stream ?? []).filter(
+          (r): r is SubAgentToolRow & { kind: 'tool' } => r.kind === 'tool',
+        );
+        const toolRows = streamTools.length > 0 ? streamTools : (msg.sub_agent_tool_rows ?? []);
+        if (toolRows.length > 0) {
+          const counts: Record<string, number> = {};
+          const children: CapsuleChild[] = toolRows.map((row, r) => {
+            const name = row.name || 'tool';
+            counts[name] = (counts[name] ?? 0) + 1;
+            const hasResult = row.result_preview !== undefined;
+            return {
+              type: 'tool_call_row',
+              tool_name: name,
+              target_description: row.arguments
+                ? describeWorkerTool(name, row.arguments, workspace, tr)
+                : `${(row.duration_seconds ?? 0).toFixed(1)}s`,
+              tool_call_id: row.tool_call_id || `sub:${handle}:${msg.timestamp}:${r}`,
+              category: workerToolCategory(name),
+              timestamp: row.timestamp || msg.timestamp,
+              result_content: hasResult ? (row.result_preview ?? '') : null,
+              result_status: 'received',
+            };
+          });
+          const startedAtMs = tsToMs(msg.timestamp);
+          const durationMs = Math.round((msg.sub_agent_duration ?? 0) * 1000);
+          items.push({
+            type: 'agent_run',
+            capsule_id: `sub_agent:${handle}:${msg.timestamp}:${capsuleCounter++}`,
+            status: 'completed',
+            items: children,
+            tool_call_count_by_name: counts,
+            has_thinking: false,
+            started_at: startedAtMs,
+            ended_at: startedAtMs + durationMs,
+            source: handle,
+            memory_record: true,
+          });
+        }
+        i++;
+        continue;
+      }
+      if (msg.role === 'assistant') {
+        const hasTools = !!(msg.tool_calls && msg.tool_calls.length > 0);
+        if (!hasTools) {
+          i++;
+          continue;
+        }
+        if (!currentCapsule || !currentCapsule.memoryRecord) {
+          finalizeCapsule();
+          currentCapsule = openCapsuleAt(msg.timestamp, false);
+          currentCapsule.memoryRecord = true;
+        }
+        const msTime = tsToMs(msg.timestamp);
+        for (const tc of msg.tool_calls!) {
+          const activity = toolCallToActivity(tc, msg.timestamp, msg, workspace, tr);
+          currentCapsule.items.push({
+            type: 'tool_call_row',
+            tool_name: activity.toolName,
+            target_description: activity.description,
+            tool_call_id: tc.id,
+            category: activity.category,
+            timestamp: msg.timestamp,
+            result_content: null,
+            result_status: 'pending',
+          });
+          currentCapsule.endedAtMs = msTime;
+        }
+        i++;
+        continue;
+      }
+      // role === 'tool': pairs into the open memory capsule below.
     }
 
     // Synthetic sub-agent run injected by the /chat endpoint after a dispatch

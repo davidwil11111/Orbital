@@ -387,6 +387,14 @@ export interface ChatMessage {
   _meta?: Record<string, unknown>;
   _activity_descriptions?: Record<string, string>;
   /**
+   * Spec 112 A6: "memory_record" on every row the daemon's end-of-run memory
+   * record turn produced (the [MEMORY] ask, the model's edits, its closing
+   * text; a pinned worker's reminder, dispatch marker, run summary and
+   * completion). Never a bubble: chatTransform renders the edits as a
+   * collapsed activity capsule and drops the rest.
+   */
+  _kind?: string;
+  /**
    * Format-1 user-facing chat session identity. Stable within a chat thread;
    * rotates when ``/new-session`` is invoked. Treated as an opaque equality
    * key in chatTransform.ts (used only to draw session-boundary separators).

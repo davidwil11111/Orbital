@@ -113,10 +113,13 @@ function formatDuration(startedAt: number, endedAt: number | null, tr: CapsuleTr
   return rs ? `${m}m ${rs}s` : `${m}m`;
 }
 
-function capsuleSummaryText(capsule: AgentRunItem, tr: CapsuleTr = EN_CAPSULE): string {
+export function capsuleSummaryText(capsule: AgentRunItem, tr: CapsuleTr = EN_CAPSULE): string {
   const breakdown = formatToolBreakdown(capsule.tool_call_count_by_name);
   const dur = formatDuration(capsule.started_at, capsule.ended_at, tr);
-  const head = breakdown || (capsule.has_thinking ? tr('chat.capsule.thinking') : tr('chat.capsule.agentStep'));
+  // Spec 112 A6: the memory record turn's capsule says what it is.
+  const head = capsule.memory_record
+    ? (breakdown ? `${tr('chat.capsule.memoryRecord')} · ${breakdown}` : tr('chat.capsule.memoryRecord'))
+    : breakdown || (capsule.has_thinking ? tr('chat.capsule.thinking') : tr('chat.capsule.agentStep'));
   let line = `${head} · ${dur}`;
   if (capsule.status === 'error' || capsule.status === 'stopped') {
     line += ` ${tr('chat.capsule.stoppedAtError')}`;

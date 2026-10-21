@@ -1,0 +1,348 @@
+# Orbital — An operating system for AI agents
+# Copyright (C) 2026 Orbital Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Spec 112 A6 (7d): a pinned direct-chat worker gets the record turn too.
+
+The record turn goes to whoever ended the exchange with the user. A worker
+the manager dispatched is not asked (the manager records on its wake run);
+a worker the user talks to directly (the composer pin, spec 074) is — as its
+next turn on its resumed session, right after its completion row lands,
+once per turn, never for the reminder turn itself, and only on transports
+that report tool names and paths (claude-code SDK stream, codex app-server,
+ACP, Pi RPC — not pipe/PTY, whose output is parsed text).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from agent_os.agent.loop import MEMORY_RECORD_KIND
+from agent_os.agent.session import Session, persist_user_row
+from agent_os.daemon_v2.agent_manager import (
+    AgentManager, ProjectHandle, worker_turn_changed_files,
+)
+from agent_os.daemon_v2.models import make_session_key
+
+
+PROJECT = "proj_pin"
+SID = "sess-pin-0001"
+HANDLE = "codex"
+
+
+class CodexTransport:  # eligibility is by transport class name
+    pass
+
+
+class SDKTransport:
+    pass
+
+
+class ACPSDKTransport:
+    pass
+
+
+class PipeTransport:
+    pass
+
+
+def _write_transcript(path: str, *, tool_rows: list[dict], dispatch_id="d1",
+                      reply="Done, routes fixed.") -> None:
+    rows = []
+    for idx, tr in enumerate(tool_rows):
+        rows.append({
+            "source": HANDLE, "content": f"[Tool: {tr['tool_name']}]",
+            "timestamp": f"2026-10-20T10:00:0{idx}+00:00", "chunk_type": "tool_activity",
+            "metadata": {"tool_call_id": f"t{idx}", **tr}, "dispatch_id": dispatch_id,
+        })
+    rows.append({"source": HANDLE, "content": reply,
+                 "timestamp": "2026-10-20T10:00:09+00:00", "chunk_type": "response",
+                 "dispatch_id": dispatch_id})
+    rows.append({"source": HANDLE, "content": "", "timestamp": "2026-10-20T10:00:10+00:00",
+                 "chunk_type": "turn_complete", "dispatch_id": dispatch_id})
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
+def _manager(tmp_path, *, transport_cls=CodexTransport, tool_rows=None):
+    ws = MagicMock()
+    ws.broadcast = MagicMock()
+    sub = MagicMock()
+    sub.send = AsyncMock(return_value=f"Message sent to {HANDLE}. Transcript: t.jsonl")
+    sub.list_active = MagicMock(return_value=[])
+    adapter = MagicMock()
+    adapter._transport = transport_cls() if transport_cls else None
+    sk = make_session_key(PROJECT, SID)
+    sub._adapters = {sk: {HANDLE: adapter}}
+    transcript_path = os.path.join(str(tmp_path), "codex.jsonl")
+    _write_transcript(transcript_path, tool_rows=tool_rows if tool_rows is not None else [
+        {"tool_name": "Edit", "arguments": {"file_path": os.path.join(str(tmp_path), "src/api/routes.py")}},
+        {"tool_name": "Bash", "arguments": {"command": "pytest"}},
+        {"tool_name": "Write", "arguments": {"file_path": "tests/test_routes.py"}},
+    ])
+    transcript = MagicMock()
+    transcript.filepath = transcript_path
+    sub._transcripts = {(PROJECT, SID, HANDLE): transcript}
+    project_store = MagicMock()
+    project_store.get_project = MagicMock(return_value={"workspace": str(tmp_path)})
+    mgr = AgentManager(
+        project_store=project_store, ws_manager=ws, sub_agent_manager=sub,
+        activity_translator=MagicMock(), process_manager=MagicMock(),
+    )
+    return mgr, sub
+
+
+def _plant_session(mgr, tmp_path, *, pinned_target=HANDLE):
+    session = Session.new(SID, str(tmp_path))
+    session.pinned_target = pinned_target
+    persist_user_row(session, "fix the route")
+    handle = ProjectHandle(
+        session=session, loop=MagicMock(), provider=MagicMock(), registry=MagicMock(),
+        context_manager=MagicMock(), interceptor=None, task=None,
+    )
+    mgr._handles[make_session_key(PROJECT, SID)] = handle
+    return session
+
+
+def _completed_meta(handle=HANDLE, **extra):
+    display = f"[Sub-agent] {handle} completed. Summary: Done. Transcript: t.jsonl."
+    return {"event": "sub_agent_terminal", "kind": "completed",
+            "display_content": display, "reply": "Done, routes fixed.",
+            "suppress_wake": True, **extra}
+
+
+async def _settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Changed-file extraction from a worker turn
+# ---------------------------------------------------------------------------
+
+
+def test_worker_turn_changed_files_collects_edit_like_tools_relative_to_the_workspace(tmp_path):
+    rows = [
+        {"name": "Edit", "arguments": {"file_path": os.path.join(str(tmp_path), "src/a.py")}},
+        {"name": "Write", "arguments": {"file_path": "docs/b.md"}},
+        {"name": "MultiEdit", "arguments": {"file_path": "src/a.py"}},   # duplicate path
+        {"name": "fileChange", "arguments": {"changes": [{"path": "src/c.py"}, {"path": "src/d.py"}]}},
+        {"name": "Bash", "arguments": {"command": "echo hi > e.txt"}},    # not a file tool
+        {"name": "Read", "arguments": {"file_path": "src/z.py"}},
+        {"name": "edit", "arguments": {"path": "lib/f.py"}},               # pi / acp shape
+    ]
+    changed, wrote_memory = worker_turn_changed_files(rows, str(tmp_path))
+    assert changed == ["src/a.py", "docs/b.md", "src/c.py", "src/d.py", "lib/f.py"]
+    assert wrote_memory is False
+
+
+def test_worker_turn_changed_files_flags_memory_writes(tmp_path):
+    rows = [{"name": "Edit", "arguments": {"file_path": "orbital/PROJECT_STATE.md"}},
+            {"name": "Write", "arguments": {"file_path": "src/a.py"}}]
+    changed, wrote_memory = worker_turn_changed_files(rows, str(tmp_path))
+    assert changed == ["src/a.py"] and wrote_memory is True
+
+
+# ---------------------------------------------------------------------------
+# The reminder dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pinned_worker_completion_sends_the_worker_variant_as_its_next_turn(tmp_path):
+    mgr, sub = _manager(tmp_path)
+    session = _plant_session(mgr, tmp_path)
+    content = "[Sub-agent] codex completed. Summary: Done. Transcript: t.jsonl. (guidance)"
+
+    status = await mgr.inject_system_message(PROJECT, content, session_id=SID,
+                                             meta=_completed_meta())
+    assert status == "suppressed"
+    await _settle()
+
+    sub.send.assert_awaited_once()
+    args, kwargs = sub.send.call_args
+    assert args[:2] == (PROJECT, HANDLE)
+    text = args[2]
+    assert text.startswith("[Orbital memory] Your last turn is ending.")
+    assert "Files this turn changed: src/api/routes.py, tests/test_routes.py\n" in text
+    assert text.endswith("If nothing durable happened, reply exactly: nothing to record")
+    assert kwargs["session_id"] == SID
+    assert kwargs["initiator"] == "user_pinned"
+    assert kwargs["dispatch_id"]
+
+    rows = session.get_messages()
+    reminder = rows[-1]
+    assert reminder["role"] == "user" and reminder["target"] == HANDLE
+    assert reminder["source"] == "daemon"
+    assert reminder["_kind"] == MEMORY_RECORD_KIND
+    assert reminder["content"] == text
+    # The worker's completion row before it stays untagged — it IS the reply.
+    assert rows[-2]["content"] == content and rows[-2].get("_kind") is None
+
+
+@pytest.mark.asyncio
+async def test_the_reminders_marker_and_completion_are_tagged_and_do_not_re_trigger(tmp_path):
+    mgr, sub = _manager(tmp_path)
+    session = _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    dispatch_id = sub.send.call_args.kwargs["dispatch_id"]
+
+    # send() fires on_message_routed → the dispatch marker lands with the id.
+    await mgr.inject_system_message(
+        PROJECT, f'[Sub-agent] Message sent to {HANDLE}: "[Orbital memory] …". Transcript: t.jsonl',
+        session_id=SID,
+        meta={"dispatch_id": dispatch_id, "handle": HANDLE, "transcript_path": "t.jsonl",
+              "suppress_wake": True})
+    # …and its completion closes the reminder turn.
+    await mgr.inject_system_message(
+        PROJECT, "[Sub-agent] codex completed. Summary: nothing to record. Transcript: t.jsonl.",
+        session_id=SID,
+        meta=_completed_meta(reply="nothing to record"))
+    await _settle()
+
+    rows = session.get_messages()
+    assert rows[-2]["_kind"] == MEMORY_RECORD_KIND          # the marker
+    assert rows[-1]["_kind"] == MEMORY_RECORD_KIND          # the reminder's completion
+    assert sub.send.await_count == 1                        # no second ask
+
+    # A later ordinary completion is untagged and asks again.
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: more work.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    assert session.get_messages()[-2].get("_kind") is None
+    assert sub.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatched_by_the_manager_is_not_asked(tmp_path):
+    """The session is not pinned to the worker: the manager is waiting for
+    the result and records on its own wake run."""
+    mgr, sub = _manager(tmp_path)
+    _plant_session(mgr, tmp_path, pinned_target=None)
+    meta = _completed_meta()
+    meta.pop("suppress_wake")
+    mgr._start_loop = AsyncMock()
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=meta)
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_pinned_to_another_worker_is_not_asked_for_this_one(tmp_path):
+    mgr, sub = _manager(tmp_path)
+    _plant_session(mgr, tmp_path, pinned_target="claude-code")
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_cls", [PipeTransport, None])
+async def test_pipe_and_pty_transports_are_not_asked(tmp_path, transport_cls):
+    mgr, sub = _manager(tmp_path, transport_cls=transport_cls)
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_cls", [SDKTransport, ACPSDKTransport])
+async def test_sdk_and_acp_transports_are_asked(tmp_path, transport_cls):
+    mgr, sub = _manager(tmp_path, transport_cls=transport_cls)
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_worker_turn_that_wrote_a_memory_file_is_not_asked(tmp_path):
+    mgr, sub = _manager(tmp_path, tool_rows=[
+        {"tool_name": "Edit", "arguments": {"file_path": "orbital/PROJECT_STATE.md"}},
+        {"tool_name": "Write", "arguments": {"file_path": "src/x.py"}},
+    ])
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_turn_with_no_file_changes_is_still_asked_with_none(tmp_path):
+    mgr, sub = _manager(tmp_path, tool_rows=[
+        {"tool_name": "Bash", "arguments": {"command": "ls"}},
+    ])
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_awaited_once()
+    assert "Files this turn changed: none\n" in sub.send.call_args.args[2]
+
+
+@pytest.mark.asyncio
+async def test_error_and_stopped_terminals_are_not_asked(tmp_path):
+    mgr, sub = _manager(tmp_path)
+    _plant_session(mgr, tmp_path)
+    for kind in ("error", "stopped", "interrupted", "failed"):
+        await mgr.inject_system_message(PROJECT, f"[Sub-agent] codex {kind}", session_id=SID,
+                                        meta={"event": "sub_agent_terminal", "kind": kind,
+                                              "suppress_wake": True})
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_send_leaves_no_pending_tag(tmp_path):
+    mgr, sub = _manager(tmp_path)
+    sub.send = AsyncMock(return_value="Error: agent 'codex' not running")
+    session = _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    # The next real completion is untagged (nothing is left pending).
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Again.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    completions = [m for m in session.get_messages()
+                   if (m.get("_meta") or {}).get("event") == "sub_agent_terminal"]
+    assert all(m.get("_kind") is None for m in completions)
+
+
+@pytest.mark.asyncio
+async def test_the_reminder_task_is_strongly_referenced_until_it_finishes(tmp_path):
+    """The event loop holds tasks weakly; a fire-and-forget task with no
+    reference can be collected mid-flight ("Task was destroyed but it is
+    pending"). The manager keeps it in a set that empties itself."""
+    mgr, sub = _manager(tmp_path)
+    gate = asyncio.Event()
+
+    async def slow_send(*args, **kwargs):
+        await gate.wait()
+        return "Message sent to codex. Transcript: t.jsonl"
+
+    sub.send = AsyncMock(side_effect=slow_send)
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    assert len(mgr._background_tasks) == 1
+    task = next(iter(mgr._background_tasks))
+    assert isinstance(task, asyncio.Task) and not task.done()
+    gate.set()
+    await _settle()
+    assert mgr._background_tasks == set()

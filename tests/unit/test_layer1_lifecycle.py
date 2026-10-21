@@ -225,3 +225,178 @@ def test_mem_comments_are_still_excluded_for_state():
     """The pre-existing exclusion must survive the new one."""
     body = "- [user] a line\n  <!--mem id:abc created:2026-07-01 touched:2026-07-01-->\n"
     assert "abc" not in _mem._budget_text(body, "state")
+
+
+# ---------------------------------------------------------------------------
+# 6. Spec 112 A1–A3: Layer 1 is snapshotted once per run.
+#
+#    ``prepare()`` used to re-read the four files on every call and inject
+#    whatever was on disk. The agent edits them mid-run (314 times in two
+#    months, almost all mid-run), and from that call on the injected row was
+#    byte-different, so the provider's prefix cache broke right there and
+#    60–90k tokens re-prefilled. The injected rendering is now frozen for the
+#    run (``begin_run()`` clears it); the disk is still read each call, but
+#    only for the drift line and the hygiene flags, which ride the tail.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from agent_os.agent.context import ContextManager, _LAYER1_FILES
+from agent_os.agent.prompt_builder import Autonomy, PromptContext
+from agent_os.agent.session import Session
+
+
+class _SnapBuilder:
+    def build(self, context: PromptContext) -> tuple[str, str, str]:
+        return ("cached-system-prefix", "semi-stable-suffix", "dynamic-runtime")
+
+
+def _snap_ctx(workspace: str) -> PromptContext:
+    return PromptContext(
+        workspace=workspace,
+        model="test-model",
+        autonomy=Autonomy.HANDS_OFF,
+        enabled_agents=[],
+        tool_names=["read"],
+        os_type="linux",
+        datetime_now="2026-01-01T00:00:00",
+        context_usage_pct=0.0,
+    )
+
+
+def _snap_rig(tmp_path):
+    session = Session.new("snap", str(tmp_path))
+    ws = WorkspaceFileManager(str(tmp_path))
+    ws.ensure_dir()
+    mgr = ContextManager(session, _SnapBuilder(), _snap_ctx(str(tmp_path)),
+                         model_context_limit=200_000, workspace_files=ws)
+    session.append({"role": "user", "content": "hello", "source": "user"})
+    return session, ws, mgr
+
+
+def _layer1_rows(messages: list[dict], filename: str) -> list[str]:
+    return [
+        m["content"] for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
+        and m["content"].startswith(f"[{filename}")
+    ]
+
+
+def _runtime_text(messages: list[dict]) -> str:
+    tail = messages[-1]
+    content = tail.get("content")
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content or ""
+
+
+@pytest.mark.parametrize("key,filename", list(_LAYER1_FILES))
+def test_layer1_row_is_byte_identical_within_a_run_and_the_tail_names_the_drift(tmp_path, key, filename):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write(key, "# Heading\n- first fact that is true\n")
+    mgr.begin_run()
+    first = mgr.prepare()
+    assert "first fact" in "".join(_layer1_rows(first, filename))
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(first)
+
+    ws.write(key, "# Heading\n- first fact that is true\n- SECOND-FACT-ADDED-MID-RUN\n")
+    second = mgr.prepare()
+
+    assert _layer1_rows(second, filename) == _layer1_rows(first, filename)
+    assert "SECOND-FACT-ADDED-MID-RUN" not in "".join(_layer1_rows(second, filename))
+    tail = _runtime_text(second)
+    assert "[MEMORY SNAPSHOT]" in tail
+    drift_line = next(l for l in tail.splitlines() if l.startswith("[MEMORY SNAPSHOT]"))
+    assert filename in drift_line
+    # Only the changed file is named.
+    for _other_key, other in _LAYER1_FILES:
+        if other != filename:
+            assert other not in drift_line
+
+
+def test_no_drift_line_when_nothing_changed_between_calls(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()
+    second = mgr.prepare()
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(second)
+
+
+def test_begin_run_refreshes_the_snapshot_and_clears_the_drift_line(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()
+    ws.write("state", "# S\n- a fact\n- NEW-FACT-FOR-NEXT-RUN\n")
+    assert "[MEMORY SNAPSHOT]" in _runtime_text(mgr.prepare())
+
+    mgr.begin_run()
+    third = mgr.prepare()
+    assert "NEW-FACT-FOR-NEXT-RUN" in "".join(_layer1_rows(third, "PROJECT_STATE.md"))
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(third)
+
+
+def test_snapshot_header_is_the_static_run_start_text(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("decisions", "# D\n- chose B over A because it ships\n")
+    mgr.begin_run()
+    rows = _layer1_rows(mgr.prepare(), "DECISIONS.md")
+    assert len(rows) == 1
+    header = rows[0].splitlines()[0]
+    assert header == (
+        "[DECISIONS.md — snapshot taken when this run started. Do not edit "
+        "memory files during the run; at the end of the run you will be asked "
+        "what to record, with the current file text in hand.]"
+    )
+
+
+def test_layer1_snapshot_accessor_exposes_the_injected_rows(tmp_path):
+    """Spec 124 §3.7: the Memory session starts from the SAME bytes so its
+    first call hits the prefix cache."""
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    ws.write("index", "# I\n- docs/ — notes\n")
+    assert mgr.layer1_snapshot() == []          # nothing until the first build
+    mgr.begin_run()
+    prepared = mgr.prepare()
+    snap = mgr.layer1_snapshot()
+    assert [name for name, _ in snap] == ["PROJECT_STATE.md", "INDEX.md"]
+    for filename, row_text in snap:
+        assert _layer1_rows(prepared, filename) == [row_text]
+    ws.write("state", "# S\n- changed on disk\n")
+    mgr.prepare()
+    assert mgr.layer1_snapshot() == snap        # frozen for the run
+
+
+def test_disk_is_still_read_each_call_for_the_hygiene_flag(tmp_path):
+    """The over-budget flag reflects the file on disk NOW (it rides the tail),
+    while the injected row stays the snapshot."""
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- small\n")
+    mgr.begin_run()
+    first = mgr.prepare()
+    assert "[MEMORY HYGIENE]" not in _runtime_text(first)
+    big = "# S\n" + "".join(f"- line {i} " + "x" * 120 + "\n" for i in range(120))
+    ws.write("state", big)
+    second = mgr.prepare()
+    assert _layer1_rows(second, "PROJECT_STATE.md") == _layer1_rows(first, "PROJECT_STATE.md")
+    assert "[MEMORY HYGIENE]" in _runtime_text(second)
+
+
+def test_prefix_only_changes_at_the_tail_across_a_mid_run_memory_edit(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()   # the first call of a manager carries the one-off cold-resume row
+    first = mgr.prepare()
+    ws.write("state", "# S\n- a fact\n- edited mid-run\n")
+    session.append({"role": "assistant", "content": "Done.", "source": "management"})
+    session.append({"role": "user", "content": "next", "source": "user"})
+    second = mgr.prepare()
+    diff_at = next(
+        (i for i, (a, b) in enumerate(zip(first, second))
+         if _json.dumps(a, sort_keys=True) != _json.dumps(b, sort_keys=True)),
+        min(len(first), len(second)),
+    )
+    assert diff_at >= len(first) - 1, f"prefix rewritten at {diff_at} of {len(first)}"

@@ -87,15 +87,20 @@ def _make_token_usage(usage_obj) -> TokenUsage:
     )
 
 
-def _log_cache_audit(model: str, usage: TokenUsage) -> None:
-    """Log cache efficiency metrics after each LLM call."""
+def _log_cache_audit(model: str, usage: TokenUsage, caller: str = "main") -> None:
+    """Log cache efficiency metrics after each LLM call — ONCE per response.
+
+    ``caller`` (spec 112 A4) is ``main`` for the management loop and
+    ``memory`` for spec 124's Memory session, so the two can be attributed
+    separately by the offline scripts (``scripts/diag/cache_attribution.py``).
+    """
     input_tokens = usage.input_tokens
     cached_tokens = usage.cache_read_tokens
     output_tokens = usage.output_tokens
     cache_rate = cached_tokens / input_tokens if input_tokens > 0 else 0.0
     _cache_logger.info(
-        "[CACHE_AUDIT] model=%s input=%d cached=%d output=%d cache_rate=%.1f%%",
-        model, input_tokens, cached_tokens, output_tokens, cache_rate * 100,
+        "[CACHE_AUDIT] model=%s input=%d cached=%d output=%d cache_rate=%.1f%% caller=%s",
+        model, input_tokens, cached_tokens, output_tokens, cache_rate * 100, caller,
     )
 
 
@@ -529,6 +534,10 @@ class LLMProvider:
         self.session_header = session_header or None
         self._session_id_getter = None
         self._instance_session_id = uuid.uuid4().hex
+        # Spec 112 A4: who this client serves, stamped on every
+        # ``[CACHE_AUDIT]`` line. The Memory session (spec 124 §3.7) sets
+        # ``"memory"`` on its own client; everything else is ``main``.
+        self.cache_audit_caller: str = "main"
 
         if sdk == "anthropic":
             import anthropic
@@ -725,12 +734,26 @@ class LLMProvider:
         # `_stream_anthropic` has always guarded its iteration this way.
         # CancelledError/GeneratorExit are BaseException, so cancel_turn() and
         # consumer close still propagate untouched.
+        # Spec 112 A4: a streamed response may carry usage on the
+        # finish_reason chunk AND on a trailing usage-only chunk (DeepSeek,
+        # OpenRouter); it used to be audited at each, so every streamed call
+        # logged twice. One line per response, at the first chunk that
+        # carries usage.
+        audited = False
+
+        def _audit_once(usage: TokenUsage) -> None:
+            nonlocal audited
+            if audited:
+                return
+            audited = True
+            _log_cache_audit(self.model, usage, caller=self.cache_audit_caller)
+
         try:
             async for chunk in response_iter:
                 if not chunk.choices:
                     if chunk.usage is not None:
                         usage = _make_token_usage(chunk.usage)
-                        _log_cache_audit(self.model, usage)
+                        _audit_once(usage)
                         yield StreamChunk(
                             is_final=True,
                             usage=usage,
@@ -750,7 +773,7 @@ class LLMProvider:
 
                 if choice.finish_reason is not None and chunk.usage is not None:
                     usage = _make_token_usage(chunk.usage)
-                    _log_cache_audit(self.model, usage)
+                    _audit_once(usage)
                     yield StreamChunk(
                         text=text,
                         tool_calls_delta=tc_delta,
@@ -761,7 +784,7 @@ class LLMProvider:
                     )
                 elif chunk.usage is not None and not text and not tc_delta and not reasoning:
                     usage = _make_token_usage(chunk.usage)
-                    _log_cache_audit(self.model, usage)
+                    _audit_once(usage)
                     yield StreamChunk(
                         is_final=True,
                         usage=usage,
@@ -879,7 +902,7 @@ class LLMProvider:
             tool_calls = []
         finish_reason = choice.finish_reason
         usage = _make_token_usage(response.usage)
-        _log_cache_audit(self.model, usage)
+        _log_cache_audit(self.model, usage, caller=self.cache_audit_caller)
 
         # Inline-think models: peel <think>…</think> out of content into
         # reasoning_content so the persisted message keeps a clean answer.
