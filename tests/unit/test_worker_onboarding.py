@@ -264,6 +264,7 @@ class TestWorkerFlavours:
         # The manager's text is shared verbatim, not rewritten.
         assert op.cold_start_instruction(ws, None) in text
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX pass-through: os.path.join itself yields backslashes on a Windows host")
     def test_posix_paths_are_untouched(self, monkeypatch):
         monkeypatch.setattr(op, "_WINDOWS", False)
         skeleton = "[WORKSPACE SKELETON] 1 files\nodd\\name.txt\t3"
