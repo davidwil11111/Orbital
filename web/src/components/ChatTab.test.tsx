@@ -1216,3 +1216,65 @@ describe('ChatTab — route.previewPath opens the panel, not the overlay (§9.10
     expect(setRoute).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Session import: entering a project never auto-opens an import that has not
+// been converted yet (opening one materializes it, and landing there would
+// skip the cold-start card and the onboarding kickoff).
+// ---------------------------------------------------------------------------
+describe('ChatTab — default resolution skips unmaterialized imports', () => {
+  beforeEach(() => resetMocks());
+
+  const imported = (id: string, at: string, materialized: boolean) =>
+    makeSession({
+      session_id: id, session_uuid: id, origin: 'imported', last_activity_at: at,
+      imported: { agent: 'codex', native_id: id, materialized, size_bytes: 10 },
+    });
+
+  async function resolvedFor(): Promise<string | undefined> {
+    const setRoute = vi.fn();
+    const route = makeRoute();
+    await act(async () => {
+      render(
+        <ChatTab project={PROJECT} agentStatus="idle" agents={[]} route={route} setRoute={setRoute} />,
+      );
+    });
+    if (setRoute.mock.calls.length === 0) return undefined;
+    const updated = (setRoute.mock.calls[0][0] as (prev: Route) => Route)(route);
+    return (updated as Extract<Route, { name: 'project' }>).sessionId;
+  }
+
+  it('a project with only unmaterialized imports resolves to no session', async () => {
+    mockSessions = [
+      imported('imp_codex_a', '2026-10-20T10:00:00Z', false),
+      imported('imp_codex_b', '2026-10-19T10:00:00Z', false),
+    ];
+    expect(await resolvedFor()).toBeUndefined();
+    expect(lastChatViewProps.sessionId).toBeUndefined();
+  });
+
+  it('the newest ordinary session wins over a newer unmaterialized import', async () => {
+    mockSessions = [
+      imported('imp_codex_new', '2026-10-21T10:00:00Z', false),
+      makeSession({ session_id: 'sess-chat', last_activity_at: '2026-10-01T00:00:00Z' }),
+    ];
+    expect(await resolvedFor()).toBe('sess-chat');
+  });
+
+  it('a persisted id naming an unmaterialized import is not reopened', async () => {
+    mockSessions = [
+      imported('imp_codex_new', '2026-10-21T10:00:00Z', false),
+      makeSession({ session_id: 'sess-chat', last_activity_at: '2026-10-01T00:00:00Z' }),
+    ];
+    mockActiveSessionId = 'imp_codex_new';
+    expect(await resolvedFor()).toBe('sess-chat');
+  });
+
+  it('a materialized import is an ordinary session', async () => {
+    mockSessions = [
+      imported('imp_codex_done', '2026-10-21T10:00:00Z', true),
+      makeSession({ session_id: 'sess-chat', last_activity_at: '2026-10-01T00:00:00Z' }),
+    ];
+    expect(await resolvedFor()).toBe('imp_codex_done');
+  });
+});

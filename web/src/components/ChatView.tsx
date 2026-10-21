@@ -870,7 +870,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // not materialized yet (the PATCH 404s until the first message lands —
   // handleSend re-persists the pin after a successful pinned send).
   const { sessions: pinSessions, pinAgent } = useSessions(projectId);
-  const [localPin, setLocalPin] = useState<{ sessionId: string; slug: string | null } | null>(null);
+  // Keyed by the viewed session; `sessionId: undefined` is the project with no
+  // session minted yet (the choice is the project's sticky pin then).
+  const [localPin, setLocalPin] = useState<{ sessionId: string | undefined; slug: string | null } | null>(null);
   // The pin PATCH write-locks the session JSONL on the backend for a
   // load+meta-rewrite burst; an inject landing inside that burst gets
   // rejected (2026-08-31 bug: pick agent → send immediately → "Failed to
@@ -884,18 +886,44 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         if (pinPatchInFlightRef.current === done) {
           pinPatchInFlightRef.current = null;
         }
+        // The PATCH also moved the project's sticky pin (last choice wins),
+        // which seeds the next new session — re-read the project row.
+        onRefreshProject?.(projectId);
       });
     pinPatchInFlightRef.current = done;
-  }, [pinAgent]);
-  const backendPin = useMemo(() => {
-    if (sessionId === undefined) return null;
-    const entry = pinSessions.find(
+  }, [pinAgent, onRefreshProject, projectId]);
+  // The viewed session's list entry (absent for a minted id whose JSONL has
+  // not materialized yet, and while there is no session at all).
+  const viewedEntry = useMemo(() => {
+    if (sessionId === undefined) return undefined;
+    return pinSessions.find(
       (s) => s.session_id === sessionId || s.session_uuid === sessionId,
     );
-    return entry?.pinned_target ?? null;
   }, [pinSessions, sessionId]);
+  // The session's own pin record; undefined = no record yet.
+  const recordedPin = viewedEntry?.pinned_target;
+  // Keyless onboarding (contract §2/§3): a session with no pin record starts
+  // on the project's effective pin — its sticky choice, or with no key the
+  // first available worker. An older daemon sends neither (→ Orbital).
+  const projectPin = project.effective_pinned_target ?? null;
+  const managerReady = project.manager_ready !== false;
   const pinnedTarget =
-    localPin && localPin.sessionId === sessionId ? localPin.slug : backendPin;
+    localPin && localPin.sessionId === sessionId
+      ? localPin.slug
+      : recordedPin !== undefined
+        ? recordedPin
+        : projectPin;
+  // Before the first session exists the pin can only be the project's sticky
+  // choice: offer it when there is one to show, or when Orbital has no key
+  // (a worker is then the only way to talk at all). Otherwise, as before,
+  // the control waits for a session.
+  const pinDisabled = sessionId === undefined && projectPin === null && managerReady;
+  const pinnedAgentName = pinnedTarget
+    ? (agents.find((a) => a.slug === pinnedTarget)?.name ?? pinnedTarget)
+    : null;
+  // Session import: an imported row whose transcript the first /chat converts.
+  const viewedIsUnimportedImport =
+    viewedEntry?.origin === 'imported' && viewedEntry.imported?.materialized === false;
   const [showThinking, setShowThinking] = useState(false);
   const [showCommandDropdown, setShowCommandDropdown] = useState(false);
   const [commandFilter, setCommandFilter] = useState('');
@@ -2835,6 +2863,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     if (item.type === 'fanout_summary') {
       return `fanout_summary:${item.fanout_id}`;
     }
+    if (item.type === 'daemon_row') {
+      return `daemon_row:${item.event}:${item.timestamp}:${item.handle}`;
+    }
     // user_message, agent_message, sub_agent_message — use timestamp +
     // first 32 chars of content as a stable-enough fingerprint.
     const contentPrefix = item.content.slice(0, 32);
@@ -3146,7 +3177,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         resolved.pinned &&
         sessionId !== undefined &&
         target !== undefined &&
-        backendPin !== target
+        (recordedPin ?? null) !== target
       ) {
         persistPin(sessionId, target);
       }
@@ -3463,6 +3494,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-7 py-5 max-md:pb-20 flex flex-col gap-4">
         {loading && (
           <div className="space-y-3">
+            {viewedIsUnimportedImport && (
+              <p data-testid="chat-importing" className="text-xs text-secondary px-1">
+                {t('chat.importing')}
+              </p>
+            )}
             {[1, 2, 3].map((i) => (
               <div key={i} className="h-12 bg-sidebar rounded-lg animate-pulse" />
             ))}
@@ -3684,6 +3720,35 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                 >
                   <span className="text-primary">{item.handle}</span>
                   <span className="truncate">{label}</span>
+                </div>
+              );
+            } else if (item.type === 'daemon_row') {
+              // Keyless onboarding / session import divider: the session
+              // separator's shape at full strength, translated here from the
+              // row's fields (the daemon's English content is not shown).
+              const agentName =
+                agents.find((a) => a.slug === item.handle)?.name ?? item.handle;
+              const date = item.lastActivity ? new Date(item.lastActivity) : null;
+              const dateText = date && !Number.isNaN(date.getTime())
+                ? date.toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+                : '';
+              const text = item.event === 'worker_onboarding'
+                ? t('chat.daemonRow.workerOnboarding', { agent: agentName })
+                : t(item.truncated ? 'chat.daemonRow.importedTruncated' : 'chat.daemonRow.imported', {
+                    agent: agentName,
+                    date: dateText,
+                  });
+              rendered = (
+                <div
+                  key={`daemon-${index}`}
+                  className="flex items-center gap-3 px-2"
+                  data-event={item.event}
+                >
+                  <div className="flex-1 border-t border-border" />
+                  <span data-testid="chat-daemon-row" className="text-xs text-secondary text-center">
+                    {text}
+                  </span>
+                  <div className="flex-1 border-t border-border" />
                 </div>
               );
             } else if (item.type === 'session_separator') {
@@ -4147,12 +4212,25 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               agents={agents}
               value={pinnedTarget}
               runningSlugs={runningSubAgents}
+              managerReady={managerReady}
               onChange={(slug) => {
-                if (sessionId === undefined) return;
                 setLocalPin({ sessionId, slug });
+                if (sessionId === undefined) {
+                  // No session yet: the choice is the project's sticky pin,
+                  // which the first send's session then starts on. Best
+                  // effort — an older daemon ignores or rejects the field
+                  // and the local pin still steers that first send.
+                  void api(`/api/v2/projects/${encodeURIComponent(projectId)}`, {
+                    method: 'PUT',
+                    body: JSON.stringify({ default_pinned_target: slug }),
+                  })
+                    .then(() => onRefreshProject?.(projectId))
+                    .catch(() => {});
+                  return;
+                }
                 persistPin(sessionId, slug);
               }}
-              disabled={sessionId === undefined}
+              disabled={pinDisabled}
             />
             <input
               type="file"
@@ -4264,6 +4342,16 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             )}
           </div>
         </div>
+        {/* Keyless onboarding: an empty chat on a project whose own agent
+            has no key says who the composer is talking to, and why. */}
+        {!managerReady && pinnedAgentName && !loading && items.length === 0 && !stream && (
+          <p
+            data-testid="chat-keyless-hint"
+            className="mt-2 px-1 text-xs text-secondary leading-relaxed"
+          >
+            {t('chat.keyless.hint', { agent: pinnedAgentName })}
+          </p>
+        )}
         </>
         )}
       </div>

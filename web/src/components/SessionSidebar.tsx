@@ -17,6 +17,12 @@
  *   automations, and the filter makes either half one click away. A session's
  *   state is derived purely from its current condition
  *   (running/waiting/idle/error/pending_approval/new_session).
+ * Cap (session import, 2026-10-21): only the 50 most recent rows below the
+ *   pins render, then a "Show older (n)" row that reveals the rest for this
+ *   project until the sidebar moves to another one. Importing a heavy Claude
+ *   Code / Codex history can add hundreds of rows; the cap applies to the whole
+ *   list, imported or not. An automation group counts as one row; n counts
+ *   the sessions behind the hidden rows.
  * Bottom: "+ new session" button — calls onNewSession prop (no implementation here).
  *
  * ALL sessions are listed regardless of origin. A collapsed automation group
@@ -65,6 +71,9 @@ import type { StringKey } from '../i18n/strings';
 import { useT } from '../i18n/useT';
 
 const FILTER_KEY = 'orbital:sessionSidebar.filter';
+
+/** Rows shown below the pins before "Show older (n)". */
+const SESSION_ROW_CAP = 50;
 
 const FILTERS: { key: SessionFilter; labelKey: StringKey }[] = [
   { key: 'all', labelKey: 'sessionSidebar.filter.all' },
@@ -177,6 +186,22 @@ export function SessionSidebar({
     () => buildSessionList(sortedSessions, filter),
     [sortedSessions, filter],
   );
+
+  // The cap. Revealed per project and in memory only: the reveal belongs to
+  // the project it was clicked in, so switching projects starts capped again.
+  const [showOlderFor, setShowOlderFor] = useState<string | null>(null);
+  const showAll = projectId !== null && showOlderFor === projectId;
+  const { shownNodes, olderCount } = useMemo(() => {
+    if (showAll || nodes.length <= SESSION_ROW_CAP) return { shownNodes: nodes, olderCount: 0 };
+    const hidden = nodes.slice(SESSION_ROW_CAP);
+    return {
+      shownNodes: nodes.slice(0, SESSION_ROW_CAP),
+      olderCount: hidden.reduce(
+        (n, node) => n + (node.type === 'session' ? 1 : node.group.runs.length),
+        0,
+      ),
+    };
+  }, [nodes, showAll]);
 
   // Which automation groups are open. Not persisted: a group is opened to look
   // something up, and a sidebar that remembers every expansion drifts back to
@@ -416,8 +441,19 @@ export function SessionSidebar({
             className="my-1 border-t border-border/60"
           />
         )}
-        {nodes.map((node) =>
+        {shownNodes.map((node) =>
           node.type === 'session' ? renderRow(node.session) : renderGroup(node.group),
+        )}
+        {olderCount > 0 && (
+          <button
+            type="button"
+            data-testid="session-show-older"
+            onClick={() => setShowOlderFor(projectId)}
+            className="w-full px-2.5 py-[7px] rounded-md text-left text-secondary hover:text-primary hover:bg-card-hover transition-colors"
+            style={{ fontSize: '11.5px' }}
+          >
+            {t('session.showOlder', { n: olderCount })}
+          </button>
         )}
       </div>
 

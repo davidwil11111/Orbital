@@ -836,3 +836,112 @@ describe('SessionSidebar — unread badge (spec 108)', () => {
     expect(dotIn('chat')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Session import (contract §7): imported rows sit inline by recency, and the
+// whole list is capped at the 50 most recent rows with a "Show older (n)" row.
+// ---------------------------------------------------------------------------
+describe('SessionSidebar — imported rows and the 50-row cap', () => {
+  const at = (minutesAgo: number) => new Date(Date.UTC(2026, 9, 21, 12, 0) - minutesAgo * 60_000).toISOString();
+  const rowIds = () =>
+    screen.getAllByTestId(/^session-list-item-/).map((el) => el.getAttribute('data-testid')!.replace('session-list-item-', ''));
+
+  it('imported rows sort inline with everything else by last activity', () => {
+    resetMocks();
+    mockSessions = [
+      makeSession({ session_id: 'chat-old', session_uuid: 'u1', last_activity_at: at(30) }),
+      makeSession({
+        session_id: 'imp_codex_a', session_uuid: 'imp_codex_a', origin: 'imported', name: 'Imported one',
+        last_activity_at: at(10),
+        imported: { agent: 'codex', native_id: 'a', materialized: false, size_bytes: 1 },
+      }),
+      makeSession({ session_id: 'chat-new', session_uuid: 'u2', last_activity_at: at(1) }),
+    ];
+    render(<SessionSidebar projectId="p1" />);
+    expect(rowIds()).toEqual(['chat-new', 'imp_codex_a', 'chat-old']);
+    expect(screen.getAllByTestId('session-agent-mark')).toHaveLength(1);
+  });
+
+  function manySessions(n: number) {
+    return Array.from({ length: n }, (_, k) => makeSession({
+      session_id: `s${k}`, session_uuid: `u${k}`, name: `Chat ${k}`, last_activity_at: at(k),
+    }));
+  }
+
+  it('shows the 50 most recent rows and a Show older row counting the rest', () => {
+    resetMocks();
+    mockSessions = manySessions(53);
+    render(<SessionSidebar projectId="p1" />);
+    const ids = rowIds();
+    expect(ids).toHaveLength(50);
+    expect(ids[0]).toBe('s0');
+    expect(ids[49]).toBe('s49');
+    expect(screen.getByTestId('session-show-older').textContent).toBe('Show older (3)');
+    // The header still counts every session.
+    expect(screen.getByTestId('session-active-count').textContent).toBe('(53)');
+  });
+
+  it('Show older reveals the rest', async () => {
+    resetMocks();
+    mockSessions = manySessions(53);
+    render(<SessionSidebar projectId="p1" />);
+    await userEvent.click(screen.getByTestId('session-show-older'));
+    expect(rowIds()).toHaveLength(53);
+    expect(screen.queryByTestId('session-show-older')).toBeNull();
+  });
+
+  it('no Show older row at 50 or fewer', () => {
+    resetMocks();
+    mockSessions = manySessions(50);
+    render(<SessionSidebar projectId="p1" />);
+    expect(rowIds()).toHaveLength(50);
+    expect(screen.queryByTestId('session-show-older')).toBeNull();
+  });
+
+  it('the reveal is per project: another project starts capped again', async () => {
+    resetMocks();
+    mockSessions = manySessions(53);
+    const { rerender } = render(<SessionSidebar projectId="p1" />);
+    await userEvent.click(screen.getByTestId('session-show-older'));
+    rerender(<SessionSidebar projectId="p2" />);
+    expect(rowIds()).toHaveLength(50);
+    expect(screen.getByTestId('session-show-older')).toBeTruthy();
+  });
+
+  it('pinned rows are never capped away', () => {
+    resetMocks();
+    mockSessions = [
+      ...manySessions(55),
+      makeSession({ session_id: 'pinned-old', session_uuid: 'up', pinned: true, last_activity_at: at(500) }),
+    ];
+    render(<SessionSidebar projectId="p1" />);
+    const ids = rowIds();
+    expect(ids[0]).toBe('pinned-old');
+    expect(ids).toHaveLength(51);
+    expect(screen.getByTestId('session-show-older').textContent).toBe('Show older (5)');
+  });
+
+  it('a capped-away automation group counts its runs in n', () => {
+    resetMocks();
+    const runs = Array.from({ length: 4 }, (_, k) => makeSession({
+      session_id: `run${k}`, session_uuid: `ur${k}`, name: "[Triggered by schedule 'Nightly' (Every day)]", trigger_type: 'schedule',
+      last_activity_at: at(100 + k),
+    }));
+    mockSessions = [...manySessions(50), ...runs];
+    render(<SessionSidebar projectId="p1" />);
+    expect(screen.getByTestId('session-show-older').textContent).toBe('Show older (4)');
+  });
+
+  it('zh copy', async () => {
+    resetMocks();
+    mockSessions = manySessions(52);
+    window.localStorage.setItem('orbital.locale', 'zh');
+    try {
+      const { LocaleProvider } = await import('../i18n/LocaleContext');
+      render(<LocaleProvider><SessionSidebar projectId="p1" /></LocaleProvider>);
+      expect(screen.getByTestId('session-show-older').textContent).toBe('显示更早的 2 条');
+    } finally {
+      window.localStorage.removeItem('orbital.locale');
+    }
+  });
+});

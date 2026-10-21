@@ -2429,3 +2429,138 @@ describe('transformChatHistory — sub_agent_dispatch_failed rows (spec 116)', (
     expect(item.error).toContain('click Update');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Keyless onboarding + session import: the two new daemon rows, and imported
+// assistant turns (sub_agent_terminal completed rows carrying `reply`).
+// ---------------------------------------------------------------------------
+describe('transformChatHistory — import and worker-onboarding rows', () => {
+  const IMPORTED_META = {
+    event: 'imported_transcript', agent: 'codex', native_id: 'abc',
+    last_activity: '2026-10-20T09:00:00Z', truncated: false,
+  };
+  const daemon = (content: string, _meta: Record<string, unknown>, timestamp = TS): ChatMessage => ({
+    role: 'system', source: 'daemon', content, timestamp, _meta,
+  } as ChatMessage);
+  const user = (content: string, timestamp: string): ChatMessage => ({
+    role: 'user', source: 'user', content, timestamp, _meta: { imported: true },
+  } as ChatMessage);
+  const reply = (handle: string, text: string, timestamp: string): ChatMessage => daemon(
+    `[Sub-agent] ${handle} completed. Summary: ${text.slice(0, 200)}`,
+    {
+      event: 'sub_agent_terminal', kind: 'completed', handle, reply: text,
+      display_content: `[Sub-agent] ${handle} completed. Summary: ${text.slice(0, 200)}`,
+      suppress_wake: true, imported: true,
+    },
+    timestamp,
+  );
+
+  it('the imported_transcript row becomes a daemon divider carrying agent + date', () => {
+    const items = transformChatHistory([
+      daemon('[Imported] Conversation imported from Codex (last active 2026-10-20)', IMPORTED_META),
+    ]);
+    expect(items).toEqual([{
+      type: 'daemon_row', event: 'imported_transcript', handle: 'codex',
+      lastActivity: '2026-10-20T09:00:00Z', truncated: false, timestamp: TS,
+    }]);
+  });
+
+  it('carries the truncated flag', () => {
+    const items = transformChatHistory([
+      daemon('[Imported] … — earlier messages not imported', { ...IMPORTED_META, truncated: true }),
+    ]);
+    expect(items[0]).toMatchObject({ type: 'daemon_row', truncated: true });
+  });
+
+  it('the worker_onboarding row becomes a daemon divider, never a bubble', () => {
+    const items = transformChatHistory([
+      daemon('[Onboarding] codex is setting up this project', {
+        event: 'worker_onboarding', handle: 'codex', mode: 'scan', suppress_wake: true,
+      }),
+    ]);
+    expect(items).toEqual([{
+      type: 'daemon_row', event: 'worker_onboarding', handle: 'codex', timestamp: TS,
+    }]);
+  });
+
+  it('an imported transcript renders user bubbles and worker bubbles, in order', () => {
+    const longReply = 'A'.repeat(250) + '\n\n(tools: Read ×3, Edit ×1)';
+    const items = transformChatHistory([
+      daemon('[Imported] Conversation imported from Codex', IMPORTED_META, TS),
+      user('fix the login bug', TS2),
+      reply('codex', longReply, TS3),
+      user('thanks, now add a test', TS4),
+      reply('codex', 'Added test_login.py.', TS5),
+    ]);
+    expect(items.map((it) => it.type)).toEqual([
+      'daemon_row', 'user_message', 'agent_message', 'user_message', 'agent_message',
+    ]);
+    // The whole reply, not the 200-char summary, under the worker's identity.
+    expect(items[2]).toMatchObject({ type: 'agent_message', source: 'codex', content: longReply, timestamp: TS3 });
+    expect(items[4]).toMatchObject({ type: 'agent_message', source: 'codex', content: 'Added test_login.py.' });
+    expect(items.some((it) => it.type === 'sub_agent_activity')).toBe(false);
+  });
+
+  it('a live completion whose transcript join already drew the bubble keeps today\'s one-liner', () => {
+    const items = transformChatHistory([
+      user('hi', TS),
+      { role: 'assistant', source: 'sub_agent', sub_agent_handle: 'codex', content: 'Hello!', timestamp: TS2 } as ChatMessage,
+      reply('codex', 'Hello!', TS3),
+    ]);
+    expect(items.map((it) => it.type)).toEqual(['user_message', 'agent_message', 'sub_agent_activity']);
+  });
+
+  it('a completed row without a reply stays the one-line marker', () => {
+    const items = transformChatHistory([
+      user('hi', TS),
+      daemon('[Sub-agent] codex completed. Summary: done', { event: 'sub_agent_terminal', kind: 'completed', handle: 'codex' }, TS2),
+    ]);
+    expect(items.map((it) => it.type)).toEqual(['user_message', 'sub_agent_activity']);
+  });
+});
+
+describe('transformChatHistory — worker onboarding hides its setup-instruction marker', () => {
+  const onboarding: ChatMessage = {
+    role: 'system', source: 'daemon', content: '[Onboarding] codex is setting up this project', timestamp: TS,
+    _meta: { event: 'worker_onboarding', handle: 'codex', mode: 'interview', suppress_wake: true },
+  } as ChatMessage;
+  const marker = (handle: string, timestamp = TS2): ChatMessage => ({
+    role: 'system', source: 'daemon', timestamp,
+    content: `[Sub-agent] Message sent to ${handle}: "You are ${handle} working directly with the user in Orbital project /tmp/ws. Orbital's own agent is not configured…"`,
+    _meta: { dispatch_id: 'd-1', handle, transcript_path: '/tmp/t.jsonl' },
+  } as ChatMessage);
+  const opener: ChatMessage = {
+    role: 'system', source: 'daemon', timestamp: TS3,
+    content: '[Sub-agent] codex completed. Summary: Hi! What is this project for?',
+    _meta: {
+      event: 'sub_agent_terminal', kind: 'completed', handle: 'codex',
+      reply: 'Hi! What is this project for?',
+      display_content: '[Sub-agent] codex completed. Summary: Hi! What is this project for?',
+      suppress_wake: true,
+    },
+  } as ChatMessage;
+
+  it('onboarding row + marker + terminal → one onboarding capsule and one worker bubble', () => {
+    const items = transformChatHistory([onboarding, marker('codex'), opener]);
+    expect(items.map((it) => it.type)).toEqual(['daemon_row', 'agent_message']);
+    expect(items[0]).toMatchObject({ type: 'daemon_row', event: 'worker_onboarding', handle: 'codex' });
+    // No user message yet: the terminal row's reply is the worker's first bubble.
+    expect(items[1]).toMatchObject({ type: 'agent_message', source: 'codex', content: 'Hi! What is this project for?' });
+  });
+
+  it('a marker for a different worker after the onboarding row still renders', () => {
+    const items = transformChatHistory([onboarding, marker('claude-code')]);
+    expect(items.map((it) => it.type)).toEqual(['daemon_row', 'sub_agent_activity']);
+  });
+
+  it('a marker that does not directly follow the onboarding row still renders', () => {
+    const user: ChatMessage = { role: 'user', source: 'user', content: 'hello', timestamp: TS2 } as ChatMessage;
+    const items = transformChatHistory([onboarding, user, marker('codex', TS3)]);
+    expect(items.map((it) => it.type)).toEqual(['daemon_row', 'user_message', 'sub_agent_activity']);
+  });
+
+  it('an ordinary dispatch marker is unchanged', () => {
+    const items = transformChatHistory([marker('codex')]);
+    expect(items.map((it) => it.type)).toEqual(['sub_agent_activity']);
+  });
+});

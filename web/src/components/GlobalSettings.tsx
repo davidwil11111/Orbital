@@ -22,7 +22,7 @@ import ConnectorSettings from './ConnectorSettings';
 import TelemetrySettings from './TelemetrySettings';
 import SendFeedback from './SendFeedback';
 import AboutSection from './AboutSection';
-import SettingsRail, { type SettingsRailSection } from './SettingsRail';
+import SettingsRail, { scrollToSettingsSection, type SettingsRailSection } from './SettingsRail';
 import { useLocale } from '../i18n/LocaleContext';
 import { LOCALES } from '../i18n/locales';
 import { useT } from '../i18n/useT';
@@ -33,6 +33,12 @@ interface GlobalSettingsProps {
   /** First-journey tour replay, surfaced in About (see AboutSection). */
   onTakeTour?: () => void;
   canTakeTour?: boolean;
+  /**
+   * A `data-settings-section` id to scroll into view on open (the composer
+   * pin's "API key required" row sends 'llm'). Applied once the settings have
+   * loaded, so the fields above it have their final height.
+   */
+  scrollToSection?: string;
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
@@ -80,7 +86,20 @@ export const GLOBAL_SETTINGS_SECTIONS: SettingsRailSection[] = [
   { id: 'about', labelKey: 'update.about.heading' },
 ];
 
-export default function GlobalSettings({ onBack, onTakeTour, canTakeTour }: GlobalSettingsProps) {
+/**
+ * The section an `open-global-settings` window event asks for
+ * (`detail.section`), or undefined for a bare "open settings". App's listener
+ * feeds it to `scrollToSection`. Anything that is not a non-empty string is
+ * ignored, so an older dispatcher with no detail still just opens the page.
+ */
+export function requestedSettingsSection(event: Event): string | undefined {
+  const detail = (event as CustomEvent<unknown>).detail;
+  if (!detail || typeof detail !== 'object') return undefined;
+  const section = (detail as { section?: unknown }).section;
+  return typeof section === 'string' && section ? section : undefined;
+}
+
+export default function GlobalSettings({ onBack, onTakeTour, canTakeTour, scrollToSection }: GlobalSettingsProps) {
   const [userPreferences, setUserPreferences] = useState('');
   const [userMemory, setUserMemory] = useState('');
   const [userMemoryEnabled, setUserMemoryEnabled] = useState(true);
@@ -110,6 +129,12 @@ export default function GlobalSettings({ onBack, onTakeTour, canTakeTour }: Glob
       })
       .catch(() => setLoading(false));
   }, []);
+
+  // Deep link: same shared section-scroll as project settings' anchor.
+  useEffect(() => {
+    if (loading || !scrollToSection || !scrollContainerRef.current) return;
+    scrollToSettingsSection(scrollContainerRef.current, scrollToSection);
+  }, [loading, scrollToSection]);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/v2/providers`)
