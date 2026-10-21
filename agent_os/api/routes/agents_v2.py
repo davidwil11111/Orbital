@@ -364,6 +364,10 @@ class TriggerCreateRequest(BaseModel):
     # Spec 079: the sub-agent handle chosen to run this automation. Omitted or
     # null = the management agent runs it (today's behaviour and the default).
     agent: str | None = None
+    # Session import (contract §6): fires continue this session instead of
+    # minting one; ``imported_from`` marks an imported automation.
+    session_id: str | None = None
+    imported_from: dict | None = None
 
 
 class TriggerUpdateRequest(BaseModel):
@@ -868,6 +872,13 @@ async def create_project(req: CreateProjectRequest):
         logger.warning(
             "failed to create dispatcher for new project %s", pid, exc_info=True,
         )
+    # Session import (contract §6): list the folder's Claude Code / Codex
+    # sessions and import its Codex automations now, not on the first list.
+    try:
+        await asyncio.to_thread(_agent_manager.sync_imports, pid)
+    except Exception:
+        logger.warning("session import: sync failed for new project %s", pid,
+                       exc_info=True)
     return _redact_project(project)
 
 
@@ -1657,12 +1668,29 @@ async def _retry_session_lock(fn):
     return await _attempt()
 
 
+async def _materialize_if_imported(project_id: str, session_id: str | None) -> None:
+    """Session import (contract §6): the first open of — or first send into —
+    an imported session writes its converted transcript, so everything after
+    this sees an ordinary on-disk session. A no-op for every other id and for
+    one already written; a failure is logged, never raised into the route."""
+    from agent_os.onboarding.session_import import is_imported_session_id
+    if not is_imported_session_id(session_id):
+        return
+    try:
+        await asyncio.to_thread(
+            _agent_manager.materialize_imported_session, project_id, session_id)
+    except Exception:
+        logger.warning("session import: could not materialize %s/%s",
+                       project_id, session_id, exc_info=True)
+
+
 @router.post("/agents/{project_id}/inject")
 async def inject_message(project_id: str, req: InjectRequest):
     # Verify project exists before attempting inject
     project = _project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    await _materialize_if_imported(project_id, req.session_id)
 
     # The "Conversation so far" block a worker receives is built by
     # SubAgentManager at dispatch time (agent_os/daemon_v2/recap.py) for
@@ -3189,6 +3217,7 @@ async def chat_history(
 
     # ── session_id filter path ────────────────────────────────────────────
     if session_id is not None:
+        await _materialize_if_imported(project_id, session_id)
         # Map F1 session_id → F2 session_uuid so we know which JSONL to read.
         # list_sessions returns both fields for active/idle sessions; for
         # stopped/popped sessions the handle is gone but the JSONL still
@@ -3940,6 +3969,10 @@ async def create_trigger(project_id: str, body: TriggerCreateRequest):
         # as a handle by the fire path.
         "agent": (body.agent or "").strip() or None,
     }
+    if body.session_id:
+        trigger["session_id"] = body.session_id
+    if body.imported_from:
+        trigger["imported_from"] = body.imported_from
     if body.type == "schedule":
         if body.schedule is None:
             raise HTTPException(

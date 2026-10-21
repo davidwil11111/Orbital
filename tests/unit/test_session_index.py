@@ -415,4 +415,5 @@ def test_derive_tail_legacy_rows_without_timestamps(tmp_path):
 def test_index_version_is_bumped_for_the_reply_fields():
     # An index written under "1" (v0.15.0) has rows without the two fields;
     # the version mismatch empties it and the background build re-derives.
-    assert si.INDEX_VERSION == "2"
+    # "3" (session import, 2026-10-21) added imported_from / imported.
+    assert si.INDEX_VERSION == "3"

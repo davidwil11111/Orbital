@@ -4608,6 +4608,9 @@ class AgentManager:
         # Local import, as the disk path does: the index module is pulled in
         # only where it is used.
         from agent_os.daemon_v2.session_index import is_reply_row
+        # Session import (2026-10-21): the first list per project per daemon
+        # lifetime also imports the folder's Codex automations.
+        self._lazy_sync_imports(project_id)
         sessions = []
         for (pid, sid), handle in self._handles.items():
             if pid != project_id:
@@ -4692,11 +4695,150 @@ class AgentManager:
         seen_uuids |= {
             s["session_uuid"] for s in pending_entries if s.get("session_uuid")
         }
-        sessions.extend(self._disk_session_entries(project_id, seen_uuids))
+        disk_entries = self._disk_session_entries(project_id, seen_uuids)
+        sessions.extend(disk_entries)
+        seen_uuids |= {
+            s["session_uuid"] for s in disk_entries if s.get("session_uuid")
+        }
+        # Session import (contract §6): the folder's Claude Code / Codex
+        # sessions not yet opened in Orbital, as virtual idle entries. An
+        # opened one is an ordinary disk entry above; dedupe on its stem and
+        # on ``imported_from.native_id``.
+        seen_native = {
+            s["imported_from"].get("native_id") for s in sessions
+            if isinstance(s.get("imported_from"), dict)
+        }
+        sessions.extend(
+            self._imported_session_entries(project_id, seen_uuids, seen_native))
         # Stable ordering by session id (the "default"-first rule retired with
         # DEFAULT_SESSION_ID; ids are now uuids). None-safe.
         sessions.sort(key=lambda s: (s.get("session_id") or ""))
         return sessions
+
+    # ── Session import (keyless onboarding, 2026-10-21, contract §6) ─────
+
+    def _import_workspace(self, project_id: str) -> str | None:
+        """The project's workspace when its native sessions may be imported:
+        an existing folder that is not the scratch (Quick Tasks) project."""
+        project = self._project_store.get_project(project_id) if self._project_store else None
+        if not isinstance(project, dict) or project.get("is_scratch"):
+            return None
+        workspace = project.get("workspace") or ""
+        if not isinstance(workspace, str) or not os.path.isdir(workspace):
+            return None
+        return workspace
+
+    def _imported_session_entries(self, project_id: str, seen_uuids: set,
+                                  seen_native_ids: set) -> list[dict]:
+        """Virtual list entries for the folder's native sessions (metadata
+        only — nothing is read past the sqlite row / bounded title read and
+        nothing is written). Never raises."""
+        try:
+            workspace = self._import_workspace(project_id)
+            if workspace is None:
+                return []
+            from agent_os.onboarding.session_import import list_native_sessions
+            natives = list_native_sessions(workspace)
+        except Exception:
+            logger.warning("session import: listing failed for %s", project_id,
+                           exc_info=True)
+            return []
+        entries: list[dict] = []
+        for native in natives:
+            sid = native.session_id
+            if sid in seen_uuids or native.native_id in seen_native_ids:
+                continue
+            entries.append({
+                "session_id": sid,
+                "status": "idle",
+                "session_uuid": sid,
+                "origin": "imported",
+                "trigger_type": None,
+                "name": native.title,
+                "pinned": False,
+                "pinned_target": native.agent,
+                "imported": {
+                    "agent": native.agent,
+                    "native_id": native.native_id,
+                    "materialized": False,
+                    "size_bytes": native.size_bytes,
+                },
+                "last_terminal_event": None,
+                "last_activity_at": native.last_activity,
+                "last_user_at": None,
+                "last_reply_at": None,
+                "scope": self.get_session_scope(project_id, sid),
+            })
+        return entries
+
+    def materialize_imported_session(self, project_id: str, session_id: str) -> str:
+        """Write an imported session's converted transcript on first open.
+
+        Returns ``"materialized"`` (written now), ``"exists"`` (already on
+        disk — a no-op), ``"unknown"`` (no native session behind the id) or
+        ``"not_imported"`` (not an ``imp_`` id). Serialized per session, so a
+        chat read and an inject racing on the first open write it once.
+        Blocking disk I/O — call off the event loop.
+        """
+        from agent_os.onboarding import session_import as si
+        if not si.is_imported_session_id(session_id):
+            return "not_imported"
+        workspace = self._import_workspace(project_id)
+        if workspace is None:
+            return "unknown"
+        target = os.path.join(ProjectPaths(workspace).sessions_dir, f"{session_id}.jsonl")
+        if os.path.exists(target):
+            return "exists"
+        mutex, locks, _synced = self._import_state()
+        with mutex:
+            lock = locks.setdefault((project_id, session_id), threading.Lock())
+        with lock:
+            if os.path.exists(target):
+                return "exists"
+            native = si.find_native_session(workspace, session_id)
+            if native is None:
+                return "unknown"
+            si.materialize_session(workspace, native, project_id=project_id)
+            logger.info("session import: materialized %s (%s %s) for %s",
+                        session_id, native.agent, native.native_id, project_id)
+            return "materialized"
+
+    def _import_state(self) -> tuple:
+        """``(mutex, per-session materialize locks, projects synced)`` —
+        created on first use (``dict.setdefault`` is atomic, so two threads
+        racing here share one)."""
+        return self.__dict__.setdefault(
+            "_import_state_obj", (threading.Lock(), {}, set()))
+
+    def _import_coordinator(self):
+        coordinator = getattr(self, "_import_coordinator_obj", None)
+        if coordinator is None:
+            from agent_os.onboarding.import_coordinator import ImportCoordinator
+            coordinator = ImportCoordinator(
+                self._project_store, self,
+                trigger_manager=lambda: getattr(self, "_trigger_manager", None),
+            )
+            self._import_coordinator_obj = coordinator
+        return coordinator
+
+    def sync_imports(self, project_id: str) -> dict:
+        """Contract §6 ``sync_imports``: the count of virtual imported
+        sessions and the Codex automations imported/skipped. Never raises."""
+        return self._import_coordinator().sync_imports(project_id)
+
+    def _lazy_sync_imports(self, project_id: str) -> None:
+        """Import the project's Codex automations the first time its session
+        list is drawn in this daemon's lifetime. Never raises."""
+        mutex, _locks, synced = self._import_state()
+        with mutex:
+            if project_id in synced:
+                return
+            synced.add(project_id)
+        try:
+            self._import_coordinator().import_automations(project_id)
+        except Exception:
+            logger.warning("session import: lazy automation sync failed for %s",
+                           project_id, exc_info=True)
 
     def _materialized_session_ids(self, project_id: str) -> set[str]:
         """Stems of the project's on-disk session logs — a cheap ``listdir``.

@@ -1,0 +1,531 @@
+# Orbital — An operating system for AI agents
+# Copyright (C) 2026 Orbital Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Session import (keyless onboarding, 2026-10-21): a project folder's Claude
+Code / Codex conversations listed as sessions (metadata only) and converted
+into Orbital's own row shapes on first open.
+
+Fixtures are SYNTHETIC rows in the real native formats: a fake Claude home
+(``projects/<slug>/<id>.jsonl``) and a fake Codex home (``state_5.sqlite``
+``threads`` table + ``sessions/YYYY/MM/DD/rollout-*.jsonl``).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+
+import pytest
+
+from agent_os.agent.transports.sdk_transport import SDKTransport
+from agent_os.onboarding import session_import as si
+
+
+CLAUDE_ID = "11111111-2222-3333-4444-555555555555"
+CODEX_ID = "019f0000-aaaa-7bbb-8ccc-dddddddddddd"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache(monkeypatch):
+    si.clear_cache()
+    for var in ("CLAUDE_CONFIG_DIR", "ORBITAL_CODEX_HOME", "CODEX_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    yield
+    si.clear_cache()
+
+
+# --------------------------------------------------------------------------
+# Fixture builders
+# --------------------------------------------------------------------------
+
+
+def _claude_user(text, ts, cwd, sid=CLAUDE_ID, **extra):
+    return {"type": "user", "sessionId": sid, "cwd": cwd, "entrypoint": "cli",
+            "isSidechain": False, "timestamp": ts,
+            "message": {"role": "user", "content": text}, **extra}
+
+
+def _claude_assistant(blocks, ts, cwd, sid=CLAUDE_ID, **extra):
+    return {"type": "assistant", "sessionId": sid, "cwd": cwd, "entrypoint": "cli",
+            "isSidechain": False, "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-x", "content": blocks},
+            **extra}
+
+
+def _claude_tool_result(ts, cwd, sid=CLAUDE_ID):
+    return {"type": "user", "sessionId": sid, "cwd": cwd, "isSidechain": False,
+            "timestamp": ts, "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+
+
+def write_claude_session(claude_dir, workspace, rows, sid=CLAUDE_ID):
+    d = os.path.join(claude_dir, "projects", SDKTransport.claude_project_slug(workspace))
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{sid}.jsonl")
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    return path
+
+
+def basic_claude_rows(ws):
+    return [
+        {"type": "permission-mode", "permissionMode": "default", "sessionId": CLAUDE_ID},
+        _claude_user("Fix the flaky test", "2026-10-01T10:00:00.000Z", ws),
+        _claude_assistant([{"type": "thinking", "thinking": "hmm"}],
+                          "2026-10-01T10:00:01.000Z", ws),
+        _claude_assistant([{"type": "text", "text": "Looking."}],
+                          "2026-10-01T10:00:02.000Z", ws),
+        _claude_assistant([{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}],
+                          "2026-10-01T10:00:03.000Z", ws),
+        _claude_tool_result("2026-10-01T10:00:04.000Z", ws),
+        _claude_assistant([{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}],
+                          "2026-10-01T10:00:05.000Z", ws),
+        _claude_tool_result("2026-10-01T10:00:06.000Z", ws),
+        _claude_assistant([{"type": "tool_use", "id": "t3", "name": "Edit", "input": {}}],
+                          "2026-10-01T10:00:07.000Z", ws),
+        _claude_tool_result("2026-10-01T10:00:08.000Z", ws),
+        _claude_assistant([{"type": "text", "text": "Fixed it."}],
+                          "2026-10-01T10:00:09.000Z", ws),
+        {"type": "attachment", "sessionId": CLAUDE_ID, "attachment": {"x": 1}},
+        {"type": "api-request-blob", "sessionId": CLAUDE_ID, "message": {"content": "blob"}},
+        _claude_user("Thanks", "2026-10-01T11:00:00.000Z", ws),
+        _claude_assistant([{"type": "text", "text": "You're welcome."}],
+                          "2026-10-01T11:00:01.000Z", ws),
+        {"type": "ai-title", "aiTitle": "Flaky test fix", "sessionId": CLAUDE_ID},
+    ]
+
+
+def make_codex_home(codex_dir, threads):
+    """``threads``: list of dicts with id/cwd/rollout_path/… (missing columns
+    default)."""
+    os.makedirs(codex_dir, exist_ok=True)
+    con = sqlite3.connect(os.path.join(codex_dir, "state_5.sqlite"))
+    con.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL,"
+        " created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL,"
+        " cwd TEXT NOT NULL, title TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0,"
+        " first_user_message TEXT NOT NULL DEFAULT '', updated_at_ms INTEGER,"
+        " thread_source TEXT, preview TEXT NOT NULL DEFAULT '', originator TEXT)")
+    for t in threads:
+        con.execute(
+            "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, cwd,"
+            " title, archived, first_user_message, updated_at_ms, thread_source, originator)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t["id"], t["rollout_path"], 1, t.get("updated_at", 1790000000),
+             t.get("source", "exec"), t["cwd"], t.get("title", ""), t.get("archived", 0),
+             t.get("first_user_message", ""), t.get("updated_at_ms"),
+             t.get("thread_source"), t.get("originator", "codex_exec")))
+    con.commit()
+    con.close()
+
+
+def codex_rollout_rows(ws, tid=CODEX_ID):
+    def ri(ts, payload):
+        return {"timestamp": ts, "type": "response_item", "payload": payload}
+    return [
+        {"timestamp": "2026-10-02T09:00:00.000Z", "type": "session_meta",
+         "payload": {"id": tid, "cwd": ws, "originator": "codex_exec", "source": "exec",
+                     "base_instructions": {"text": "BASE"}}},
+        ri("2026-10-02T09:00:00.100Z", {"type": "message", "role": "developer",
+                                         "content": [{"type": "input_text", "text": "DEV"}]}),
+        ri("2026-10-02T09:00:00.200Z", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<environment_context>\n  <cwd>x</cwd>\n</environment_context>"}]}),
+        ri("2026-10-02T09:00:01.000Z", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Rename the helper"}]}),
+        {"timestamp": "2026-10-02T09:00:01.100Z", "type": "event_msg",
+         "payload": {"type": "token_count", "info": {}}},
+        {"timestamp": "2026-10-02T09:00:01.200Z", "type": "turn_context", "payload": {"cwd": ws}},
+        {"timestamp": "2026-10-02T09:00:01.300Z", "type": "world_state", "payload": {}},
+        ri("2026-10-02T09:00:02.000Z", {"type": "reasoning", "summary": [], "encrypted_content": "x"}),
+        ri("2026-10-02T09:00:03.000Z", {"type": "function_call", "name": "exec_command",
+                                         "arguments": "{}", "call_id": "c1"}),
+        ri("2026-10-02T09:00:04.000Z", {"type": "function_call_output", "call_id": "c1",
+                                         "output": "ok"}),
+        ri("2026-10-02T09:00:05.000Z", {"type": "custom_tool_call", "name": "apply_patch",
+                                         "input": "*** Begin", "call_id": "c2"}),
+        ri("2026-10-02T09:00:06.000Z", {"type": "custom_tool_call_output", "call_id": "c2",
+                                         "output": "done"}),
+        ri("2026-10-02T09:00:07.000Z", {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "Renamed."}]}),
+    ]
+
+
+def write_codex_rollout(codex_dir, ws, rows, tid=CODEX_ID):
+    d = os.path.join(codex_dir, "sessions", "2026", "10", "02")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"rollout-2026-10-02T09-00-00-{tid}.jsonl")
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    return path
+
+
+@pytest.fixture
+def ws(tmp_path):
+    w = tmp_path / "project"
+    w.mkdir()
+    return os.path.realpath(str(w))
+
+
+@pytest.fixture
+def homes(tmp_path):
+    return str(tmp_path / "claude-home"), str(tmp_path / "codex-home")
+
+
+# --------------------------------------------------------------------------
+# I1 — listing
+# --------------------------------------------------------------------------
+
+
+def test_imported_session_id_is_stable_and_bounded():
+    sid = si.imported_session_id("codex", CODEX_ID)
+    assert sid == "imp_codex_019f0000aaaa7bbb"
+    assert si.imported_session_id("codex", CODEX_ID) == sid
+    assert si.imported_session_id("claude-code", CLAUDE_ID) == "imp_claude-code_1111111122223333"
+    assert si.is_imported_session_id(sid)
+    assert not si.is_imported_session_id("proj_abcd1234")
+    # A project named "Imp" mints chat ids like this one.
+    assert not si.is_imported_session_id("imp_85d5e77f")
+    assert not si.is_imported_session_id("imp_codex_019f0000aaaa7bbbX")
+
+
+def test_lists_a_claude_session_with_its_ai_title(ws, homes):
+    claude_dir, codex_dir = homes
+    path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert len(found) == 1
+    s = found[0]
+    assert (s.agent, s.native_id, s.path) == ("claude-code", CLAUDE_ID, path)
+    assert s.title == "Flaky test fix"
+    assert s.last_activity == "2026-10-01T11:00:01+00:00"
+    assert s.size_bytes == os.path.getsize(path)
+    assert s.session_id == "imp_claude-code_1111111122223333"
+
+
+def test_claude_title_falls_back_to_the_first_user_message_truncated(ws, homes):
+    claude_dir, codex_dir = homes
+    long = "Please investigate why the nightly build keeps failing on the release branch"
+    write_claude_session(claude_dir, ws, [
+        _claude_user(long, "2026-10-01T10:00:00Z", ws),
+        _claude_assistant([{"type": "text", "text": "ok"}], "2026-10-01T10:00:01Z", ws),
+    ])
+    (s,) = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    from agent_os.agent.session import _derive_name
+    assert s.title == _derive_name(long)
+    assert s.title.endswith("…") and len(s.title) <= 51
+
+
+def test_claude_sessions_without_a_user_message_are_skipped(ws, homes):
+    claude_dir, codex_dir = homes
+    # Sidechain-only (a sub-agent file) and a meta/tool-result-only file.
+    write_claude_session(claude_dir, ws, [
+        {**_claude_user("side task", "2026-10-01T10:00:00Z", ws), "isSidechain": True},
+    ], sid="aaaaaaaa-0000-0000-0000-000000000000")
+    write_claude_session(claude_dir, ws, [
+        {**_claude_user("Caveat: generated", "2026-10-01T10:00:00Z", ws), "isMeta": True},
+        _claude_user("<command-name>/clear</command-name>", "2026-10-01T10:00:01Z", ws),
+        _claude_tool_result("2026-10-01T10:00:02Z", ws),
+    ], sid="bbbbbbbb-0000-0000-0000-000000000000")
+    assert si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir) == []
+
+
+def test_orbitals_own_sdk_sessions_are_not_listed(ws, homes):
+    claude_dir, codex_dir = homes
+    rows = [dict(r, entrypoint="sdk-py") if r.get("type") in ("user", "assistant") else r
+            for r in basic_claude_rows(ws)]
+    write_claude_session(claude_dir, ws, rows)
+    assert si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir) == []
+
+
+def test_claude_slug_collision_is_resolved_by_the_recorded_cwd(ws, homes, tmp_path):
+    """The slug is lossy: another folder can encode to the same dir name."""
+    claude_dir, codex_dir = homes
+    other = str(tmp_path / "elsewhere")
+    write_claude_session(claude_dir, ws, [
+        _claude_user("not here", "2026-10-01T10:00:00Z", other),
+    ])
+    assert si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir) == []
+
+
+def test_claude_cwd_probe_fallback_finds_a_drifted_slug_dir(ws, homes):
+    claude_dir, codex_dir = homes
+    d = os.path.join(claude_dir, "projects", "some-drifted-name")
+    os.makedirs(d)
+    with open(os.path.join(d, f"{CLAUDE_ID}.jsonl"), "w") as fh:
+        for r in basic_claude_rows(ws):
+            fh.write(json.dumps(r) + "\n")
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [s.native_id for s in found] == [CLAUDE_ID]
+
+
+def test_claude_config_dir_env_override(ws, homes, monkeypatch):
+    claude_dir, codex_dir = homes
+    write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
+    monkeypatch.setenv("ORBITAL_CODEX_HOME", codex_dir)
+    found = si.list_native_sessions(ws)
+    assert [s.agent for s in found] == ["claude-code"]
+
+
+def test_title_read_is_bounded_head_and_tail(ws, homes, monkeypatch):
+    """A big transcript is never read whole for its metadata: the ai-title
+    in the tail is still found."""
+    claude_dir, codex_dir = homes
+    rows = [_claude_user("first ask", "2026-10-01T10:00:00Z", ws)]
+    filler = "x" * 2000
+    for i in range(400):  # ~0.9 MB of assistant rows
+        rows.append(_claude_assistant([{"type": "text", "text": filler}],
+                                      "2026-10-01T10:00:01Z", ws))
+    rows.append({"type": "ai-title", "aiTitle": "Tail title", "sessionId": CLAUDE_ID})
+    path = write_claude_session(claude_dir, ws, rows)
+    reads = []
+    real_open = open
+
+    def spy_open(file, mode="r", *a, **k):
+        fh = real_open(file, mode, *a, **k)
+        if str(file) == path and "b" in mode:
+            orig = fh.read
+
+            def read(n=-1):
+                data = orig(n)
+                reads.append(len(data))
+                return data
+            fh.read = read
+        return fh
+    monkeypatch.setattr("builtins.open", spy_open)
+    (s,) = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert s.title == "Tail title"
+    assert sum(reads) <= si._HEAD_BYTES + si._TAIL_BYTES
+    assert os.path.getsize(path) > si._HEAD_BYTES + si._TAIL_BYTES
+
+
+def test_listing_is_cached_by_path_mtime_and_size(ws, homes, monkeypatch):
+    claude_dir, codex_dir = homes
+    path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    calls = []
+    real = si._claude_metadata
+    monkeypatch.setattr(si, "_claude_metadata",
+                        lambda p, st: calls.append(p) or real(p, st))
+    si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert calls == [path]
+    with open(path, "a") as fh:
+        fh.write(json.dumps({"type": "ai-title", "aiTitle": "Renamed",
+                             "sessionId": CLAUDE_ID}) + "\n")
+    (s,) = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert len(calls) == 2 and s.title == "Renamed"
+
+
+def test_lists_codex_threads_from_the_index(ws, homes, tmp_path):
+    claude_dir, codex_dir = homes
+    rollout = write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
+    gone = str(tmp_path / "missing-rollout.jsonl")
+    make_codex_home(codex_dir, [
+        {"id": CODEX_ID, "cwd": ws, "rollout_path": rollout, "title": "Rename the helper",
+         "first_user_message": "Rename the helper", "updated_at_ms": 1790000000123},
+        # archived, another folder, no user message, Orbital's own, codex sub-agent,
+        # and one whose rollout is gone — none are listed.
+        {"id": "t-arch", "cwd": ws, "rollout_path": rollout, "first_user_message": "a",
+         "archived": 1},
+        {"id": "t-other", "cwd": str(tmp_path), "rollout_path": rollout,
+         "first_user_message": "a"},
+        {"id": "t-empty", "cwd": ws, "rollout_path": rollout},
+        {"id": "t-orbital", "cwd": ws, "rollout_path": rollout, "first_user_message": "a",
+         "originator": "orbital", "source": "vscode"},
+        {"id": "t-sub", "cwd": ws, "rollout_path": rollout, "first_user_message": "a",
+         "source": '{"subagent":{"other":"guardian"}}', "thread_source": "subagent"},
+        {"id": "t-gone", "cwd": ws, "rollout_path": gone, "first_user_message": "a"},
+    ])
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [(s.agent, s.native_id) for s in found] == [("codex", CODEX_ID)]
+    s = found[0]
+    assert s.title == "Rename the helper"
+    assert s.rollout_path == rollout
+    assert s.last_activity == si._iso_epoch(1790000000.123)
+    assert s.size_bytes == os.path.getsize(rollout)
+
+
+def test_codex_cwd_matching_is_by_realpath(ws, homes, tmp_path):
+    claude_dir, codex_dir = homes
+    link = str(tmp_path / "link-to-project")
+    os.symlink(ws, link)
+    rollout = write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
+    make_codex_home(codex_dir, [
+        {"id": CODEX_ID, "cwd": link, "rollout_path": rollout,
+         "first_user_message": "Rename the helper"},
+    ])
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [s.native_id for s in found] == [CODEX_ID]
+    # …and from the symlinked workspace too.
+    si.clear_cache()
+    found = si.list_native_sessions(link, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [s.native_id for s in found] == [CODEX_ID]
+
+
+def test_codex_falls_back_to_rollouts_without_an_index(ws, homes):
+    claude_dir, codex_dir = homes
+    write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [(s.agent, s.native_id, s.title) for s in found] == [
+        ("codex", CODEX_ID, "Rename the helper")]
+
+
+def test_codex_home_env_precedence(ws, homes, tmp_path, monkeypatch):
+    claude_dir, codex_dir = homes
+    write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nothing-here"))
+    assert si.list_native_sessions(ws) == []
+    monkeypatch.setenv("ORBITAL_CODEX_HOME", codex_dir)  # wins over CODEX_HOME
+    assert [s.agent for s in si.list_native_sessions(ws)] == ["codex"]
+
+
+def test_sorted_newest_first_across_agents(ws, homes):
+    claude_dir, codex_dir = homes
+    write_claude_session(claude_dir, ws, basic_claude_rows(ws))  # 2026-10-01
+    write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))   # 2026-10-02
+    found = si.list_native_sessions(ws, claude_dir=claude_dir, codex_dir=codex_dir)
+    assert [s.agent for s in found] == ["codex", "claude-code"]
+
+
+def test_missing_sources_list_nothing(ws, tmp_path):
+    assert si.list_native_sessions(ws, claude_dir=str(tmp_path / "a"),
+                                   codex_dir=str(tmp_path / "b")) == []
+    assert si.list_native_sessions(str(tmp_path / "no-such-dir")) == []
+
+
+# --------------------------------------------------------------------------
+# I2 — conversion
+# --------------------------------------------------------------------------
+
+
+def _terminals(rows):
+    return [r for r in rows if r.get("_meta", {}).get("event") == "sub_agent_terminal"]
+
+
+def test_claude_conversion_rows(ws, homes):
+    claude_dir, _ = homes
+    path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    conv = si.convert_transcript("claude-code", path, handle="claude-code",
+                                 now="2026-10-21T00:00:00+00:00")
+    header, *rows = conv.rows
+    assert header["role"] == "system" and header["source"] == "daemon"
+    assert header["content"] == (
+        "[Imported] Conversation imported from Claude Code (last active 2026-10-01)")
+    assert header["_meta"]["event"] == "imported_transcript"
+    assert header["_meta"]["agent"] == "claude-code"
+    assert header["_meta"]["native_id"] == CLAUDE_ID
+    assert header["_meta"]["truncated"] is False
+    assert header["_meta"]["last_activity"] == "2026-10-01T11:00:01+00:00"
+
+    assert [r["role"] for r in rows] == ["user", "system", "user", "system"]
+    u1 = rows[0]
+    assert u1 == {"role": "user", "source": "user", "content": "Fix the flaky test",
+                  "target": "claude-code", "timestamp": "2026-10-01T10:00:00+00:00",
+                  "_meta": {"imported": True}}
+    t1 = rows[1]
+    reply = "Looking.\n\nFixed it.\n\n(tools: Read ×2, Edit ×1)"
+    assert t1["_meta"] == {
+        "event": "sub_agent_terminal", "kind": "completed", "handle": "claude-code",
+        "reply": reply, "display_content": t1["content"], "suppress_wake": True,
+        "imported": True,
+    }
+    assert t1["content"] == f"[Sub-agent] claude-code completed. Summary: {reply[:200]}"
+    assert t1["timestamp"] == "2026-10-01T10:00:09+00:00"
+    assert rows[3]["_meta"]["reply"] == "You're welcome."
+    # Thinking, attachments and api-request blobs never reach a row.
+    blob = json.dumps(conv.all_rows())
+    assert "hmm" not in blob and "blob" not in blob
+
+
+def test_claude_thread_record_is_the_set_sub_agent_thread_shape(ws, homes):
+    claude_dir, _ = homes
+    path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    conv = si.convert_transcript("claude-code", path, handle="claude-code",
+                                 now="2026-10-21T00:00:00+00:00")
+    rec = conv.all_rows()[-1]
+    assert rec == {"role": "meta", "event": "sub_agent_thread",
+                   "timestamp": "2026-10-21T00:00:00+00:00", "handle": "claude-code",
+                   "thread": {"session_id": CLAUDE_ID, "model": None,
+                              "last_used_at": "2026-10-21T00:00:00+00:00"}}
+
+
+def test_codex_conversion_rows(ws, homes):
+    _, codex_dir = homes
+    path = write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
+    conv = si.convert_transcript("codex", path, handle="codex",
+                                 now="2026-10-21T00:00:00+00:00")
+    header, *rows = conv.rows
+    assert header["content"].startswith("[Imported] Conversation imported from Codex ")
+    assert [r["role"] for r in rows] == ["user", "system"]
+    assert rows[0]["content"] == "Rename the helper"
+    assert rows[1]["_meta"]["reply"] == "Renamed.\n\n(tools: exec_command ×1, apply_patch ×1)"
+    thread = conv.thread_record["thread"]
+    assert thread["session_id"] == CODEX_ID
+    assert thread["rollout_path"] == path
+    blob = json.dumps(conv.all_rows())
+    for dropped in ("DEV", "BASE", "environment_context", "encrypted_content",
+                    "token_count", "world_state"):
+        assert dropped not in blob, dropped
+
+
+def test_codex_injected_context_and_heartbeat_turns(ws, homes):
+    """A turn whose user message is only injected context (an automation
+    heartbeat) keeps its reply, with no user row."""
+    _, codex_dir = homes
+    rows = codex_rollout_rows(ws) + [
+        {"timestamp": "2026-10-03T10:30:00Z", "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "<heartbeat>\n<automation_id>a</automation_id>\n</heartbeat>"}]}},
+        {"timestamp": "2026-10-03T10:30:05Z", "type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Daily report."}]}},
+    ]
+    path = write_codex_rollout(codex_dir, ws, rows)
+    conv = si.convert_transcript("codex", path)
+    roles = [(r["role"], r.get("content", "")[:20]) for r in conv.rows[1:]]
+    assert [r for r, _ in roles] == ["user", "system", "system"]
+    assert _terminals(conv.rows)[-1]["_meta"]["reply"] == "Daily report."
+    assert "heartbeat" not in json.dumps(conv.rows)
+
+
+def test_conversion_keeps_the_last_400_turns(ws, homes):
+    claude_dir, _ = homes
+    rows = []
+    for i in range(405):
+        rows.append(_claude_user(f"ask {i}", f"2026-10-01T10:{i // 60:02d}:{i % 60:02d}Z", ws))
+        rows.append(_claude_assistant([{"type": "text", "text": f"answer {i}"}],
+                                      f"2026-10-01T10:{i // 60:02d}:{i % 60:02d}Z", ws))
+    path = write_claude_session(claude_dir, ws, rows)
+    conv = si.convert_transcript("claude-code", path)
+    users = [r for r in conv.rows if r["role"] == "user"]
+    assert len(users) == 400
+    assert users[0]["content"] == "ask 5" and users[-1]["content"] == "ask 404"
+    assert conv.truncated is True
+    assert conv.rows[0]["_meta"]["truncated"] is True
+    assert conv.rows[0]["content"].endswith(" — earlier messages not imported")
+
+
+def test_conversion_caps_reply_text_at_2_mb(ws, homes, monkeypatch):
+    claude_dir, _ = homes
+    monkeypatch.setattr(si, "MAX_REPLY_BYTES", 1200)
+    rows = []
+    for i in range(5):
+        rows.append(_claude_user(f"ask {i}", f"2026-10-01T10:00:0{i}Z", ws))
+        rows.append(_claude_assistant([{"type": "text", "text": str(i) * 400}],
+                                      f"2026-10-01T10:00:0{i}Z", ws))
+    path = write_claude_session(claude_dir, ws, rows)
+    conv = si.convert_transcript("claude-code", path)
+    replies = [r["_meta"]["reply"] for r in _terminals(conv.rows)]
+    assert replies == ["2" * 400, "3" * 400, "4" * 400]
+    assert conv.truncated is True
+
+
+def test_untruncated_header_has_no_suffix(ws, homes):
+    claude_dir, _ = homes
+    path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    conv = si.convert_transcript("claude-code", path)
+    assert "earlier messages" not in conv.rows[0]["content"]

@@ -38,7 +38,9 @@ INDEX_FILENAME = ".session-index.sqlite"
 # naming rule): an index written under another version is emptied and rebuilt
 # from the files, so it can never serve rows in an old shape.
 #   "2": ``last_user_at`` / ``last_reply_at`` (spec 108).
-INDEX_VERSION = "2"
+#   "3": ``imported_from`` / ``imported`` on imported sessions (session
+#        import, 2026-10-21).
+INDEX_VERSION = "3"
 
 # ``_meta.event`` values of the system rows that answer the user (spec 108):
 # a worker's terminal marker (completed / error / failed / stopped /
@@ -165,6 +167,7 @@ def derive_disk_entry(path: str, uuid: str) -> dict | None:
     stored_pinned = False  # `pinned` on the same meta (spec 067)
     stored_pinned_target = None  # `pinned_target` (spec 074)
     stored_trigger_type = None  # `trigger_type` (spec 066 4b)
+    imported_from = None  # session import (2026-10-21): {agent, native_id}
     origin = "chat"  # session_start meta origin; legacy logs → chat
     first_user_content = None  # for name backfill
     is_worker = False  # session_kind:"worker" meta (spec 009 fanout)
@@ -197,6 +200,8 @@ def derive_disk_entry(path: str, uuid: str) -> dict | None:
                         stored_pinned_target = rec["pinned_target"]
                     if rec.get("trigger_type"):
                         stored_trigger_type = rec["trigger_type"]
+                    if isinstance(rec.get("imported_from"), dict):
+                        imported_from = rec["imported_from"]
                 elif rec.get("event") == "session_kind" and rec.get("kind") == "worker":
                     # Fanout native-worker session (spec 009 §3a): a one-shot,
                     # anonymous sub-task thread tagged immediately at
@@ -230,7 +235,7 @@ def derive_disk_entry(path: str, uuid: str) -> dict | None:
     # logs, which would shadow the active session and break the chat
     # endpoint's F1→F2 fast-path mapping. The uuid is unique and is what
     # callers use to load/act on (hydrate) the disk-only session.
-    return {
+    entry = {
         "session_id": uuid,
         "status": "idle",
         "session_uuid": uuid,
@@ -249,6 +254,18 @@ def derive_disk_entry(path: str, uuid: str) -> dict | None:
         "last_user_at": last_user_at,
         "last_reply_at": last_reply_at,
     }
+    if imported_from is not None:
+        # A materialized imported session (contract §6): the list dedupes the
+        # native session's virtual entry on ``imported_from.native_id``, and
+        # the sidebar keeps its "Imported" chip. Only these logs carry the
+        # keys, so every other row keeps its exact shape.
+        entry["imported_from"] = imported_from
+        entry["imported"] = {
+            "agent": imported_from.get("agent"),
+            "native_id": imported_from.get("native_id"),
+            "materialized": True,
+        }
+    return entry
 
 
 class SessionIndex:

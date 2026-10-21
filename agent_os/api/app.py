@@ -545,6 +545,12 @@ def create_app(data_dir: str | None = None) -> FastAPI:
                         lifecycle_observer=lifecycle_observer)
     app.include_router(agents_v2.router)
 
+    # 7a-import. Session import sync (contract §6): Claude Code / Codex
+    # sessions of a project folder + Codex automations → triggers.
+    from agent_os.api.routes import imports_v2
+    imports_v2.configure(project_store, agent_manager)
+    app.include_router(imports_v2.router)
+
     # 7a-cred. Credential routes
     from agent_os.api.routes import credentials as credential_routes
     credential_routes.configure(user_credential_store, agent_manager=agent_manager)
