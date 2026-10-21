@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import PurePath
 
 import pytest
 
@@ -225,15 +226,17 @@ def test_manager_flavours_are_the_section_text(tmp_path):
 class TestWorkerFlavours:
     def test_interview_has_preamble_paths_and_the_manager_text(self, tmp_path):
         ws = str(tmp_path)
+        # Prompt paths use forward slashes on every platform (ffa7653).
+        ws_posix = PurePath(ws).as_posix()
         text = op.worker_interview_instruction(
             "codex", ws, project_name="Demo", project_instructions="")
         assert text.startswith(
-            f"You are codex working directly with the user in Orbital project {ws}. "
+            f"You are codex working directly with the user in Orbital project {ws_posix}. "
             "Orbital's own agent is not configured, so you run this setup. "
             "Use your own file tools. Write files at these absolute paths:")
         for rel in ("orbital/instructions/project_goals.md",
                     "orbital/PROJECT_STATE.md", "orbital/INDEX.md"):
-            assert os.path.join(ws, rel) in text
+            assert f"{ws_posix}/{rel}" in text
         assert op.interview_instruction(
             ws, is_scratch=False, project_name="Demo",
             project_instructions="") in text
@@ -244,6 +247,28 @@ class TestWorkerFlavours:
         text = op.worker_cold_start_instruction("claude-code", ws, skeleton)
         assert text.startswith("You are claude-code working directly with the user")
         assert op.cold_start_instruction(ws, None) in text
+        assert skeleton in text
+
+    def test_windows_paths_reach_the_worker_with_forward_slashes(self, monkeypatch):
+        monkeypatch.setattr(op, "_WINDOWS", True)
+        ws = "C:\\Users\\dev\\proj"
+        skeleton = "[WORKSPACE SKELETON] 2 files\nREADME.md\t12\nsrc\\app.py\t40"
+        text = op.worker_cold_start_instruction("codex", ws, skeleton)
+        head = text.split("\n\n", 1)[0]
+        assert "Orbital project C:/Users/dev/proj." in head
+        assert "C:/Users/dev/proj/orbital/instructions/project_goals.md" in head
+        assert "C:/Users/dev/proj/orbital/PROJECT_STATE.md" in head
+        assert "C:/Users/dev/proj/orbital/INDEX.md" in head
+        assert "\\" not in head
+        assert "src/app.py\t40" in text and "src\\app.py" not in text
+        # The manager's text is shared verbatim, not rewritten.
+        assert op.cold_start_instruction(ws, None) in text
+
+    def test_posix_paths_are_untouched(self, monkeypatch):
+        monkeypatch.setattr(op, "_WINDOWS", False)
+        skeleton = "[WORKSPACE SKELETON] 1 files\nodd\\name.txt\t3"
+        text = op.worker_cold_start_instruction("codex", "/home/dev/proj", skeleton)
+        assert "/home/dev/proj/orbital/INDEX.md" in text
         assert skeleton in text
 
     def test_skeleton_is_bounded(self, tmp_path):
