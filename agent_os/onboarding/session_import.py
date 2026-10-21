@@ -375,16 +375,6 @@ def _list_codex(workspace: str, home: str) -> list[NativeSession]:
     return _codex_sessions_from_rollouts(os.path.join(home, "sessions"), workspace)
 
 
-def codex_threads_for(workspace: str, codex_dir: str | None = None) -> dict[str, dict]:
-    """``{thread_id: row}`` of the Codex threads index whose cwd is
-    ``workspace`` (unfiltered by origin) — the automation importer's lookup."""
-    index = os.path.join(codex_home(codex_dir), "state_5.sqlite")
-    rows = _codex_threads(index) if os.path.isfile(index) else None
-    want = path_key(workspace)
-    return {r["id"]: r for r in (rows or [])
-            if r.get("cwd") and path_key(r["cwd"]) == want}
-
-
 def _codex_threads(index: str) -> list[dict] | None:
     """Non-archived rows of the threads index, memoized on the db + WAL stat.
     None when the index is not the expected schema (caller falls back)."""
