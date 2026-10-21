@@ -372,6 +372,9 @@ def test_claude_project_dirs_for_matches_by_recorded_cwd(home, tmp_path):
     assert claude_project_dirs_for(projects, str(target)) == [d_target]
     # through a symlink to the same folder
     link = tmp_path / "link"
-    os.symlink(target, link)
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        return  # no symlink privilege (Windows): the realpath leg is covered elsewhere
     assert claude_project_dirs_for(projects, str(link)) == [d_target]
     assert claude_project_dirs_for(str(tmp_path / "none"), str(target)) == []

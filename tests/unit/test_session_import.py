@@ -27,11 +27,23 @@ CLAUDE_ID = "11111111-2222-3333-4444-555555555555"
 CODEX_ID = "019f0000-aaaa-7bbb-8ccc-dddddddddddd"
 
 
+def _symlink_or_skip(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        # Windows without Developer Mode / symlink privilege can't create one.
+        pytest.skip("symlink creation not permitted on this platform")
+
+
 @pytest.fixture(autouse=True)
-def _fresh_cache(monkeypatch):
+def _fresh_cache(monkeypatch, tmp_path):
+    """Empty native homes by default (never the real ~/.claude, ~/.codex —
+    and never via HOME, which Windows' expanduser ignores); tests that need
+    the env-derived homes set them explicitly."""
     si.clear_cache()
-    for var in ("CLAUDE_CONFIG_DIR", "ORBITAL_CODEX_HOME", "CODEX_HOME"):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "no-claude-home"))
+    monkeypatch.setenv("ORBITAL_CODEX_HOME", str(tmp_path / "no-codex-home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     yield
     si.clear_cache()
 
@@ -351,7 +363,7 @@ def test_lists_codex_threads_from_the_index(ws, homes, tmp_path):
 def test_codex_cwd_matching_is_by_realpath(ws, homes, tmp_path):
     claude_dir, codex_dir = homes
     link = str(tmp_path / "link-to-project")
-    os.symlink(ws, link)
+    _symlink_or_skip(ws, link)
     rollout = write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
     make_codex_home(codex_dir, [
         {"id": CODEX_ID, "cwd": link, "rollout_path": rollout,
@@ -377,6 +389,7 @@ def test_codex_home_env_precedence(ws, homes, tmp_path, monkeypatch):
     claude_dir, codex_dir = homes
     write_codex_rollout(codex_dir, ws, codex_rollout_rows(ws))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
+    monkeypatch.delenv("ORBITAL_CODEX_HOME", raising=False)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nothing-here"))
     assert si.list_native_sessions(ws) == []
     monkeypatch.setenv("ORBITAL_CODEX_HOME", codex_dir)  # wins over CODEX_HOME
@@ -529,3 +542,14 @@ def test_untruncated_header_has_no_suffix(ws, homes):
     path = write_claude_session(claude_dir, ws, basic_claude_rows(ws))
     conv = si.convert_transcript("claude-code", path)
     assert "earlier messages" not in conv.rows[0]["content"]
+
+
+def test_resume_pre_check_reads_the_same_claude_home_as_the_importer(ws, homes, monkeypatch):
+    """A session the importer lists from $CLAUDE_CONFIG_DIR must also pass the
+    resume pre-check, or an imported session could never resume."""
+    claude_dir, _ = homes
+    write_claude_session(claude_dir, ws, basic_claude_rows(ws))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
+    assert [s.native_id for s in si.list_native_sessions(ws)] == [CLAUDE_ID]
+    assert SDKTransport.resume_source_exists(ws, CLAUDE_ID) is True
+    assert SDKTransport.resume_source_exists(ws, "00000000-0000-0000-0000-000000000000") is False

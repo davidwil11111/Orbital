@@ -251,10 +251,16 @@ class SDKTransport(AgentTransport):
         Primary check is the derived cwd-slug path; a glob fallback covers
         any slug-derivation drift (session ids are UUIDs, so a cross-project
         match is unambiguous).
+
+        The store is ``$CLAUDE_CONFIG_DIR/projects`` when that is set (Claude
+        Code's own override, honoured by the session importer too), else
+        ``~/.claude/projects``.
         """
         import glob as _glob
         root = projects_root or os.path.join(
-            os.path.expanduser("~"), ".claude", "projects")
+            os.environ.get("CLAUDE_CONFIG_DIR")
+            or os.path.join(os.path.expanduser("~"), ".claude"),
+            "projects")
         slug = SDKTransport.claude_project_slug(workspace)
         if os.path.isfile(os.path.join(root, slug, f"{session_id}.jsonl")):
             return True

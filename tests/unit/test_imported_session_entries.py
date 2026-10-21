@@ -41,15 +41,20 @@ CODEX_SID = "imp_codex_019f0000aaaa7bbb"
 def env(tmp_path, monkeypatch):
     """A project whose workspace has one Claude and one Codex session.
 
-    HOME is redirected so SDKTransport.resume_source_exists (which reads
-    ~/.claude/projects) sees the fixture store, never the real one."""
+    Both native homes are set explicitly through the env overrides the
+    importer and the resume pre-checks read (CLAUDE_CONFIG_DIR,
+    ORBITAL_CODEX_HOME / CODEX_HOME). Never through HOME alone: on Windows
+    ``os.path.expanduser`` reads USERPROFILE and ignores HOME, which made this
+    fixture look in the CI runner's real ~/.claude. HOME and USERPROFILE are
+    still pointed at a scratch dir so nothing can reach the real home."""
     si.clear_cache()
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     claude_dir = str(home / ".claude")
     codex_dir = str(tmp_path / "codex-home")
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
     monkeypatch.setenv("ORBITAL_CODEX_HOME", codex_dir)
     monkeypatch.setenv("CODEX_HOME", codex_dir)
     ws = tmp_path / "ws"
