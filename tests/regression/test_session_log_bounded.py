@@ -13,8 +13,8 @@ The Layer-1 memory redesign GENUINELY REMOVED the SESSION_LOG feature in its
 entirety. There is no longer a "session_log" roster key, no SESSION_LOG.md
 file, no `_truncate_session_log` / `_get_session_log_lock` helpers, no
 `_SESSION_LOG_WRITE_CAP` / `_SESSION_LOG_MAX_SESSIONS` constants, and no
-`session_log_entry` key in the session-end LLM contract. `build_cold_resume_context`
-and `sub_agent_prompt` no longer reference it. The Layer-1 roster is now
+`session_log_entry` key in the session-end LLM contract. `sub_agent_prompt`
+no longer references it (`build_cold_resume_context` itself was removed 2026-10-20). The Layer-1 roster is now
 state / decisions / lessons / index (CONTEXT.md → INDEX.md).
 
 Every test and helper in this file exercised that removed feature, so there
@@ -24,7 +24,7 @@ intentionally empty of tests.
 Coverage of the new contract lives elsewhere:
   - `tests/regression/test_layer1_memory_redesign.py` asserts the removal
     directly (`test_session_log_removed_from_roster`,
-    `test_cold_resume_has_no_session_log`,
+    `test_cold_resume_builder_is_gone`,
     `test_sub_agent_prompt_omits_session_log`).
   - The bounding intent (keep durable memory within budget instead of letting
     a log grow monotonically) is now served by the deterministic hard cap

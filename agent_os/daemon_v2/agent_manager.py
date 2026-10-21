@@ -249,6 +249,11 @@ class AgentManager:
         # marker and its terminal row get ``_kind: memory_record`` and the
         # terminal clears the key, so the reminder never asks again.
         self._worker_memory_records: set[tuple[str, str | None, str]] = set()
+        # Strong references for fire-and-forget tasks this manager starts
+        # (the event loop only holds tasks weakly — an unreferenced task can
+        # be garbage-collected mid-flight with "Task was destroyed but it is
+        # pending"). Entries remove themselves on completion.
+        self._background_tasks: set[asyncio.Task] = set()
         self._sleep_handle: object | None = None
         # Queue infrastructure (per project)
         self._queue_stores: dict[str, QueueStore] = {}
@@ -2392,8 +2397,10 @@ class AgentManager:
             if wrote_memory:
                 return
             text = build_worker_memory_record_text(changed)
-            asyncio.ensure_future(self._send_worker_memory_record(
+            task = asyncio.ensure_future(self._send_worker_memory_record(
                 project_id, session_id, handle, text))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         except Exception:  # noqa: BLE001 — a reminder must never break a completion
             logger.warning("memory reminder scheduling failed for %s/%s",
                            project_id, session_id, exc_info=True)
@@ -5420,8 +5427,6 @@ class AgentManager:
         cm = handle.context_manager
         if hasattr(cm, "_session"):
             cm._session = new_session
-        if hasattr(cm, "_cold_resume_injected"):
-            cm._cold_resume_injected = False
         if hasattr(cm, "_recovery_injected"):
             cm._recovery_injected = False
         if hasattr(cm, "_window_factor"):

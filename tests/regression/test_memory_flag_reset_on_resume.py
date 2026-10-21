@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """Regression: a resume after a chat-mode write to PROJECT_STATE.md must
-cause the next prepare() to re-read the file. The mechanism is the
-_cold_resume_injected flag being cleared by AgentManager.switch_session
-(used by QueueDispatcher.resume).
+cause the next run's prepare() to re-read the file. The mechanism is the
+per-run Layer-1 snapshot (spec 112): ``begin_run()`` at the next run's
+entry refreshes it. (The cold-resume row and its ``_cold_resume_injected``
+flag were removed 2026-10-20.)
 """
 
 from __future__ import annotations
@@ -58,20 +59,16 @@ async def test_cold_resume_flag_reset_causes_memory_reread(tmp_path):
         sub_agent_provider=lambda: [],
     )
 
-    # First prepare() reads memory
+    # First run reads memory
+    cm.begin_run()
     cm.prepare()
-    assert cm._cold_resume_injected is True
 
-    # Modify the file. Without flag reset, the cached injection wins.
+    # Modify the file. Within the run the snapshot wins; the next run re-reads.
     with open(paths.project_state, "w", encoding="utf-8") as f:
         f.write("# Mutated state — after chat")
 
-    # Simulate what AgentManager.switch_session does on resume
-    cm._cold_resume_injected = False
-
-    # Spy on the WorkspaceFileManager.build_cold_resume_context output
+    cm.begin_run()
     second = cm.prepare()
-    assert cm._cold_resume_injected is True
 
     # The newly built result must contain the post-chat content somewhere
     # in the system messages it produced.

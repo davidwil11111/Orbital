@@ -139,6 +139,12 @@ def compaction_threshold_tokens(
     # but the trigger must not be a landmine if one ever is.
     return budget_rule if budget_rule > 0 else int(_COMPACT_FRACTION * window)
 
+# Spec 112 A6: the ``_kind`` tag on every row the end-of-run memory record
+# turn produces (the [MEMORY] ask, the model's edits, its closing text; a
+# pinned worker's reminder and its lifecycle rows). Defined here, where the
+# window is cut, and re-exported by agent_os.agent.loop.
+MEMORY_RECORD_KIND = "memory_record"
+
 # Frame for the per-call runtime block so the model reads it as an injected
 # runtime note rather than something the user typed (backlog #38).
 _RUNTIME_MARKER = "[runtime]"
@@ -191,7 +197,13 @@ class ContextManager:
         self._sub_agent_deployment_instructions_provider = (
             sub_agent_deployment_instructions_provider
         )  # callable() -> str
-        self._cold_resume_injected: bool = False
+        # Spec 112: the record turn's rows are its own mini-conversation and
+        # are in the window only while it runs (AgentLoop sets this for the
+        # duration of ``_memory_record_turn``). Every later call drops them:
+        # the [MEMORY] row carries a full copy of PROJECT_STATE, and keeping
+        # five of those in history costs 2-10k tokens a run and shows the
+        # model stale state alongside the snapshot.
+        self.include_memory_record_rows: bool = False
         # Spec 112 A1/A5: the Layer-1 rows as rendered for the current run
         # (None until the run's first prepare()), and the number of assistant
         # messages in the model view when the run began (None = no run has
@@ -581,23 +593,14 @@ class ContextManager:
                 "content": f"[Project Instructions]\n{instructions_content}",
             })
 
-        # Cold resume injection (first call only)
-        cold_resume_messages: list[dict] = []
-        if not self._cold_resume_injected and self._workspace_files is not None:
-            resume_ctx = self._workspace_files.build_cold_resume_context()
-            if resume_ctx:
-                cold_resume_messages.append({
-                    "role": "system",
-                    "content": f"[WORKSPACE MEMORY — Resume Context]\n\n{resume_ctx}",
-                })
-            self._cold_resume_injected = True
+        # (The first-call-only "cold resume" row — a second, unbudgeted copy
+        # of the same four Layer-1 files that vanished on the second call and
+        # broke the prefix cache every session — was removed 2026-10-20; the
+        # Layer-1 rows above are the resume context.)
 
         # Estimate layer tokens
         layer_tokens = sum(
             estimate_message_tokens(m) for m in layer_messages
-        )
-        cold_resume_tokens = sum(
-            estimate_message_tokens(m) for m in cold_resume_messages
         )
 
         # Calculate remaining budget for sliding window. The estimate runs ~2x
@@ -605,11 +608,17 @@ class ContextManager:
         # converted to estimate units with the ratio the last reported call
         # measured (1.0 before any), leaving room for the tool schemas.
         calibrated_budget = available_budget * self._estimate_ratio - self._overhead_estimate
-        remaining = calibrated_budget - system_tokens - semi_stable_tokens - dynamic_tokens - layer_tokens - cold_resume_tokens
+        remaining = calibrated_budget - system_tokens - semi_stable_tokens - dynamic_tokens - layer_tokens
         remaining = max(0, int(remaining * self._window_factor))
 
-        # Get sliding window from session
-        sliding_window = self._session.get_recent(remaining)
+        # Get sliding window from session. Spec 112: finished record turns
+        # never ride along (their every row is tagged, so the assistant
+        # tool-call rows and their results leave together and
+        # _validate_tool_results sees a consistent window).
+        sliding_window = self._session.get_recent(
+            remaining,
+            exclude_kind=None if self.include_memory_record_rows else MEMORY_RECORD_KIND,
+        )
 
         # Remap non-standard roles for LLM compatibility
         sliding_window = self._sanitize_roles(sliding_window)
@@ -639,9 +648,6 @@ class ContextManager:
         for msg in layer_messages:
             if "[Project Instructions]" not in msg.get("content", ""):
                 result.append(msg)
-
-        # Cold resume context (workspace memory)
-        result.extend(cold_resume_messages)
 
         # Sliding window
         result.extend(sliding_window)

@@ -154,58 +154,9 @@ def test_read_all_mixed(ws):
 
 
 # ---------------------------------------------------------------------------
-# 6. test_build_cold_resume_context_all_files
-# ---------------------------------------------------------------------------
-
-def test_build_cold_resume_context_all_files(ws):
-    """All Layer-1 files exist -- assembled string with section headers in order.
-
-    The Layer-1 redesign retired SESSION_LOG and renamed CONTEXT -> INDEX. The
-    cold-resume order is now state, decisions, lessons, index (no session log).
-    """
-    ws.write("state", "In progress.")
-    ws.write("decisions", "Chose X over Y.")
-    ws.write("lessons", "Don't do Z.")
-    ws.write("index", "src/foo.py — the foo module.")
-
-    ctx = ws.build_cold_resume_context()
-
-    # Check section order (index replaces the old context/session-log tail).
-    state_pos = ctx.index("## Project State")
-    decisions_pos = ctx.index("## Decisions")
-    lessons_pos = ctx.index("## Lessons Learned")
-    index_pos = ctx.index("## Project Index")
-
-    assert state_pos < decisions_pos < lessons_pos < index_pos
-
-    # Check content is included
-    assert "In progress." in ctx
-    assert "Chose X over Y." in ctx
-    assert "Don't do Z." in ctx
-    assert "src/foo.py — the foo module." in ctx
-
-    # SESSION_LOG was removed — no such section should ever appear.
-    assert "Session Log" not in ctx
-
-
-# ---------------------------------------------------------------------------
-# 7. test_build_cold_resume_context_minimal
-# ---------------------------------------------------------------------------
-
-def test_build_cold_resume_context_minimal(ws):
-    """Only PROJECT_STATE.md exists -- just that section."""
-    ws.write("state", "I am the project state.")
-
-    ctx = ws.build_cold_resume_context()
-
-    assert "## Project State" in ctx
-    assert "I am the project state." in ctx
-    # No other sections
-    assert "## Decisions" not in ctx
-    assert "## Lessons Learned" not in ctx
-
-
-# ---------------------------------------------------------------------------
+# 6./7. build_cold_resume_context tests — DELETED 2026-10-20 with the method:
+# the Layer-1 rows injected every turn are the resume context.
+#
 # 8. test_session_log_truncation — DELETED.
 #
 # SESSION_LOG.md and its last-3-sessions resume truncation are a genuinely
@@ -342,7 +293,6 @@ def test_write_invalid_key(ws):
         ws.write("bad_key", "content")
 
 
-def test_build_cold_resume_empty_workspace(ws):
-    """No files exist -- returns empty string."""
-    ctx = ws.build_cold_resume_context()
-    assert ctx == ""
+def test_no_cold_resume_builder(ws):
+    """build_cold_resume_context was removed with the cold-resume row (2026-10-20)."""
+    assert not hasattr(ws, "build_cold_resume_context")

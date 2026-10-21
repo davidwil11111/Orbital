@@ -93,7 +93,7 @@ _EMPTY_RESPONSE_NUDGE_LIMIT = 2
 # user is already persisted and broadcast by then; every row the record turn
 # produces carries ``_kind: MEMORY_RECORD_KIND`` so it never replaces it.
 # ---------------------------------------------------------------------------
-MEMORY_RECORD_KIND = "memory_record"
+from agent_os.agent.context import MEMORY_RECORD_KIND  # noqa: E402 — re-exported
 MEMORY_RECORD_MAX_LLM_CALLS = 3
 MEMORY_RECORD_MAX_TOOL_CALLS = 6
 # The four Layer-1 files, by on-disk name (agent_os.agent.context._LAYER1_FILES
@@ -2304,6 +2304,9 @@ class AgentLoop:
         tool_calls = 0
         outcome = "nothing"
         try:
+            # The record turn's own rows are its conversation: in the window
+            # now, dropped from every later call (context.py).
+            self._context_manager.include_memory_record_rows = True
             text = build_memory_record_text(
                 workspace, list(self._run_changed_files),
                 self._sub_agent_results_this_run(rows_at_run_start),
@@ -2412,6 +2415,10 @@ class AgentLoop:
         finally:
             self._session.row_kind = None
             self._memory_record_active = False
+            try:
+                self._context_manager.include_memory_record_rows = False
+            except AttributeError:
+                pass
             self._diag(
                 "memory_record", iteration=iteration, trigger=trigger,
                 llm_calls=llm_calls, tool_calls=tool_calls, outcome=outcome,

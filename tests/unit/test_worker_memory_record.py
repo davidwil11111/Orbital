@@ -321,3 +321,28 @@ async def test_a_failed_send_leaves_no_pending_tag(tmp_path):
     completions = [m for m in session.get_messages()
                    if (m.get("_meta") or {}).get("event") == "sub_agent_terminal"]
     assert all(m.get("_kind") is None for m in completions)
+
+
+@pytest.mark.asyncio
+async def test_the_reminder_task_is_strongly_referenced_until_it_finishes(tmp_path):
+    """The event loop holds tasks weakly; a fire-and-forget task with no
+    reference can be collected mid-flight ("Task was destroyed but it is
+    pending"). The manager keeps it in a set that empties itself."""
+    mgr, sub = _manager(tmp_path)
+    gate = asyncio.Event()
+
+    async def slow_send(*args, **kwargs):
+        await gate.wait()
+        return "Message sent to codex. Transcript: t.jsonl"
+
+    sub.send = AsyncMock(side_effect=slow_send)
+    _plant_session(mgr, tmp_path)
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: Done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    assert len(mgr._background_tasks) == 1
+    task = next(iter(mgr._background_tasks))
+    assert isinstance(task, asyncio.Task) and not task.done()
+    gate.set()
+    await _settle()
+    assert mgr._background_tasks == set()

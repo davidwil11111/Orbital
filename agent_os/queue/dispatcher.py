@@ -384,7 +384,7 @@ class QueueDispatcher:
 
         Hot-resume semantics: pulls the most recent attempt's session_id and
         calls AgentManager.switch_session to reload that JSONL as the active
-        session. switch_session also resets `_cold_resume_injected` and
+        session. switch_session also resets `_recovery_injected` and
         related ContextManager flags so memory files re-read fresh on the
         next loop run. A new AttemptRecord is appended sharing the prior
         session_id (we are continuing it, not opening a new one).
@@ -410,7 +410,7 @@ class QueueDispatcher:
         prior_session_id = item.attempts[-1].session_id
 
         # 3 + 4. Swap the active session back to the parked attempt's JSONL.
-        # switch_session resets _cold_resume_injected / _recovery_injected /
+        # switch_session resets _recovery_injected /
         # _window_factor / _last_usage_pct on the ContextManager for us.
         try:
             await self._agent_manager.switch_session(

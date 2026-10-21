@@ -880,14 +880,19 @@ class Session:
         """Return full in-memory message list."""
         return list(self._messages)
 
-    def get_recent(self, max_tokens: int) -> list[dict]:
+    def get_recent(self, max_tokens: int, *,
+                   exclude_kind: str | None = None) -> list[dict]:
         """Return recent messages fitting within token budget (newest first priority).
 
-        Iterates backward, estimates tokens as len(str(msg))/4.
+        Iterates backward, estimates tokens as len(str(msg))/4. Rows whose
+        ``_kind`` equals ``exclude_kind`` are left out and do not count
+        against the budget (spec 112: finished memory record turns).
         """
         result = []
         used_tokens = 0
         for msg in reversed(self.get_model_messages()):
+            if exclude_kind is not None and msg.get("_kind") == exclude_kind:
+                continue
             est = estimate_message_tokens(msg)
             if used_tokens + est > max_tokens:
                 break

@@ -652,3 +652,79 @@ async def test_compaction_is_preceded_by_a_record_turn_then_the_snapshot_refresh
     # begin_run: once at run start, once after compaction.
     assert cm.begin_run.call_count == 2
     assert llm.calls == 4
+
+
+# ---------------------------------------------------------------------------
+# Finished record turns leave the prompt (follow-up 2026-10-20)
+# ---------------------------------------------------------------------------
+
+
+def _memory_record_rows_in(prompt: list[dict]) -> list[dict]:
+    return [m for m in prompt if m.get("_kind") == MEMORY_RECORD_KIND
+            or "[MEMORY] This run" in str(m.get("content"))
+            or m.get("content") == "nothing to record"]
+
+
+@pytest.mark.asyncio
+async def test_next_run_drops_the_record_rows_and_keeps_the_prefix(tmp_path):
+    """(a) The next run's first build carries none of the record turn's rows
+    and extends the previous run's last non-record build byte for byte."""
+    llm = _ScriptedLLM([
+        _tool_calls(("tc_r", "read", {"path": "orbital/INDEX.md"})),   # run 1, call 0
+        _reply("the reply"),                                             # run 1, call 1 (last non-record build)
+        _reply("nothing to record"),                                     # run 1 record turn
+        _reply("second reply"),                                          # run 2, call 0
+        _reply("nothing to record"),                                     # run 2 record turn
+    ])
+    session, tools, loop = _rig(tmp_path, llm)
+    await loop.run()
+    persist_user_row(session, "and now this")
+    await loop.run()
+    assert llm.calls == 5
+    last_main_run1, first_run2 = llm.sent[1], llm.sent[3]
+    assert _memory_record_rows_in(first_run2) == []
+    # run 1's last build ended in a tool-result tail, so its runtime block rode
+    # its own user row; everything before that row is run 2's prefix.
+    body = last_main_run1[:-1]
+    assert [json.dumps(m, sort_keys=True) for m in first_run2[:len(body)]] == \
+        [json.dumps(m, sort_keys=True) for m in body]
+    # …followed by the reply the user saw, then the new message.
+    assert first_run2[len(body)]["content"] == "the reply"
+    assert first_run2[len(body) + 1]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_record_rows_are_in_the_window_while_the_record_turn_runs(tmp_path):
+    """(b) Inside the record turn the [MEMORY] row and the turn's own tool
+    rounds are the conversation and must be sent."""
+    llm = _ScriptedLLM([_reply("reply"), _edit_state_call(), _reply("Done.")])
+    session, tools, loop = _rig(tmp_path, llm)
+    await loop.run()
+    first_record_call, second_record_call = llm.sent[1], llm.sent[2]
+    assert any("[MEMORY] This run is ending" in str(m.get("content")) for m in first_record_call)
+    assert any(m.get("role") == "tool" and str(m.get("content")).startswith("Edited")
+               for m in second_record_call)
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") and m.get("_kind") == MEMORY_RECORD_KIND
+               for m in second_record_call)
+    assert loop._context_manager.include_memory_record_rows is False
+
+
+@pytest.mark.asyncio
+async def test_five_completed_record_turns_leave_no_rows_in_the_window(tmp_path):
+    """(c)"""
+    script = []
+    for i in range(5):
+        script += [_reply(f"reply {i}"), _reply("nothing to record")]
+    script += [_reply("final reply")]
+    llm = _ScriptedLLM(script)
+    session, tools, loop = _rig(tmp_path, llm)
+    await loop.run()
+    for i in range(1, 6):
+        persist_user_row(session, f"message {i}")
+        await loop.run()
+    assert len(_memory_rows(session)) == 6
+    sixth_run_first_build = llm.sent[10]
+    assert _memory_record_rows_in(sixth_run_first_build) == []
+    assert sum(1 for m in sixth_run_first_build if m.get("role") == "assistant") == 5
+    # And the consistency invariant: no dangling tool rows anywhere in it.
+    assert all(m.get("role") != "tool" for m in sixth_run_first_build)
