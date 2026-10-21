@@ -22,6 +22,12 @@ Pure functions only: no I/O, no project lookups.
 from __future__ import annotations
 
 import os
+import pathlib
+
+# Paths that go INTO a prompt use forward slashes on every platform (the
+# convention of ffa7653): agents' file tools accept them, and the text stays
+# the same across OSes. Module-level so a test can exercise the Windows form.
+_WINDOWS = os.name == "nt"
 
 # Upper bound on the workspace skeleton inlined into a worker's scan
 # instruction. The manager gets the skeleton as its own system row; a worker
@@ -164,11 +170,13 @@ def interview_instruction(workspace: str, *, is_scratch: bool,
 
 def worker_preamble(slug: str, workspace: str, *, scan: bool = False) -> str:
     """What a worker needs before the shared onboarding text."""
-    goals = os.path.join(workspace, "orbital", "instructions", "project_goals.md")
-    state = os.path.join(workspace, "orbital", "PROJECT_STATE.md")
-    index = os.path.join(workspace, "orbital", "INDEX.md")
+    goals = _prompt_path(os.path.join(workspace, "orbital", "instructions",
+                                      "project_goals.md"))
+    state = _prompt_path(os.path.join(workspace, "orbital", "PROJECT_STATE.md"))
+    index = _prompt_path(os.path.join(workspace, "orbital", "INDEX.md"))
     lines = [
-        f"You are {slug} working directly with the user in Orbital project {workspace}. "
+        f"You are {slug} working directly with the user in Orbital project "
+        f"{_prompt_path(workspace)}. "
         "Orbital's own agent is not configured, so you run this setup. "
         "Use your own file tools. Write files at these absolute paths:",
         f"- Project goals: {goals}",
@@ -204,7 +212,29 @@ def worker_cold_start_instruction(slug: str, workspace: str,
     """The cold-start scan, for a worker CLI, with the skeleton inlined."""
     return (worker_preamble(slug, workspace, scan=True)
             + cold_start_instruction(workspace, None)
-            + "\n\n" + _bounded_skeleton(skeleton_text or ""))
+            + "\n\n" + _bounded_skeleton(_prompt_separators(skeleton_text or "")))
+
+
+def _prompt_path(path: str) -> str:
+    """``path`` with forward slashes on Windows (drive letter kept).
+
+    Unchanged elsewhere, so the text a macOS/Linux worker gets is exactly
+    the joined path.
+    """
+    if _WINDOWS:
+        return pathlib.PureWindowsPath(path).as_posix()
+    return path
+
+
+def _prompt_separators(text: str) -> str:
+    """A skeleton listing with forward slashes on Windows.
+
+    ``scan_workspace`` lists ``os.path`` relative paths, so on Windows they
+    carry backslashes — a character no Windows file name can contain, which
+    makes the swap lossless there. Elsewhere a backslash may be a real file
+    name character, so the text is left alone.
+    """
+    return text.replace("\\", "/") if _WINDOWS else text
 
 
 def _bounded_skeleton(skeleton_text: str) -> str:
