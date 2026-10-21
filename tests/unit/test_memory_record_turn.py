@@ -99,7 +99,7 @@ def _tool_calls(*calls: tuple[str, str, dict]) -> list[StreamChunk]:
 
 class _ScriptedLLM:
     """Replays one scripted response per ``stream`` call (the last one
-    repeats). ``complete`` (compaction summary / flush) answers with text."""
+    repeats). ``complete`` (the compaction summary) answers with text."""
 
     provider = "test"
     model = "test-model"
@@ -544,8 +544,9 @@ async def test_tool_call_cap_skips_the_extras_and_ends_the_run(tmp_path):
 
 @pytest.mark.asyncio
 async def test_record_turn_only_runs_memory_file_tools(tmp_path):
-    """The flush-turn precedent: scoped to memory persistence, so it can run
-    without the approval interceptor. Anything else is refused, not run."""
+    """Scoped to memory persistence (the precedent set by the since-removed
+    pre-compaction flush turn), so it can run without the approval
+    interceptor. Anything else is refused, not run."""
     llm = _ScriptedLLM([
         _reply("reply"),
         _tool_calls(("tc_a", "write", {"path": "src/app.py", "content": "oops"}),

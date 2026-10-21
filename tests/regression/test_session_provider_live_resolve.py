@@ -18,8 +18,8 @@ These tests pin the live-resolve contract:
   2. With unchanged config, the provider object is preserved (no client churn
      per turn — keeps the prefix cache warm and pins the cheap path).
   3. The out-of-turn-start readers (session-end / state-refresh callbacks →
-     memory flush, PROJECT_STATE refresh) also use the live provider, not the
-     closure snapshot from session start.
+     PROJECT_STATE refresh) also use the live provider, not the closure
+     snapshot from session start.
 """
 
 import asyncio
@@ -256,9 +256,9 @@ async def test_unchanged_config_preserves_provider_object(tmp_path):
 
 @pytest.mark.asyncio
 async def test_session_end_callbacks_use_live_provider(tmp_path):
-    """Out-of-turn-start readers (session-end routine → memory flush /
-    PROJECT_STATE refresh) must also live-resolve, not keep the closure
-    snapshot of provider A."""
+    """Out-of-turn-start readers (session-end routine → PROJECT_STATE
+    refresh) must also live-resolve, not keep the closure snapshot of
+    provider A."""
     project_id = "proj_live"
     project_store = FakeProjectStore({
         project_id: dict(PROJECT_A, workspace=str(tmp_path)),

@@ -99,9 +99,9 @@ MEMORY_RECORD_MAX_TOOL_CALLS = 6
 # The four Layer-1 files, by on-disk name (agent_os.agent.context._LAYER1_FILES
 # carries the same list keyed for WorkspaceFileManager).
 _MEMORY_FILE_NAMES = ("PROJECT_STATE.md", "DECISIONS.md", "LESSONS.md", "INDEX.md")
-# The only tools the record turn may run, on the four files only. Mirrors the
-# pre-compaction flush precedent: scoped to memory persistence, so it runs
-# without the approval interceptor (FO-1).
+# The only tools the record turn may run, on the four files only. Scoped to
+# memory persistence, so it runs without the approval interceptor (FO-1) —
+# the precedent set by the (since removed) pre-compaction flush turn.
 _MEMORY_RECORD_TOOLS = frozenset({"read", "edit", "write"})
 
 _MEMORY_RECORD_BODY = (
@@ -2105,113 +2105,29 @@ class AgentLoop:
     # ------------------------------------------------------------------
 
     async def _compact_now(self, iteration: int) -> bool:
-        """Pre-compaction flush + compaction + reorientation (moved out of
-        ``run()`` verbatim so spec 112's record turn can precede it). Returns
-        True when the pre-flight budget guard tripped and the run must end.
+        """Compaction + reorientation (moved out of ``run()`` so spec 112's
+        record turn can precede it). Returns True when the pre-flight budget
+        guard tripped and the run must end.
+
+        There is no pre-compaction "memory flush" turn any more: the record
+        turn that runs right before this (``_memory_record_turn`` with
+        trigger ``"compaction"``) is the agent's chance to save working
+        state, and it does so with the project-state text and anchors in
+        hand. The flush used to ask the same question a second time, at the
+        utility model when one was configured (a cold, full-window call).
         """
         from agent_os.agent import compaction as compaction_mod
 
-        # Pre-flight budget guard (Budget Piece 2): the
-        # pre-compaction flush is a real management-LLM call that
-        # spends. Evaluate the SAME single guard before it fires so a
-        # tripped budget stops here rather than buying one more flush
-        # response. On trip, exit with ``budget_blocked`` without
-        # compacting (compaction is a no-spend local op, but the loop
-        # is ending anyway — the next resume re-evaluates).
-        _flush_budget = self._budget_tripped()
-        if _flush_budget is not None:
-            self._trip_budget(_flush_budget, iteration)
+        # Pre-flight budget guard (Budget Piece 2): the compaction summary
+        # is a real LLM call that spends (the old rows go to the summarizer
+        # as text). Evaluate the SAME single guard before it fires so a
+        # tripped budget stops here rather than buying one more response.
+        # On trip, exit with ``budget_blocked`` without compacting — the
+        # loop is ending anyway; the next resume re-evaluates.
+        _summary_budget = self._budget_tripped()
+        if _summary_budget is not None:
+            self._trip_budget(_summary_budget, iteration)
             return True
-
-        # No memory consolidation here (the old blocking
-        # token_pressure refresh is gone): consolidation is
-        # scheduled by memory-file budget, and the flush turn below
-        # is the agent's chance to save working state first.
-
-        # Pre-compaction memory flush: give agent one turn to save state
-        _fits = getattr(self._context_manager, "flush_fits", None)
-        try:
-            if callable(_fits) and not _fits():
-                # The step that crossed the threshold also overflows
-                # the window: the flush prompt would lose its oldest
-                # rows. Same outcome as a flush that overflows.
-                raise ContextOverflowError("flush prompt would be trimmed")
-            self._session.append_system(compaction_mod.MEMORY_FLUSH_PROMPT)
-            flush_llm = self._utility_provider or self._provider
-            flush_context = self._context_manager.prepare()
-            flush_response = await flush_llm.complete(flush_context)
-            # Token ledger (Budget Piece 1): the pre-compaction
-            # flush is a real management-LLM response with real
-            # spend. It is served by flush_llm (the utility
-            # provider when configured, else the primary) — NOT
-            # the rotated active_provider — so attribute to
-            # flush_llm. Purely additive: the legacy budget path
-            # deliberately does not count the flush, and that
-            # stays unchanged.
-            if getattr(flush_response, "usage", None):
-                self._emit_ledger_event(
-                    flush_llm, flush_response.usage,
-                )
-            flush_text = flush_response.text or ""
-            if not compaction_mod.is_silent_response(flush_text):
-                # Agent wants to save state — execute any tool calls.
-                # FO-1 invariant (audit 2026-06-03): this flush executor is
-                # intentionally NOT interceptor-gated, and is scoped to project-state
-                # persistence only (MEMORY_FLUSH_PROMPT directs PROJECT_STATE.md writes;
-                # the flush completion is given no tool schemas). Do not repurpose it to
-                # run arbitrary approval-required tools without routing through the
-                # interceptor.
-                if flush_response.tool_calls:
-                    raw_msg = dict(flush_response.raw_message)
-                    raw_msg["source"] = "management"
-                    self._session.append(raw_msg)
-                    for tc_raw in flush_response.tool_calls:
-                        try:
-                            tc = normalize_tool_call(tc_raw)
-                            if not tc["id"]:
-                                tc["id"] = uuid4().hex
-                            if not tc["name"]:
-                                self._session.append_tool_result(
-                                    tc["id"],
-                                    "Error: tool call has no function name",
-                                )
-                                continue
-                            if self._tool_registry.is_async(tc["name"]):
-                                result = await self._tool_registry.execute_async(
-                                    tc["name"], tc["arguments"],
-                                )
-                            else:
-                                result = await asyncio.to_thread(
-                                    self._tool_registry.execute,
-                                    tc["name"], tc["arguments"],
-                                )
-                            self._session.append_tool_result(tc["id"], result.content)
-                        except Exception as e:
-                            tc_id = tc.get("id") if isinstance(tc, dict) else tc_raw.get("id", uuid4().hex)
-                            self._session.append_tool_result(
-                                tc_id, f"Error: {e}",
-                            )
-                else:
-                    flush_msg = {
-                        "role": "assistant",
-                        "content": flush_text,
-                        "source": "management",
-                    }
-                    # Carry reasoning through (same omission as the
-                    # main text-only persist). Reasoning lives on the
-                    # flush response's raw_message when present.
-                    _reasoning = (
-                        flush_response.raw_message or {}
-                    ).get("reasoning_content")
-                    if _reasoning:
-                        flush_msg["reasoning_content"] = _reasoning
-                    self._session.append(flush_msg)
-        except (ContextOverflowError, LLMError):
-            # Context too full for flush — skip and proceed to compaction
-            pass
-        except Exception:
-            # Any other error during flush — don't crash, just compact
-            logger.warning("Pre-compaction flush failed, proceeding to compaction")
 
         # Append-only: the summary lands as a marker row and the
         # kept tail is sized to the window (compaction.run).

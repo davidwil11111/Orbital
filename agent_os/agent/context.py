@@ -271,11 +271,14 @@ class ContextManager:
         return over
 
     def flush_fits(self) -> bool:
-        """Whether the next prompt fits the usable window untrimmed.
+        """Whether one more prompt fits the usable window untrimmed.
 
-        When it does not, the pre-compaction flush would be built from a
-        prompt the sliding window has cut, oldest rows (the user's task)
-        first, and the agent saves state from a partial view.
+        Gates the record turn that precedes a compaction (spec 112 A6). When
+        the step that crossed the threshold also overflows the window, that
+        turn would be built from a prompt the sliding window has cut, oldest
+        rows (the user's task) first, and the agent would record from a
+        partial view — so the loop skips it and compacts at once. (Named for
+        the pre-compaction flush it originally gated; that turn is gone.)
         """
         return self._projected_tokens() <= self._model_context_limit - self._response_reserve
 
