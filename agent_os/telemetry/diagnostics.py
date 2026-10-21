@@ -116,8 +116,11 @@ def error_class_of(exc: BaseException | str | None) -> str | None:
     return name if name in ERROR_CLASSES else "other"
 
 
-def install_kind_of(binary_path: str | None) -> str:
-    """npm | native | unknown, judged from the resolved binary path alone.
+def install_kind_of(binary_path: str | None, *, user_override: bool = False) -> str:
+    """npm | native | user | unknown, judged from the resolved binary path.
+
+    ``user``: the path came from the locate card (the user pasted it), so
+    the layout says nothing about how detection would have fared.
 
     npm-flavoured layouts: a ``node_modules`` tree, an npm prefix (``npm/``,
     ``.npm-global``, ``.npm``), or Claude Code's ``~/.claude/local`` (an
@@ -125,6 +128,8 @@ def install_kind_of(binary_path: str | None) -> str:
     ``~/.local/bin`` or a bare ``.exe`` outside node_modules. Everything else
     (Homebrew, a custom path) is ``unknown``.
     """
+    if user_override and binary_path:
+        return "user"
     if not binary_path:
         return "unknown"
     normalised = binary_path.replace("\\", "/").lower()

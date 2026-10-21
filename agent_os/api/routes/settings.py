@@ -700,6 +700,11 @@ def _build_sub_agent_status_entry(s) -> dict:
         # still says signed in (1018 bench item 9): the card shows Login and
         # "Sign-in expired". Not part of ``ready`` — it is a hint, not a gate.
         "auth_expired": bool(getattr(s, "auth_expired", False)),
+        # The locate card: the launcher the user pasted, and whether that
+        # file has since disappeared (then ``installed`` is false and the
+        # card names the missing file instead of offering the prompt).
+        "override_path": getattr(s, "override_path", None),
+        "override_missing": bool(getattr(s, "override_missing", False)),
         "supports_update": bool(manifest is not None
                                 and manifest.setup.update_command),
         "dependencies_met": s.dependencies_met,
@@ -876,6 +881,94 @@ async def put_sub_agent_config(slug: str, req: SubAgentConfigRequest):
     except SubAgentConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"slug": slug, "config": cleaned}
+
+
+class LocateRequest(BaseModel):
+    # What the agent answered to the locate prompt, or a bare path.
+    answer: str = ""
+
+
+def _locate_manifest(slug: str):
+    if _setup_engine is None:
+        raise HTTPException(status_code=503, detail="Setup engine not available")
+    manifest = _registry_manifest(slug)
+    if manifest is None or manifest.runtime.adapter == "built_in":
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {slug}")
+    return manifest
+
+
+def _locate_test(slug: str, answer: str) -> dict:
+    """Parse the pasted answer and run the agent's version check with it.
+    Every failure is ``{"ok": False, "error": <text for the card>}``."""
+    from agent_os.agents.locate_answer import LocateAnswerError, parse_locate_answer
+    try:
+        parsed = parse_locate_answer(answer)
+    except LocateAnswerError as exc:
+        return {"ok": False, "error": str(exc)}
+    result = _setup_engine.test_override(
+        slug, parsed.command, path_prepend=list(parsed.path_prepend))
+    result.update({
+        "binary": parsed.command,
+        "target": parsed.target,
+        "path_prepend": list(parsed.path_prepend),
+        "env_names": list(parsed.env_names),
+    })
+    return result
+
+
+def _fresh_sub_agent_entry(slug: str) -> dict:
+    """The listing entry for ``slug`` after a detection change."""
+    _setup_engine.invalidate_resolved_path(slug)
+    if hasattr(_setup_engine, "invalidate_cache"):
+        _setup_engine.invalidate_cache()
+    return _build_sub_agent_status_entry(_setup_engine.check_agent(slug))
+
+
+@router.get("/settings/sub-agents/{slug}/locate-prompt")
+async def get_sub_agent_locate_prompt(slug: str):
+    """The text the locate card copies: a prompt the user pastes into the
+    agent so it reports its own executable, PATH needs and env names."""
+    from agent_os.agents.locate_answer import locate_prompt
+    manifest = _locate_manifest(slug)
+    return {"slug": slug, "prompt": locate_prompt(manifest.name)}
+
+
+@router.post("/settings/sub-agents/{slug}/locate/test")
+async def test_sub_agent_locate(slug: str, req: LocateRequest):
+    """Parse the pasted answer and run the version check against it. 200
+    either way: the card shows ``version_output`` or ``error`` verbatim."""
+    _locate_manifest(slug)
+    return await asyncio.to_thread(_locate_test, slug, req.answer)
+
+
+@router.put("/settings/sub-agents/{slug}/locate")
+async def put_sub_agent_locate(slug: str, req: LocateRequest):
+    """Save the pasted location. The check is re-run on the exact inputs
+    first (the card-save rule): a failing check is a 400, nothing is stored."""
+    _locate_manifest(slug)
+    if _sub_agent_config_store is None:
+        raise HTTPException(status_code=503, detail="Sub-agent config store not available")
+    from agent_os.daemon_v2.sub_agent_config_store import SubAgentConfigError
+    result = await asyncio.to_thread(_locate_test, slug, req.answer)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Test failed")
+    try:
+        _sub_agent_config_store.set_override(
+            slug, binary=result["binary"], path_prepend=result["path_prepend"],
+            env={name: "" for name in result["env_names"]})
+    except SubAgentConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return await asyncio.to_thread(_fresh_sub_agent_entry, slug)
+
+
+@router.delete("/settings/sub-agents/{slug}/locate")
+async def delete_sub_agent_locate(slug: str):
+    """Forget the user-chosen location; detection runs on its own again."""
+    _locate_manifest(slug)
+    if _sub_agent_config_store is None:
+        raise HTTPException(status_code=503, detail="Sub-agent config store not available")
+    _sub_agent_config_store.clear_override(slug)
+    return await asyncio.to_thread(_fresh_sub_agent_entry, slug)
 
 
 def _forget_quota(slug: str) -> None:
@@ -1075,16 +1168,19 @@ def _cli_diagnostics(slug: str) -> dict:
     from the resolved binary path. Both degrade to unknown/None."""
     version = None
     binary = None
+    user_override = False
     if _setup_engine is not None:
         cached = getattr(_setup_engine, "cached_status", None)
         status = cached(slug) if callable(cached) else None
         if status is not None:
             version = getattr(status, "version", None)
             binary = getattr(status, "binary_path", None)
+            user_override = bool(getattr(status, "override_path", None)) and binary is not None
         if binary is None:
             get_path = getattr(_setup_engine, "get_resolved_path", None)
             binary = get_path(slug) if callable(get_path) else None
-    return {"cli_version": clean_version(version), "install_kind": install_kind_of(binary)}
+    return {"cli_version": clean_version(version),
+            "install_kind": install_kind_of(binary, user_override=user_override)}
 
 
 def _prune_login_jobs() -> None:
@@ -1220,7 +1316,10 @@ async def _run_login_job(slug: str, job_id: str, command: str,
             return False, False
         diagnostics = {
             "cli_version": clean_version(getattr(after, "version", None)),
-            "install_kind": install_kind_of(getattr(after, "binary_path", None)),
+            "install_kind": install_kind_of(
+                getattr(after, "binary_path", None),
+                user_override=bool(getattr(after, "override_path", None))
+                and getattr(after, "binary_path", None) is not None),
         }
         missing = not (getattr(after, "installed", False) and getattr(after, "version", None))
         return verified, missing

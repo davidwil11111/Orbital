@@ -78,6 +78,10 @@ interface SubAgentEntry {
   update_needed?: boolean;
   min_version?: string | null;
   supports_update?: boolean;
+  /** The locate card: the launcher the user pasted (null when detection
+   *  found the agent on its own), and whether that file has since gone. */
+  override_path?: string | null;
+  override_missing?: boolean;
   /** A dispatch failed with an authentication error while the CLI's status
    *  probe still says signed in (it reads the local token file and cannot see
    *  expiry). The card says "Sign-in expired" and offers Login. */
@@ -405,7 +409,15 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
           {visibleEntries.map(entry => (
             <div key={entry.slug} className="flex flex-col gap-2">
               {isNotDetectedEntry(entry)
-                ? <NotDetectedRow slug={entry.slug} name={entry.name} />
+                ? (
+                  <NotDetectedRow
+                    slug={entry.slug}
+                    name={entry.name}
+                    overridePath={entry.override_path}
+                    overrideMissing={entry.override_missing}
+                    onChanged={load}
+                  />
+                )
                 : <SubAgentCard entry={entry} onChanged={load} />}
               {cliMissing[entry.slug] && (
                 <p
@@ -721,6 +733,24 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     }
   };
 
+  // The locate card's Clear: forget the pasted location; detection runs on
+  // its own again (the row may come back as "not detected").
+  const [clearBusy, setClearBusy] = useState(false);
+  const handleClearLocation = async () => {
+    setClearBusy(true);
+    setActionError(null);
+    try {
+      await api(`/api/v2/settings/sub-agents/${encodeURIComponent(entry.slug)}/locate`, {
+        method: 'DELETE',
+      });
+      await onChanged();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearBusy(false);
+    }
+  };
+
   const handleApiKeySubmit = async () => {
     if (!apiKeyDraft.trim()) return;
     setLoginBusy(true);
@@ -771,6 +801,26 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
             )}
             {entry.version && (
               <span className="text-secondary/80 font-mono">v{entry.version}</span>
+            )}
+            {entry.override_path && (
+              <>
+                <span
+                  data-testid={`sub-agent-locate-chip-${entry.slug}`}
+                  title={entry.override_path}
+                  className="px-2 py-0.5 rounded-full border text-[11px] bg-sidebar text-secondary border-border"
+                >
+                  {t('subAgentCard.locate.chip')}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleClearLocation}
+                  disabled={clearBusy}
+                  data-testid={`sub-agent-locate-clear-${entry.slug}`}
+                  className="text-secondary hover:text-primary transition-all duration-150 disabled:opacity-50"
+                >
+                  {t('subAgentCard.locate.clear')}
+                </button>
+              </>
             )}
           </div>
         </div>
