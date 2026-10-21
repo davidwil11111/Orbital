@@ -215,7 +215,8 @@ class TestSpawnEnv:
         reg = AgentRegistry()
         reg.register(_manifest(credentials=[cred]))
         engine = SetupEngine(reg, sub_agent_config_store=store)
-        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        base_a, base_b = str(tmp_path / "base-a"), str(tmp_path / "base-b")
+        monkeypatch.setenv("PATH", os.pathsep.join([base_a, base_b]))
         monkeypatch.setenv("CODEX_KEY", "from-manifest-cred")
         node_bin = str(tmp_path / "node@24" / "bin")
         store.set_override(SLUG, binary=binary, path_prepend=[node_bin],
@@ -224,7 +225,7 @@ class TestSpawnEnv:
         assert cfg["command"] == binary
         path = cfg["env"]["PATH"].split(os.pathsep)
         assert path[0] == node_bin
-        assert "/usr/bin" in path and "/bin" in path
+        assert base_a in path and base_b in path
         # User env never overrides a credential the manifest injects.
         assert cfg["env"]["CODEX_KEY"] == "from-manifest-cred"
         assert cfg["env"]["CODEX_HOME"] == "/tmp/codex-home"
