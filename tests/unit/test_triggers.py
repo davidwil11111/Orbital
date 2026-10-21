@@ -1212,3 +1212,109 @@ class TestTriggerErrorSurfacing:
         assert err["reason"] == "No LLM API key configured"
         assert err["source"] == "trigger"
         assert err["trigger_id"] == "trg_err"
+
+
+# ===========================================================================
+# Session import (2026-10-21, contract §6): an imported Codex automation
+# carries ``session_id`` (fires continue that session) and ``imported_from``.
+# ===========================================================================
+
+class TestImportedTriggerFields:
+
+    def _schedule(self, **extra):
+        return {"name": "Radar", "type": "schedule", "task": "Reply PONG",
+                "schedule": {"cron": "30 10 * * *"}, **extra}
+
+    def test_validate_accepts_session_id_and_imported_from(self):
+        t = self._schedule(session_id="imp_codex_019f0000aaaa7bbb",
+                           imported_from={"codex_automation_id": "a1"})
+        assert validate_trigger(t) is None
+        assert validate_trigger(self._schedule(session_id=None)) is None
+
+    def test_validate_rejects_malformed_session_fields(self):
+        assert "session_id" in validate_trigger(self._schedule(session_id=""))
+        assert "session_id" in validate_trigger(self._schedule(session_id=7))
+        assert "imported_from" in validate_trigger(self._schedule(imported_from="a1"))
+
+    def test_create_route_copies_session_id_and_imported_from(self):
+        client, pid, store, _tm = _make_trigger_client()
+        resp = client.post(f"/api/v2/projects/{pid}/triggers", json={
+            "name": "Radar", "type": "schedule", "task": "Reply PONG",
+            "schedule": {"cron": "30 10 * * *"}, "agent": "codex",
+            "session_id": "imp_codex_019f0000aaaa7bbb",
+            "imported_from": {"codex_automation_id": "a1"},
+        })
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["session_id"] == "imp_codex_019f0000aaaa7bbb"
+        assert body["imported_from"] == {"codex_automation_id": "a1"}
+        # Omitted → absent (records stay byte-compatible with the tool's).
+        resp = client.post(f"/api/v2/projects/{pid}/triggers", json={
+            "name": "Plain", "type": "schedule", "task": "x",
+            "schedule": {"cron": "0 7 * * *"}})
+        assert "session_id" not in resp.json() and "imported_from" not in resp.json()
+
+
+class TestFireOnWorkerIntoAnExistingSession:
+
+    def _store(self, **trigger_extra):
+        store, pid = _make_project_store(triggers=[{
+            "id": "trg_imp", "name": "Radar", "type": "schedule", "enabled": True,
+            "schedule": {"cron": "30 10 * * *", "human": "Daily at 10:30"},
+            "task": "Reply PONG", "trigger_count": 0, "last_triggered": None,
+            "agent": "codex", **trigger_extra,
+        }])
+        return store, pid
+
+    def _manager(self, *, live_session=None, disk_session=None):
+        sub = MagicMock()
+        sub.send = AsyncMock(return_value="Message sent to codex.")
+        mgr = MagicMock()
+        mgr.is_running = MagicMock(return_value=False)
+        mgr.new_session = AsyncMock(return_value={"session_id": "proj_minted"})
+        mgr.get_sub_agent_manager = MagicMock(return_value=sub)
+        mgr.get_session = MagicMock(return_value=live_session)
+        mgr._load_session_from_disk = MagicMock(return_value=disk_session)
+        mgr.materialize_imported_session = MagicMock(return_value="materialized")
+        return mgr, sub
+
+    @pytest.mark.asyncio
+    async def test_fires_into_the_triggers_session_instead_of_minting(self):
+        store, pid = self._store(session_id="imp_codex_019f0000aaaa7bbb")
+        disk = MagicMock()
+        mgr, sub = self._manager(disk_session=disk)
+        tm = TriggerManager(store, mgr)
+        await tm._fire_trigger(pid, "trg_imp")
+        mgr.new_session.assert_not_awaited()
+        mgr.materialize_imported_session.assert_called_once_with(
+            pid, "imp_codex_019f0000aaaa7bbb")
+        mgr._load_session_from_disk.assert_called_once_with(
+            pid, "imp_codex_019f0000aaaa7bbb")
+        # The trigger's message is persisted into THAT session, then sent there.
+        disk.append.assert_called_once()
+        row = disk.append.call_args.args[0]
+        assert row["role"] == "user" and "Reply PONG" in row["content"]
+        assert sub.send.await_args.kwargs["session_id"] == "imp_codex_019f0000aaaa7bbb"
+        assert sub.send.await_args.args[1] == "codex"
+
+    @pytest.mark.asyncio
+    async def test_a_live_session_is_used_as_is(self):
+        store, pid = self._store(session_id="proj_live1")
+        live = MagicMock()
+        mgr, sub = self._manager(live_session=live)
+        tm = TriggerManager(store, mgr)
+        await tm._fire_trigger(pid, "trg_imp")
+        live.append.assert_called_once()
+        mgr._load_session_from_disk.assert_not_called()
+        mgr._wire_session_observers.assert_not_called()
+        assert sub.send.await_args.kwargs["session_id"] == "proj_live1"
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_session_falls_back_to_minting(self):
+        store, pid = self._store(session_id="imp_codex_019f0000aaaa7bbb")
+        mgr, sub = self._manager()  # neither live nor on disk
+        mgr.materialize_imported_session.return_value = "unknown"
+        tm = TriggerManager(store, mgr)
+        await tm._fire_trigger(pid, "trg_imp")
+        mgr.new_session.assert_awaited_once()
+        assert sub.send.await_args.kwargs["session_id"] == "proj_minted"

@@ -61,6 +61,14 @@ def validate_trigger(trigger: dict, workspace: str | None = None) -> str | None:
                 return path_error
     if not trigger.get("task"):
         return "Trigger task is required"
+    # Session import (contract §6): an imported Codex automation fires into
+    # an existing session and remembers where it came from.
+    session_id = trigger.get("session_id")
+    if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
+        return "session_id must be a non-empty string"
+    imported_from = trigger.get("imported_from")
+    if imported_from is not None and not isinstance(imported_from, dict):
+        return "imported_from must be an object"
     return None
 
 
@@ -524,7 +532,7 @@ class TriggerManager:
 
     async def _fire_on_worker(
         self, project_id: str, config, agent: str, *,
-        initial_message: str, trigger_id: str,
+        initial_message: str, trigger_id: str, session_id: str | None = None,
     ) -> None:
         """Fire a worker-assigned automation down the chat direct-send path.
 
@@ -539,16 +547,29 @@ class TriggerManager:
         saving the automation is the likely one — raises, so the caller's
         existing handler broadcasts it as an ``agent.status`` error instead of
         letting the fire fail silently.
+
+        ``session_id`` (the trigger's own, session import contract §6): an
+        imported Codex automation continues its thread's session instead of
+        minting one — materialized first if it was never opened, then the
+        live handle's session or the on-disk log. A session that no longer
+        exists falls back to minting, so the automation still runs.
         """
         from agent_os.agent.session import persist_user_row
 
-        minted = await self._agent_manager.new_session(project_id)
-        session_id = minted["session_id"]
+        session = None
+        if session_id:
+            session = await self._existing_session_for_fire(project_id, session_id)
+        if session is None:
+            if session_id:
+                logger.info("Trigger %s: session %s is gone; firing into a new session",
+                            trigger_id, session_id)
+            minted = await self._agent_manager.new_session(project_id)
+            session_id = minted["session_id"]
 
-        session = self._agent_manager._new_session_object(config, session_id)
-        self._agent_manager._wire_session_observers(
-            session, project_id, session_id,
-        )
+            session = self._agent_manager._new_session_object(config, session_id)
+            self._agent_manager._wire_session_observers(
+                session, project_id, session_id,
+            )
         persist_user_row(session, initial_message)
 
         sub_mgr = self._agent_manager.get_sub_agent_manager()
@@ -566,6 +587,24 @@ class TriggerManager:
             "Trigger %s dispatched directly to '%s' (session=%s)",
             trigger_id, agent, session_id,
         )
+
+    async def _existing_session_for_fire(self, project_id: str, session_id: str):
+        """The session a trigger with its own ``session_id`` fires into, or None."""
+        materialize = getattr(self._agent_manager, "materialize_imported_session", None)
+        if materialize is not None:
+            try:
+                await asyncio.to_thread(materialize, project_id, session_id)
+            except Exception:
+                logger.warning("Trigger: could not materialize %s/%s",
+                               project_id, session_id, exc_info=True)
+        live = self._agent_manager.get_session(project_id, session_id=session_id)
+        if live is not None:
+            return live
+        session = await asyncio.to_thread(
+            self._agent_manager._load_session_from_disk, project_id, session_id)
+        if session is not None:
+            self._agent_manager._wire_session_observers(session, project_id, session_id)
+        return session
 
     async def _fire_trigger(self, project_id: str, trigger_id: str,
                              changed_files: list[str] | None = None) -> None:
@@ -667,6 +706,7 @@ class TriggerManager:
                     project_id, config, chosen_agent,
                     initial_message=initial_message,
                     trigger_id=trigger_id,
+                    session_id=trigger.get("session_id"),
                 )
             else:
                 await self._agent_manager.start_agent(

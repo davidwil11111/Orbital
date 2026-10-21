@@ -215,6 +215,43 @@ def _claude_session_cwd(path: str) -> str | None:
     return None
 
 
+def claude_project_dirs_for(projects_dir: str, workspace: str) -> list[str]:
+    """Claude Code project dirs whose sessions ran in ``workspace``.
+
+    The cwd-probe fallback for session import (keyless onboarding, 2026-10-21):
+    the per-cwd dir name is a lossy encoding of the path, so when the derived
+    slug dir is missing, each project dir's newest transcript is probed for its
+    recorded ``cwd`` (the same whitelisted-key read the scanner uses) and the
+    dirs whose cwd resolves to ``workspace`` are returned. Matching uses
+    :func:`path_key`. Never raises; read-only.
+    """
+    out: list[str] = []
+    if not os.path.isdir(projects_dir):
+        return out
+    want = path_key(workspace)
+    try:
+        entries = list(os.scandir(projects_dir))
+    except OSError:
+        return out
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        sessions = _jsonl_files(entry.path)
+        if not sessions:
+            continue
+        sessions.sort(key=lambda p: _safe_mtime(p) or 0.0, reverse=True)
+        for session in sessions[:3]:
+            cwd = _claude_session_cwd(session)
+            if cwd:
+                if path_key(cwd) == want:
+                    out.append(entry.path)
+                break
+    return out
+
+
 # --------------------------------------------------------------------------
 # Codex — ~/.codex/state_5.sqlite index (fallback: session_meta JSONL)
 # --------------------------------------------------------------------------
@@ -458,6 +495,12 @@ def _path_key(path: str) -> str:
     two can never disagree about which folder is which.
     """
     return os.path.normcase(os.path.realpath(path))
+
+
+def path_key(path: str) -> str:
+    """Public alias of :func:`_path_key` for the session importer, so the two
+    modules agree on which folder is which."""
+    return _path_key(path)
 
 
 def _rank(candidates: list[ImportCandidate]) -> list[ImportCandidate]:

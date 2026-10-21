@@ -353,3 +353,25 @@ def test_already_imported_matches_through_a_symlink(home, tmp_path):
     # real path. Same realpath/normcase key as _dedupe → still a match.
     found = scan_importable_projects(home=home, existing_workspaces=[link])
     assert [c.already_imported for c in found] == [True]
+
+
+# --------------------------------------------------------------------------
+# Shared helper for session import (keyless onboarding, 2026-10-21)
+# --------------------------------------------------------------------------
+
+
+def test_claude_project_dirs_for_matches_by_recorded_cwd(home, tmp_path):
+    from agent_os.onboarding.import_scanner import claude_project_dirs_for
+    projects = str(home / ".claude" / "projects")
+    target = tmp_path / "proj"
+    target.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    d_target = _write_claude_project(projects, str(target))
+    _write_claude_project(projects, str(other))
+    assert claude_project_dirs_for(projects, str(target)) == [d_target]
+    # through a symlink to the same folder
+    link = tmp_path / "link"
+    os.symlink(target, link)
+    assert claude_project_dirs_for(projects, str(link)) == [d_target]
+    assert claude_project_dirs_for(str(tmp_path / "none"), str(target)) == []
