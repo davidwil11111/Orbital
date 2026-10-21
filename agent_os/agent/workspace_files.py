@@ -543,6 +543,7 @@ async def run_session_end_routine(
     force: bool = False,
     run_turn=None,
     trigger: str = "over_budget",
+    on_pass_done=None,
 ) -> str:
     """One memory-tidy pass: the Memory session's turn (spec 124 §3.7)
     between the deterministic prepass and postpass, then the size floor.
@@ -569,7 +570,10 @@ async def run_session_end_routine(
     callers' signature; the turn runs on the project's own provider inside
     the Memory session, which ``run_turn(task_text)`` (supplied by the agent
     manager) starts. ``force`` (an explicit ``checkpoint_state``) runs the
-    pass even when no file is over its soft budget.
+    pass even when no file is over its soft budget. ``on_pass_done(result)``,
+    when given, receives the pass's ``EditorResult`` once the pass has run
+    (never for the gates above that skip it) — the agent manager uses it to
+    leave the one "Memory tidied" row in the triggering session.
     """
     from agent_os.agent import memory_editor
 
@@ -611,6 +615,11 @@ async def run_session_end_routine(
         # what is still past its hard cap. The existing over-budget trigger
         # stays armed: the next change to a memory file is a delta again.
         _apply_hard_caps(workspace_files)
+        if on_pass_done is not None:
+            try:
+                on_pass_done(result)
+            except Exception:  # noqa: BLE001 — a reporting hook never fails the pass
+                logger.warning("memory pass: on_pass_done failed", exc_info=True)
         if result.ok and result.outcome != "skipped":
             # Only a pass whose turn actually ran counts: stamping the files
             # "clean" after a failure or a declined turn would disarm the

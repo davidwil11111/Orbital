@@ -570,6 +570,7 @@ class EditorResult:
     turn: TurnResult | None = None
     written: list[str] = field(default_factory=list)      # file keys that changed
     restored: list[str] = field(default_factory=list)     # ids put back by conservation
+    archived: list[str] = field(default_factory=list)     # ids that left a live file for its archive
     backup_dir: str | None = None
     error: str | None = None
 
@@ -674,6 +675,7 @@ async def run_pass(
     changed = [k for k in EDITABLE_KEYS if (workspace_files.read(k) or "") != snapshot[k]]
     result.restored = _wf.postpass_conservation(workspace_files, snapshot, changed)
     result.written = [k for k in LIVE_KEYS if (workspace_files.read(k) or "") != snapshot[k]]
+    result.archived = _archived_ids(workspace_files, snapshot, changed)
 
     if result.ok:
         if turn is None:
@@ -700,6 +702,26 @@ async def run_pass(
                     result.error)
     _write_run_record(backup_dir, result, trigger=trigger)
     return result
+
+
+def _archived_ids(workspace_files, snapshot: dict[str, str], keys) -> list[str]:
+    """The ids the pass moved out of a live file and into its archive (after
+    conservation, so an id that left without reaching the archive is back in
+    the live file and not counted). Parsed with the same block parser the
+    conservation check uses; nothing new is judged here."""
+    from agent_os.agent import state_blocks
+    out: list[str] = []
+    for key in keys:
+        before = snapshot.get(key) or ""
+        if not before:
+            continue
+        _, before_blocks = state_blocks.parse(before)
+        _, after_blocks = state_blocks.parse(workspace_files.read(key) or "")
+        live_now = {b.id for b in after_blocks if b.id}
+        in_archive = _mem.archive_ids(workspace_files.read(_mem.ARCHIVE_OF[key]))
+        out.extend(b.id for b in before_blocks
+                   if b.id and b.id not in live_now and b.id in in_archive)
+    return out
 
 
 def _write_run_record(backup_dir: str | None, result: EditorResult, *, trigger: str = "") -> None:

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from agent_os.agent.context import ContextManager
+from agent_os.agent.context import MEMORY_TIDY_KIND, ContextManager
 from agent_os.agent.loop import (
     AgentLoop,
     MEMORY_RECORD_KIND,
@@ -257,6 +257,12 @@ class AgentManager:
         # can render a persistent warning glyph across WS disconnects and
         # page reloads. See TASK-state-model-alignment-fixes.md §2.4.
         self._last_terminal_events: dict[SessionKey, dict] = {}
+        # Spec 124 §3.7 follow-up (2026-10-21): every Memory session this
+        # daemon has started, by key. Never pruned (a handful per lifetime):
+        # ``_broadcast`` drops every event addressed to one of them, so the
+        # hidden session never shows the project as running, never disables
+        # the composer, and never feeds the chat's live activity.
+        self._memory_session_keys: set[SessionKey] = set()
         # Spec 112 A6 (pinned workers): ``(project_id, session_id, handle)``
         # whose NEXT dispatch is the daemon's memory reminder. Its dispatch
         # marker and its terminal row get ``_kind: memory_record`` and the
@@ -641,6 +647,10 @@ class AgentManager:
         field being present on every payload.
         """
         sid = self._resolve_session_id(session_id)
+        # getattr: a few tests build the manager without __init__.
+        if sid is not None and make_session_key(project_id, sid) in getattr(
+                self, "_memory_session_keys", ()):
+            return      # the Memory session is hidden: nothing about it reaches a client
         # Don't overwrite a session_id already set by the caller (rare,
         # but cleaner than special-casing): the call site's choice wins.
         payload.setdefault("session_id", sid)
@@ -985,6 +995,16 @@ class AgentManager:
         ``chat.user_message`` echo the frontend dedups its optimistic bubble
         against — and ``start_agent`` can re-wire them without consequence.
         """
+        if _is_memory_session(session):
+            # Spec 124 §3.7 follow-up: the Memory session is hidden. Nothing
+            # it does is a live event — no stream deltas, no activity rows,
+            # no user-row echo — so its observers are silent, and its key is
+            # registered so ``_broadcast`` drops whatever else names it.
+            self._register_memory_session(project_id, session_id)
+            session.on_append = lambda _msg: None
+            session.on_stream = lambda _chunk: None
+            session.on_queue_drained = lambda _nonces: None
+            return
         session.on_append = self._on_message(project_id, session_id)
         session.on_stream = self._on_stream(project_id, session_id)
         session.on_queue_drained = self._on_queue_drained(project_id, session_id)
@@ -1060,6 +1080,8 @@ class AgentManager:
         # loop allowed beside the slot — single-flight per project through
         # memory_editor.claim, never through the holder.
         is_memory = _is_memory_session(session)
+        if is_memory:
+            self._register_memory_session(project_id, session_id)
         holder = None if is_memory else self.current_holder_session_id(project_id)
         if holder is not None and holder != session_id:
             raise ValueError(f"Slot held by session {holder}")
@@ -1300,6 +1322,8 @@ class AgentManager:
                 list_sessions=lambda: self.list_sessions(project_id),
                 run_turn=_memory_turn_runner("session_end"),
                 trigger="session_end",
+                on_pass_done=lambda result: self._append_memory_tidy_row(
+                    session, trigger="session_end", result=result),
             )
 
         def _memory_turn_runner(trigger_name: str):
@@ -1365,6 +1389,8 @@ class AgentManager:
                     force=trigger_name in ("agent_decided", "agent_decided_coalesced"),
                     run_turn=_memory_turn_runner(trigger_name),
                     trigger=trigger_name,
+                    on_pass_done=lambda result: self._append_memory_tidy_row(
+                        session, trigger=trigger_name, result=result),
                 )
                 self._broadcast(project_id, {
                     "type": "state_refresh.lifecycle",
@@ -2454,7 +2480,7 @@ class AgentManager:
             if (not isinstance(meta, dict)
                     or meta.get("event") != "sub_agent_terminal"
                     or meta.get("kind") != "completed"
-                    or row.get("_kind") == MEMORY_RECORD_KIND):
+                    or row.get("_kind") in (MEMORY_RECORD_KIND, MEMORY_TIDY_KIND)):
                 return
             handle = _terminal_handle(meta, row.get("content"))
             if not handle or getattr(session, "pinned_target", None) != handle:
@@ -3014,7 +3040,7 @@ class AgentManager:
         for (pid, _sid), handle in self._handles.items():
             if pid == project_id and _is_memory_session(handle.session):
                 return handle.session
-        for entry in self.list_sessions(project_id):
+        for entry in self.list_sessions(project_id, include_memory=True):
             if entry.get("origin") != "memory" or not entry.get("session_uuid"):
                 continue
             loaded = self._load_session_from_disk(project_id, entry["session_uuid"])
@@ -3033,6 +3059,59 @@ class AgentManager:
         )
         session.set_name(self.MEMORY_SESSION_NAME)
         return session
+
+    def _register_memory_session(self, project_id: str, session_uuid: str) -> None:
+        """Remember a Memory session's key so ``_broadcast`` can hide it."""
+        if not hasattr(self, "_memory_session_keys"):   # built without __init__ (tests)
+            self._memory_session_keys = set()
+        self._memory_session_keys.add(make_session_key(project_id, session_uuid))
+
+    def _append_memory_tidy_row(self, session, *, trigger: str, result) -> None:
+        """Leave the one row a tidy pass is allowed to leave (spec 124 §3.7
+        follow-up): a ``_kind: memory_tidy`` system row in the session that
+        triggered the pass, carrying what the editor already measured —
+        the outcome, the ids that moved to an archive, the ids conservation
+        put back, the files that changed. Nothing for a pass that never ran
+        (``skipped``); never into a Memory session (that transcript is the
+        pass itself). Never raises: the files are already written."""
+        from agent_os.agent.workspace_files import FILE_NAMES
+        try:
+            if session is None or _is_memory_session(session):
+                return
+            outcome = str(getattr(result, "outcome", "") or "")
+            if outcome == "skipped":
+                return
+            archived = list(getattr(result, "archived", None) or [])
+            restored = list(getattr(result, "restored", None) or [])
+            written = list(getattr(result, "written", None) or [])
+            files = [f"orbital/{FILE_NAMES.get(k, k)}" for k in written]
+            turn = getattr(result, "turn", None)
+            if not getattr(result, "ok", False):
+                error = str(getattr(result, "error", "") or outcome or "failed")
+                content = f"Memory tidy failed: {error}"
+            elif archived or restored or written:
+                content = f"Memory tidied: {len(archived)} archived, {len(restored)} restored"
+            else:
+                content = "Memory tidied: nothing to change"
+            session.append({
+                "role": "system",
+                "content": content,
+                "source": "daemon",
+                "_kind": MEMORY_TIDY_KIND,
+                "_meta": {
+                    "event": "memory_tidy",
+                    "trigger": trigger,
+                    "outcome": outcome,
+                    "archived": len(archived),
+                    "restored": len(restored),
+                    "files": files,
+                    "llm_calls": int(getattr(turn, "llm_calls", 0) or 0),
+                    "ended": str(getattr(turn, "ended", "") or ""),
+                    **({"error": str(result.error)} if getattr(result, "error", None) else {}),
+                },
+            })
+        except Exception:  # noqa: BLE001 — a bookkeeping row never fails a pass
+            logger.warning("memory pass: could not append the tidy row", exc_info=True)
 
     @staticmethod
     def _loop_providers(loop) -> list:
@@ -4889,8 +4968,13 @@ class AgentManager:
             rollout_path=rollout_path,
         )
 
-    def list_sessions(self, project_id: str) -> list[dict]:
+    def list_sessions(self, project_id: str, *, include_memory: bool = False) -> list[dict]:
         """Return a list of active/idle sessions for a project.
+
+        The project's Memory session (origin ``memory``, spec 124 §3.7) is
+        left out unless ``include_memory`` is set: it is the daemon's own
+        tidy pass, not a conversation, so the sidebar never shows it. Only
+        ``memory_session()`` asks for it.
 
         Each entry has ``session_id``, ``status`` (running | pending_approval |
         waiting | idle), and ``session_uuid`` (the per-loop
@@ -4991,6 +5075,8 @@ class AgentManager:
         # Stable ordering by session id (the "default"-first rule retired with
         # DEFAULT_SESSION_ID; ids are now uuids). None-safe.
         sessions.sort(key=lambda s: (s.get("session_id") or ""))
+        if not include_memory:
+            sessions = [s for s in sessions if s.get("origin") != "memory"]
         return sessions
 
     def _materialized_session_ids(self, project_id: str) -> set[str]:
@@ -5994,7 +6080,7 @@ class AgentManager:
             # file as a collapsed activity line; nothing streams or
             # broadcasts while it runs, so the reply the user already has
             # stays the reply.
-            if msg.get("_kind") == "memory_record":
+            if msg.get("_kind") in ("memory_record", MEMORY_TIDY_KIND):
                 return
             self._activity_translator.on_message(msg, project_id, session_id=session_id)
         return callback

@@ -392,6 +392,9 @@ export interface ChatMessage {
    * text; a pinned worker's reminder, dispatch marker, run summary and
    * completion). Never a bubble: chatTransform renders the edits as a
    * collapsed activity capsule and drops the rest.
+   * "memory_tidy" (spec 124 §3.7 follow-up) on the one daemon system row a
+   * memory tidy pass leaves in the session that triggered it; rendered as a
+   * collapsed capsule of the files it changed.
    */
   _kind?: string;
   /**

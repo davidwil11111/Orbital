@@ -881,17 +881,24 @@ class Session:
         return list(self._messages)
 
     def get_recent(self, max_tokens: int, *,
-                   exclude_kind: str | None = None) -> list[dict]:
+                   exclude_kind=None) -> list[dict]:
         """Return recent messages fitting within token budget (newest first priority).
 
         Iterates backward, estimates tokens as len(str(msg))/4. Rows whose
-        ``_kind`` equals ``exclude_kind`` are left out and do not count
-        against the budget (spec 112: finished memory record turns).
+        ``_kind`` is ``exclude_kind`` (one kind, or a set of kinds) are left
+        out and do not count against the budget (spec 112: finished memory
+        record turns; the tidy pass's row).
         """
+        if exclude_kind is None:
+            excluded: frozenset[str] = frozenset()
+        elif isinstance(exclude_kind, str):
+            excluded = frozenset({exclude_kind})
+        else:
+            excluded = frozenset(exclude_kind)
         result = []
         used_tokens = 0
         for msg in reversed(self.get_model_messages()):
-            if exclude_kind is not None and msg.get("_kind") == exclude_kind:
+            if excluded and msg.get("_kind") in excluded:
                 continue
             est = estimate_message_tokens(msg)
             if used_tokens + est > max_tokens:

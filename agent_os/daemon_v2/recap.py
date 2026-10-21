@@ -110,7 +110,7 @@ def _visible_line(row: dict, handle: str, *, fresh: bool) -> str | None:
     # model's edits and its "nothing to record", a pinned worker's reminder
     # and its reply) is bookkeeping, not conversation. The reply before it
     # is what the chat said.
-    if row.get("_kind") == "memory_record":
+    if row.get("_kind") in ("memory_record", "memory_tidy"):
         return None
     role = row.get("role")
     content = row.get("content")

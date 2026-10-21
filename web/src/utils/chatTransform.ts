@@ -106,6 +106,13 @@ export type DisplayItem =
        * update; it never carries a bubble or an agent header of its own.
        */
       memory_record?: boolean;
+      /**
+       * Spec 124 §3.7 follow-up: the capsule is the one row a memory tidy
+       * pass leaves in the session that triggered it (`_kind: "memory_tidy"`).
+       * Its children are the files the pass changed; the counts come from
+       * the row's `_meta`. Collapsed, no bubble, no agent header.
+       */
+      memory_tidy?: { outcome: string; archived: number; restored: number; error?: string };
     }
   | { type: 'session_separator'; timestamp: string }
   | {
@@ -880,6 +887,50 @@ export function transformChatHistory(
       // model reads, not something to paste into the transcript.
       finalizeCapsule();
       items.push({ type: 'compaction_marker', timestamp: msg.timestamp });
+      i++;
+      continue;
+    }
+
+    // Spec 124 §3.7 follow-up: the tidy pass's one row. The Memory session
+    // itself is hidden; this daemon system row is the only trace a pass
+    // leaves, rendered as ONE collapsed capsule whose children are the
+    // files the pass changed. It closes any open capsule first so a tidy
+    // that landed mid-run never merges into the agent's own step.
+    if (msg._kind === 'memory_tidy') {
+      finalizeCapsule();
+      const meta = (msg._meta ?? {}) as Record<string, unknown>;
+      const files = Array.isArray(meta.files)
+        ? (meta.files as unknown[]).filter((f): f is string => typeof f === 'string')
+        : [];
+      const outcome = typeof meta.outcome === 'string' ? meta.outcome : '';
+      const error = typeof meta.error === 'string' && meta.error ? meta.error : undefined;
+      const ms = tsToMs(msg.timestamp);
+      const children: CapsuleChild[] = files.map((path, f) => ({
+        type: 'tool_call_row',
+        tool_name: 'edit',
+        target_description: path,
+        tool_call_id: `tidy:${msg.timestamp}:${f}`,
+        category: 'file_edit',
+        timestamp: msg.timestamp,
+        result_content: '',
+        result_status: 'received',
+      }));
+      items.push({
+        type: 'agent_run',
+        capsule_id: `tidy:${ms}:${capsuleCounter++}`,
+        status: outcome === 'failed' ? 'error' : 'completed',
+        items: children,
+        tool_call_count_by_name: children.length > 0 ? { edit: children.length } : {},
+        has_thinking: false,
+        started_at: ms,
+        ended_at: ms,
+        memory_tidy: {
+          outcome,
+          archived: typeof meta.archived === 'number' ? meta.archived : 0,
+          restored: typeof meta.restored === 'number' ? meta.restored : 0,
+          ...(error ? { error } : {}),
+        },
+      });
       i++;
       continue;
     }

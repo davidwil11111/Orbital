@@ -145,6 +145,12 @@ def compaction_threshold_tokens(
 # window is cut, and re-exported by agent_os.agent.loop.
 MEMORY_RECORD_KIND = "memory_record"
 
+# Spec 124 §3.7 follow-up (2026-10-21): the one row a tidy pass leaves in the
+# session that triggered it ("Memory tidied: …"). Bookkeeping like the record
+# turn's rows: never in the window, the recap, the reply badge or the live
+# activity feed; the chat renders it as a collapsed capsule.
+MEMORY_TIDY_KIND = "memory_tidy"
+
 # Frame for the per-call runtime block so the model reads it as an injected
 # runtime note rather than something the user typed (backlog #38).
 _RUNTIME_MARKER = "[runtime]"
@@ -641,7 +647,10 @@ class ContextManager:
         # _validate_tool_results sees a consistent window).
         sliding_window = self._session.get_recent(
             remaining,
-            exclude_kind=None if self.include_memory_record_rows else MEMORY_RECORD_KIND,
+            exclude_kind=(
+                {MEMORY_TIDY_KIND} if self.include_memory_record_rows
+                else {MEMORY_RECORD_KIND, MEMORY_TIDY_KIND}
+            ),
         )
 
         # Remap non-standard roles for LLM compatibility

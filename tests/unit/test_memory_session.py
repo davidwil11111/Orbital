@@ -694,7 +694,9 @@ def test_a_running_memory_session_does_not_hold_the_slot(tmp_path):
     mgr._handles[make_session_key("p1", mem.session_uuid)].task.done = MagicMock(return_value=True)
     assert mgr._start_rejection("p1", mem.session_uuid, session=mem) is None
     assert mgr._start_rejection("p1", "demo_third00001") is not None
-    listed = {s["session_uuid"]: s for s in mgr.list_sessions("p1")}
+    # hidden from the sidebar's list, visible to the daemon's own lookup
+    assert mem.session_uuid not in {s["session_uuid"] for s in mgr.list_sessions("p1")}
+    listed = {s["session_uuid"]: s for s in mgr.list_sessions("p1", include_memory=True)}
     assert listed[mem.session_uuid]["origin"] == "memory" and listed[mem.session_uuid]["status"] == "idle"
 
 
@@ -759,7 +761,8 @@ def test_memory_session_is_created_once_named_memory_and_found_again(tmp_path):
     again = mgr.memory_session("p1")
     assert again.session_uuid == first.session_uuid
     assert again.origin == "memory" and again.name == "Memory"
-    listed = [s for s in mgr.list_sessions("p1") if s["origin"] == "memory"]
+    assert not [s for s in mgr.list_sessions("p1") if s["origin"] == "memory"]   # hidden
+    listed = [s for s in mgr.list_sessions("p1", include_memory=True) if s["origin"] == "memory"]
     assert len(listed) == 1 and listed[0]["name"] == "Memory"
 
 

@@ -2430,6 +2430,91 @@ describe('transformChatHistory — sub_agent_dispatch_failed rows (spec 116)', (
   });
 });
 
+describe('transformChatHistory — the tidy pass row (_kind: memory_tidy)', () => {
+  // Spec 124 §3.7 follow-up: the Memory session is hidden; the one trace a
+  // tidy pass leaves is a daemon system row in the session that triggered
+  // it. It renders as ONE collapsed capsule (no bubble, no agent header)
+  // whose children are the files the pass changed.
+  function tidyRow(meta: Record<string, unknown>, content: string, timestamp = TS3): ChatMessage {
+    return {
+      role: 'system',
+      content,
+      source: 'daemon',
+      timestamp,
+      _meta: { event: 'memory_tidy', trigger: 'over_budget', ...meta },
+      _kind: 'memory_tidy',
+    };
+  }
+
+  it('renders as one collapsed memory_tidy capsule after the reply, one child per changed file', () => {
+    const items = transformChatHistory([
+      user('plan it', TS),
+      asst({ content: 'Here is the plan.', timestamp: TS2 }),
+      tidyRow(
+        { outcome: 'restored', archived: 3, restored: 7, files: ['orbital/PROJECT_STATE.md', 'orbital/INDEX.md'], llm_calls: 4, ended: 'text' },
+        'Memory tidied: 3 archived, 7 restored',
+      ),
+      user('now the copy', TS4),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message', 'agent_run', 'user_message']);
+    const capsule = items[2];
+    expect(capsule.type).toBe('agent_run');
+    if (capsule.type === 'agent_run') {
+      expect(capsule.memory_record).toBeUndefined();
+      expect(capsule.memory_tidy).toEqual({ outcome: 'restored', archived: 3, restored: 7 });
+      expect(capsule.status).toBe('completed');
+      expect(capsule.defaultExpanded).toBeUndefined();
+      expect(capsule.source).toBeUndefined();
+      expect(capsule.items.map((x) => x.type)).toEqual(['tool_call_row', 'tool_call_row']);
+      const [a, b] = capsule.items;
+      if (a.type === 'tool_call_row' && b.type === 'tool_call_row') {
+        expect(a.tool_name).toBe('edit');
+        expect(a.target_description).toBe('orbital/PROJECT_STATE.md');
+        expect(a.category).toBe('file_edit');
+        expect(a.result_status).toBe('received');
+        expect(b.target_description).toBe('orbital/INDEX.md');
+      }
+      expect(capsule.tool_call_count_by_name).toEqual({ edit: 2 });
+      expect(capsule.started_at).toBe(Date.parse(TS3));
+      expect(capsule.ended_at).toBe(Date.parse(TS3));
+    }
+  });
+
+  it('a pass that changed nothing still shows one capsule with no children; a failed pass carries its error', () => {
+    const items = transformChatHistory([
+      user('plan it', TS),
+      asst({ content: 'Here is the plan.', timestamp: TS2 }),
+      tidyRow({ outcome: 'no_change', archived: 0, restored: 0, files: [] }, 'Memory tidied: nothing to change', TS3),
+      tidyRow({ outcome: 'failed', archived: 0, restored: 0, files: [], error: 'turn timed out' }, 'Memory tidy failed: turn timed out', TS4),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message', 'agent_run', 'agent_run']);
+    const quiet = items[2];
+    const failed = items[3];
+    if (quiet.type === 'agent_run') {
+      expect(quiet.memory_tidy).toEqual({ outcome: 'no_change', archived: 0, restored: 0 });
+      expect(quiet.items).toEqual([]);
+    }
+    if (failed.type === 'agent_run') {
+      expect(failed.memory_tidy).toEqual({ outcome: 'failed', archived: 0, restored: 0, error: 'turn timed out' });
+      expect(failed.status).toBe('error');
+    }
+  });
+
+  it('never interrupts an open management capsule: the tidy row closes it first', () => {
+    const items = transformChatHistory([
+      user('go', TS),
+      asst({ content: null, tool_calls: [tc('r1', 'read', '{"path":"README.md"}')], timestamp: TS2 }),
+      tool('r1', 'readme text', TS2),
+      tidyRow({ outcome: 'edited', archived: 1, restored: 0, files: ['orbital/DECISIONS.md'] }, 'Memory tidied: 1 archived, 0 restored', TS3),
+      asst({ content: 'Done.', timestamp: TS4 }),
+    ]);
+    const types = items.map((i) => i.type);
+    expect(types.filter((t) => t === 'agent_run')).toHaveLength(2);
+    const tidy = items.find((i) => i.type === 'agent_run' && i.memory_tidy);
+    expect(tidy).toBeDefined();
+  });
+});
+
 describe('transformChatHistory — spec 112 memory record turn (_kind: memory_record)', () => {
   // The daemon's end-of-run record turn: the [MEMORY] ask, the model's edits
   // and its closing text all carry `_kind: "memory_record"`. The reply the
