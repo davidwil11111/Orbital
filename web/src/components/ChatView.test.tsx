@@ -4587,7 +4587,7 @@ describe('Keyless: the composer pin falls back to the project pin', () => {
     await flushEffects();
     const hint = container.querySelector('[data-testid="chat-keyless-hint"]');
     expect(hint?.textContent).toBe(
-      "Talking to Codex directly. Add an API key to let Orbital manage this project's context.",
+      'Talking to Codex. Add an API key to let Orbital manage this project.',
     );
   });
 
@@ -4678,7 +4678,7 @@ describe('Session import: opening an imported row', () => {
     await renderChat({ sessionId: 'imp_codex_0123456789abcdef', agents: [{ slug: 'codex', name: 'Codex' }] });
     await flushEffects();
     expect(container.querySelector('[data-testid="chat-importing"]')?.textContent)
-      .toBe('Importing this conversation…');
+      .toBe('Importing…');
     await act(async () => { release(); });
     await flushEffects();
     expect(container.querySelector('[data-testid="chat-importing"]')).toBeNull();
