@@ -11,20 +11,19 @@ them. What survived was::
     - [user] **选方案 A / B / C**（默认 A）？
 
 and what was destroyed was the briefing that made it answerable. The fix then
-was section-level flag protection; spec 089 replaced it with something simpler
-that covers the same failure without the flag: the floor is AGE-based. It only
-ever moves a bullet older than 14 days (with its continuation lines, leaving a
-pointer), never prose or headings, and nothing recent — so a briefing written
-alongside its questions can only leave together with them, and only once all
-of it is old.
+was section-level flag protection; spec 089 replaced it with an age-based
+floor; spec 124 removed the floor altogether: the daemon never moves an
+entry, only a Memory session does, by judgement. The injected view folds
+what does not fit instead.
 
-  1. Recent content is never cut; old bullets MOVE, never delete.
-  2. PROJECT_STATE demotes to a Layer-2 ``PROJECT_STATE_ARCHIVE.md`` — never
-     injected, never budgeted, read on demand.
+  1. Nothing is ever cut by the daemon, whatever its age.
+  2. PROJECT_STATE's archive is ``PROJECT_STATE_ARCHIVE.md`` — never
+     injected, never budgeted, read on demand — and INDEX carries one line
+     per archive.
 
-Plus: INDEX carries the pointers that make every archive discoverable, and its
-``LESSONS_ARCHIVE`` pointer was the LAST line of the file — first to go under a
-tail-dropping trim, which would strand the archive on disk. Pointer lines are
+Plus: INDEX's archive lines make every archive discoverable, and its
+``LESSONS_ARCHIVE`` line was the LAST line of the file — first to go under a
+tail-dropping trim, which would strand the archive on disk. Those lines are
 pinned.
 """
 
@@ -68,20 +67,28 @@ def _old_bullets(n: int, created: str = "2026-01-01") -> str:
 # 1. A recent briefing is never cut — nor is prose, whatever its age
 # ---------------------------------------------------------------------------
 
-def test_recent_briefing_and_its_questions_survive_the_floor(tmp_path):
+def test_recent_briefing_and_its_questions_survive_the_floor(tmp_path, monkeypatch):
     """The exact regression shape, written today: the floor may not touch it,
     however far over target the file is."""
+    monkeypatch.setitem(_mem.FILE_BUDGETS, "state", {"soft": 5, "hard": 8})
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", BRIEFED_SECTION)       # the chokepoint stamps created=today
     content = ws.read("state")
-    r = _mem.floor_state(content, 5, _mem._today())
-    assert r.content is content
-    assert r.over_by > 0
+    from agent_os.agent import workspace_files as wsf
+    assert wsf._apply_hard_caps(ws) == ["state"]
+    assert ws.read("state") == content
+    assert "pick option A / B / C" in content
 
 
-def test_prose_and_headings_are_never_floor_candidates():
-    content = "# S\n\n## Old\n" + "".join(f"filler {i}\n" for i in range(400))
-    assert _mem.floor_state(content, 5, "2026-09-19").content is content
+def test_old_bullets_prose_and_headings_are_never_floor_candidates(tmp_path, monkeypatch):
+    monkeypatch.setitem(_mem.FILE_BUDGETS, "state", {"soft": 5, "hard": 8})
+    ws = WorkspaceFileManager(str(tmp_path))
+    ws.write("state", "# S\n\n## Old\n" + _old_bullets(20))
+    content = ws.read("state")
+    from agent_os.agent import workspace_files as wsf
+    wsf._apply_hard_caps(ws)
+    assert ws.read("state") == content
+    assert not ws.exists("state_archive")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +107,7 @@ def test_archives_are_layer2_never_injected():
         assert archive_key not in _mem.FILE_BUDGETS
 
 
-def test_state_overflow_moves_old_bullets_to_archive_instead_of_deleting(tmp_path):
+def test_state_overflow_only_folds_the_view_and_moves_nothing(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
     doomed = "UNIQUE-SENTINEL-OLD-BULLET-THAT-MUST-SURVIVE " + "d" * 300
@@ -111,18 +118,22 @@ def test_state_overflow_moves_old_bullets_to_archive_instead_of_deleting(tmp_pat
     from agent_os.agent import workspace_files as wsf
     wsf._apply_hard_caps(ws)
 
-    assert "- " + doomed not in (ws.read("state") or ""), "should have been moved out"
-    assert "id:dm0001" in (ws.read("state") or ""), "a pointer must be left"
-    assert doomed in (ws.read("state_archive") or ""), "must be MOVED, not deleted"
+    live = ws.read("state") or ""
+    assert "- " + doomed in live and "id:dm0001" in live
+    assert not ws.exists("state_archive")
+    view = _mem.inject_view(live, "state", _mem.FILE_BUDGETS["state"]["hard"])
+    assert "more entries in this section not shown" in view
+    assert "## Old" in view
 
 
-def test_state_archive_gets_an_index_pointer(tmp_path):
+def test_state_archive_gets_an_index_line(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
-    ws.write("state", "# S\n\n## Old\n" + _old_bullets(20))
     from agent_os.agent import workspace_files as wsf
-    wsf._apply_hard_caps(ws)
-    assert "PROJECT_STATE_ARCHIVE.md" in (ws.read("index") or "")
+    wsf._append_archive_section(ws, "state_archive", "## [archived 2026-09-19]", _old_bullets(1))
+    wsf.refresh_index_archive_lines(ws)
+    index = ws.read("index") or ""
+    assert "- orbital/PROJECT_STATE_ARCHIVE.md — 1 archived entry, 2026-09-19 to 2026-09-19: to be described." in index
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +225,178 @@ def test_mem_comments_are_still_excluded_for_state():
     """The pre-existing exclusion must survive the new one."""
     body = "- [user] a line\n  <!--mem id:abc created:2026-07-01 touched:2026-07-01-->\n"
     assert "abc" not in _mem._budget_text(body, "state")
+
+
+# ---------------------------------------------------------------------------
+# 6. Spec 112 A1–A3: Layer 1 is snapshotted once per run.
+#
+#    ``prepare()`` used to re-read the four files on every call and inject
+#    whatever was on disk. The agent edits them mid-run (314 times in two
+#    months, almost all mid-run), and from that call on the injected row was
+#    byte-different, so the provider's prefix cache broke right there and
+#    60–90k tokens re-prefilled. The injected rendering is now frozen for the
+#    run (``begin_run()`` clears it); the disk is still read each call, but
+#    only for the drift line and the hygiene flags, which ride the tail.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from agent_os.agent.context import ContextManager, _LAYER1_FILES
+from agent_os.agent.prompt_builder import Autonomy, PromptContext
+from agent_os.agent.session import Session
+
+
+class _SnapBuilder:
+    def build(self, context: PromptContext) -> tuple[str, str, str]:
+        return ("cached-system-prefix", "semi-stable-suffix", "dynamic-runtime")
+
+
+def _snap_ctx(workspace: str) -> PromptContext:
+    return PromptContext(
+        workspace=workspace,
+        model="test-model",
+        autonomy=Autonomy.HANDS_OFF,
+        enabled_agents=[],
+        tool_names=["read"],
+        os_type="linux",
+        datetime_now="2026-01-01T00:00:00",
+        context_usage_pct=0.0,
+    )
+
+
+def _snap_rig(tmp_path):
+    session = Session.new("snap", str(tmp_path))
+    ws = WorkspaceFileManager(str(tmp_path))
+    ws.ensure_dir()
+    mgr = ContextManager(session, _SnapBuilder(), _snap_ctx(str(tmp_path)),
+                         model_context_limit=200_000, workspace_files=ws)
+    session.append({"role": "user", "content": "hello", "source": "user"})
+    return session, ws, mgr
+
+
+def _layer1_rows(messages: list[dict], filename: str) -> list[str]:
+    return [
+        m["content"] for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
+        and m["content"].startswith(f"[{filename}")
+    ]
+
+
+def _runtime_text(messages: list[dict]) -> str:
+    tail = messages[-1]
+    content = tail.get("content")
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content or ""
+
+
+@pytest.mark.parametrize("key,filename", list(_LAYER1_FILES))
+def test_layer1_row_is_byte_identical_within_a_run_and_the_tail_names_the_drift(tmp_path, key, filename):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write(key, "# Heading\n- first fact that is true\n")
+    mgr.begin_run()
+    first = mgr.prepare()
+    assert "first fact" in "".join(_layer1_rows(first, filename))
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(first)
+
+    ws.write(key, "# Heading\n- first fact that is true\n- SECOND-FACT-ADDED-MID-RUN\n")
+    second = mgr.prepare()
+
+    assert _layer1_rows(second, filename) == _layer1_rows(first, filename)
+    assert "SECOND-FACT-ADDED-MID-RUN" not in "".join(_layer1_rows(second, filename))
+    tail = _runtime_text(second)
+    assert "[MEMORY SNAPSHOT]" in tail
+    drift_line = next(l for l in tail.splitlines() if l.startswith("[MEMORY SNAPSHOT]"))
+    assert filename in drift_line
+    # Only the changed file is named.
+    for _other_key, other in _LAYER1_FILES:
+        if other != filename:
+            assert other not in drift_line
+
+
+def test_no_drift_line_when_nothing_changed_between_calls(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()
+    second = mgr.prepare()
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(second)
+
+
+def test_begin_run_refreshes_the_snapshot_and_clears_the_drift_line(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()
+    ws.write("state", "# S\n- a fact\n- NEW-FACT-FOR-NEXT-RUN\n")
+    assert "[MEMORY SNAPSHOT]" in _runtime_text(mgr.prepare())
+
+    mgr.begin_run()
+    third = mgr.prepare()
+    assert "NEW-FACT-FOR-NEXT-RUN" in "".join(_layer1_rows(third, "PROJECT_STATE.md"))
+    assert "[MEMORY SNAPSHOT]" not in _runtime_text(third)
+
+
+def test_snapshot_header_is_the_static_run_start_text(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("decisions", "# D\n- chose B over A because it ships\n")
+    mgr.begin_run()
+    rows = _layer1_rows(mgr.prepare(), "DECISIONS.md")
+    assert len(rows) == 1
+    header = rows[0].splitlines()[0]
+    assert header == (
+        "[DECISIONS.md — snapshot taken when this run started. Do not edit "
+        "memory files during the run; at the end of the run you will be asked "
+        "what to record, with the current file text in hand.]"
+    )
+
+
+def test_layer1_snapshot_accessor_exposes_the_injected_rows(tmp_path):
+    """Spec 124 §3.7: the Memory session starts from the SAME bytes so its
+    first call hits the prefix cache."""
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    ws.write("index", "# I\n- docs/ — notes\n")
+    assert mgr.layer1_snapshot() == []          # nothing until the first build
+    mgr.begin_run()
+    prepared = mgr.prepare()
+    snap = mgr.layer1_snapshot()
+    assert [name for name, _ in snap] == ["PROJECT_STATE.md", "INDEX.md"]
+    for filename, row_text in snap:
+        assert _layer1_rows(prepared, filename) == [row_text]
+    ws.write("state", "# S\n- changed on disk\n")
+    mgr.prepare()
+    assert mgr.layer1_snapshot() == snap        # frozen for the run
+
+
+def test_disk_is_still_read_each_call_for_the_hygiene_flag(tmp_path):
+    """The over-budget flag reflects the file on disk NOW (it rides the tail),
+    while the injected row stays the snapshot."""
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- small\n")
+    mgr.begin_run()
+    first = mgr.prepare()
+    assert "[MEMORY HYGIENE]" not in _runtime_text(first)
+    big = "# S\n" + "".join(f"- line {i} " + "x" * 120 + "\n" for i in range(120))
+    ws.write("state", big)
+    second = mgr.prepare()
+    assert _layer1_rows(second, "PROJECT_STATE.md") == _layer1_rows(first, "PROJECT_STATE.md")
+    assert "[MEMORY HYGIENE]" in _runtime_text(second)
+
+
+def test_prefix_only_changes_at_the_tail_across_a_mid_run_memory_edit(tmp_path):
+    session, ws, mgr = _snap_rig(tmp_path)
+    ws.write("state", "# S\n- a fact\n")
+    mgr.begin_run()
+    mgr.prepare()   # the first call of a manager carries the one-off cold-resume row
+    first = mgr.prepare()
+    ws.write("state", "# S\n- a fact\n- edited mid-run\n")
+    session.append({"role": "assistant", "content": "Done.", "source": "management"})
+    session.append({"role": "user", "content": "next", "source": "user"})
+    second = mgr.prepare()
+    diff_at = next(
+        (i for i, (a, b) in enumerate(zip(first, second))
+         if _json.dumps(a, sort_keys=True) != _json.dumps(b, sort_keys=True)),
+        min(len(first), len(second)),
+    )
+    assert diff_at >= len(first) - 1, f"prefix rewritten at {diff_at} of {len(first)}"

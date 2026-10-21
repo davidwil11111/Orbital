@@ -27,40 +27,49 @@ def _wf(tmp_path) -> WorkspaceFileManager:
 
 
 def _decisions(n: int, *, touched=None, body="x" * 120) -> str:
-    """n stamped DECISIONS entries, oldest-first, with explicit touched dates."""
+    """n stamped DECISIONS entries, oldest-first, with explicit touched dates
+    (the one shape of spec 124: bullet, comment under it, indented detail)."""
     out = []
     for i in range(1, n + 1):
         t = touched(i) if touched else f"2026-01-{i:02d}"
         out.append(
-            f"## 2026-01-{i:02d}: Decision {i} "
-            f"<!--mem id:d{i} created:2026-01-{i:02d} touched:{t}-->\n"
-            f"**Chose:** option {i}\n**Reason:** {body}\n**Rejected:** alt {i}\n\n"
+            f"- 2026-01-{i:02d}: Decision {i} — chose option {i}\n"
+            f"  <!--mem id:d{i} created:2026-01-{i:02d} touched:{t}-->\n"
+            f"  **Reason:** {body}\n  **Rejected:** alt {i}\n\n"
         )
     return "".join(out)
 
 
 # ---------------------------------------------------------------------------
-# Gate 1 — injection cap + oldest-3
+# Gate 1 — injection: every bullet line, detail for the hottest, fold by section
 # ---------------------------------------------------------------------------
 
-def test_injection_cap_keeps_budget_and_oldest_three(monkeypatch):
+def test_injection_keeps_every_bullet_and_only_hot_detail(monkeypatch):
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 200, "hard": 400})
     content = _decisions(20, body="x" * 20)
     view = M.inject_view(content, "decisions", 400)
-    # oldest-3 (foundational) always present
-    for i in (1, 2, 3):
+    for i in range(1, 21):
         assert f"Decision {i} " in view
-    # newest present, a middle one omitted, with a pointer note
-    assert "Decision 20" in view
-    assert "Decision 10" not in view
-    assert "omitted from this view" in view
-    # injected size stays near budget (oldest-3 is the only allowed overshoot)
-    assert M.est_tokens(view) <= 400 + 150
+    assert "<!--mem" not in view
+    # detail only for the most recently touched entries, within budget
+    assert "**Reason:**" in view
+    assert view.count("**Reason:**") < 20
+    assert "**Rejected:** alt 20" in view and "**Rejected:** alt 1\n" not in view
+    assert M.est_tokens(view) <= 400
+
+
+def test_injection_folds_by_section_when_bullets_overflow(monkeypatch):
+    monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 60, "hard": 100})
+    content = "## Pricing\n" + _decisions(10, body="x") + "## Channels\n" + _decisions(10, body="x").replace("id:d", "id:c")
+    view = M.inject_view(content, "decisions", 100)
+    assert "## Pricing" in view and "## Channels" in view
+    assert view.count("more entries in this section not shown") == 2
+    assert M.est_tokens(view) <= 100 + 40
 
 
 def test_injection_unchanged_when_fits(monkeypatch):
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 7000, "hard": 9000})
-    content = _decisions(5)
+    content = "# D\n- a decision\n  detail\n- another\n"
     view = M.inject_view(content, "decisions", 9000)
     assert view is content  # same object — prefix-cache friendly
 
@@ -71,76 +80,56 @@ def test_injection_unchanged_when_fits(monkeypatch):
 
 def test_metadata_survives_overwrite_with_headers_stripped():
     old = (
-        "## 2026-06-15: Keep API base url "
-        "<!--mem id:keep-api created:2026-06-15 touched:2026-06-15-->\n"
-        "**Chose:** moonshot\n\n"
+        "- 2026-06-15: Keep API base url\n"
+        "  <!--mem id:keep-api created:2026-06-15 touched:2026-06-15-->\n"
+        "  **Chose:** moonshot\n\n"
     )
     # agent overwrites WITHOUT the metadata comment, body unchanged
-    new = "## 2026-06-15: Keep API base url\n**Chose:** moonshot\n\n"
+    new = "- 2026-06-15: Keep API base url\n  **Chose:** moonshot\n\n"
     stamped, warns = M.stamp(new, old, "decisions", today="2026-06-18")
     assert "id:keep-api" in stamped          # id preserved
     assert "created:2026-06-15" in stamped    # created preserved
     assert "touched:2026-06-15" in stamped    # body unchanged → touched preserved
     # body changed → touched advances
-    new2 = "## 2026-06-15: Keep API base url\n**Chose:** minimax\n\n"
+    new2 = "- 2026-06-15: Keep API base url\n  **Chose:** minimax\n\n"
     stamped2, _ = M.stamp(new2, old, "decisions", today="2026-06-18")
     assert "touched:2026-06-18" in stamped2
     assert "created:2026-06-15" in stamped2
 
 
-def test_lessons_renumbered_contiguously():
+def test_legacy_numbered_lessons_become_bullets_not_renumbered():
     broken = "1. **A.** a.\n\n4. **B.** b.\n\n7. **C.** c.\n"
-    stamped, _ = M.stamp(broken, None, "lessons", today="2026-06-18")
-    nums = [ln.split(".")[0] for ln in stamped.splitlines() if ln and ln[0].isdigit()]
-    assert nums == ["1", "2", "3"]
+    text, _ = M.normalise_entries(broken, "lessons")
+    stamped, _ = M.stamp(text, None, "lessons", today="2026-06-18")
+    bullets = [ln for ln in stamped.splitlines() if ln.startswith("- ")]
+    assert bullets == ["- A. a.", "- B. b.", "- C. c."]
+    assert not any(ln[:1].isdigit() for ln in stamped.splitlines())
 
 
 # ---------------------------------------------------------------------------
-# Gate 3 — demotion to archive (coldest touched first; protect oldest-3 + pinned)
+# Gate 3 — the floor never demotes (spec 124); pinned is never moved by anyone
 # ---------------------------------------------------------------------------
 
-def test_hard_cap_demotes_coldest_to_archive(tmp_path, monkeypatch):
+def test_hard_cap_never_demotes(tmp_path, monkeypatch):
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 120, "hard": 180})
     wf = _wf(tmp_path)
-    # 10 entries; make the MIDDLE ones (4..7) coldest by touched so they demote,
-    # NOT the protected oldest 3.
     def touched(i):
         return "2025-01-01" if i in (4, 5, 6, 7) else "2026-06-18"
     wf.write("decisions", _decisions(10, touched=touched, body="x" * 20))
-    WF._apply_hard_caps(wf)
-
-    kept = wf.read("decisions")
-    archive = wf.read("decisions_archive")
-    index = wf.read("index") or ""
-    # oldest-3 retained in the live file
-    for i in (1, 2, 3):
-        assert f"Decision {i} " in kept
-    # the coldest moved to the archive (by id), each leaving a pointer
-    assert archive and "Decision" in archive
-    import re
-    moved = re.findall(r"\[archived \S+ id:(\S+)\]", kept)
-    # coldest first: the 2025-touched ones all go before any warmer one
-    assert {"d4", "d5", "d6", "d7"} <= set(moved)
-    assert not {"d1", "d2", "d3"} & set(moved)
-    for eid in moved:
-        assert f"id:{eid} " in archive
-    assert "DECISIONS_ARCHIVE.md" in index
-    # coldest (a middle entry) went to the archive, not entry 1
-    assert "Decision 1 " not in archive
+    before = wf.read("decisions")
+    assert WF._apply_hard_caps(wf) == ["decisions"]
+    assert wf.read("decisions") == before
+    assert not wf.exists("decisions_archive")
 
 
-def test_hard_cap_protects_pinned(tmp_path, monkeypatch):
-    monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 40, "hard": 70})
-    wf = _wf(tmp_path)
-    entries = _decisions(8)
-    # pin entry 5 and make it coldest — it must NOT demote
-    entries = entries.replace(
-        "id:d5 created:2026-01-05 touched:2026-01-05",
-        "id:d5 created:2026-01-05 touched:2000-01-01 tag:pinned",
+def test_the_task_message_forbids_touching_pinned_entries():
+    from agent_os.agent import memory_editor
+    text = memory_editor.build_task_message(
+        sizes={k: (1, 10, 5) for k in memory_editor.LIVE_KEYS}, folded=[], over=["decisions"],
+        forced=False, pointer_paths=[], last_pass=None, sessions=[], today="2026-06-18", tool_cap=12,
     )
-    wf.write("decisions", entries)
-    WF._apply_hard_caps(wf)
-    assert "Decision 5 " in (wf.read("decisions") or "")
+    assert "Never touch entries tagged tag:pinned." in text
+    assert "never because it is\n  old" in text
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +138,7 @@ def test_hard_cap_protects_pinned(tmp_path, monkeypatch):
 
 def test_lessons_long_playbook_survives_persist(tmp_path):
     long_body = " ".join(["word"] * 243)
-    lesson = f"1. **Slate.js playbook.** {long_body}\n"
+    lesson = f"- Slate.js playbook. {long_body}\n"
     stamped, warns = M.stamp(lesson, None, "lessons", today="2026-06-18")
     assert long_body in stamped  # byte-intact, not shortened
     assert not warns
@@ -165,7 +154,7 @@ def test_soft_flag_only_over_threshold(monkeypatch):
     big = _decisions(20)
     assert M.soft_flag(small, "decisions") is None
     flag = M.soft_flag(big, "decisions")
-    assert flag and "memory editor" in flag and "automatically" in flag and "tok" in flag and "entries" in flag
+    assert flag and "memory pass" in flag and "automatically" in flag and "tok" in flag and "entries" in flag
 
 
 # ---------------------------------------------------------------------------
@@ -189,29 +178,20 @@ def test_no_delta_gate(tmp_path):
 # Gate 7 — contradiction dedup via the session-end pass (fake provider)
 # ---------------------------------------------------------------------------
 
-class _FakeResp:
-    def __init__(self, text):
-        self.text = text
+class _FakeTurn:
+    """A Memory turn runner (spec 124 §3.7) that applies ``moves(wf)`` the
+    way the agent's edits would, and counts its calls."""
 
-
-class _FakeProvider:
-    def __init__(self, payload):
-        self._payload = payload
+    def __init__(self, moves=None):
+        self._moves = moves
         self.calls = 0
 
-    async def complete(self, messages, tools=None, disable_reasoning=False):
+    async def __call__(self, task_text):
+        from agent_os.agent import memory_editor
         self.calls += 1
-        return _FakeResp(json.dumps(self._payload))
-
-    async def stream(self, messages, tools=None, **kwargs):
-        # The merge streams (a 15-min idle connection is unreliable); replay
-        # complete()'s payload as chunks so this test keeps its own subject.
-        from agent_os.agent.providers.types import StreamChunk, TokenUsage
-        resp = await self.complete(messages)
-        text = getattr(resp, "text", "") or ""
-        for i in range(0, len(text), 256):
-            yield StreamChunk(text=text[i:i + 256])
-        yield StreamChunk(is_final=True, usage=TokenUsage(input_tokens=1, output_tokens=1))
+        if self._moves is not None:
+            self._moves()
+        return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=2, ended="text_complete")
 
 
 class _FakeSession:
@@ -224,34 +204,52 @@ class _FakeSession:
 
 @pytest.mark.asyncio
 async def test_session_end_merges_supersedes(tmp_path):
-    """Spec 089: superseding is a MERGE BY ID — the contradiction pair leaves
-    the live file (both originals archived verbatim, a pointer left) and one
-    condensed entry takes its place."""
+    """Spec 124 §3.7: superseding is a MERGE the Memory session writes — the
+    contradiction pair leaves the live file (both originals archived
+    verbatim under a [merged …] section) and one condensed entry takes its
+    place."""
+    from agent_os.agent import state_blocks
     wf = _wf(tmp_path)
     # the real contradiction pair from the reports
     wf.write("decisions",
-        "## 2026-06-15: QClaw PM Identity for Outreach <!--mem id:qclaw created:2026-06-15 touched:2026-06-15-->\n"
-        "**Chose:** Use QClaw PM identity.\n\n"
-        "## 2026-06-15: Use Orbital Name (Not QClaw) for Outreach <!--mem id:orbital-name created:2026-06-15 touched:2026-06-15-->\n"
-        "**Chose:** Orbital indie builder.\n\n")
+        "- 2026-06-15: QClaw PM Identity for Outreach\n  <!--mem id:qclaw created:2026-06-15 touched:2026-06-15-->\n"
+        "  **Chose:** Use QClaw PM identity.\n\n"
+        "- 2026-06-15: Use Orbital Name (Not QClaw) for Outreach\n  <!--mem id:orbital-name created:2026-06-15 touched:2026-06-15-->\n"
+        "  **Chose:** Orbital indie builder.\n\n")
     merged = (
-        "## 2026-06-15: Use Orbital Name (Not QClaw) for Outreach\n"
-        "**Chose:** Orbital indie builder.\n**Rejected:** QClaw PM identity (superseded).\n"
+        "- 2026-06-15: Use Orbital Name (Not QClaw) for Outreach\n"
+        "  **Chose:** Orbital indie builder.\n  **Rejected:** QClaw PM identity (superseded).\n"
     )
-    prov = _FakeProvider({"merge": [{
-        "file": "DECISIONS.md", "ids": ["qclaw", "orbital-name"],
-        "text": merged, "pointer": "QClaw identity superseded by the Orbital name",
-    }]})
+
+    def moves():
+        # the merged entry in the live file first, then the originals under
+        # a [merged …] section (what the task message asks for)
+        from agent_os.agent import state_blocks
+        live = wf.read("decisions")
+        blocks = {b.id: b for b in state_blocks.parse(live)[1] if b.id}
+        new_live = live.replace(blocks["qclaw"].raw + "\n\n", "").replace(
+            blocks["orbital-name"].raw + "\n", merged)
+        wf.write("decisions", new_live)
+        # the daemon stamps the merged entry: a title it already knows keeps
+        # its id (orbital-name here), a new title gets a fresh one
+        new_id = state_blocks.parse(wf.read("decisions"))[1][0].id
+        WF._append_archive_section(
+            wf, "decisions_archive", f"## [merged 2026-06-18 into id:{new_id}]",
+            blocks["qclaw"].raw + "\n" + blocks["orbital-name"].raw)
+
+    prov = _FakeTurn(moves)
     await WF.run_session_end_routine(
-        _FakeSession(), prov, wf, utility_provider=None,
-        session_uuid="u1", bypass_idempotency=True, project_id="p1", force=True,
+        _FakeSession(), None, wf, utility_provider=None,
+        session_uuid="u1", bypass_idempotency=True, project_id="p1", force=True, run_turn=prov,
     )
     out = wf.read("decisions")
     assert "Use Orbital Name" in out
     assert "QClaw PM Identity for Outreach" not in out   # superseded entry left
-    assert "id:qclaw id:orbital-name]" in out            # pointer to both
+    assert "id:qclaw" not in out and "[archived" not in out   # nothing left behind
+    assert len(state_blocks.parse(out)[1]) == 1
     archive = wf.read("decisions_archive")
-    assert "QClaw PM Identity for Outreach <!--mem id:qclaw" in archive
+    assert "- 2026-06-15: QClaw PM Identity for Outreach\n  <!--mem id:qclaw" in archive
+    assert "## [merged " in archive and "into id:" in archive
     assert prov.calls == 1
 
 
@@ -260,39 +258,36 @@ async def test_session_end_no_delta_skips_llm(tmp_path):
     wf = _wf(tmp_path)
     wf.write("decisions", _decisions(2))
     WF._write_cleanup_marker(wf)  # mark as already cleaned
-    prov = _FakeProvider({"decisions": "x"})
+    prov = _FakeTurn()
     await WF.run_session_end_routine(
-        _FakeSession(), prov, wf, session_uuid="u2",
-        bypass_idempotency=True, project_id="p1",
+        _FakeSession(), None, wf, session_uuid="u2",
+        bypass_idempotency=True, project_id="p1", run_turn=prov,
     )
     assert prov.calls == 0  # no-delta → no LLM call
 
 
 @pytest.mark.asyncio
-async def test_session_end_survives_llm_timeout_and_still_caps(tmp_path, monkeypatch):
-    """LLM times out → deterministic floor still runs (no propagation)."""
+async def test_session_end_survives_llm_timeout_and_leaves_the_file_whole(tmp_path, monkeypatch):
+    """LLM times out → no propagation; the floor runs but moves nothing."""
     from agent_os.agent import memory_editor
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 120, "hard": 180})
-    monkeypatch.setattr(memory_editor, "EDITOR_CALL_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(memory_editor, "EDITOR_TOTAL_TIMEOUT_S", 0.01)
     wf = _wf(tmp_path)
     wf.write("decisions", _decisions(12, body="x" * 20))
     before = wf.read("decisions")
 
-    class _Timeout:
-        model = "hangs"
-
-        async def complete(self, messages, tools=None, disable_reasoning=False):
-            import asyncio
-            await asyncio.sleep(999)
+    async def _hangs(task_text):
+        import asyncio
+        await asyncio.sleep(999)
 
     out = await WF.run_session_end_routine(
-        _FakeSession(), _Timeout(), wf, session_uuid="u3",
-        bypass_idempotency=True, project_id="p1",
+        _FakeSession(), None, wf, session_uuid="u3",
+        bypass_idempotency=True, project_id="p1", run_turn=_hangs,
     )
     assert out == "backstop_only"
-    # deterministic floor ran despite the timeout
-    assert M.est_tokens(wf.read("decisions")) < M.est_tokens(before)
-    assert wf.read("decisions_archive")
+    # the floor never moves an entry: the file is whole, there is no archive
+    assert wf.read("decisions") == before
+    assert not wf.exists("decisions_archive")
 
 
 # ---------------------------------------------------------------------------
@@ -303,18 +298,13 @@ def test_session_log_removed_from_roster():
     assert "session_log" not in WF.FILE_NAMES
     assert "index" in WF.FILE_NAMES
     assert "decisions_archive" in WF.FILE_NAMES
-    assert WF._RESUME_ORDER == ["state", "decisions", "lessons", "index"]
+    assert not hasattr(WF, "_RESUME_ORDER")  # cold resume removed 2026-10-20
     assert not hasattr(WF, "_truncate_session_log")
     assert not hasattr(WF, "_get_session_log_lock")
 
 
-def test_cold_resume_has_no_session_log(tmp_path):
-    wf = _wf(tmp_path)
-    wf.write("state", "current state")
-    wf.write("index", "the map")
-    ctx = wf.build_cold_resume_context()
-    assert "current state" in ctx and "the map" in ctx
-    assert "Session Log" not in ctx
+def test_cold_resume_builder_is_gone(tmp_path):
+    assert not hasattr(_wf(tmp_path), "build_cold_resume_context")
 
 
 def test_sub_agent_prompt_omits_session_log(tmp_path):

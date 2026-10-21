@@ -3162,6 +3162,10 @@ def _interleave_sub_agent_summaries(messages: list[dict]) -> list[dict]:
             row["sub_agent_thinking"] = turn["thinking"]
         if in_flight:
             row["sub_agent_in_flight"] = True
+        if msg.get("_kind"):
+            # Spec 112 A6: a pinned worker's memory record turn — the marker
+            # is tagged, so its run summary is too (the chat collapses it).
+            row["_kind"] = msg["_kind"]
         out.append(row)
     return out
 

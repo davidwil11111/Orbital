@@ -13,8 +13,8 @@ prompt tokens for the call it just made to the context manager, and the
 estimate is only the fallback for a call that reported no usage.
 
 Compaction also no longer runs a blocking memory consolidation first (the old
-``token_pressure`` refresh). Consolidation is scheduled by memory-file budget;
-compaction keeps only its own flush turn.
+``token_pressure`` refresh), and since 2026-10-21 no pre-compaction flush turn
+either: the record turn (spec 112) precedes it, then the summary, nothing else.
 """
 
 from __future__ import annotations
@@ -66,16 +66,18 @@ def _response(text: str, usage: TokenUsage | None, tool_calls=None) -> LLMRespon
 
 
 class _Provider:
-    """Primary provider; serves the pre-compaction flush via complete()."""
+    """Primary provider; serves the compaction summary via complete() (when
+    compaction.run is not stubbed). Counts the calls: the loop itself never
+    calls complete() around a compaction — there is no flush turn."""
 
     def __init__(self, sdk: str = "openai"):
         self.provider = "opencode-go"
         self.model = "deepseek-v4-flash"
         self.sdk = sdk
-        self.flushes = 0
+        self.completes = 0
 
     async def complete(self, messages, tools=None):
-        self.flushes += 1
+        self.completes += 1
         return _response("<silent>", TokenUsage(input_tokens=10, output_tokens=1))
 
 
@@ -200,7 +202,7 @@ class TestLoopCompactsOnReportedTokens:
                              cache_read_tokens=150_000),
         )
         assert order == ["compaction"]
-        assert provider.flushes == 1
+        assert provider.completes == 0
 
     @pytest.mark.asyncio
     async def test_chinese_estimate_alone_does_not_compact(self, tmp_path):
@@ -217,7 +219,7 @@ class TestLoopCompactsOnReportedTokens:
             usage=TokenUsage(input_tokens=45_000, output_tokens=50),
         )
         assert order == []
-        assert provider.flushes == 0
+        assert provider.completes == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("usage", [
@@ -252,8 +254,8 @@ class TestNoConsolidationBeforeCompaction:
 
     @pytest.mark.asyncio
     async def test_compaction_does_not_spawn_a_refresh(self, tmp_path):
-        """The token-pressure consolidation is gone: compaction runs its own
-        flush turn and nothing else."""
+        """The token-pressure consolidation is gone: compaction runs no
+        refresh (and, since 2026-10-21, no flush turn either)."""
         session = Session.new("no_tp", str(tmp_path))
         refreshes: list[str] = []
 
@@ -266,7 +268,7 @@ class TestNoConsolidationBeforeCompaction:
             on_refresh=on_refresh,
         )
         assert order == ["compaction"]
-        assert provider.flushes == 1
+        assert provider.completes == 0
         assert refreshes == []
 
 
@@ -422,11 +424,11 @@ async def test_loop_compacts_append_only_and_resumes_from_the_summary(tmp_path):
 
     mgr = ContextManager(session, _Builder(), _ctx(str(tmp_path)),
                          model_context_limit=128_000)
-    replies = iter(["<silent>", "Read docs 0-4. Code words: A, B, C, D, E."])
+    replies = iter(["Read docs 0-4. Code words: A, B, C, D, E."])   # the summary only
 
     class _P(_Provider):
         async def complete(self, messages, tools=None):
-            self.flushes += 1
+            self.completes += 1
             return _response(next(replies), TokenUsage(input_tokens=10, output_tokens=1))
 
     provider = _P()
@@ -467,18 +469,17 @@ async def test_loop_compacts_append_only_and_resumes_from_the_summary(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reported,new_result_chars,flushed", [
-    (104_000, 400, True),       # next prompt ~104k: fits 108k, flush sees it all
-    (104_000, 40_000, False),   # a 10k-token read lands: ~114k would be trimmed
+@pytest.mark.parametrize("reported,new_result_chars", [
+    (104_000, 400),       # next prompt ~104k: would fit 108k untrimmed
+    (104_000, 40_000),    # a 10k-token read lands: ~114k would be trimmed
 ])
-async def test_flush_only_when_its_prompt_fits_untrimmed(
-    tmp_path, reported, new_result_chars, flushed,
+async def test_no_flush_turn_whether_or_not_one_more_prompt_fits(
+    tmp_path, reported, new_result_chars,
 ):
-    """The pre-compaction flush asks the agent to save its state. When the
-    step that crossed the threshold also overflows the window, the flush
-    prompt is cut by the sliding window, oldest rows (the task) first; in a
-    live run the agent then saved "awaiting user instruction". Skip the flush
-    there: compaction keeps the task verbatim anyway."""
+    """The pre-compaction flush is gone (2026-10-21). Whether or not one more
+    prompt would fit the window untrimmed, the loop makes no complete() call
+    of its own and appends no flush row; it just compacts (the record turn's
+    own fit gate is covered in test_compaction_no_flush_turn.py)."""
     session = Session.new("flush_fit", str(tmp_path))
     persist_user_row(session, "Read the docs.")
     mgr = ContextManager(session, _Builder(), _ctx(str(tmp_path)),
@@ -488,8 +489,7 @@ async def test_flush_only_when_its_prompt_fits_untrimmed(
     class _P(_Provider):
         async def complete(self, messages, tools=None):
             requests.append(messages[0]["content"])
-            return _response("<silent>" if len(requests) == 1 and flushed
-                             else "Summary of the reads.",
+            return _response("Summary of the reads.",
                              TokenUsage(input_tokens=10, output_tokens=1))
 
     registry = MagicMock()
@@ -516,8 +516,7 @@ async def test_flush_only_when_its_prompt_fits_untrimmed(
             patch("agent_os.agent.compaction.inject_reorientation"):
         await loop.run()
 
-    from agent_os.agent.compaction import MEMORY_FLUSH_PROMPT
-    flush_rows = [m for m in session.get_messages() if m.get("content") == MEMORY_FLUSH_PROMPT]
     assert compactions == ["compaction"]
-    assert bool(flush_rows) is flushed
-    assert (len(requests) == 1) is flushed
+    assert requests == []
+    assert not any("Pre-compaction memory flush" in str(m.get("content"))
+                   for m in session.get_messages())

@@ -2,12 +2,14 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""PROJECT_STATE.md as a sequence of bullet blocks (spec 089 §4.1, §4.3).
+"""Memory files as a sequence of bullet blocks (spec 089 §4.1, spec 124 §3.1).
 
-One parser shared by the write chokepoint (which stamps every block with an
-id + dates) and the deterministic floor / memory editor (which move blocks
-to the archive by id). A block is the unit that moves, so it has to be the
-same unit everywhere:
+One parser shared by every memory file — PROJECT_STATE, DECISIONS and LESSONS
+all use the same entry shape since spec 124 — and by every consumer: the
+write chokepoints (which stamp every block with an id + dates), the injected
+view, the memory editor / Memory session (which move blocks to the archive
+by id) and the archive contents tables. A block is the unit that moves, so it
+has to be the same unit everywhere:
 
 - it starts at a top-level list item (``- `` / ``3. `` / ``12) `` — the same
   ``user_flags.LIST_MARKER`` grammar the rest of the memory code uses);
@@ -30,6 +32,9 @@ from agent_os.agent import user_flags
 
 _BULLET_START_RE = re.compile(rf"^(?P<prefix>{user_flags.LIST_MARKER})(?P<text>\S.*)$")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+# A heading with its level and text; ``## Topic`` headings are sections (never
+# entries) — the injected view folds by them when bullet lines alone overflow.
+HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<text>.*?)\s*$")
 _COMMENT_RE = re.compile(r"<!--\s*mem\b(?P<body>.*?)-->", re.DOTALL)
 _COMMENT_OPEN_RE = re.compile(r"<!--\s*mem\b")
 # A leading `[user …]` / `[due:…]` bracket tag. Only these tokens make it a
@@ -202,3 +207,19 @@ def render(block: Block, fields: dict[str, str]) -> list[str]:
 def pointer_date(line: str) -> str | None:
     m = POINTER_RE.match(line)
     return m.group("date") if m else None
+
+
+def is_bullet_line(line: str) -> bool:
+    """True for a top-level list item (the first line of a block)."""
+    return bool(_BULLET_START_RE.match(line))
+
+
+def heading_level(line: str) -> int:
+    """0 for a non-heading line, else the number of leading ``#``."""
+    m = HEADING_RE.match(line)
+    return len(m.group("hashes")) if m else 0
+
+
+def heading_text(line: str) -> str:
+    m = HEADING_RE.match(line)
+    return m.group("text") if m else ""

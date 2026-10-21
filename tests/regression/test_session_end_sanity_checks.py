@@ -406,33 +406,28 @@ def test_dedup_before_cap():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_session_end_demotes_oversized_decisions_to_archive(
+async def test_session_end_never_demotes_decisions_by_size(
     tmp_path, monkeypatch
 ):
-    """LLM returns many decisions over the hard budget; session-end's
-    deterministic backstop DEMOTES the coldest to DECISIONS_ARCHIVE.md (never
-    deletes), protecting the oldest 3. This replaces the old "session-end
-    enforces a 30-entry cap" assertion — the cap moved to a token-budget
-    demotion."""
+    """Spec 124: the deterministic floor measures and logs but never moves an
+    entry — only the editor's (future: Memory session's) judgement archives.
+    An editor that chooses nothing leaves every decision live, however far
+    over budget the file is."""
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 120, "hard": 180})
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
 
-    # 12 stamped decisions, oldest-first, with explicit touched dates so the
-    # MIDDLE ones are coldest and demote (not the protected oldest 3).
     def _decisions(n):
         out = []
         for i in range(1, n + 1):
             touched = "2025-01-01" if 4 <= i <= 9 else "2026-06-18"
             out.append(
-                f"## 2026-01-{i:02d}: Decision {i} "
-                f"<!--mem id:d{i} created:2026-01-{i:02d} touched:{touched}-->\n"
-                f"**Chose:** option {i}\n**Reason:** {'x' * 20}\n\n"
+                f"- 2026-01-{i:02d}: Decision {i}\n"
+                f"  <!--mem id:d{i} created:2026-01-{i:02d} touched:{touched}-->\n"
+                f"  **Chose:** option {i}\n  **Reason:** {'x' * 20}\n\n"
             )
         return "".join(out)
 
-    # Spec 089: the editor chooses nothing here ({}); the point is the
-    # deterministic demotion that runs afterwards.
     ws.write("decisions", _decisions(12))
     before = ws.read("decisions")
     session = _mock_session(session_id="s_demote")
@@ -443,21 +438,10 @@ async def test_session_end_demotes_oversized_decisions_to_archive(
         session_uuid="s_demote", bypass_idempotency=True, project_id="p1",
     )
 
-    kept = ws.read("decisions") or ""
-    archive = ws.read("decisions_archive") or ""
-    index = ws.read("index") or ""
-
-    # Live file shrank (each demoted entry leaves a one-line id pointer).
-    assert M.est_tokens(kept) < M.est_tokens(before)
-    assert "[archived " in kept and "→ DECISIONS_ARCHIVE.md" in kept
-    # Oldest-3 protected, never demoted.
-    for i in (1, 2, 3):
-        assert f"Decision {i} " in kept
-    # Something demoted (never deleted), and INDEX points to the archive.
-    assert archive and "Decision" in archive
-    assert "DECISIONS_ARCHIVE.md" in index
-    # The protected entry-1 is NOT in the archive.
-    assert "Decision 1 " not in archive
+    assert ws.read("decisions") == before
+    assert not ws.exists("decisions_archive")
+    for i in range(1, 13):
+        assert f"id:d{i} " in before
 
 
 # ---------------------------------------------------------------------------

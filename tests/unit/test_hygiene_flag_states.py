@@ -15,7 +15,7 @@ Spec 089: over-budget files are tidied AUTOMATICALLY by the memory editor, so
 no state asks the agent to call checkpoint_state or to trim a file by hand:
 
   idle           → "tidied automatically in the background, no action"
-  in-flight      → "the memory editor is tidying it — no action needed"
+  in-flight      → "a memory pass is tidying it — no action needed"
   backstop_only  → the editor could not run; it retries on its own
   edited / ...   → tidied; what remains is recent or live
   near hard cap  → escalation note appended in ANY state
@@ -78,7 +78,7 @@ def test_in_flight_flag_says_no_action_needed():
         refresh=RefreshView(in_flight=True, in_flight_since_turn=14),
     )
     assert flag is not None
-    assert "memory editor" in flag
+    assert "memory pass" in flag
     assert "turn 14" in flag
     assert "no action needed" in flag.lower()
     assert "do not trim it by hand" in flag.lower()
@@ -138,7 +138,8 @@ def test_near_hard_cap_escalates_idle():
     flag = M.soft_flag(_near_hard(), "state")
     assert flag is not None
     assert "hard cap" in flag
-    assert "pointer" in flag
+    assert "pointer" not in flag
+    assert "newest entries of each section" in flag
 
 
 def test_near_hard_cap_escalates_even_in_flight():

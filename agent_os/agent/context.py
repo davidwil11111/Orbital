@@ -9,11 +9,13 @@ Owned by Component A. Builds the message list sent to the LLM on each iteration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 from dataclasses import replace
 from datetime import datetime
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,47 @@ _LAYER1_FILES: tuple[tuple[str, str], ...] = (
 _POSITIONAL_EVENT_TAGS: frozenset[str] = frozenset({
     "sub_agent_terminal",
     "interaction_required",
+    # Spec 112 A6: the daemon's end-of-run "what is worth recording" row.
+    # Positional for the same reason — it is an instruction about the turn
+    # that just ended, not a preamble fact.
+    "memory_record",
 })
+
+
+class _Layer1Snap(NamedTuple):
+    """One Layer-1 file as rendered for THIS run (spec 112 A1).
+
+    ``row_text`` is the exact ``content`` of the injected system row (header
+    included) or None when the file injected nothing; ``content_hash`` is the
+    hash of the on-disk text the rendering came from, compared against the
+    disk on every later call to produce the drift line (A3).
+    """
+    filename: str
+    row_text: str | None
+    content_hash: str
+
+
+# Spec 112 A2: static per-file header on every injected Layer-1 row. The
+# text never changes, so it costs one prefix miss at deploy and then nothing.
+_SNAPSHOT_HEADER = (
+    "[{filename} — snapshot taken when this run started. Do not edit memory "
+    "files during the run; at the end of the run you will be asked what to "
+    "record, with the current file text in hand.]"
+)
+
+# Spec 112 A3: the drift note appended to the per-call runtime block (the
+# tail, never the prefix) when a file's bytes on disk no longer match the
+# snapshot the run started from. Absent when nothing changed.
+_DRIFT_LINE = (
+    "[MEMORY SNAPSHOT] {files} changed on disk during this run; the rows "
+    "injected above are the snapshot taken when the run started. The files "
+    "on disk already reflect your edits — do not apply them again. Read a "
+    "file if you need its current content."
+)
+
+
+def _content_hash(content: str | None) -> str:
+    return hashlib.sha1((content or "").encode("utf-8")).hexdigest()
 
 # Fraction of the model's raw context window at which the next turn boundary
 # compacts. See compaction_threshold_tokens() for why this is taken off the raw
@@ -96,6 +138,18 @@ def compaction_threshold_tokens(
     # compaction forever. No registry entry is that small (32k is the floor),
     # but the trigger must not be a landmine if one ever is.
     return budget_rule if budget_rule > 0 else int(_COMPACT_FRACTION * window)
+
+# Spec 112 A6: the ``_kind`` tag on every row the end-of-run memory record
+# turn produces (the [MEMORY] ask, the model's edits, its closing text; a
+# pinned worker's reminder and its lifecycle rows). Defined here, where the
+# window is cut, and re-exported by agent_os.agent.loop.
+MEMORY_RECORD_KIND = "memory_record"
+
+# Spec 124 §3.7 follow-up (2026-10-21): the one row a tidy pass leaves in the
+# session that triggered it ("Memory tidied: …"). Bookkeeping like the record
+# turn's rows: never in the window, the recap, the reply badge or the live
+# activity feed; the chat renders it as a collapsed capsule.
+MEMORY_TIDY_KIND = "memory_tidy"
 
 # Frame for the per-call runtime block so the model reads it as an injected
 # runtime note rather than something the user typed (backlog #38).
@@ -149,7 +203,25 @@ class ContextManager:
         self._sub_agent_deployment_instructions_provider = (
             sub_agent_deployment_instructions_provider
         )  # callable() -> str
-        self._cold_resume_injected: bool = False
+        # Spec 112: the record turn's rows are its own mini-conversation and
+        # are in the window only while it runs (AgentLoop sets this for the
+        # duration of ``_memory_record_turn``). Every later call drops them:
+        # the [MEMORY] row carries a full copy of PROJECT_STATE, and keeping
+        # five of those in history costs 2-10k tokens a run and shows the
+        # model stale state alongside the snapshot.
+        self.include_memory_record_rows: bool = False
+        # Spec 112 A1/A5: the Layer-1 rows as rendered for the current run
+        # (None until the run's first prepare()), and the number of assistant
+        # messages in the model view when the run began (None = no run has
+        # begun on this manager, which keeps the legacy per-call media
+        # pruning for callers that never call begin_run()).
+        self._layer1_snapshot: dict[str, _Layer1Snap] | None = None
+        self._run_start_turn: int | None = None
+        # Spec 124 §3.7: Layer-1 rows handed over by another run (the Memory
+        # session starts from the triggering run's ``layer1_snapshot()``).
+        # Consumed by the next ``begin_run()`` — one run only; later runs
+        # read the disk again.
+        self._adopted_layer1: list[tuple[str, str]] | None = None
         self._last_usage_pct: float = 0.0
         self._last_used_tokens: float = 0.0
         self._window_factor: float = 1.0
@@ -205,11 +277,14 @@ class ContextManager:
         return over
 
     def flush_fits(self) -> bool:
-        """Whether the next prompt fits the usable window untrimmed.
+        """Whether one more prompt fits the usable window untrimmed.
 
-        When it does not, the pre-compaction flush would be built from a
-        prompt the sliding window has cut, oldest rows (the user's task)
-        first, and the agent saves state from a partial view.
+        Gates the record turn that precedes a compaction (spec 112 A6). When
+        the step that crossed the threshold also overflows the window, that
+        turn would be built from a prompt the sliding window has cut, oldest
+        rows (the user's task) first, and the agent would record from a
+        partial view — so the loop skips it and compacts at once. (Named for
+        the pre-compaction flush it originally gated; that turn is gone.)
         """
         return self._projected_tokens() <= self._model_context_limit - self._response_reserve
 
@@ -359,6 +434,62 @@ class ContextManager:
 
         self._session.append_system(injection_text)
 
+    def begin_run(self) -> None:
+        """Mark a run boundary (spec 112): ``AgentLoop.run()`` entry and the
+        point right after a compaction.
+
+        Drops the Layer-1 snapshot so the next ``prepare()`` re-reads the four
+        files and renders them afresh (A1), and advances the media-pruning
+        horizon to the current number of assistant messages so everything the
+        previous run produced is now eligible for pruning while nothing this
+        run produces is (A5). Nothing on disk is touched or locked: the agent,
+        the Memory session and external writers keep writing files as before;
+        only the bytes injected into the prompt are frozen between boundaries.
+        """
+        self._layer1_snapshot = None
+        if self._adopted_layer1 is not None:
+            self._layer1_snapshot = self._install_adopted(self._adopted_layer1)
+            self._adopted_layer1 = None
+        self._run_start_turn = sum(
+            1 for m in self._session.get_model_messages()
+            if m.get("role") == "assistant"
+        )
+
+    def adopt_layer1_snapshot(self, rows: list[tuple[str, str]]) -> None:
+        """Start the NEXT run from these ``(filename, row_text)`` rows instead
+        of rendering the files (spec 124 §3.7): the Memory session injects
+        the triggering run's rows byte-for-byte so its first call rides that
+        run's prefix. The drift note still compares the disk against the
+        bytes as they are now, so a file that changed since is named."""
+        self._adopted_layer1 = list(rows)
+
+    def _install_adopted(self, rows: list[tuple[str, str]]) -> dict[str, _Layer1Snap]:
+        by_name = {filename: row_text for filename, row_text in rows}
+        snapshot: dict[str, _Layer1Snap] = {}
+        for key, filename in _LAYER1_FILES:
+            content = self._workspace_files.read(key) if self._workspace_files is not None else None
+            snapshot[key] = _Layer1Snap(filename, by_name.get(filename), _content_hash(content))
+        return snapshot
+
+    def layer1_snapshot(self) -> list[tuple[str, str]]:
+        """The current run's injected Layer-1 rows as ``(filename, row_text)``.
+
+        ``row_text`` is the exact ``content`` string of the ``role:"system"``
+        row ``prepare()`` injects (static header included), in injection
+        order; files that injected nothing are omitted. Empty before the run's
+        first ``prepare()``. Spec 124 §3.7's Memory session starts its prompt
+        from these same bytes so its first call hits the prefix cache. This
+        is not spec 125's ``fork_prefix()`` — no tool schemas, no semi-stable
+        block — just the rendering.
+        """
+        if not self._layer1_snapshot:
+            return []
+        return [
+            (snap.filename, snap.row_text)
+            for _key, snap in self._layer1_snapshot.items()
+            if snap.row_text is not None
+        ]
+
     def prepare(self) -> list[dict]:
         """Build context: system prompt + layer injections + sliding window."""
         if not self._recovery_injected:
@@ -433,22 +564,42 @@ class ContextManager:
         )
         soft_flags: list[str] = []
         over_budget: list[str] = []
+        drifted: list[str] = []
         if self._workspace_files is not None:
+            # Spec 112 A1: the rendering is taken once per run and reused
+            # byte-for-byte on every later call (the provider's prefix cache
+            # depends on it); the disk is still read every call, but only for
+            # the hygiene flags and the drift line, both of which ride the
+            # tail. The view text is opaque here — whatever inject_view
+            # renders is what gets frozen.
+            taking = self._layer1_snapshot is None
+            if taking:
+                self._layer1_snapshot = {}
             for key, filename in _LAYER1_FILES:
                 content = self._workspace_files.read(key)
-                if not content:
-                    continue
-                if _mem.over_soft_budget(content, key):
-                    over_budget.append(key)
-                view = _mem.inject_view(content, key, _budgets[key]["hard"])
-                if view:
+                if content:
+                    if _mem.over_soft_budget(content, key):
+                        over_budget.append(key)
+                    flag = _mem.soft_flag(content, key, refresh=_refresh_view)
+                    if flag:
+                        soft_flags.append(flag)
+                digest = _content_hash(content)
+                if taking:
+                    view = (_mem.inject_view(content, key, _budgets[key]["hard"])
+                            if content else None)
+                    row_text = (
+                        _SNAPSHOT_HEADER.format(filename=filename) + "\n" + view
+                        if view else None
+                    )
+                    self._layer1_snapshot[key] = _Layer1Snap(filename, row_text, digest)
+                snap = self._layer1_snapshot[key]
+                if snap.content_hash != digest:
+                    drifted.append(filename)
+                if snap.row_text is not None:
                     layer_messages.append({
                         "role": "system",
-                        "content": f"[{filename}]\n{view}",
+                        "content": snap.row_text,
                     })
-                flag = _mem.soft_flag(content, key, refresh=_refresh_view)
-                if flag:
-                    soft_flags.append(flag)
 
         # Asks (spec 089 §3.5): open asks plus the ones the user dropped
         # recently ("never re-propose") ride the per-call runtime block, which
@@ -475,23 +626,14 @@ class ContextManager:
                 "content": f"[Project Instructions]\n{instructions_content}",
             })
 
-        # Cold resume injection (first call only)
-        cold_resume_messages: list[dict] = []
-        if not self._cold_resume_injected and self._workspace_files is not None:
-            resume_ctx = self._workspace_files.build_cold_resume_context()
-            if resume_ctx:
-                cold_resume_messages.append({
-                    "role": "system",
-                    "content": f"[WORKSPACE MEMORY — Resume Context]\n\n{resume_ctx}",
-                })
-            self._cold_resume_injected = True
+        # (The first-call-only "cold resume" row — a second, unbudgeted copy
+        # of the same four Layer-1 files that vanished on the second call and
+        # broke the prefix cache every session — was removed 2026-10-20; the
+        # Layer-1 rows above are the resume context.)
 
         # Estimate layer tokens
         layer_tokens = sum(
             estimate_message_tokens(m) for m in layer_messages
-        )
-        cold_resume_tokens = sum(
-            estimate_message_tokens(m) for m in cold_resume_messages
         )
 
         # Calculate remaining budget for sliding window. The estimate runs ~2x
@@ -499,11 +641,20 @@ class ContextManager:
         # converted to estimate units with the ratio the last reported call
         # measured (1.0 before any), leaving room for the tool schemas.
         calibrated_budget = available_budget * self._estimate_ratio - self._overhead_estimate
-        remaining = calibrated_budget - system_tokens - semi_stable_tokens - dynamic_tokens - layer_tokens - cold_resume_tokens
+        remaining = calibrated_budget - system_tokens - semi_stable_tokens - dynamic_tokens - layer_tokens
         remaining = max(0, int(remaining * self._window_factor))
 
-        # Get sliding window from session
-        sliding_window = self._session.get_recent(remaining)
+        # Get sliding window from session. Spec 112: finished record turns
+        # never ride along (their every row is tagged, so the assistant
+        # tool-call rows and their results leave together and
+        # _validate_tool_results sees a consistent window).
+        sliding_window = self._session.get_recent(
+            remaining,
+            exclude_kind=(
+                {MEMORY_TIDY_KIND} if self.include_memory_record_rows
+                else {MEMORY_RECORD_KIND, MEMORY_TIDY_KIND}
+            ),
+        )
 
         # Remap non-standard roles for LLM compatibility
         sliding_window = self._sanitize_roles(sliding_window)
@@ -534,9 +685,6 @@ class ContextManager:
             if "[Project Instructions]" not in msg.get("content", ""):
                 result.append(msg)
 
-        # Cold resume context (workspace memory)
-        result.extend(cold_resume_messages)
-
         # Sliding window
         result.extend(sliding_window)
 
@@ -561,6 +709,14 @@ class ContextManager:
             truly_dynamic = (
                 (truly_dynamic + "\n\n" if truly_dynamic else "")
                 + "[MEMORY HYGIENE] " + " ".join(soft_flags)
+            )
+
+        # Spec 112 A3: name the files whose on-disk bytes drifted from the
+        # run-start snapshot. Tail only — the prefix stays byte-identical.
+        if drifted:
+            truly_dynamic = (
+                (truly_dynamic + "\n\n" if truly_dynamic else "")
+                + _DRIFT_LINE.format(files=", ".join(drifted))
             )
 
         # Truly dynamic runtime context (timestamps, context budget) rides the
@@ -770,9 +926,29 @@ class ContextManager:
         "Turns" are counted as assistant messages (LLM responses), not raw
         message indices, so multi-message tool batches within one turn are
         not over-pruned.
+
+        Spec 112 A5: the TTLs only apply to results from turns BEFORE the
+        current run began (``begin_run()`` records the horizon). A snapshot
+        taken in this run stays intact however many turns ago it was, so the
+        prompt only ever changes at its tail within a run; the previous run's
+        expired media is pruned once, on the next run's first call — one miss
+        instead of one per call. Screenshots are replaced regardless (they
+        are stable: the same one-liner on every call). A manager that never
+        began a run (``_run_start_turn`` None) keeps the per-call TTLs.
         """
         if len(messages) <= 2:
             return messages
+
+        run_start = getattr(self, "_run_start_turn", None)
+        run_turns = 0
+        if run_start is not None:
+            session = getattr(self, "_session", None)
+            if session is not None:
+                total_now = sum(
+                    1 for m in session.get_model_messages()
+                    if m.get("role") == "assistant"
+                )
+                run_turns = max(0, total_now - run_start)
 
         # Pre-compute the LLM turn index for each message.
         # A "turn" increments each time an assistant message appears.
@@ -800,8 +976,17 @@ class ContextManager:
                 pruned.append(new_msg)
                 continue
 
+            # Age measured against the run-start horizon, not the moving
+            # total: negative = produced in this run (never rewritten until
+            # the run ends); otherwise the TTLs read exactly as they did at
+            # the run's first call, so a decision never flips mid-run.
+            age = llm_turns_ago - run_turns
+            if age < 0:
+                pruned.append(msg)
+                continue
+
             # Browser snapshot: aggressive 2-turn TTL
-            if meta.get("snapshot_stats") and llm_turns_ago > 2:
+            if meta.get("snapshot_stats") and age > 2:
                 stats = meta["snapshot_stats"]
                 url = meta.get("url", "unknown")
                 ref_count = stats.get("refs", 0)
@@ -812,7 +997,7 @@ class ContextManager:
 
             # Image-bearing tool results: aggressive 1-turn TTL
             content = msg.get("content", "")
-            if llm_turns_ago > 1 and isinstance(content, list):
+            if age > 1 and isinstance(content, list):
                 has_image = any(
                     isinstance(b, dict) and b.get("type") in ("image_url", "image")
                     for b in content

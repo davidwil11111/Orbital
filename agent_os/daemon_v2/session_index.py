@@ -136,6 +136,11 @@ def is_reply_row(rec: dict) -> bool:
     user's last message. A row shape this does not know is not a reply —
     a missed badge, never a false one.
     """
+    # Spec 112 A6: rows the end-of-run memory record turn produced (and the
+    # row that asked for it) never answer the user — the reply before them
+    # is the reply.
+    if rec.get("_kind") in ("memory_record", "memory_tidy"):
+        return False
     role = rec.get("role")
     if role == "assistant":
         return not rec.get("tool_calls")  # the final answer, not a tool step

@@ -13,10 +13,10 @@
    special treatment and a lone oversized entry is never cut.
 3. PROJECT_STATE soft cap is 1800 tokens (was 1500).
 
-DECISIONS/LESSONS carry their own, unrelated ``<!--mem id:...-->`` stamp
-(``memory_entries.stamp``) that is always injected — none of the above
-changes may touch that behavior, so a couple of pass-through regression
-checks are included here too.
+Since spec 124 DECISIONS/LESSONS use the same shape and the same comment
+grammar, so their comments are stripped from the view and excluded from the
+budget exactly like PROJECT_STATE's; the soft budget counts bullet lines
+only.
 """
 
 from __future__ import annotations
@@ -70,16 +70,14 @@ def test_soft_budget_still_trips_once_visible_text_itself_is_big(monkeypatch):
     assert "automatically" in flag
 
 
-def test_budget_text_passes_through_decisions_and_lessons_unchanged():
-    # DECISIONS/LESSONS have their OWN "<!--mem id:...-->" stamp (a different
-    # convention, always injected) — the state-only exclusion must not touch it.
+def test_budget_text_counts_bullet_lines_only_for_decisions_and_lessons():
     entry = (
-        "## 2026-01-01: Some decision "
-        "<!--mem id:d1 created:2026-01-01 touched:2026-01-01-->\n"
-        "**Chose:** x\n**Reason:** y\n**Rejected:** z\n\n"
+        "- 2026-01-01: Some decision\n"
+        "  <!--mem id:d1 created:2026-01-01 touched:2026-01-01-->\n"
+        "  **Chose:** x\n  **Reason:** y\n  **Rejected:** z\n\n"
     )
-    assert M._budget_text(entry, "decisions") == entry
-    assert M._budget_text(entry, "lessons") == entry
+    assert M._budget_text(entry, "decisions").strip() == "- 2026-01-01: Some decision"
+    assert M._budget_text(entry, "lessons").strip() == "- 2026-01-01: Some decision"
 
 
 # ---------------------------------------------------------------------------
@@ -102,20 +100,19 @@ def test_inject_view_state_strips_mem_comments_keeps_sentence():
     assert sentence in view
 
 
-def test_inject_view_decisions_still_shows_its_own_mem_stamp():
-    # Regression: the state-only strip must not leak into decisions/lessons,
-    # whose "<!--mem id:...-->" IS the always-injected metadata contract.
+def test_inject_view_decisions_strips_its_mem_stamps_too():
     content = (
-        "## 2026-01-01: Some decision "
-        "<!--mem id:d1 created:2026-01-01 touched:2026-01-01-->\n"
-        "**Chose:** x\n**Reason:** y\n**Rejected:** z\n\n"
-        "## 2026-01-02: Another decision "
-        "<!--mem id:d2 created:2026-01-02 touched:2026-01-02-->\n"
-        "**Chose:** a\n**Reason:** b\n**Rejected:** c\n\n"
+        "- 2026-01-01: Some decision\n"
+        "  <!--mem id:d1 created:2026-01-01 touched:2026-01-01-->\n"
+        "  **Chose:** x\n  **Reason:** y\n  **Rejected:** z\n\n"
+        "- 2026-01-02: Another decision\n"
+        "  <!--mem id:d2 created:2026-01-02 touched:2026-01-02-->\n"
+        "  **Chose:** a\n  **Reason:** b\n  **Rejected:** c\n\n"
     )
     view = M.inject_view(content, "decisions", M.FILE_BUDGETS["decisions"]["hard"])
-    assert "<!--mem id:d1" in view
-    assert "<!--mem id:d2" in view
+    assert "<!--mem" not in view
+    assert "- 2026-01-01: Some decision\n  **Chose:** x" in view
+    assert "- 2026-01-02: Another decision" in view
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +138,11 @@ def test_flagged_tag_earns_no_protection_in_the_view():
         + _filler_lines(7, "2026-09-10") + "\n"
     )
     view = M.inject_view(content, "state", hard)
-    assert "Old flagged question" not in view
+    # every bullet line is injected (the view folds, never hides by tag);
+    # the OLD flagged line earns no detail or protection of any kind
     assert "filler line 7" in view
     assert "<!--mem" not in view
+    assert "[user]" not in view or "Old flagged question" in view
 
 
 def test_trim_volatile_ignores_flags_now():
@@ -162,12 +161,14 @@ def test_trim_volatile_fits_already_returns_unchanged():
     assert result == content
 
 
-def test_state_floor_leaves_a_lone_oversized_recent_entry_untouched():
+def test_a_lone_entry_keeps_its_bullet_line_when_only_its_detail_overflows():
     text = "This obligation absolutely cannot be silently dropped by any means."
-    content = f"- [user] {text}\n  <!--mem id:abc999 created:2026-09-18 touched:2026-09-18-->\n"
-    r = M.floor_state(content, 5, "2026-09-19")
-    assert r.content is content
-    assert r.over_by > 0
+    content = (
+        f"- [user] {text}\n  <!--mem id:abc999 created:2026-09-18 touched:2026-09-18-->\n"
+        "  detail " + "d" * 400 + "\n"
+    )
+    view = M.inject_view(content, "state", (len(text) + 20) // 4)
+    assert text in view and "dddd" not in view
 
 
 def test_inject_view_state_everything_fits_is_just_comment_stripped():

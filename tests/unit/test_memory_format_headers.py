@@ -152,27 +152,6 @@ class TestShapeReport:
         assert mem.shape_report(None, "index") is None
 
 
-class TestEditorPromptRideAlong:
-    """Spec 089: the memory editor replaced the whole-file merge. INDEX is the
-    one file it may rewrite whole, so INDEX's format drift rides along in the
-    editor prompt (report-only — never a trigger of its own)."""
-
-    def _prompt(self, index_text):
-        from agent_os.agent import memory_editor
-        return memory_editor.build_prompt(
-            {"state": "", "decisions": "", "lessons": "", "index": index_text},
-            today="2026-09-19", since=None, sessions=[],
-        )
-
-    def test_prompt_contains_formatting_section_when_dirty(self):
-        prompt = self._prompt(_DIRTY_INDEX)
-        assert "INDEX FORMATTING TO FIX" in prompt
-        assert mem.FORMAT_HEADERS["index"] in prompt
-
-    def test_prompt_omits_formatting_section_when_clean(self):
-        assert "FORMATTING TO FIX" not in self._prompt(_CLEAN_INDEX)
-
-
 class TestShapeReportFilenameDates:
     """Dates embedded in artifact FILENAMES (agent_output/YYYY-MM-DD-*.md) are
     navigation, not drift — they must not count as dated lines."""

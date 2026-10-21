@@ -154,58 +154,9 @@ def test_read_all_mixed(ws):
 
 
 # ---------------------------------------------------------------------------
-# 6. test_build_cold_resume_context_all_files
-# ---------------------------------------------------------------------------
-
-def test_build_cold_resume_context_all_files(ws):
-    """All Layer-1 files exist -- assembled string with section headers in order.
-
-    The Layer-1 redesign retired SESSION_LOG and renamed CONTEXT -> INDEX. The
-    cold-resume order is now state, decisions, lessons, index (no session log).
-    """
-    ws.write("state", "In progress.")
-    ws.write("decisions", "Chose X over Y.")
-    ws.write("lessons", "Don't do Z.")
-    ws.write("index", "src/foo.py — the foo module.")
-
-    ctx = ws.build_cold_resume_context()
-
-    # Check section order (index replaces the old context/session-log tail).
-    state_pos = ctx.index("## Project State")
-    decisions_pos = ctx.index("## Decisions")
-    lessons_pos = ctx.index("## Lessons Learned")
-    index_pos = ctx.index("## Project Index")
-
-    assert state_pos < decisions_pos < lessons_pos < index_pos
-
-    # Check content is included
-    assert "In progress." in ctx
-    assert "Chose X over Y." in ctx
-    assert "Don't do Z." in ctx
-    assert "src/foo.py — the foo module." in ctx
-
-    # SESSION_LOG was removed — no such section should ever appear.
-    assert "Session Log" not in ctx
-
-
-# ---------------------------------------------------------------------------
-# 7. test_build_cold_resume_context_minimal
-# ---------------------------------------------------------------------------
-
-def test_build_cold_resume_context_minimal(ws):
-    """Only PROJECT_STATE.md exists -- just that section."""
-    ws.write("state", "I am the project state.")
-
-    ctx = ws.build_cold_resume_context()
-
-    assert "## Project State" in ctx
-    assert "I am the project state." in ctx
-    # No other sections
-    assert "## Decisions" not in ctx
-    assert "## Lessons Learned" not in ctx
-
-
-# ---------------------------------------------------------------------------
+# 6./7. build_cold_resume_context tests — DELETED 2026-10-20 with the method:
+# the Layer-1 rows injected every turn are the resume context.
+#
 # 8. test_session_log_truncation — DELETED.
 #
 # SESSION_LOG.md and its last-3-sessions resume truncation are a genuinely
@@ -218,70 +169,81 @@ def test_build_cold_resume_context_minimal(ws):
 
 
 # ---------------------------------------------------------------------------
-# 9-12. The session-end routine is the memory editor (spec 089 §4.2)
+# 9-12. The session-end routine is the Memory session's turn (spec 124 §3.7)
 # ---------------------------------------------------------------------------
 
-def _mock_editor_provider(response_text):
-    """A provider whose complete() answers once with plain text (no tools)."""
-    provider = _mock_provider(response_text)
-    provider.complete.return_value.raw_message = {"role": "assistant", "content": response_text}
-    provider.complete.return_value.tool_calls = []
-    return provider
+def _turn_result():
+    from agent_os.agent import memory_editor
+    return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=1, ended="text_complete")
 
 
 @pytest.mark.asyncio
-async def test_session_end_routine_applies_editor_choices_by_id(tmp_path):
+async def test_session_end_routine_lands_the_turns_archive_move(tmp_path):
+    from agent_os.agent import state_blocks
+    from agent_os.agent import workspace_files as wsf
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", "## Now\n- Old launch plan.\n- Current focus.\n")
     old_id = [ln for ln in ws.read("state").split("\n") if "<!--mem id:" in ln][0].split("id:")[1].split()[0]
-    provider = _mock_editor_provider(json.dumps({
-        "archive": [{"file": "PROJECT_STATE.md", "id": old_id, "pointer": "old launch plan"}],
-    }))
     session = _mock_session([], session_id="sess_editor")
 
+    async def run_turn(task_text):
+        live = ws.read("state")
+        b = [b for b in state_blocks.parse(live)[1] if b.id == old_id][0]
+        wsf._append_archive_section(ws, "state_archive", "## [archived 2026-10-21]", b.raw)
+        ws.write("state", live.replace(b.raw + "\n", ""))
+        return _turn_result()
+
     out = await run_session_end_routine(
-        session, provider, ws, session_uuid=session.session_uuid, force=True)
+        session, None, ws, session_uuid=session.session_uuid, force=True, run_turn=run_turn)
 
     assert out == "edited"
     state = ws.read("state")
     assert "- Old launch plan." not in state and "- Current focus." in state
-    assert "[archived " in state and f"id:{old_id}] old launch plan → PROJECT_STATE_ARCHIVE.md" in state
-    assert "- Old launch plan." in ws.read("state_archive")
+    assert "[archived " not in state and f"id:{old_id}" not in state
+    archive = ws.read("state_archive")
+    assert "- Old launch plan." in archive and f"id:{old_id}" in archive
+    assert f"- id:{old_id} · archived " in archive        # contents table
+    assert "PROJECT_STATE_ARCHIVE.md — 1 archived entry" in ws.read("index")
     assert "session_log" not in FILE_NAMES
 
 
 @pytest.mark.asyncio
-async def test_session_end_routine_bad_json(tmp_path, caplog):
-    """Unparseable replies: nothing is edited, the floor still runs, and the
+async def test_session_end_routine_turn_failure(tmp_path, caplog):
+    """A failing turn: nothing is edited, the floor still runs, and the
     outcome says only the backstop ran."""
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", "original state")
     session = _mock_session([{"role": "user", "content": "Hello"}], session_id="sess_bad_json")
-    provider = _mock_editor_provider("This is not JSON at all, sorry!")
+
+    async def run_turn(task_text):
+        raise RuntimeError("the turn failed")
 
     with caplog.at_level(logging.WARNING):
         out = await run_session_end_routine(
-            session, provider, ws, session_uuid=session.session_uuid, force=True)
+            session, None, ws, session_uuid=session.session_uuid, force=True, run_turn=run_turn)
 
     assert out == "backstop_only"
     assert ws.read("state") == _hdr("state", "original state")
     assert ws.read("decisions") is None
     assert ws.read("lessons") is None
-    assert "no usable JSON" in caplog.text
+    assert "the turn failed" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_session_end_routine_ignores_whole_file_replies(tmp_path):
-    """The old contract (complete files back) no longer means anything."""
+async def test_session_end_routine_never_regenerates_files(tmp_path):
+    """No reply shape can replace a whole file: the turn's only way to change
+    memory is the agent's own edit/write; a turn that writes nothing changes
+    nothing."""
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", "# State\nDoing well.")
-    provider = _mock_editor_provider(json.dumps({
-        "project_state": "# State\nsomething else", "decisions": "## x\n", "lessons": "1. y\n",
-    }))
     session = _mock_session([{"role": "user", "content": "Go"}], session_id="sess_whole")
 
+    async def run_turn(task_text):
+        assert "Tidy this project's memory." in task_text
+        return _turn_result()
+
     out = await run_session_end_routine(
-        session, provider, ws, session_uuid=session.session_uuid, force=True)
+        session, None, ws, session_uuid=session.session_uuid, force=True, run_turn=run_turn)
 
     assert out == "no_change"
     assert ws.read("state") == _hdr("state", "# State\nDoing well.")
@@ -301,27 +263,35 @@ def test_exists(ws):
 
 
 # ---------------------------------------------------------------------------
-# Extra: test_session_end_uses_utility_provider
+# Extra: the providers passed to the routine are not used — the turn runs on
+# the project's own provider inside the Memory session (spec 124 §3.7, no
+# utility-provider split).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_session_end_uses_utility_provider(tmp_path):
-    """When utility_provider is given, the editor runs on it, not the main one."""
+async def test_session_end_runs_on_the_memory_session_not_the_passed_providers(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", "state")
 
     session = _mock_session([{"role": "user", "content": "Hi"}], session_id="sess_util_prov")
-    main_provider = _mock_editor_provider("should not be called")
-    utility_provider = _mock_editor_provider("{}")
+    main_provider = _mock_provider("should not be called")
+    utility_provider = _mock_provider("should not be called either")
+    turns = []
+
+    async def run_turn(task_text):
+        turns.append(task_text)
+        return _turn_result()
 
     await run_session_end_routine(
         session, main_provider, ws,
         utility_provider=utility_provider,
         session_uuid=session.session_uuid,
         force=True,
+        run_turn=run_turn,
     )
 
-    utility_provider.complete.assert_called_once()
+    assert len(turns) == 1
+    utility_provider.complete.assert_not_called()
     main_provider.complete.assert_not_called()
     assert ws.read("state") == _hdr("state", "state")
 
@@ -342,7 +312,6 @@ def test_write_invalid_key(ws):
         ws.write("bad_key", "content")
 
 
-def test_build_cold_resume_empty_workspace(ws):
-    """No files exist -- returns empty string."""
-    ctx = ws.build_cold_resume_context()
-    assert ctx == ""
+def test_no_cold_resume_builder(ws):
+    """build_cold_resume_context was removed with the cold-resume row (2026-10-20)."""
+    assert not hasattr(ws, "build_cold_resume_context")

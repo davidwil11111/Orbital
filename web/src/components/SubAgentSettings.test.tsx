@@ -157,13 +157,15 @@ describe('SubAgentSettings', () => {
     await waitFor(() => {
       expect(screen.getByText('Claude Code')).toBeInTheDocument();
     });
-    // The not-installed agent used to vanish; now it says so in one line,
-    // with no login / config controls.
+    // The not-installed agent used to vanish; now it is the locate card:
+    // the paste flow, with no login / config controls.
     const row = screen.getByTestId('sub-agent-not-detected-gemini-cli');
     expect(row).toHaveTextContent('Gemini CLI');
     expect(row).toHaveTextContent('Not detected');
-    expect(row).toHaveTextContent("Gemini CLI is not on Orbital's PATH.");
-    expect(within(row).queryByRole('button')).not.toBeInTheDocument();
+    expect(row).toHaveTextContent('Copy this into Gemini CLI and paste its answer below.');
+    expect(within(row).queryByRole('combobox')).not.toBeInTheDocument();
+    expect(within(row).queryByText('Login')).not.toBeInTheDocument();
+    expect(within(row).getByTestId('sub-agent-locate-answer-gemini-cli')).toBeInTheDocument();
   });
 
   it('keeps the install helper out of the embedded view, and on the standalone page', async () => {

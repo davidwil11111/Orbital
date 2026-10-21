@@ -406,6 +406,17 @@ export interface ChatMessage {
   _meta?: Record<string, unknown>;
   _activity_descriptions?: Record<string, string>;
   /**
+   * Spec 112 A6: "memory_record" on every row the daemon's end-of-run memory
+   * record turn produced (the [MEMORY] ask, the model's edits, its closing
+   * text; a pinned worker's reminder, dispatch marker, run summary and
+   * completion). Never a bubble: chatTransform renders the edits as a
+   * collapsed activity capsule and drops the rest.
+   * "memory_tidy" (spec 124 §3.7 follow-up) on the one daemon system row a
+   * memory tidy pass leaves in the session that triggered it; rendered as a
+   * collapsed capsule of the files it changed.
+   */
+  _kind?: string;
+  /**
    * Format-1 user-facing chat session identity. Stable within a chat thread;
    * rotates when ``/new-session`` is invoked. Treated as an opaque equality
    * key in chatTransform.ts (used only to draw session-boundary separators).
@@ -541,11 +552,13 @@ export interface SessionListEntry {
    * the list API (agent_manager.list_sessions). 'chat' is the default for
    * manually started sessions; 'queue' marks dispatcher-minted sessions and
    * drives the queue kind-chip in SessionListItem; 'cold_start' marks the
-   * onboarding session. Trigger-fired sessions are NOT distinguished here
-   * (they arrive as 'chat') — the UI detects them from the '[Triggered by …'
-   * name prefix instead (lib/sessionLabel.ts).
+   * onboarding session; 'memory' is the project's Memory session (spec 124
+   * §3.7: the tidy pass's own session, one per project, named "Memory").
+   * Trigger-fired sessions are NOT distinguished here (they arrive as
+   * 'chat') — the UI detects them from the '[Triggered by …' name prefix
+   * instead (lib/sessionLabel.ts).
    */
-  origin?: 'chat' | 'queue' | 'cold_start' | 'imported';
+  origin?: 'chat' | 'queue' | 'cold_start' | 'imported' | 'memory';
   /**
    * Session import: a native Claude Code / Codex conversation found for this
    * workspace. `materialized: false` = a virtual entry the daemon converts to

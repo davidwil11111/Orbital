@@ -218,7 +218,7 @@ Each entry carries system-managed metadata (`id` / `created` / `touched` / `tag`
 <p align="center"><img src="docs/screenshots/memory-lessons.png" alt="LESSONS.md — patterns and pitfalls the agent learned, read back before each task" width="100%"></p>
 <p align="center"><em>DECISIONS.md and LESSONS.md — written by the agent as it works, and carried into every future session</em></p>
 
-**Compaction** (when context usage exceeds 80%): memory flush, LLM-driven summarization of older messages, recent messages kept intact, post-compaction reorientation with project goals and current state.
+**Compaction** (when context usage exceeds 80%): a memory record turn (the agent decides what to keep in the project memory files), LLM-driven summarization of older messages, recent messages kept intact, post-compaction reorientation with project goals and current state.
 
 **Prefix caching** (v0.4.2): the system prompt is split into static, semi-stable, and truly-dynamic sections so up to ~95% of input tokens hit the provider's prefix cache on follow-up turns. See the [v0.4.2 release notes](https://github.com/zqiren/Orbital/releases/tag/v0.4.2) for benchmark numbers.
 
@@ -688,7 +688,7 @@ curl http://localhost:8000/api/v2/projects
 - Continuous operation via schedule and file-watch triggers
 - Natural language trigger creation
 - Cloud relay with push notifications and device pairing
-- Context compaction with pre-compaction memory flush
+- Context compaction with a pre-compaction memory record turn
 - Prefix-cache-optimized prompt assembly (v0.4.2)
 - Per-project budget limits and cost tracking
 - Credential management (API keys + website credentials)

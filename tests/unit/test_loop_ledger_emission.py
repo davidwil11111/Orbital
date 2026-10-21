@@ -115,6 +115,8 @@ async def test_one_ledger_line_per_response(tmp_path):
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     persist_user_row(loop._session, "hi")
     await loop.run()
@@ -153,12 +155,16 @@ async def test_ledger_is_the_sole_spend_record(tmp_path):
             project_dir=str(tmp_path),
             on_cost_update=lambda d, t: None,
             max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
         )
 
     loop = AgentLoop(
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     persist_user_row(loop._session, "hi")
     await loop.run()
@@ -181,7 +187,8 @@ async def test_no_project_dir_no_ledger_no_crash(tmp_path):
     context_mgr = ContextManager(session, builder, ctx)
     registry = SimpleToolRegistry()
 
-    loop = AgentLoop(session, provider, registry, context_mgr, max_iterations=5)
+    loop = AgentLoop(session, provider, registry, context_mgr, max_iterations=5,
+                     memory_record_enabled=False)
     persist_user_row(loop._session, "hi")
     await loop.run()
 
@@ -216,6 +223,8 @@ async def test_ledger_append_failure_does_not_break_loop(tmp_path, monkeypatch):
         session, provider, registry, context_mgr,
         project_dir=str(tmp_path),
         max_iterations=5,
+        # One response per run is the premise: no spec 112 record turn here.
+        memory_record_enabled=False,
     )
     # Must not raise even though append_event blows up.
     persist_user_row(loop._session, "hi")
@@ -225,10 +234,11 @@ async def test_ledger_append_failure_does_not_break_loop(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Pre-compaction memory flush: a real management-LLM response served via
-# flush_llm.complete() (utility provider when configured, else the primary).
-# It must also append a ledger line, attributed to the provider that actually
-# served it. Trigger pattern mirrors tests/regression/test_precompaction_flush.py.
+# Compaction: no pre-compaction flush any more (removed 2026-10-21). The
+# utility provider's complete() is not called by the loop around a compaction
+# (compaction.run itself is stubbed here), so the ledger carries only the two
+# main-path lines and the utility provider sees no traffic. Trigger pattern
+# mirrors tests/regression/test_precompaction_flush.py.
 # ---------------------------------------------------------------------------
 
 def _llm_response(text: str, usage, tool_calls=None) -> LLMResponse:
@@ -246,7 +256,7 @@ def _llm_response(text: str, usage, tool_calls=None) -> LLMResponse:
 
 
 class UtilityCompleteProvider:
-    """Utility provider serving the flush via complete(); distinct identity."""
+    """Utility provider with a distinct identity; counts complete() calls."""
 
     def __init__(self, usage):
         self.provider = "moonshot"
@@ -260,9 +270,9 @@ class UtilityCompleteProvider:
         return _llm_response("<silent>", self._usage)
 
 
-def _flush_scenario_loop(tmp_path, session, utility):
-    """Build a loop whose first iteration tool-calls, then compaction fires
-    (flush turn via `utility`), then a final text ends the run."""
+def _compaction_scenario_loop(tmp_path, session, utility):
+    """Build a loop whose first iteration tool-calls, then compaction fires,
+    then a final text ends the run."""
     primary = TextProvider("moonshot", "kimi-k2.5", "openai")
 
     context_manager = MagicMock()
@@ -304,15 +314,15 @@ def _flush_scenario_loop(tmp_path, session, utility):
 
 
 @pytest.mark.asyncio
-async def test_flush_completion_emits_ledger_line(tmp_path):
-    """The pre-compaction flush response appends one ledger line attributed to
-    the provider that actually served it (the utility provider), in between the
-    two main-path lines from the primary."""
+async def test_compaction_emits_no_flush_ledger_line(tmp_path):
+    """A compaction adds no ledger line of its own around the two main-path
+    lines from the primary, and the utility provider is never asked to serve
+    a flush."""
     session = Session.new("led_flush", str(tmp_path))
     utility = UtilityCompleteProvider(
         TokenUsage(input_tokens=500, output_tokens=20, cache_read_tokens=100),
     )
-    loop = _flush_scenario_loop(tmp_path, session, utility)
+    loop = _compaction_scenario_loop(tmp_path, session, utility)
 
     async def mock_compact_run(sess, prov, utility_provider=None, **kwargs):
         pass
@@ -321,44 +331,11 @@ async def test_flush_completion_emits_ledger_line(tmp_path):
         persist_user_row(loop._session, "do the task")
         await loop.run()
 
-    assert utility.complete_calls == 1
-    events = _read_ledger(str(tmp_path))
-    assert len(events) == 3, events
-
-    # Lines 1 and 3: main-path responses served by the primary.
-    assert events[0]["model"] == "kimi-k2.5"
-    assert events[0]["uncached_input"] == 100
-    assert events[0]["output"] == 50
-    assert events[2]["model"] == "kimi-k2.5"
-    assert events[2]["uncached_input"] == 80
-    assert events[2]["output"] == 30
-
-    # Line 2: the flush, attributed to the utility provider that served it.
-    assert events[1]["provider"] == "moonshot"
-    assert events[1]["model"] == "kimi-utility"
-    assert events[1]["source"] == "management"
-    # openai_compat: uncached = 500 - 100 cache_read.
-    assert events[1]["uncached_input"] == 400
-    assert events[1]["cache_read"] == 100
-    assert events[1]["output"] == 20
-
-
-@pytest.mark.asyncio
-async def test_flush_without_usage_emits_nothing(tmp_path):
-    """If the flush response carries no usage, no flush ledger line is written
-    (only the two main-path lines), and the loop completes normally."""
-    session = Session.new("led_flush_nousage", str(tmp_path))
-    utility = UtilityCompleteProvider(None)  # usage=None on the flush response
-    loop = _flush_scenario_loop(tmp_path, session, utility)
-
-    async def mock_compact_run(sess, prov, utility_provider=None, **kwargs):
-        pass
-
-    with patch("agent_os.agent.compaction.run", new=mock_compact_run):
-        persist_user_row(loop._session, "do the task")
-        await loop.run()
-
-    assert utility.complete_calls == 1
+    assert utility.complete_calls == 0
     events = _read_ledger(str(tmp_path))
     assert len(events) == 2, events
     assert all(e["model"] == "kimi-k2.5" for e in events)
+    assert events[0]["uncached_input"] == 100
+    assert events[0]["output"] == 50
+    assert events[1]["uncached_input"] == 80
+    assert events[1]["output"] == 30

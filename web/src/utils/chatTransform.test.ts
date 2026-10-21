@@ -2564,3 +2564,209 @@ describe('transformChatHistory — worker onboarding hides its setup-instruction
     expect(items.map((it) => it.type)).toEqual(['sub_agent_activity']);
   });
 });
+
+describe('transformChatHistory — the tidy pass row (_kind: memory_tidy)', () => {
+  // Spec 124 §3.7 follow-up: the Memory session is hidden; the one trace a
+  // tidy pass leaves is a daemon system row in the session that triggered
+  // it. It renders as ONE collapsed capsule (no bubble, no agent header)
+  // whose children are the files the pass changed.
+  function tidyRow(meta: Record<string, unknown>, content: string, timestamp = TS3): ChatMessage {
+    return {
+      role: 'system',
+      content,
+      source: 'daemon',
+      timestamp,
+      _meta: { event: 'memory_tidy', trigger: 'over_budget', ...meta },
+      _kind: 'memory_tidy',
+    };
+  }
+
+  it('renders as one collapsed memory_tidy capsule after the reply, one child per changed file', () => {
+    const items = transformChatHistory([
+      user('plan it', TS),
+      asst({ content: 'Here is the plan.', timestamp: TS2 }),
+      tidyRow(
+        { outcome: 'restored', archived: 3, restored: 7, files: ['orbital/PROJECT_STATE.md', 'orbital/INDEX.md'], llm_calls: 4, ended: 'text' },
+        'Memory tidied: 3 archived, 7 restored',
+      ),
+      user('now the copy', TS4),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message', 'agent_run', 'user_message']);
+    const capsule = items[2];
+    expect(capsule.type).toBe('agent_run');
+    if (capsule.type === 'agent_run') {
+      expect(capsule.memory_record).toBeUndefined();
+      expect(capsule.memory_tidy).toEqual({ outcome: 'restored', archived: 3, restored: 7 });
+      expect(capsule.status).toBe('completed');
+      expect(capsule.defaultExpanded).toBeUndefined();
+      expect(capsule.source).toBeUndefined();
+      expect(capsule.items.map((x) => x.type)).toEqual(['tool_call_row', 'tool_call_row']);
+      const [a, b] = capsule.items;
+      if (a.type === 'tool_call_row' && b.type === 'tool_call_row') {
+        expect(a.tool_name).toBe('edit');
+        expect(a.target_description).toBe('orbital/PROJECT_STATE.md');
+        expect(a.category).toBe('file_edit');
+        expect(a.result_status).toBe('received');
+        expect(b.target_description).toBe('orbital/INDEX.md');
+      }
+      expect(capsule.tool_call_count_by_name).toEqual({ edit: 2 });
+      expect(capsule.started_at).toBe(Date.parse(TS3));
+      expect(capsule.ended_at).toBe(Date.parse(TS3));
+    }
+  });
+
+  it('a pass that changed nothing still shows one capsule with no children; a failed pass carries its error', () => {
+    const items = transformChatHistory([
+      user('plan it', TS),
+      asst({ content: 'Here is the plan.', timestamp: TS2 }),
+      tidyRow({ outcome: 'no_change', archived: 0, restored: 0, files: [] }, 'Memory tidied: nothing to change', TS3),
+      tidyRow({ outcome: 'failed', archived: 0, restored: 0, files: [], error: 'turn timed out' }, 'Memory tidy failed: turn timed out', TS4),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message', 'agent_run', 'agent_run']);
+    const quiet = items[2];
+    const failed = items[3];
+    if (quiet.type === 'agent_run') {
+      expect(quiet.memory_tidy).toEqual({ outcome: 'no_change', archived: 0, restored: 0 });
+      expect(quiet.items).toEqual([]);
+    }
+    if (failed.type === 'agent_run') {
+      expect(failed.memory_tidy).toEqual({ outcome: 'failed', archived: 0, restored: 0, error: 'turn timed out' });
+      expect(failed.status).toBe('error');
+    }
+  });
+
+  it('never interrupts an open management capsule: the tidy row closes it first', () => {
+    const items = transformChatHistory([
+      user('go', TS),
+      asst({ content: null, tool_calls: [tc('r1', 'read', '{"path":"README.md"}')], timestamp: TS2 }),
+      tool('r1', 'readme text', TS2),
+      tidyRow({ outcome: 'edited', archived: 1, restored: 0, files: ['orbital/DECISIONS.md'] }, 'Memory tidied: 1 archived, 0 restored', TS3),
+      asst({ content: 'Done.', timestamp: TS4 }),
+    ]);
+    const types = items.map((i) => i.type);
+    expect(types.filter((t) => t === 'agent_run')).toHaveLength(2);
+    const tidy = items.find((i) => i.type === 'agent_run' && i.memory_tidy);
+    expect(tidy).toBeDefined();
+  });
+});
+
+describe('transformChatHistory — spec 112 memory record turn (_kind: memory_record)', () => {
+  // The daemon's end-of-run record turn: the [MEMORY] ask, the model's edits
+  // and its closing text all carry `_kind: "memory_record"`. The reply the
+  // user already saw stays the reply; the record turn renders as a collapsed
+  // activity capsule only when it edited something, and as nothing otherwise.
+  function memoryAsk(timestamp = TS3): ChatMessage {
+    return {
+      role: 'system',
+      content: '[MEMORY] This run is ending. Decide whether anything durable happened in it.',
+      source: 'daemon',
+      timestamp,
+      _meta: { event: 'memory_record', trigger: 'run_end' },
+      _kind: 'memory_record',
+    };
+  }
+
+  it('an edit in the record turn renders as one memory capsule after the reply, with no bubble or header', () => {
+    const items = transformChatHistory([
+      user('plan it', TS),
+      asst({ content: 'Here is the plan.', timestamp: TS2 }),
+      memoryAsk(TS3),
+      asst({
+        content: null,
+        tool_calls: [tc('m1', 'edit', '{"path":"orbital/PROJECT_STATE.md"}')],
+        timestamp: TS4,
+        _kind: 'memory_record',
+      }),
+      { ...tool('m1', 'Edited orbital/PROJECT_STATE.md', TS5), _kind: 'memory_record' },
+      asst({ content: 'Done, updated state.', timestamp: TS6, _kind: 'memory_record' }),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message', 'agent_run']);
+    const reply = items[1];
+    if (reply.type === 'agent_message') expect(reply.content).toBe('Here is the plan.');
+    const capsule = items[2];
+    expect(capsule.type).toBe('agent_run');
+    if (capsule.type === 'agent_run') {
+      expect(capsule.memory_record).toBe(true);
+      expect(capsule.items.map((x) => x.type)).toEqual(['tool_call_row']);
+      const row = capsule.items[0];
+      if (row.type === 'tool_call_row') {
+        expect(row.tool_name).toBe('edit');
+        expect(row.result_status).toBe('received');
+        expect(row.result_content).toBe('Edited orbital/PROJECT_STATE.md');
+      }
+      expect(capsule.defaultExpanded).toBeUndefined();
+    }
+  });
+
+  it('a record turn with no tool call renders nothing at all', () => {
+    const items = transformChatHistory([
+      user('thanks', TS),
+      asst({ content: 'You are welcome.', timestamp: TS2 }),
+      memoryAsk(TS3),
+      asst({ content: 'nothing to record', timestamp: TS4, _kind: 'memory_record' }),
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_message']);
+  });
+
+  it('a record turn that read before editing keeps both calls in one capsule', () => {
+    const items = transformChatHistory([
+      user('go', TS),
+      asst({ content: 'Shipped.', timestamp: TS2 }),
+      memoryAsk(TS3),
+      asst({ content: null, tool_calls: [tc('r1', 'read', '{"path":"orbital/INDEX.md"}')], timestamp: TS4, _kind: 'memory_record' }),
+      { ...tool('r1', 'index text', TS4), _kind: 'memory_record' },
+      asst({ content: null, tool_calls: [tc('e1', 'edit', '{"path":"orbital/INDEX.md"}')], timestamp: TS5, _kind: 'memory_record' }),
+      { ...tool('e1', 'Edited', TS5), _kind: 'memory_record' },
+      asst({ content: 'Done.', timestamp: TS6, _kind: 'memory_record' }),
+    ]);
+    const capsules = items.filter((i) => i.type === 'agent_run');
+    expect(capsules).toHaveLength(1);
+    if (capsules[0].type === 'agent_run') {
+      expect(capsules[0].items.map((x) => x.type)).toEqual(['tool_call_row', 'tool_call_row']);
+      expect(capsules[0].tool_call_count_by_name).toEqual({ read: 1, edit: 1 });
+    }
+  });
+
+  it('a pinned worker record turn renders its edits as a memory capsule under the worker, never its reminder or reply', () => {
+    const items = transformChatHistory([
+      user('fix the route', TS, ),
+      { ...user('[Orbital memory] Your last turn is ending.', TS3), target: 'codex', source: 'daemon', _kind: 'memory_record' },
+      {
+        role: 'system', source: 'daemon', timestamp: TS3, _kind: 'memory_record',
+        content: '[Sub-agent] Message sent to codex: "[Orbital memory] …". Transcript: /t.jsonl',
+        _meta: { dispatch_id: 'd9', handle: 'codex', transcript_path: '/t.jsonl' },
+      },
+      {
+        role: 'assistant', source: 'sub_agent', timestamp: TS4, _kind: 'memory_record',
+        content: 'Updated PROJECT_STATE.md.',
+        sub_agent_handle: 'codex',
+        sub_agent_tool_rows: [{ name: 'Edit', timestamp: TS4, duration_seconds: 0.4, arguments: { file_path: 'orbital/PROJECT_STATE.md' } }],
+        sub_agent_duration: 1.2,
+      } as ChatMessage,
+      {
+        role: 'system', source: 'daemon', timestamp: TS5, _kind: 'memory_record',
+        content: '[Sub-agent] codex completed. Summary: Updated PROJECT_STATE.md. Transcript: /t.jsonl.',
+        _meta: { event: 'sub_agent_terminal', kind: 'completed', handle: 'codex' },
+      },
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message', 'agent_run']);
+    const capsule = items[1];
+    if (capsule.type === 'agent_run') {
+      expect(capsule.memory_record).toBe(true);
+      expect(capsule.source).toBe('codex');
+      expect(capsule.items.map((x) => x.type)).toEqual(['tool_call_row']);
+    }
+  });
+
+  it('a pinned worker record turn with no tool rows renders nothing', () => {
+    const items = transformChatHistory([
+      user('hi', TS),
+      { ...user('[Orbital memory] Your last turn is ending.', TS3), target: 'codex', source: 'daemon', _kind: 'memory_record' },
+      {
+        role: 'assistant', source: 'sub_agent', timestamp: TS4, _kind: 'memory_record',
+        content: 'nothing to record', sub_agent_handle: 'codex', sub_agent_tool_rows: [], sub_agent_duration: 0.3,
+      } as ChatMessage,
+    ]);
+    expect(items.map((i) => i.type)).toEqual(['user_message']);
+  });
+});

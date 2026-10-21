@@ -1242,8 +1242,10 @@ class TestContextReadsLayerFiles:
         all_content = " ".join(m.get("content", "") for m in system_msgs)
         assert "Working on feature X" in all_content
 
-    def test_picks_up_file_changes(self, tmp_path):
-        """Modifying PROJECT_STATE.md between prepare() calls should be reflected."""
+    def test_picks_up_file_changes_on_the_next_run(self, tmp_path):
+        """Modifying PROJECT_STATE.md between prepare() calls is reflected on
+        the NEXT RUN (spec 112 A1: the injected row is a per-run snapshot;
+        within a run the tail names the drift instead)."""
         agent_os_dir = tmp_path / "orbital"
         agent_os_dir.mkdir(parents=True, exist_ok=True)
         state_file = agent_os_dir / "PROJECT_STATE.md"
@@ -1259,11 +1261,17 @@ class TestContextReadsLayerFiles:
         sys1 = " ".join(m.get("content", "") for m in result1 if m.get("role") == "system")
         assert "Version 1" in sys1
 
-        # Modify the file
+        # Modify the file mid-run: the injected row stays the snapshot.
         state_file.write_text("Version 2 updated", encoding="utf-8")
         result2 = context_mgr.prepare()
         sys2 = " ".join(m.get("content", "") for m in result2 if m.get("role") == "system")
-        assert "Version 2" in sys2
+        assert "Version 2" not in sys2
+
+        # The next run sees the change.
+        context_mgr.begin_run()
+        result3 = context_mgr.prepare()
+        sys3 = " ".join(m.get("content", "") for m in result3 if m.get("role") == "system")
+        assert "Version 2" in sys3
 
     def test_missing_project_state_is_fine(self, tmp_path):
         """If PROJECT_STATE.md doesn't exist, prepare() should not fail."""

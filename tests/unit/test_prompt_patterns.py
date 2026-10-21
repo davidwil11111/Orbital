@@ -108,8 +108,11 @@ class TestLessonsLayer1Injection:
         # No "[LESSONS.md]" header should appear
         assert "[LESSONS.md]" not in layer1_content
 
-    def test_lessons_md_updates_visible_next_iteration(self, tmp_path):
-        """Write LESSONS.md between two prepare() calls -> second sees new content."""
+    def test_lessons_md_updates_visible_next_run(self, tmp_path):
+        """Write LESSONS.md between two prepare() calls of the SAME run -> the
+        injected row stays the run-start snapshot (spec 112 A1; the tail names
+        the drift instead); the next run (``begin_run()``) sees the new
+        content."""
         agent_os_dir = tmp_path / "orbital"
         agent_os_dir.mkdir()
 
@@ -118,6 +121,7 @@ class TestLessonsLayer1Injection:
         ctx = _make_base_prompt_context(str(tmp_path))
         cm = ContextManager(session, builder, ctx)
 
+        cm.begin_run()
         msgs1 = cm.prepare()
         content1 = " ".join(m["content"] for m in msgs1 if m["role"] == "system")
         assert "Avoid eval" not in content1
@@ -128,7 +132,12 @@ class TestLessonsLayer1Injection:
 
         msgs2 = cm.prepare()
         content2 = " ".join(m["content"] for m in msgs2 if m["role"] == "system")
-        assert "Avoid eval" in content2
+        assert "Avoid eval" not in content2
+
+        cm.begin_run()
+        msgs3 = cm.prepare()
+        content3 = " ".join(m["content"] for m in msgs3 if m["role"] == "system")
+        assert "Avoid eval" in content3
 
 
 class TestLiveSubAgentDeploymentInstructions:
@@ -168,27 +177,28 @@ class TestLiveSubAgentDeploymentInstructions:
 
 
 class TestSessionEndConsolidation:
-    """Spec 089: the session-end pass is the memory editor — it chooses by id
-    and never regenerates a file, so existing memory cannot be silently
-    dropped by the pass (the intent these tests always guarded)."""
+    """Spec 124 §3.7: the session-end pass is the Memory session's turn — it
+    moves whole entries into archives and never regenerates a file, so
+    existing memory cannot be silently dropped by the pass (the intent these
+    tests always guarded)."""
 
     def _prompt(self):
         from agent_os.agent import memory_editor
-        return memory_editor.build_prompt(
-            {"state": "- a", "decisions": "", "lessons": "", "index": ""},
-            today="2026-09-19", since=None, sessions=[],
+        return memory_editor.build_task_message(
+            sizes={k: (1, 10, 5) for k in memory_editor.LIVE_KEYS}, folded=[], over=["state"],
+            forced=False, pointer_paths=[], last_pass=None, sessions=[], today="2026-09-19", tool_cap=12,
         )
 
-    def test_editor_prompt_asks_for_choices_by_id_not_files(self):
+    def test_task_asks_for_moves_not_whole_files(self):
         prompt = self._prompt()
-        assert "BY ID" in prompt or "by id" in prompt
+        assert "Move entries intact" in prompt
         assert '"project_state"' not in prompt
         assert "COMPLETE updated" not in prompt
 
-    def test_editor_prompt_never_deletes(self):
-        lower = self._prompt().lower()
-        assert "nothing is ever deleted" in lower
-        assert "never a source of new facts" in lower
+    def test_task_never_deletes_or_invents(self):
+        prompt = self._prompt()
+        assert "Archive only what is no longer true or no longer live" in prompt
+        assert "Never add facts." in prompt
 
 
 # ===========================================================================
@@ -321,19 +331,20 @@ class TestContextBudgetReflection:
 
 class TestLessonsInstructionUpdate:
 
-    def test_append_mid_session_instruction(self):
-        """Normal project prompt says agent updates LESSONS.md proactively mid-session.
+    def test_write_at_run_end_instruction(self):
+        """Normal project prompt says the daemon asks at the end of every run.
 
-        The Layer-1 redesign replaced the explicit "You may append mid-session"
-        line with the unified instruction to update the memory files (including
-        LESSONS.md) proactively with the write/edit tools as work happens, plus
-        the trigger to add a lesson on error-recovery. Same intent: the agent
-        writes lessons during the session, not only at session end.
+        Spec 112 A6b / 124 §3.8 replaced "update them proactively as you
+        work" with a single, deterministic write point: the daemon asks what
+        to record at run end (and before compaction) and hands over the
+        current file text; the trigger to add a lesson on error-recovery
+        stays.
         """
         builder = PromptBuilder()
         ctx = make_context(is_scratch=False)
         _, semi_stable, _ = builder.build(ctx)
-        assert "Update them proactively with the write/edit tools as you work" in semi_stable
+        assert "Do not update the memory files during a run." in semi_stable
+        assert "Update them proactively" not in semi_stable
         assert "LESSONS.md" in semi_stable
         assert "Add a lesson when you" in semi_stable
 
