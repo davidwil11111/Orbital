@@ -599,6 +599,7 @@ export const STRINGS = {
   "llm.test.success": { en: "Connected to {provider} using {model}", zh: "已连接到 {provider}，使用 {model}" },
   "llm.testing": { en: "Testing...", zh: "测试中…" },
   "llm.wizard.changeIn": { en: "Change defaults in Global Settings.", zh: "在全局设置中更改默认值。" },
+  "llm.wizard.keyless": { en: "No API key for Orbital\u2019s own agent yet. This project talks to your pinned coding agent directly; add a key in Global Settings whenever you want Orbital to manage its context.", zh: "尚未为 Orbital 自己的 Agent 配置 API 密钥。这个项目会直接与你固定的编程 Agent 对话；想让 Orbital 管理项目上下文时，随时可在全局设置中添加密钥。" },
   "llm.wizard.notConfigured": { en: "No LLM provider configured yet. Set up your API key and model in Global Settings before creating a project.", zh: "尚未配置大模型。请在创建项目空间前于全局设置中配置 API 密钥和模型。" },
   "llm.wizard.notSet": { en: "not set", zh: "未设置" },
   "llm.wizard.usingDefaults": { en: "Using global defaults: {provider} / {model}", zh: "使用全局默认值：{provider} / {model}" },

@@ -20,6 +20,8 @@ import watchaLogo from '../assets/watcha-logo.png';
 import Select from './Select';
 
 interface LLMSettingsResponse {
+  /** Spec-less keyless mode (2026-10-21): the wizard's "Skip for now" choice. */
+  setup?: { api_key_skipped?: boolean };
   llm: {
     api_key_set: boolean;
     api_key_masked: string;
@@ -134,6 +136,10 @@ export default function LLMProviderSettings({
 
   // Global defaults (fetched for all modes)
   const [globalSettings, setGlobalSettings] = useState<LLMSettingsResponse['llm'] | null>(null);
+  // Keyless mode: the user skipped Orbital's own key in the wizard, so the
+  // create-project heads-up must not tell them to "set up your API key
+  // before creating a project" — projects work, pinned to their agent.
+  const [apiKeySkipped, setApiKeySkipped] = useState(false);
   const [globalLoaded, setGlobalLoaded] = useState(false);
 
   // Field state
@@ -213,6 +219,7 @@ export default function LLMProviderSettings({
         const data = await api<LLMSettingsResponse>('/api/v2/settings');
         if (!cancelled) {
           setGlobalSettings(data.llm);
+          setApiKeySkipped(!!data.setup?.api_key_skipped);
         }
       } catch {
         // not configured
@@ -830,7 +837,7 @@ export default function LLMProviderSettings({
       <div className="border border-warning/30 rounded-lg p-4 bg-warning/5">
         <p className="text-sm text-primary font-medium mb-1">{t('llm.provider.heading')}</p>
         <p className="text-sm text-secondary">
-          {t('llm.wizard.notConfigured')}
+          {apiKeySkipped ? t('llm.wizard.keyless') : t('llm.wizard.notConfigured')}
         </p>
       </div>
     );
