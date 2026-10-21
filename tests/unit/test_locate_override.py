@@ -37,6 +37,12 @@ from agent_os.daemon_v2.sub_agent_config_store import (
 )
 from agent_os.telemetry.diagnostics import install_kind_of
 
+# The fake CLIs below are sh scripts; Windows cannot execute them (WinError
+# 193). The runner itself is argv-only on every platform, and the Windows
+# shim refusal has its own test, so the executing tests skip there.
+_runs_fake_cli = pytest.mark.skipif(sys.platform == "win32",
+                                    reason="fake CLIs are sh scripts")
+
 SLUG = "codex"
 
 
@@ -98,10 +104,11 @@ class TestStoreOverride:
     def test_round_trip_and_params_untouched(self, store, tmp_path):
         binary = _fake_cli(tmp_path)
         store.set(SLUG, {"model": "gpt-6-sol"})
-        store.set_override(SLUG, binary=binary, path_prepend=["/opt/x/bin"],
+        xbin = str(tmp_path / "xbin")
+        store.set_override(SLUG, binary=binary, path_prepend=[xbin],
                            env={"CODEX_HOME": ""})
         assert store.get_override(SLUG) == {
-            "binary": binary, "path_prepend": ["/opt/x/bin"], "env": {"CODEX_HOME": ""}}
+            "binary": binary, "path_prepend": [xbin], "env": {"CODEX_HOME": ""}}
         # Params API never sees the override keys, and vice versa.
         assert store.get(SLUG) == {"model": "gpt-6-sol"}
         assert store.build_extra_args(SLUG) == ["-m", "gpt-6-sol"]
@@ -153,6 +160,7 @@ class TestStoreOverride:
 # ---------------------------------------------------------------------------
 
 class TestResolveStrategyZero:
+    @_runs_fake_cli
     @patch("agent_os.agents.setup_engine.shutil.which", return_value="/elsewhere/codex")
     def test_override_beats_which(self, _which, engine, store, tmp_path):
         binary = _fake_cli(tmp_path)
@@ -175,6 +183,7 @@ class TestResolveStrategyZero:
         assert status.override_missing is True
         assert status.override_path == binary
 
+    @_runs_fake_cli
     @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
     def test_path_prepend_reaches_the_version_check_and_daemon_path(
             self, _which, engine, store, tmp_path, monkeypatch):
@@ -208,12 +217,13 @@ class TestSpawnEnv:
         engine = SetupEngine(reg, sub_agent_config_store=store)
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         monkeypatch.setenv("CODEX_KEY", "from-manifest-cred")
-        store.set_override(SLUG, binary=binary, path_prepend=["/opt/node@24/bin"],
+        node_bin = str(tmp_path / "node@24" / "bin")
+        store.set_override(SLUG, binary=binary, path_prepend=[node_bin],
                            env={"CODEX_KEY": "user-typed", "CODEX_HOME": "/tmp/codex-home"})
         cfg = engine.get_adapter_config(SLUG, "/ws")
         assert cfg["command"] == binary
         path = cfg["env"]["PATH"].split(os.pathsep)
-        assert path[0] == "/opt/node@24/bin"
+        assert path[0] == node_bin
         assert "/usr/bin" in path and "/bin" in path
         # User env never overrides a credential the manifest injects.
         assert cfg["env"]["CODEX_KEY"] == "from-manifest-cred"
@@ -226,6 +236,7 @@ class TestSpawnEnv:
 
 
 class TestTestOverride:
+    @_runs_fake_cli
     def test_runs_check_command_without_a_shell(self, engine, tmp_path):
         binary, node_dir = _node_shim_cli(tmp_path)
         with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
@@ -238,6 +249,7 @@ class TestTestOverride:
         r = engine.test_override(SLUG, str(tmp_path / "gone"), path_prepend=[])
         assert r["ok"] is False and "gone" in r["error"]
 
+    @_runs_fake_cli
     def test_space_in_path_survives(self, tmp_path, store):
         d = tmp_path / "Application Support"
         d.mkdir()
@@ -282,6 +294,7 @@ class TestRoutes:
             "Orbital (a desktop app) could not find Codex on this machine.")
         assert client.get("/api/v2/settings/sub-agents/nope/locate-prompt").status_code == 404
 
+    @_runs_fake_cli
     @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
     def test_test_then_save_then_restart_then_clear(self, _which, client, engine, store, tmp_path):
         binary, node_dir = _node_shim_cli(tmp_path)
@@ -329,6 +342,7 @@ class TestRoutes:
             assert cleared.json()["override_path"] is None
             assert store.get_override(SLUG) is None
 
+    @_runs_fake_cli
     @patch("agent_os.agents.setup_engine.shutil.which", return_value=None)
     def test_put_refuses_a_failing_test(self, _which, client, store, tmp_path):
         binary, _node_dir = _node_shim_cli(tmp_path)
