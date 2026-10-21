@@ -18,6 +18,11 @@
  *     name while `unread` — the agent replied after the user's last message
  *     and this device has not shown that reply yet. Its own slot: an errored
  *     session can be both unread and errored, a pinned one unread and pinned.
+ *   - Imported sessions (session import, 2026-10-21): the source agent's mark
+ *     (the shared MessageAvatar, scaled to the row) before the name. Ordinary
+ *     sessions carry no mark, so the mark alone identifies the row; "Imported"
+ *     lives in the accessible label and the mark's tooltip, never as a text
+ *     chip (at 260 px a chip left the name ~55 px).
  *   - Hover-revealed three-dot menu with Rename + Delete (real handlers).
  *
  * Inline rename: double-click the name (or pick Rename from the menu) → editable
@@ -38,6 +43,7 @@ import { classifySessionName, type SessionKind } from '../lib/sessionLabel';
 import type { StringKey } from '../i18n/strings';
 import { useT } from '../i18n/useT';
 import { formatRelativeTime } from '../utils/relativeTime';
+import MessageAvatar from './MessageAvatar';
 
 export interface SessionListItemProps {
   session: SessionListEntry;
@@ -108,7 +114,14 @@ function SessionListItemBase({
       : chipText
         ? ''
         : session.session_id);
-  const ariaLabel = chipText ? `${chipText} ${label}`.trim() : label;
+  // Session import: a native Claude Code / Codex conversation. The agent comes
+  // from the import block, else the pin the daemon gives every imported row.
+  const isImported = session.origin === 'imported' || session.imported !== undefined;
+  const importAgent = isImported
+    ? (session.imported?.agent || session.pinned_target || undefined)
+    : undefined;
+  const importedText = isImported ? t('session.imported') : null;
+  const ariaLabel = [importedText, chipText, label].filter(Boolean).join(' ').trim() || label;
 
   // Focus the rename input when editing starts.
   useEffect(() => {
@@ -231,6 +244,20 @@ function SessionListItemBase({
           the name; when nothing human-readable survived the machine prefix
           the chip carries the row alone. */}
       <span className="flex-1 min-w-0 flex items-baseline gap-1.5">
+        {!editing && importAgent && (
+          // MessageAvatar is a 26 px box; the row has room for 16. Scale the
+          // shared component rather than fork a second avatar.
+          <span
+            data-testid="session-agent-mark"
+            aria-hidden="true"
+            title={importedText ?? undefined}
+            className="w-4 h-4 shrink-0 self-center flex items-center justify-center"
+          >
+            <span className="flex scale-[0.615]">
+              <MessageAvatar variant="agent" agentHandle={importAgent} />
+            </span>
+          </span>
+        )}
         {!editing && chipText && !hideKindChip && (
           <span
             data-testid="session-kind-chip"

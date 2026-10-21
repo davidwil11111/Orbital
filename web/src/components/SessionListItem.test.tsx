@@ -750,3 +750,65 @@ describe('SessionListItem — unread badge (spec 108)', () => {
     expect(screen.queryByTestId('session-unread-dot')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Session import (contract §7): an imported row carries the agent's mark (no
+// text chip — the mark alone identifies it); "Imported" is in the accessible
+// label and the mark's tooltip. Everything else about the row is unchanged.
+// ---------------------------------------------------------------------------
+describe('SessionListItem — imported sessions', () => {
+  const imported = (overrides: Partial<SessionListEntry> = {}) => makeSession({
+    session_id: 'imp_codex_0123456789abcdef',
+    session_uuid: 'imp_codex_0123456789abcdef',
+    origin: 'imported',
+    name: 'Fix the login bug',
+    pinned_target: 'codex',
+    imported: { agent: 'codex', native_id: '0123456789abcdef0000', materialized: false, size_bytes: 2048 },
+    ...overrides,
+  });
+
+  it('shows the agent mark (tooltip "Imported") and the name, with no text chip', () => {
+    render(<SessionListItem session={imported()} selected={false} onSelect={vi.fn()} />);
+    expect(screen.queryByTestId('session-imported-chip')).toBeNull();
+    expect(screen.queryByTestId('session-kind-chip')).toBeNull();
+    const mark = screen.getByTestId('session-agent-mark');
+    expect(mark.getAttribute('title')).toBe('Imported');
+    expect(mark.querySelector('[data-testid="message-avatar"]')?.getAttribute('data-agent-handle')).toBe('codex');
+    expect(screen.getByTestId('session-name').textContent).toBe('Fix the login bug');
+  });
+
+  it('keeps the mark once materialized (it is still an imported conversation)', () => {
+    render(
+      <SessionListItem
+        session={imported({ imported: { agent: 'claude-code', native_id: 'x', materialized: true, size_bytes: 1 } })}
+        selected={false}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByTestId('session-agent-mark').querySelector('[data-testid="message-avatar"]')
+        ?.getAttribute('data-agent-handle'),
+    ).toBe('claude-code');
+  });
+
+  it('falls back to pinned_target for the mark when the import block is missing', () => {
+    render(
+      <SessionListItem session={imported({ imported: undefined })} selected={false} onSelect={vi.fn()} />,
+    );
+    expect(
+      screen.getByTestId('session-agent-mark').querySelector('[data-testid="message-avatar"]')
+        ?.getAttribute('data-agent-handle'),
+    ).toBe('codex');
+  });
+
+  it('an ordinary session (or an older daemon with no origin) shows no mark', () => {
+    render(<SessionListItem session={makeSession({ name: 'Chat' })} selected={false} onSelect={vi.fn()} />);
+    expect(screen.queryByTestId('session-agent-mark')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Session Chat' })).toBeTruthy();
+  });
+
+  it('the accessible label says it was imported', () => {
+    render(<SessionListItem session={imported()} selected={false} onSelect={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Session Imported Fix the login bug' })).toBeTruthy();
+  });
+});

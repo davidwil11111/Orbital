@@ -21,6 +21,11 @@
 // instead. The collapsed control stays colorless — it only gains a corner
 // dot when the pinned worker needs attention (low, limited, not ready,
 // running).
+//
+// Keyless onboarding (2026-10-21): with no API key Orbital's own agent cannot
+// run. Its row stays first but says "API key required", and choosing it opens
+// Global Settings at the LLM cards instead of unpinning onto a manager that
+// would only fail.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronDown } from 'lucide-react';
@@ -104,6 +109,14 @@ interface PinTargetSelectProps {
   /** Spec 099: slugs with an open turn in this session (from the shared
    *  useSubAgentStatus pipeline) — their dot pulses green. */
   runningSlugs?: readonly string[];
+  /**
+   * The project's management agent has a key (`project.manager_ready`).
+   * Default true. When false the Orbital row carries an "API key required"
+   * pill and choosing it opens Global Settings → LLM (the
+   * `open-global-settings` event, detail.section 'llm') instead of
+   * calling onChange(null).
+   */
+  managerReady?: boolean;
   'data-testid'?: string;
 }
 
@@ -378,6 +391,7 @@ export default function PinTargetSelect({
   variant = 'composer',
   managerLabel,
   runningSlugs,
+  managerReady = true,
   'data-testid': testId,
 }: PinTargetSelectProps) {
   const t = useT();
@@ -419,6 +433,14 @@ export default function PinTargetSelect({
 
   const pick = (slug: string | null) => {
     setOpen(false);
+    if (slug === null && !managerReady) {
+      // Unpinning onto a manager with no key would only fail; send the user
+      // to where the key goes. App's listener scrolls to the cards block.
+      window.dispatchEvent(
+        new CustomEvent('open-global-settings', { detail: { section: 'llm' } }),
+      );
+      return;
+    }
     onChange(slug);
   };
 
@@ -543,7 +565,16 @@ export default function PinTargetSelect({
               <MessageAvatar variant="agent" />
               <span className="font-medium whitespace-nowrap">{t('pinAgent.orbital')}</span>
               <span className="ml-auto flex items-center gap-2 text-xs text-muted whitespace-nowrap">
-                <span>{t('pinAgent.managerRole')}</span>
+                {managerReady ? (
+                  <span>{t('pinAgent.managerRole')}</span>
+                ) : (
+                  <span
+                    data-testid="pin-orbital-key-required"
+                    className="rounded-full border border-warning/40 bg-warning/10 px-2 py-px text-[11px] font-medium text-warning-text"
+                  >
+                    {t('pinAgent.orbital.keyRequired')}
+                  </span>
+                )}
                 <span className="w-3 text-center">{value === null ? '✓' : ''}</span>
               </span>
             </button>

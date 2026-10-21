@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, it, expect } from 'vitest';
-import { isFirstRun, wizardLandingProjectId } from './firstRun';
+import { isFirstRun, needsSetupWizard, wizardLandingProjectId } from './firstRun';
 
 const scratch = { project_id: 'proj-scratch', is_scratch: true };
 const own = (id: string) => ({ project_id: id, is_scratch: false });
@@ -34,5 +34,30 @@ describe('wizardLandingProjectId', () => {
 
   it('lands in the most recently added own project when the wizard imported some', () => {
     expect(wizardLandingProjectId([scratch, own('a'), own('b')])).toBe('b');
+  });
+});
+
+// Keyless onboarding (contract §1): the first-run gate App.tsx applies.
+describe('needsSetupWizard — first-run gate', () => {
+  it('shows the wizard when there is no key and the step was never skipped', () => {
+    expect(needsSetupWizard({ llm: { api_key_set: false }, setup: { api_key_skipped: false } })).toBe(true);
+  });
+
+  it('does not show it once the key step was skipped', () => {
+    expect(needsSetupWizard({ llm: { api_key_set: false }, setup: { api_key_skipped: true } })).toBe(false);
+  });
+
+  it('does not show it when a key exists, skipped or not', () => {
+    expect(needsSetupWizard({ llm: { api_key_set: true }, setup: { api_key_skipped: false } })).toBe(false);
+    expect(needsSetupWizard({ llm: { api_key_set: true }, setup: { api_key_skipped: true } })).toBe(false);
+  });
+
+  it('an older daemon (no `setup`) reads as not skipped', () => {
+    expect(needsSetupWizard({ llm: { api_key_set: false } })).toBe(true);
+    expect(needsSetupWizard({ llm: { api_key_set: true } })).toBe(false);
+  });
+
+  it('an unreachable daemon (no settings) shows the wizard, as before', () => {
+    expect(needsSetupWizard(null)).toBe(true);
   });
 });

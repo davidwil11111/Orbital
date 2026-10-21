@@ -27,9 +27,13 @@ vi.mock('./SubAgentSettings', () => ({ default: () => null }));
 vi.mock('./ConnectorSettings', () => ({ default: () => null }));
 vi.mock('./TelemetrySettings', () => ({ default: () => null }));
 vi.mock('./AboutSection', () => ({ default: () => null }));
-vi.mock('./SettingsRail', () => ({ default: () => null }));
+// The rail is stubbed; its section-scroll helper stays real (the deep link uses it).
+vi.mock('./SettingsRail', async (orig) => ({
+  ...(await orig<typeof import('./SettingsRail')>()),
+  default: () => null,
+}));
 
-import GlobalSettings from './GlobalSettings';
+import GlobalSettings, { requestedSettingsSection } from './GlobalSettings';
 
 const SETTINGS = {
   user_preferences_content: 'I like short answers',
@@ -103,5 +107,56 @@ describe('GlobalSettings — autosave', () => {
     fireEvent.change(screen.getByDisplayValue('/tmp/scratch'), { target: { value: '' } });
     await act(async () => { await vi.advanceTimersByTimeAsync(900); });
     expect(puts()).toEqual([]);
+  });
+});
+
+// Keyless onboarding (contract §4): the composer's "API key required" row
+// opens Global Settings at the LLM cards block via detail.section → App →
+// this prop.
+describe('GlobalSettings — section deep link', () => {
+  it('scrolls the named data-settings-section into view once loaded', async () => {
+    const scrolled: string[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this.getAttribute('data-settings-section') ?? '');
+    } as typeof Element.prototype.scrollIntoView;
+    try {
+      render(<GlobalSettings onBack={vi.fn()} scrollToSection="llm" />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(scrolled).toContain('llm');
+      expect(scrolled.every((id) => id === 'llm')).toBe(true);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('scrolls nowhere without a section', async () => {
+    const spy = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = spy;
+    try {
+      await renderLoaded();
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+describe('requestedSettingsSection — the open-global-settings event', () => {
+  it('reads detail.section', () => {
+    const e = new CustomEvent('open-global-settings', { detail: { section: 'llm' } });
+    expect(requestedSettingsSection(e)).toBe('llm');
+  });
+
+  it('a bare event (AgentErrorNotice) asks for no section', () => {
+    expect(requestedSettingsSection(new CustomEvent('open-global-settings'))).toBeUndefined();
+    expect(requestedSettingsSection(new Event('open-global-settings'))).toBeUndefined();
+  });
+
+  it('ignores a malformed section', () => {
+    for (const detail of [{ section: '' }, { section: 3 }, 'llm', null]) {
+      expect(requestedSettingsSection(new CustomEvent('x', { detail }))).toBeUndefined();
+    }
   });
 });

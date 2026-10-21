@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { Project } from '../types';
+import type { Project, SetupGateSettings } from '../types';
 
 type ProjectLike = Pick<Project, 'project_id' | 'is_scratch'>;
 
@@ -30,4 +30,16 @@ export function isFirstRun(projects: readonly ProjectLike[]): boolean {
 export function wizardLandingProjectId(projects: readonly ProjectLike[]): string | null {
   const own = projects.filter((p) => !p.is_scratch);
   return own.length > 0 ? own[own.length - 1].project_id : null;
+}
+
+/**
+ * The first-run gate App.tsx applies to GET /api/v2/settings: the wizard shows
+ * until a key exists or the user skipped the key step. `null` (the daemon did
+ * not answer) shows it, as before. An older daemon sends no `setup`, which
+ * reads as "not skipped". Saving a key later never resets the flag — once a
+ * key exists the flag is irrelevant.
+ */
+export function needsSetupWizard(settings: SetupGateSettings | null): boolean {
+  if (!settings) return true;
+  return !settings.llm.api_key_set && settings.setup?.api_key_skipped !== true;
 }

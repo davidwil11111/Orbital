@@ -15,6 +15,12 @@
  * groups (API connectors / agent browser sign-in) — two back-to-back Google
  * prompts on separate screens would otherwise confuse users. Everything is
  * skippable; wizard completion stays derived from `llm.api_key_set` upstream.
+ *
+ * Keyless onboarding (2026-10-21): the key step is skippable too. The key is
+ * Orbital's own (its management agent); coding agents keep their own logins,
+ * so a user without a key can still work through a pinned agent. Skip
+ * persists `setup_api_key_skipped` so the first-run gate stops showing the
+ * wizard (see `needsSetupWizard` in utils/firstRun).
  */
 
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
@@ -32,6 +38,7 @@ import { warmupUrlForLocale } from '../utils/warmupUrl';
 import Select from './Select';
 
 type WizardStep = 'api_key' | 'accounts';
+
 
 interface SetupWizardProps {
   onComplete: () => void;
@@ -98,6 +105,8 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const { locale } = useLocale();
   const [step, setStep] = useState<WizardStep>('api_key');
   const [nextError, setNextError] = useState<string | null>(null);
+  const [skippingKey, setSkippingKey] = useState(false);
+  const [skipError, setSkipError] = useState<string | null>(null);
   // The provider the form must EDIT. undefined while loading and when there is
   // genuinely none, which is the true first run — there the form's create
   // branch is right, and the new provider becomes the default by being first.
@@ -197,6 +206,26 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     }
   }, [t]);
 
+  // Skip the key: persist the choice so the first-run gate stops showing the
+  // wizard, then continue to the accounts step exactly as Next does. Nothing
+  // is saved from the form — a half-filled provider stays unsaved.
+  const handleSkipKey = useCallback(async () => {
+    setSkippingKey(true);
+    setSkipError(null);
+    setNextError(null);
+    try {
+      await api('/api/v2/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ setup_api_key_skipped: true }),
+      });
+      setStep('accounts');
+    } catch {
+      setSkipError(t('wizard.skipKey.failed'));
+    } finally {
+      setSkippingKey(false);
+    }
+  }, [t]);
+
   // Connector connect — the backend runs a BLOCKING loopback OAuth flow (up
   // to ~300 s while the user completes browser consent), so the card shows a
   // "waiting for browser consent…" busy state for the whole await.
@@ -287,10 +316,10 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               {t('telemetry.wizard.disclosure')}
             </p>
 
-            <div className="mt-6 flex justify-end">
+            <div className="mt-6 flex flex-col items-end">
               <button
                 onClick={handleNext}
-                disabled={checkingKey}
+                disabled={checkingKey || skippingKey}
                 className="bg-accent text-white text-sm font-medium rounded-lg px-5 py-2.5 hover:bg-accent/90 transition-all duration-150 disabled:opacity-50 inline-flex items-center gap-2"
               >
                 {checkingKey ? (
@@ -305,6 +334,31 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               {nextError && (
                 <p className="text-xs text-error mt-2" data-testid="wizard-next-error">
                   {nextError}
+                </p>
+              )}
+            </div>
+
+            {/* Keyless path: a quiet secondary action under Next, with the
+                consequence spelled out right beside it. */}
+            <div className="mt-5 pt-4 border-t border-border flex flex-col items-end text-right">
+              <button
+                type="button"
+                onClick={handleSkipKey}
+                disabled={checkingKey || skippingKey}
+                data-testid="wizard-skip-key"
+                className="text-sm font-medium text-secondary hover:text-primary underline-offset-2 hover:underline transition-colors duration-150 disabled:opacity-50 max-md:min-h-[44px]"
+              >
+                {t('wizard.skipKey')}
+              </button>
+              <p
+                className="mt-1 text-xs text-secondary/80 leading-relaxed max-w-[380px]"
+                data-testid="wizard-skip-key-hint"
+              >
+                {t('wizard.skipKey.hint')}
+              </p>
+              {skipError && (
+                <p className="text-xs text-error mt-2" role="alert" data-testid="wizard-skip-error">
+                  {skipError}
                 </p>
               )}
             </div>

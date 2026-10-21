@@ -70,6 +70,8 @@ function makeConnector(overrides: Partial<Connector> = {}): Connector {
 
 interface MockRoutes {
   apiKeySet?: boolean;
+  /** PUT /api/v2/settings (the Skip-the-key persist). Default resolves. */
+  settingsPut?: () => Promise<unknown>;
   connectors?: Connector[] | Error;
   connect?: () => Promise<unknown>;
 }
@@ -77,6 +79,9 @@ interface MockRoutes {
 /** Route the api mock by path; unmatched paths resolve to {}. */
 function mockApi(routes: MockRoutes) {
   apiMock.mockImplementation(async (path: string, options?: RequestInit) => {
+    if (path === '/api/v2/settings' && options?.method === 'PUT') {
+      return routes.settingsPut ? routes.settingsPut() : {};
+    }
     if (path === '/api/v2/settings') {
       return { llm: { api_key_set: routes.apiKeySet ?? true } };
     }
@@ -343,5 +348,73 @@ describe('SetupWizard — agent browser sign-in group', () => {
       body: JSON.stringify({ url: 'https://accounts.google.com' }),
     });
     expect(screen.getByText('Browser open — sign in and close it...')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keyless onboarding: the key step is skippable (contract §1, §8)
+// ---------------------------------------------------------------------------
+
+describe('SetupWizard — skip the key step', () => {
+  it('says what the key is for, and offers Skip with its hint under Next', async () => {
+    mockApi({ apiKeySet: false });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    expect(
+      screen.getByText(/This key is for Orbital itself: it dispatches your coding agents/),
+    ).toBeTruthy();
+    const skip = screen.getByTestId('wizard-skip-key');
+    expect(skip.textContent).toBe('Skip for now — talk to my agents directly');
+    expect(screen.getByTestId('wizard-skip-key-hint').textContent).toMatch(
+      /You can add a key any time in Settings/,
+    );
+    // Next is still there and still the primary action.
+    expect(screen.getByText('Next →')).toBeTruthy();
+  });
+
+  it('Skip persists setup_api_key_skipped and advances to the accounts step', async () => {
+    mockApi({ apiKeySet: false });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/v2/settings'));
+
+    fireEvent.click(screen.getByTestId('wizard-skip-key'));
+    await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
+
+    const puts = apiMock.mock.calls.filter(([path, opts]) =>
+      path === '/api/v2/settings' && opts?.method === 'PUT');
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(puts[0][1].body)).toEqual({ setup_api_key_skipped: true });
+  });
+
+  it('a failed Skip shows an error line and stays on the key step', async () => {
+    mockApi({
+      apiKeySet: false,
+      settingsPut: () => Promise.reject(new MockApiError(500, 'boom')),
+    });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/v2/settings'));
+
+    fireEvent.click(screen.getByTestId('wizard-skip-key'));
+    await waitFor(() => expect(screen.getByTestId('wizard-skip-error')).toBeTruthy());
+    expect(screen.getByTestId('wizard-skip-error').textContent).toMatch(/Couldn't save that choice/);
+    expect(screen.queryByText('Connect Your Accounts')).toBeNull();
+    expect(screen.getByText('Welcome to Orbital')).toBeTruthy();
+  });
+
+  it('zh: the Skip button and hint follow the contract copy', async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, 'zh');
+    try {
+      mockApi({ apiKeySet: false });
+      render(
+        <LocaleProvider>
+          <SetupWizard onComplete={vi.fn()} />
+        </LocaleProvider>,
+      );
+      expect(screen.getByTestId('wizard-skip-key').textContent).toBe('暂时跳过 —— 直接和我的 Agent 对话');
+      expect(screen.getByTestId('wizard-skip-key-hint').textContent).toBe(
+        '之后随时可在设置中添加。此前 Orbital 自己的 Agent 不可用，新会话直接发给已固定的 Agent。',
+      );
+    } finally {
+      window.localStorage.removeItem(LOCALE_STORAGE_KEY);
+    }
   });
 });

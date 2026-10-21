@@ -20,6 +20,7 @@ import type {
   StatusSummaryEvent,
   ProjectCreateRequest,
   WebSocketEvent,
+  SetupGateSettings,
 } from './types';
 import type { Route } from './route';
 import SetupGate from './components/SetupGate';
@@ -29,7 +30,7 @@ import EdgeStrip from './components/EdgeStrip';
 import CreateProject from './components/CreateProject';
 import { requestOnboardingKickoff } from './utils/onboardingKickoff';
 import FirstRunHome from './components/FirstRunHome';
-import { isFirstRun, wizardLandingProjectId } from './utils/firstRun';
+import { isFirstRun, needsSetupWizard, wizardLandingProjectId } from './utils/firstRun';
 import FirstJourneyTour from './tour/FirstJourneyTour';
 import {
   decideTourState, readTourState, shouldStartTour, writeTourState, type TourState,
@@ -41,7 +42,7 @@ import PricingEditorPage from './components/PricingEditorPage';
 import ChatTab from './components/ChatTab';
 import ErrorBoundary from './components/ErrorBoundary';
 import FileExplorer from './components/FileExplorer';
-import GlobalSettings from './components/GlobalSettings';
+import GlobalSettings, { requestedSettingsSection } from './components/GlobalSettings';
 import CalendarPage from './components/CalendarPage';
 import WorkbenchPage from './components/WorkbenchPage';
 import { useT } from './i18n/useT';
@@ -80,6 +81,10 @@ export default function App() {
   const [setupComplete, setSetupComplete] = useState<boolean | null>(null);
   const [needsWizard, setNeedsWizard] = useState<boolean | null>(null);
   const [route, setRoute] = useState<Route>({ name: 'list' });
+  // One-shot deep link into Global Settings (the `open-global-settings`
+  // event's detail.section). Kept beside the route rather than in it: only
+  // the window event carries one, and the settings route stays a bare name.
+  const [globalSettingsSection, setGlobalSettingsSection] = useState<string | undefined>(undefined);
   // Spec 078 amendment (2026-09-03): the edge strip's click pins the project
   // list as a docked column instead of navigating "home" — home is an empty
   // route now that the project is the work interface. In-memory only, never
@@ -274,14 +279,10 @@ export default function App() {
       } else {
         setSetupComplete(false);
       }
-      // Check if first-run wizard is needed (API key missing)
-      const settingsData = await api<{ llm: { api_key_set: boolean } }>('/api/v2/settings').catch(() => null);
-      if (!cancelled && settingsData) {
-        const needsApiKey = !settingsData.llm.api_key_set;
-        setNeedsWizard(needsApiKey);
-      } else if (!cancelled) {
-        setNeedsWizard(true);
-      }
+      // First-run wizard: no key AND the key step was never skipped
+      // (keyless onboarding). An unreachable daemon still shows it.
+      const settingsData = await api<SetupGateSettings>('/api/v2/settings').catch(() => null);
+      if (!cancelled) setNeedsWizard(needsSetupWizard(settingsData));
     }
     check();
     return () => { cancelled = true; };
@@ -419,13 +420,29 @@ export default function App() {
   // (deep in ChatView) opens Global Settings — where the API key lives —
   // via the same window-event pattern as agent-status-override, avoiding a
   // callback threaded through ProjectDetail/ChatTab.
+  //
+  // `detail.section` (optional) names a `data-settings-section` block to
+  // scroll to — the composer pin's "API key required" row sends 'llm'.
   useEffect(() => {
-    function onOpenGlobalSettings() {
+    function onOpenGlobalSettings(e: Event) {
+      setGlobalSettingsSection(requestedSettingsSection(e));
       setRoute({ name: 'settings' });
+      setMobileView('content');
     }
     window.addEventListener('open-global-settings', onOpenGlobalSettings);
     return () => window.removeEventListener('open-global-settings', onOpenGlobalSettings);
   }, []);
+
+  // Leaving Global Settings re-reads the project rows: a key saved there flips
+  // `manager_ready` (the composer's "API key required" pill) and can change
+  // each project's `effective_pinned_target`, and nothing else would refetch
+  // them until the next reconnect.
+  const prevRouteForProjectsRef = useRef<Route['name']>(route.name);
+  useEffect(() => {
+    const prev = prevRouteForProjectsRef.current;
+    prevRouteForProjectsRef.current = route.name;
+    if (prev === 'settings' && route.name !== 'settings') void listProjects();
+  }, [route.name, listProjects]);
 
   // Service worker registration + push subscription (remote mode only)
   useEffect(() => {
@@ -629,6 +646,7 @@ export default function App() {
     onNewProject: handleNewProject,
     onReorderProjects: reorderProjects,
     onSettings: () => {
+      setGlobalSettingsSection(undefined);
       setRoute({ name: 'settings' });
       setMobileView('content');
     },
@@ -706,6 +724,7 @@ export default function App() {
 
         {route.name === 'settings' && (
           <GlobalSettings
+            scrollToSection={globalSettingsSection}
             onBack={() => { setRoute({ name: 'list' }); setMobileView('sidebar'); }}
             onTakeTour={handleTakeTour}
             canTakeTour={wizardLandingProjectId(projects) !== null}

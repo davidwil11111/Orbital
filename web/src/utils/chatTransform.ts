@@ -101,6 +101,23 @@ export type DisplayItem =
       defaultExpanded?: boolean;
     }
   | { type: 'session_separator'; timestamp: string }
+  /**
+   * A thin daemon divider (keyless onboarding / session import). Rendered and
+   * translated by ChatView from these fields, never from the row's English
+   * `content`: `imported_transcript` opens an imported conversation (agent +
+   * last-active date, `truncated` when older turns were cut);
+   * `worker_onboarding` marks a worker running the project setup because
+   * Orbital's own agent has no key.
+   */
+  | {
+      type: 'daemon_row';
+      event: 'imported_transcript' | 'worker_onboarding';
+      /** Sub-agent slug ('codex', 'claude-code', …). */
+      handle: string;
+      timestamp: string;
+      lastActivity?: string;
+      truncated?: boolean;
+    }
   | {
       /**
        * The agent hit its context ceiling and summarized everything older
@@ -658,6 +675,69 @@ function applyDispatchFailureReason(
   };
 }
 
+/** The keyless-onboarding / import dividers, keyed on `_meta.event`. */
+function parseDaemonRow(msg: ChatMessage): DisplayItem | null {
+  const meta = msg._meta;
+  if (!meta) return null;
+  if (meta.event === 'imported_transcript') {
+    return {
+      type: 'daemon_row',
+      event: 'imported_transcript',
+      handle: typeof meta.agent === 'string' ? meta.agent : '',
+      lastActivity: typeof meta.last_activity === 'string' ? meta.last_activity : undefined,
+      truncated: meta.truncated === true,
+      timestamp: msg.timestamp,
+    };
+  }
+  if (meta.event === 'worker_onboarding') {
+    return {
+      type: 'daemon_row',
+      event: 'worker_onboarding',
+      handle: typeof meta.handle === 'string' ? meta.handle : '',
+      timestamp: msg.timestamp,
+    };
+  }
+  return null;
+}
+
+/**
+ * True for a dispatch marker (`[Sub-agent] Message sent to <slug>: …` with a
+ * `dispatch_id`) whose previous row is the `worker_onboarding` row for the
+ * same worker: the marker carrying the onboarding instruction.
+ */
+function isOnboardingInstructionMarker(msg: ChatMessage, prev: ChatMessage | undefined): boolean {
+  const prevMeta = prev?.role === 'system' ? prev._meta : undefined;
+  if (!prevMeta || prevMeta.event !== 'worker_onboarding') return false;
+  const meta = msg._meta;
+  if (!meta || !meta.dispatch_id) return false;
+  const content = typeof meta.display_content === 'string' ? meta.display_content : (msg.content ?? '');
+  const sent = content.match(/^\[Sub-agent\]\s+Message sent to\s+([\w.-]+):/);
+  if (!sent) return false;
+  const handle = typeof meta.handle === 'string' && meta.handle ? meta.handle : sent[1];
+  return handle === prevMeta.handle;
+}
+
+/**
+ * The worker bubble for a `sub_agent_terminal` completed row carrying
+ * `_meta.reply`, or null when the row has no reply or the worker's bubble for
+ * this turn is already drawn (searching back to the user's last message).
+ */
+function terminalReplyBubble(msg: ChatMessage, items: DisplayItem[]): DisplayItem | null {
+  const meta = msg._meta;
+  if (!meta || meta.event !== 'sub_agent_terminal' || meta.kind !== 'completed') return null;
+  const reply = typeof meta.reply === 'string' ? meta.reply : '';
+  const handle = typeof meta.handle === 'string' ? meta.handle : '';
+  if (!reply.trim() || !handle) return null;
+  for (let k = items.length - 1; k >= 0; k--) {
+    const it = items[k];
+    if (it.type === 'user_message') break;
+    if ((it.type === 'agent_message' || it.type === 'agent_run') && it.source === handle) {
+      return null;
+    }
+  }
+  return { type: 'agent_message', content: reply, source: handle, timestamp: msg.timestamp };
+}
+
 function parseSubAgentSystemMessage(
   content: string,
   timestamp: string,
@@ -1142,6 +1222,35 @@ export function transformChatHistory(
           content: displayContent,
           timestamp: msg.timestamp,
         });
+        i++;
+        continue;
+      }
+      // Keyless onboarding / session import dividers (contract §5, §6).
+      const daemonRow = parseDaemonRow(msg);
+      if (daemonRow) {
+        finalizeCapsule();
+        items.push(daemonRow);
+        i++;
+        continue;
+      }
+      // Worker onboarding: the send() marker right after the onboarding row
+      // previews the whole setup instruction. The onboarding divider already
+      // says what happened, so that one marker is dropped. Only the row
+      // directly after it, and only for the same worker.
+      if (isOnboardingInstructionMarker(msg, messages[i - 1])) {
+        i++;
+        continue;
+      }
+      // A completed terminal row that carries the worker's whole reply, when
+      // no bubble from that worker has been drawn since the user's last
+      // message: the reply IS the bubble. This is every turn of an imported
+      // transcript (no dispatch marker, so the /chat endpoint joins no
+      // transcript), and a live turn whose transcript join failed. When the
+      // join did draw the bubble, today's one-line marker below stands.
+      const replyBubble = terminalReplyBubble(msg, items);
+      if (replyBubble) {
+        finalizeCapsule();
+        items.push(replyBubble);
         i++;
         continue;
       }

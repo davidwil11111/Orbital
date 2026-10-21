@@ -58,9 +58,21 @@ let runStatusTerminalEvent: unknown = null;
 // a test can answer only for the session it scopes to). Default: none pending.
 let pendingApprovalResponder: (path: string) => unknown = () => ({ pending: false });
 
+// Keyless onboarding: GET /projects/{pid}/sessions (useSessions) answers this
+// list, and PUT /projects/{pid} (the no-session sticky pin) is logged.
+let sessionsListResponse: unknown[] = [];
+const projectPutCalls: Array<{ path: string; body: unknown }> = [];
+
 vi.mock('../config', () => ({
-  api: vi.fn(async (path: string, opts?: { method?: string }) => {
+  api: vi.fn(async (path: string, opts?: { method?: string; body?: string }) => {
     apiCalls.push(path);
+    if (opts?.method === 'PUT' && /^\/api\/v2\/projects\/[^/]+$/.test(path)) {
+      projectPutCalls.push({ path, body: JSON.parse(opts.body ?? '{}') });
+      return {};
+    }
+    if (!opts?.method && /\/projects\/[^/]+\/sessions$/.test(path)) {
+      return sessionsListResponse;
+    }
     // Session pin PATCH (spec 074) — gated for the lock-race test.
     if (opts?.method === 'PATCH' && path.includes('/sessions/')) {
       sessionsPatchCalls.push(path);
@@ -317,6 +329,8 @@ beforeEach(() => {
   runStatusHolder = null;
   runStatusTerminalEvent = null;
   pendingApprovalResponder = () => ({ pending: false });
+  sessionsListResponse = [];
+  projectPutCalls.length = 0;
   chatInitialResponse = { data: [], total: 0 };
   chatOlderResponse = { data: [], total: 0 };
   queueState = 'idle';
@@ -584,12 +598,15 @@ function renderChat(props: {
   initialDraft?: string;
   onDraftConsumed?: () => void;
   agents?: Array<{ slug: string; name: string }>;
+  project?: Project;
+  onRefreshProject?: (id: string) => void;
 }) {
   return act(async () => {
     root.render(
       <ChatView
         projectId="p1"
-        project={project}
+        project={props.project ?? project}
+        onRefreshProject={props.onRefreshProject}
         agentStatus={(props.agentStatus ?? 'idle') as never}
         agents={props.agents ?? []}
         sessionId={props.sessionId}
@@ -4437,5 +4454,233 @@ describe('ChatView: pinned dispatch failure row appears without a reload', () =>
     expect(container.textContent ?? '').toContain('Failed to send message');
     // … and the canonical history is refetched so the failure row lands.
     expect(chatFetchCount()).toBeGreaterThan(before);
+  });
+});
+
+
+// --------------------------------------------------------------------------
+// Keyless onboarding + per-project sticky pin (contract §3/§4/§5)
+// --------------------------------------------------------------------------
+describe('Keyless: the composer pin falls back to the project pin', () => {
+  const CODEX = [{ slug: 'codex', name: 'Codex' }, { slug: 'claude-code', name: 'Claude Code' }];
+  const keyless: Project = {
+    ...project,
+    manager_ready: false,
+    default_pinned_target: null,
+    effective_pinned_target: 'codex',
+  };
+  const pinTrigger = () =>
+    container.querySelector('[data-testid="pin-target-select"] > button') as HTMLButtonElement;
+  const pinnedHandle = () =>
+    pinTrigger().querySelector('[data-testid="message-avatar"]')?.getAttribute('data-agent-handle') ?? null;
+  const placeholder = () =>
+    (container.querySelector('textarea') as HTMLTextAreaElement).placeholder;
+  async function send(text: string) {
+    await act(async () => { typeInComposer(text); });
+    const btn = container.querySelector('button[aria-label="Send"]') as HTMLButtonElement;
+    await act(async () => { btn.click(); });
+    await flushEffects();
+  }
+
+  it('a minted session with no record shows and sends to effective_pinned_target', async () => {
+    await renderChat({ sessionId: 's_new', agents: CODEX, project: keyless });
+    await flushEffects();
+    expect(pinnedHandle()).toBe('codex');
+    expect(pinTrigger().disabled).toBe(false);
+    expect(placeholder()).toBe('Message codex...');
+
+    await send('hello');
+    expect(injectCalls).toHaveLength(1);
+    // injectMessage(projectId, content, target, nonce, attachments, sessionId, pinned)
+    expect(injectCalls[0][2]).toBe('codex');
+    expect(injectCalls[0][5]).toBe('s_new');
+    expect(injectCalls[0][6]).toBe(true);
+  });
+
+  it('a session record wins over the project pin, an explicit null included', async () => {
+    sessionsListResponse = [
+      { session_id: 's_old', session_uuid: 'u_old', status: 'idle', last_terminal_event: null, pinned_target: null },
+      { session_id: 's_cc', session_uuid: 'u_cc', status: 'idle', last_terminal_event: null, pinned_target: 'claude-code' },
+    ];
+    await renderChat({ sessionId: 's_old', agents: CODEX, project: { ...project, effective_pinned_target: 'codex' } });
+    await flushEffects();
+    expect(pinnedHandle()).toBeNull();
+
+    await renderChat({ sessionId: 's_cc', agents: CODEX, project: { ...project, effective_pinned_target: 'codex' } });
+    await flushEffects();
+    expect(pinnedHandle()).toBe('claude-code');
+  });
+
+  it('with no session minted yet the pin is enabled when the project has one, and the first send goes to it', async () => {
+    await renderChat({ sessionId: undefined, agents: CODEX, project: keyless });
+    await flushEffects();
+    expect(pinTrigger().disabled).toBe(false);
+    expect(pinnedHandle()).toBe('codex');
+
+    await send('first message');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][2]).toBe('codex');
+    expect(injectCalls[0][5]).toBeUndefined();
+    expect(injectCalls[0][6]).toBe(true);
+  });
+
+  it('with no session and no project pin (a key exists) the pin stays disabled, as today', async () => {
+    await renderChat({ sessionId: undefined, agents: CODEX, project: { ...project, manager_ready: true, effective_pinned_target: null } });
+    await flushEffects();
+    expect(pinTrigger().disabled).toBe(true);
+  });
+
+  it('picking a worker before any session exists writes the project sticky pin', async () => {
+    const onRefreshProject = vi.fn();
+    await renderChat({ sessionId: undefined, agents: CODEX, project: keyless, onRefreshProject });
+    await flushEffects();
+    await act(async () => { pinTrigger().click(); });
+    const option = Array.from(container.querySelectorAll('[role="option"]'))
+      .find((el) => el.textContent?.includes('Claude Code')) as HTMLButtonElement;
+    await act(async () => { option.click(); });
+    await flushEffects();
+    expect(pinnedHandle()).toBe('claude-code');
+    expect(projectPutCalls).toEqual([
+      { path: '/api/v2/projects/p1', body: { default_pinned_target: 'claude-code' } },
+    ]);
+    expect(onRefreshProject).toHaveBeenCalledWith('p1');
+    expect(sessionsPatchCalls).toHaveLength(0);
+  });
+
+  it('a pin change on a session re-reads the project row (its sticky pin moved)', async () => {
+    const onRefreshProject = vi.fn();
+    await renderChat({ sessionId: 's1', agents: CODEX, project: keyless, onRefreshProject });
+    await flushEffects();
+    await act(async () => { pinTrigger().click(); });
+    const option = Array.from(container.querySelectorAll('[role="option"]'))
+      .find((el) => el.textContent?.includes('Claude Code')) as HTMLButtonElement;
+    await act(async () => { option.click(); });
+    await flushEffects();
+    expect(sessionsPatchCalls).toHaveLength(1);
+    expect(onRefreshProject).toHaveBeenCalledWith('p1');
+  });
+
+  it('keyless: the Orbital row says an API key is required and opens settings instead of unpinning', async () => {
+    const opened: CustomEvent[] = [];
+    const listener = (e: Event) => opened.push(e as CustomEvent);
+    window.addEventListener('open-global-settings', listener);
+    try {
+      await renderChat({ sessionId: 's_new', agents: CODEX, project: keyless });
+      await flushEffects();
+      await act(async () => { pinTrigger().click(); });
+      expect(container.querySelector('[data-testid="pin-orbital-key-required"]')?.textContent)
+        .toBe('API key required');
+      const orbital = Array.from(container.querySelectorAll('[role="option"]'))
+        .find((el) => el.textContent?.includes('Orbital')) as HTMLButtonElement;
+      await act(async () => { orbital.click(); });
+      await flushEffects();
+      expect(opened.map((e) => e.detail)).toEqual([{ section: 'llm' }]);
+      expect(pinnedHandle()).toBe('codex');
+      expect(sessionsPatchCalls).toHaveLength(0);
+    } finally {
+      window.removeEventListener('open-global-settings', listener);
+    }
+  });
+
+  it('keyless + pinned + empty chat: the hint names the agent under the composer', async () => {
+    await renderChat({ sessionId: 's_new', agents: CODEX, project: keyless });
+    await flushEffects();
+    const hint = container.querySelector('[data-testid="chat-keyless-hint"]');
+    expect(hint?.textContent).toBe(
+      "Talking to Codex directly. Add an API key to let Orbital manage this project's context.",
+    );
+  });
+
+  it('no hint when the manager has a key', async () => {
+    await renderChat({
+      sessionId: 's_new',
+      agents: CODEX,
+      project: { ...keyless, manager_ready: true },
+    });
+    await flushEffects();
+    expect(container.querySelector('[data-testid="chat-keyless-hint"]')).toBeNull();
+  });
+
+  it('an older daemon (no new fields) behaves exactly as before', async () => {
+    await renderChat({ sessionId: 's_new', agents: CODEX, project });
+    await flushEffects();
+    expect(pinnedHandle()).toBeNull();
+    expect(container.querySelector('[data-testid="chat-keyless-hint"]')).toBeNull();
+    await act(async () => { pinTrigger().click(); });
+    expect(container.querySelector('[data-testid="pin-orbital-key-required"]')).toBeNull();
+    await renderChat({ sessionId: undefined, agents: CODEX, project });
+    await flushEffects();
+    expect(pinTrigger().disabled).toBe(true);
+  });
+});
+
+describe('Keyless: worker onboarding through the cold-start card', () => {
+  const keylessImported: Project = {
+    ...project,
+    is_empty_workspace: false,
+    manager_ready: false,
+    effective_pinned_target: 'codex',
+  };
+  const button = (re: RegExp) =>
+    [...container.querySelectorAll('button')].find((b) => re.test(b.textContent ?? '')) as HTMLButtonElement;
+
+  it('the card stays visible in keyless mode, and a worker-run scan (runner=codex) is success', async () => {
+    coldStartScanMock = async () => ({ status: 'ok', session_id: 's_scan', session_uuid: 'u', runner: 'codex' });
+    await renderChat({ sessionId: undefined, agents: [{ slug: 'codex', name: 'Codex' }], project: keylessImported });
+    await flushEffects();
+    expect(button(/scan/i)).toBeTruthy();
+    await act(async () => { button(/scan/i).click(); });
+    await flushEffects();
+    expect(container.querySelector('[data-testid="cold-start-error"]')).toBeNull();
+  });
+
+  it('Skip runs the worker interview (runner=codex) with no error', async () => {
+    startOnboardingMock = async () => ({ status: 'ok', session_id: 's_int', session_uuid: 'u', runner: 'codex' });
+    await renderChat({ sessionId: undefined, agents: [{ slug: 'codex', name: 'Codex' }], project: keylessImported });
+    await flushEffects();
+    await act(async () => { button(/skip/i).click(); });
+    await flushEffects();
+    expect(startOnboardingCalls).toEqual(['p1']);
+    expect(container.querySelector('[data-testid="onboarding-error"]')).toBeNull();
+    expect(container.querySelector('[data-testid="cold-start-error"]')).toBeNull();
+  });
+
+  it('the worker_onboarding row renders as a daemon divider, never a user bubble', async () => {
+    chatInitialResponse = {
+      data: [
+        {
+          role: 'system', source: 'daemon', content: '[Onboarding] codex is setting up this project',
+          timestamp: '2026-10-21T10:00:00Z',
+          _meta: { event: 'worker_onboarding', handle: 'codex', mode: 'interview', suppress_wake: true },
+        },
+      ],
+      total: 1,
+    };
+    await renderChat({ sessionId: 's_int', agents: [{ slug: 'codex', name: 'Codex' }], project: keylessImported });
+    await flushEffects();
+    const row = container.querySelector('[data-testid="chat-daemon-row"]');
+    expect(row?.textContent).toBe('Codex is setting up this project');
+    expect(container.querySelector('[data-variant="user"]')).toBeNull();
+  });
+});
+
+describe('Session import: opening an imported row', () => {
+  it('shows a short importing line while the first /chat materializes it', async () => {
+    let release!: () => void;
+    chatResponseGate = new Promise<void>((r) => { release = r; });
+    sessionsListResponse = [{
+      session_id: 'imp_codex_0123456789abcdef', session_uuid: 'imp_codex_0123456789abcdef',
+      status: 'idle', origin: 'imported', name: 'Fix the login bug', pinned_target: 'codex',
+      imported: { agent: 'codex', native_id: '0123456789abcdef0000', materialized: false, size_bytes: 2048 },
+      last_activity_at: '2026-10-20T09:00:00Z', last_user_at: null, last_reply_at: null,
+      last_terminal_event: null,
+    }];
+    await renderChat({ sessionId: 'imp_codex_0123456789abcdef', agents: [{ slug: 'codex', name: 'Codex' }] });
+    await flushEffects();
+    expect(container.querySelector('[data-testid="chat-importing"]')?.textContent)
+      .toBe('Importing this conversation…');
+    await act(async () => { release(); });
+    await flushEffects();
+    expect(container.querySelector('[data-testid="chat-importing"]')).toBeNull();
   });
 });

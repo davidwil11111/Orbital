@@ -170,6 +170,91 @@ describe('PinTargetSelect', () => {
 
 
 // ---------------------------------------------------------------------------
+// Keyless onboarding (contract §4) — no key, so Orbital cannot run
+// ---------------------------------------------------------------------------
+
+describe('PinTargetSelect — managerReady=false', () => {
+  const trigger = () =>
+    screen.getByRole('button', { name: 'Choose who this chat talks to' });
+
+  function captureOpenSettings() {
+    const events: CustomEvent[] = [];
+    const listener = (e: Event) => events.push(e as CustomEvent);
+    window.addEventListener('open-global-settings', listener);
+    return { events, stop: () => window.removeEventListener('open-global-settings', listener) };
+  }
+
+  it('keeps Orbital first, with an "API key required" pill instead of the role', () => {
+    render(
+      <PinTargetSelect agents={AGENTS} value="codex" onChange={() => {}} managerReady={false} />,
+    );
+    fireEvent.click(trigger());
+    const options = screen.getAllByRole('option');
+    expect(options[0].textContent).toContain('Orbital');
+    expect(screen.getByTestId('pin-orbital-key-required').textContent).toBe('API key required');
+    expect(options[0].textContent).not.toContain('Manager');
+  });
+
+  it('choosing Orbital opens Global Settings at the LLM section and does not unpin', () => {
+    const onChange = vi.fn();
+    const cap = captureOpenSettings();
+    try {
+      render(
+        <PinTargetSelect agents={AGENTS} value="codex" onChange={onChange} managerReady={false} />,
+      );
+      fireEvent.click(trigger());
+      fireEvent.click(screen.getByRole('option', { name: /Orbital/ }));
+      expect(onChange).not.toHaveBeenCalled();
+      expect(cap.events).toHaveLength(1);
+      expect(cap.events[0].detail).toEqual({ section: 'llm' });
+      expect(screen.queryByRole('listbox')).toBeNull();
+    } finally {
+      cap.stop();
+    }
+  });
+
+  it('workers stay selectable', () => {
+    const onChange = vi.fn();
+    render(
+      <PinTargetSelect agents={AGENTS} value="codex" onChange={onChange} managerReady={false} />,
+    );
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole('option', { name: /Claude Code/ }));
+    expect(onChange).toHaveBeenCalledWith('claude-code');
+  });
+
+  it('with a key (the default) Orbital is the ordinary unpin and shows no pill', () => {
+    const onChange = vi.fn();
+    const cap = captureOpenSettings();
+    try {
+      render(<PinTargetSelect agents={AGENTS} value="codex" onChange={onChange} />);
+      fireEvent.click(trigger());
+      expect(screen.queryByTestId('pin-orbital-key-required')).toBeNull();
+      fireEvent.click(screen.getByRole('option', { name: /Orbital/ }));
+      expect(onChange).toHaveBeenCalledWith(null);
+      expect(cap.events).toHaveLength(0);
+    } finally {
+      cap.stop();
+    }
+  });
+
+  it('zh pill copy', () => {
+    window.localStorage.setItem('orbital.locale', 'zh');
+    try {
+      render(
+        <LocaleProvider>
+          <PinTargetSelect agents={AGENTS} value="codex" onChange={() => {}} managerReady={false} />
+        </LocaleProvider>,
+      );
+      fireEvent.click(screen.getAllByRole('button')[0]);
+      expect(screen.getByTestId('pin-orbital-key-required').textContent).toBe('需要 API 密钥');
+    } finally {
+      window.localStorage.removeItem('orbital.locale');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Spec 099 — availability dot, usage line, hover card
 // ---------------------------------------------------------------------------
 

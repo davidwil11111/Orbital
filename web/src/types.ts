@@ -199,6 +199,22 @@ export interface Project {
    *  provider's portal paths), listed in Settings → Folder access with a
    *  remove. Optional: a daemon that does not report them hides the list. */
   granted_folders?: GrantedFolder[];
+  /**
+   * Keyless onboarding: the project's resolved credential card (project card
+   * → global default → AGENT_OS_API_KEY) carries a key, so Orbital's own
+   * management agent can run. Absent on an older daemon — read as `true`.
+   */
+  manager_ready?: boolean;
+  /** The project's sticky composer pin (last choice wins), or null = Orbital.
+   *  Absent on an older daemon. */
+  default_pinned_target?: string | null;
+  /**
+   * What a NEW session in this project starts pinned to, computed by the
+   * daemon on read: the sticky pin when that agent is available, else (no
+   * key) the first available worker, else null. Absent on an older daemon —
+   * read as null.
+   */
+  effective_pinned_target?: string | null;
 }
 
 /** One TOFU network-access ask (Plan 2), as carried by
@@ -294,6 +310,9 @@ export interface ProjectUpdateRequest {
   safe_mode?: boolean;
   /** Spec 117 — see Project.unsandboxed_executables (replace-list). */
   unsandboxed_executables?: string[];
+  /** Keyless onboarding — see Project.default_pinned_target. Omitted =
+   *  untouched; null = clear (Orbital). */
+  default_pinned_target?: string | null;
 }
 
 /** PUT /projects response field carrying the reset outcome (codes only). */
@@ -526,7 +545,14 @@ export interface SessionListEntry {
    * (they arrive as 'chat') — the UI detects them from the '[Triggered by …'
    * name prefix instead (lib/sessionLabel.ts).
    */
-  origin?: 'chat' | 'queue' | 'cold_start';
+  origin?: 'chat' | 'queue' | 'cold_start' | 'imported';
+  /**
+   * Session import: a native Claude Code / Codex conversation found for this
+   * workspace. `materialized: false` = a virtual entry the daemon converts to
+   * an Orbital session on the first GET /chat (or inject) for its id. Absent
+   * on ordinary sessions and on an older daemon.
+   */
+  imported?: SessionImportInfo;
   /**
    * Automation kind (spec 066 4b): 'schedule' / 'file_watch' when a trigger
    * fired this session, else null. Stamped on the session_start meta from the
@@ -534,6 +560,21 @@ export interface SessionListEntry {
    * from older backends — the sidebar then falls back to the name prefix.
    */
   trigger_type?: 'schedule' | 'file_watch' | null;
+}
+
+export interface SessionImportInfo {
+  /** Sub-agent slug the conversation came from ('claude-code' | 'codex'). */
+  agent: string;
+  native_id: string;
+  materialized: boolean;
+  size_bytes: number;
+}
+
+/** The two GET /api/v2/settings fields the first-run gate reads. `setup` is
+ *  absent on an older daemon (read as "not skipped"). */
+export interface SetupGateSettings {
+  llm: { api_key_set: boolean };
+  setup?: { api_key_skipped?: boolean };
 }
 
 export interface AgentStatusEvent {

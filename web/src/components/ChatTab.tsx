@@ -106,9 +106,14 @@ interface ChatTabProps {
  * then the most-recently-active session, else undefined.
  */
 function resolveDefaultSession(
-  sessions: SessionListEntry[],
+  allSessions: SessionListEntry[],
   persisted: string | null,
 ): string | undefined {
+  // Session import: a native conversation not converted yet is never opened
+  // by default. Opening it materializes the import, and landing there on
+  // project entry would skip the cold-start card and the onboarding kickoff
+  // (both wait for "no session"). The user opens one by clicking its row.
+  const sessions = allSessions.filter((s) => s.imported?.materialized !== false);
   if (sessions.length === 0) return undefined;
   if (persisted && sessions.some((s) => s.session_id === persisted)) {
     return persisted;
