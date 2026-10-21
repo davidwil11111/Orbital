@@ -59,6 +59,8 @@ export default function CreateProject({
 }: CreateProjectProps) {
   const t = useT();
   const [name, setName] = useState('');
+  /** The name a folder pick filled in, or null once the user typed one. */
+  const autoNameRef = useRef<string | null>(null);
   const [agentName, setAgentName] = useState('');
   const [workspace, setWorkspace] = useState('');
   const [instructions, setInstructions] = useState('');
@@ -166,15 +168,25 @@ export default function CreateProject({
   /** The folder is only ever set from the embedded browser (pick an existing
    * folder, or create one under the browsed path) — there is no free-text
    * path field here, so it is always a real directory the daemon listed or
-   * just made. Name and folder are independent: picking a folder never
-   * touches the name, so a name error (e.g. a 409 collision) is left alone. */
+   * just made. Picking a folder fills the name with the folder's own name
+   * when the name is still empty or still the name a previous pick filled
+   * in; a name the user typed is never overwritten, and a name error (e.g.
+   * a 409 collision) on a typed name is left alone. */
   function handleWorkspaceSelect(path: string) {
     setWorkspace(path);
     setErrors((prev) => ({ ...prev, workspace: undefined }));
     setPickerExpanded(false);
+    const derived = basename(path);
+    if (derived && (name.trim() === '' || name === autoNameRef.current)) {
+      autoNameRef.current = derived;
+      setName(derived);
+      setErrors((prev) => ({ ...prev, name: undefined }));
+    }
   }
 
   function handleNameChange(value: string) {
+    // Typing makes the name the user's own: later folder picks leave it.
+    autoNameRef.current = null;
     setName(value);
     setErrors((prev) => ({ ...prev, name: undefined }));
   }

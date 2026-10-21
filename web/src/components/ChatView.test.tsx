@@ -4587,7 +4587,7 @@ describe('Keyless: the composer pin falls back to the project pin', () => {
     await flushEffects();
     const hint = container.querySelector('[data-testid="chat-keyless-hint"]');
     expect(hint?.textContent).toBe(
-      'Talking to Codex. Add an API key to let Orbital manage this project.',
+      'Talking to Codex. Add an API key and Orbital will help manage this project.',
     );
   });
 

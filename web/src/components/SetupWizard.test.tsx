@@ -360,10 +360,10 @@ describe('SetupWizard — skip the key step', () => {
     mockApi({ apiKeySet: false });
     render(<SetupWizard onComplete={vi.fn()} />);
     expect(
-      screen.getByText(/Add an API key for Orbital’s own agent/),
+      screen.getByText(/Add an API key for the Orbital agent/),
     ).toBeTruthy();
     const skip = screen.getByTestId('wizard-skip-key');
-    expect(skip.textContent).toBe('Skip — use my agents directly');
+    expect(skip.textContent).toBe('Skip for now — use my existing agents');
     expect(screen.getByTestId('wizard-skip-key-hint').textContent).toMatch(
       /Add a key later in Settings\./,
     );
@@ -409,7 +409,7 @@ describe('SetupWizard — skip the key step', () => {
           <SetupWizard onComplete={vi.fn()} />
         </LocaleProvider>,
       );
-      expect(screen.getByTestId('wizard-skip-key').textContent).toBe('跳过，直接使用我的 Agent');
+      expect(screen.getByTestId('wizard-skip-key').textContent).toBe('暂时跳过，使用已有 Agent');
       expect(screen.getByTestId('wizard-skip-key-hint').textContent).toBe(
         '之后可在设置中添加。',
       );

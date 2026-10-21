@@ -130,11 +130,29 @@ describe('CreateProject — name and folder are separate fields', () => {
     expect(screen.getByText('Use this folder')).toBeTruthy();
   });
 
-  it('never derives the project name from the folder', async () => {
+  it('picking a folder fills an empty name with the folder name', async () => {
     render(<CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />);
     await pickFolder();
-    expect(nameInput().value).toBe('');
+    expect(nameInput().value).toBe('user');
+    expect(createButton().disabled).toBe(false);
+  });
 
+  it('a name the user typed survives a later folder pick', async () => {
+    render(<CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    fireEvent.change(nameInput(), { target: { value: 'Copenhagen' } });
+    await pickFolder();
+    expect(nameInput().value).toBe('Copenhagen');
+  });
+
+  it('a name that came from a folder pick is replaced by the next pick, until the user types', async () => {
+    render(<CreateProject onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    await pickFolder();
+    expect(nameInput().value).toBe('user');
+    // Same mock folder again: the auto name is still the auto name.
+    await expandPicker();
+    fireEvent.click(screen.getByText('Use this folder'));
+    expect(nameInput().value).toBe('user');
+    // Once typed, it is the user's.
     fireEvent.change(nameInput(), { target: { value: 'Copenhagen' } });
     await expandPicker();
     fireEvent.click(screen.getByText('Use this folder'));
