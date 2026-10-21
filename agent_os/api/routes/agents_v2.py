@@ -146,6 +146,10 @@ class ProjectUpdate(BaseModel):
     # edited raw here.
     safe_mode: bool | None = None
     unsandboxed_executables: list[str] | None = None
+    # The project's sticky pin (keyless onboarding contract §2). Tri-state on
+    # PRESENCE like ``card_id``: omitted = untouched, null = clear (Orbital),
+    # a slug = that worker. An unknown slug is a 400.
+    default_pinned_target: str | None = None
 
     @field_validator("sub_agent_deployment_instructions", mode="before")
     @classmethod
@@ -614,7 +618,73 @@ def _redact_project(project: dict) -> dict:
     if "budget_action" in result:
         from agent_os.budget.guard import normalize_budget_action
         result["budget_action"] = normalize_budget_action(result["budget_action"])
+    result.update(_pin_fields(result))
     return result
+
+
+def _pin_fields(project: dict) -> dict:
+    """Keyless-mode fields of a project row (contract §2), computed on read.
+
+    ``manager_ready``: the project's credential card carries a key.
+    ``default_pinned_target``: the persisted sticky pin.
+    ``effective_pinned_target``: who a NEW session starts pinned to. Cheap by
+    construction (cached ``has_key``, stale-ok setup status); the row routes
+    warm the setup status off the loop first (``_warm_agent_status``).
+    """
+    pid = project.get("project_id")
+    default = project.get("default_pinned_target") or None
+    if _agent_manager is None or not pid:
+        return {"manager_ready": False, "default_pinned_target": default,
+                "effective_pinned_target": None}
+    try:
+        ready = bool(_agent_manager.manager_ready(pid))
+        effective = _agent_manager.effective_pinned_target(pid, ready=ready)
+    except Exception:
+        logger.warning("pin fields failed for %s", pid, exc_info=True)
+        ready, effective = False, None
+    return {"manager_ready": ready, "default_pinned_target": default,
+            "effective_pinned_target": effective}
+
+
+async def _warm_agent_status() -> None:
+    """Fill the setup engine's status cache off the event loop.
+
+    ``effective_pinned_target`` reads it stale-ok, but a never-filled cache
+    still probes every agent CLI by subprocess (seconds). The row routes call
+    this first so that probe, when it happens at all, never blocks the loop.
+    """
+    if _setup_engine is None:
+        return
+    try:
+        await asyncio.to_thread(_setup_engine.check_all, True)
+    except Exception:
+        logger.warning("agent status warm-up failed", exc_info=True)
+
+
+def _validate_pin_slug(slug: str | None) -> None:
+    """400 unless ``slug`` names a registered worker (or is None).
+
+    Registered, not "available": a pin may name an agent that is signed out
+    right now (``effective_pinned_target`` falls through until it is back).
+    ``orbital`` and ``built-in`` name the management agent, which is "no pin"
+    (null), never a slug.
+    """
+    if slug is None:
+        return
+    reserved = {"orbital", "built-in"}
+    known: set[str] = set()
+    if _setup_engine is not None:
+        try:
+            known = {getattr(s, "slug", None)
+                     for s in _setup_engine.check_all(allow_stale=True)}
+        except Exception:
+            logger.warning("pin slug validation: setup check failed", exc_info=True)
+    if (not slug or slug.lstrip("@").lower() in reserved
+            or slug not in known):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown agent {slug!r} for default_pinned_target",
+        )
 
 
 def _read_file_or_empty(path: str) -> str:
@@ -789,6 +859,7 @@ async def create_project(req: CreateProjectRequest):
         )
 
     project = _project_store.get_project(pid)
+    await _warm_agent_status()
     # Create the project's dispatcher now (project-scoped lifecycle manager) so
     # queue work can be picked up without waiting for a daemon restart.
     try:
@@ -802,6 +873,7 @@ async def create_project(req: CreateProjectRequest):
 
 @router.get("/projects")
 async def list_projects():
+    await _warm_agent_status()
     projects = [_redact_project(p) for p in _project_store.list_projects()]
     # Spec 056 — manual order. Two components, in this order:
     #   1. ``not is_scratch`` — Quick Tasks stays pinned above everything. It
@@ -850,6 +922,7 @@ async def get_project(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     workspace = project.get("workspace", "")
+    await _warm_agent_status()
     result = _redact_project(project)
     _enrich_with_disk_content(result, workspace)
     result.setdefault("agent_name", result.get("name", ""))
@@ -878,6 +951,13 @@ async def update_project(project_id: str, body: ProjectUpdate):
         _require_known_card(body.card_id)
         updates["card_id"] = body.card_id
         updates["migration_note"] = None
+    # The sticky pin: applied on PRESENCE (explicit null clears it), after the
+    # slug is checked against the registry.
+    updates.pop("default_pinned_target", None)
+    if "default_pinned_target" in body.model_fields_set:
+        await _warm_agent_status()
+        _validate_pin_slug(body.default_pinned_target)
+        updates["default_pinned_target"] = body.default_pinned_target
     if "llm_fallback_models" in updates:
         updates["llm_fallback_models"] = _card_refs(updates["llm_fallback_models"])
     if "sub_agent_deployment_instructions" in updates:
@@ -1030,6 +1110,7 @@ async def update_project(project_id: str, body: ProjectUpdate):
                 )
 
     updated = _project_store.get_project(project_id)
+    await _warm_agent_status()
     result = _redact_project(updated)
     _enrich_with_disk_content(result, workspace)
     # P3-F coupled removal: no ``budget_spent_usd`` flatten in the PUT response.
@@ -1372,6 +1453,10 @@ async def cold_start_scan(project_id: str):
     Runs the deterministic skeleton walk synchronously (so a walker failure
     surfaces as an HTTP error), then starts a content-less loop whose prompt
     drives the 3-stage scan. No user message is fabricated.
+
+    Keyless project (``manager_ready`` false): the effective pinned worker
+    runs the scan instead (``_worker_onboarding``); the body carries
+    ``runner`` either way ("orbital" on the manager path).
     """
     from agent_os.agent.workspace_scan import scan_workspace
     project = _project_store.get_project(project_id)
@@ -1382,6 +1467,15 @@ async def cold_start_scan(project_id: str):
         raise HTTPException(status_code=400, detail="workspace missing")
 
     skeleton = scan_workspace(workspace)
+    if not _agent_manager.manager_ready(project_id):
+        # Keyless project: the pinned worker runs the scan (contract §5).
+        if project_id in _ONBOARDING_STARTING:
+            raise HTTPException(status_code=409, detail="onboarding already starting")
+        _ONBOARDING_STARTING.add(project_id)
+        try:
+            return await _worker_onboarding(project_id, "scan", skeleton)
+        finally:
+            _ONBOARDING_STARTING.discard(project_id)
     config = _agent_manager._build_agent_config_from_project(project_id)
     # Validate the provider BEFORE minting: a credential failure must surface
     # as a structured 400 the frontend can translate, and must not leave an
@@ -1405,13 +1499,66 @@ async def cold_start_scan(project_id: str):
         # Belt-and-braces: settings changed between validate and start.
         raise HTTPException(status_code=400,
                             detail={"code": e.code, "message": str(e)})
-    return {"status": "started", "session_id": session_id}
+    return {"status": "started", "session_id": session_id,
+            "session_uuid": minted.get("session_uuid", session_id),
+            "runner": "orbital"}
 
 
 # Projects with a start-onboarding request between its guard and its mint. The
 # guard reads the session list and the mint awaits, so without this a
 # double-fire would pass the guard twice and leave an orphan second session.
 _ONBOARDING_STARTING: set[str] = set()
+
+
+def _orbital_sessions(entries) -> list[dict]:
+    """The session-list entries that are real Orbital sessions.
+
+    The list also carries VIRTUAL entries for Claude Code / Codex
+    conversations found under the project folder that have not been imported
+    yet (``imported.materialized`` false). They are not sessions of this
+    project until opened, so they must not trip the onboarding guard — or
+    every project created on an existing agent folder would 409 there.
+    """
+    out = []
+    for entry in entries or []:
+        imported = entry.get("imported") if isinstance(entry, dict) else None
+        if isinstance(imported, dict) and imported.get("materialized") is False:
+            continue
+        out.append(entry)
+    return out
+
+
+async def _worker_onboarding(project_id: str, mode: str,
+                             skeleton: str | None = None) -> dict:
+    """The keyless branch of start-onboarding / cold-start-scan (contract §5).
+
+    Orbital's own agent has no key here, so the project's effective pinned
+    worker runs the interview or the scan. No worker available → the typed
+    ``missing_api_key`` 400 the manager branch has always returned, and no
+    session is minted.
+    """
+    from agent_os.daemon_v2.worker_onboarding import (
+        WorkerDispatchError, start_worker_onboarding,
+    )
+    runner = await asyncio.to_thread(
+        _agent_manager.effective_pinned_target, project_id, ready=False)
+    if runner is None:
+        err = ProviderConfigError(
+            "missing_api_key",
+            "No LLM API key configured for this project or globally",
+        )
+        raise HTTPException(status_code=400,
+                            detail={"code": err.code, "message": str(err)})
+    try:
+        return await start_worker_onboarding(
+            _agent_manager, _sub_agent_manager, project_id, runner,
+            mode=mode, skeleton_text=skeleton, ws_manager=_ws_manager,
+        )
+    except WorkerDispatchError as e:
+        raise HTTPException(status_code=502, detail={
+            "code": "worker_dispatch_failed", "message": str(e),
+            "runner": runner, "session_id": e.session_id,
+        })
 
 
 @router.post("/agents/{project_id}/start-onboarding", status_code=201)
@@ -1428,6 +1575,9 @@ async def start_onboarding(project_id: str):
     Tasks — else 409. A content-less start on a project that HAS goals is how
     agents used to invent their own work on project open (removed in 0722d5fa);
     a stale tab or a retry must not be able to bring that back.
+
+    Keyless project (``manager_ready`` false): same guards, then the
+    effective pinned worker runs the interview (``_worker_onboarding``).
     """
     project = _project_store.get_project(project_id)
     if not project:
@@ -1444,8 +1594,12 @@ async def start_onboarding(project_id: str):
         raise HTTPException(status_code=409, detail="onboarding already starting")
     _ONBOARDING_STARTING.add(project_id)
     try:
-        if await asyncio.to_thread(_agent_manager.list_sessions, project_id):
+        sessions = await asyncio.to_thread(_agent_manager.list_sessions, project_id)
+        if _orbital_sessions(sessions):
             raise HTTPException(status_code=409, detail="project already has sessions")
+        if not _agent_manager.manager_ready(project_id):
+            # Keyless project: the pinned worker runs the interview.
+            return await _worker_onboarding(project_id, "interview")
         config = _agent_manager._build_agent_config_from_project(project_id)
         # Validate before minting, as the scan does: a credential failure is a
         # structured 400 and leaves no orphan session behind.
@@ -1467,7 +1621,9 @@ async def start_onboarding(project_id: str):
                                 detail={"code": e.code, "message": str(e)})
     finally:
         _ONBOARDING_STARTING.discard(project_id)
-    return {"status": "started", "session_id": session_id}
+    return {"status": "started", "session_id": session_id,
+            "session_uuid": minted.get("session_uuid", session_id),
+            "runner": "orbital"}
 
 
 # The session JSONL's advisory lock is held in short bursts by concurrent
@@ -2116,6 +2272,15 @@ async def patch_session(project_id: str, session_id: str, req: SessionPatchReque
         result["pinned"] = bool(req.pinned)
     if target_set:
         result["pinned_target"] = req.pinned_target
+        # The project's sticky pin follows the user's last choice (keyless
+        # onboarding contract §2), including an explicit null (= Orbital).
+        # Written here on the loop, after the session write succeeded.
+        try:
+            _agent_manager.set_default_pinned_target(
+                project_id, req.pinned_target)
+        except Exception:
+            logger.warning("could not remember the default pin for %s",
+                           project_id, exc_info=True)
         # Pin time (spec 074 §3.6): hash-guarded AGENTS.md refresh — codex's
         # only context channel is reading that file from the workspace root.
         # Guarded inside reseed_project_agent_md; a user-edited file is never

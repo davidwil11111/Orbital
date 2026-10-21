@@ -1799,6 +1799,134 @@ class AgentManager:
         """
         return any(pid == project_id for (pid, _sid) in self._handles.keys())
 
+    # ------------------------------------------------------------------
+    # Keyless mode: can Orbital's own agent run here, and who answers a new
+    # session (the project's sticky pin)
+    # ------------------------------------------------------------------
+
+    def manager_ready(self, project_id: str) -> bool:
+        """Whether the management agent has a key to run with in this project.
+
+        The credential half of ``_build_agent_config_from_project`` and
+        nothing else: project ``card_id`` → global default card (the
+        ``AGENT_OS_API_KEY`` env card while it exists) → a non-empty key.
+        Builds no provider, never raises, makes no network call, and asks the
+        settings store's cached ``has_key`` so a list of project rows costs
+        one Keychain read per card, not one per row. A project pointing at a
+        deleted card with no default to fall back on is not ready (the start
+        path raises ``missing_card`` there).
+        """
+        project = (self._project_store.get_project(project_id)
+                   if self._project_store is not None else None)
+        store = self._settings_store
+        if project is None or store is None:
+            return False
+        try:
+            card_ref = project.get("card_id")
+            card = store.resolve_card(card_ref) if card_ref else None
+            if card is None:
+                card = store.default_card()
+            if card is None:
+                return False
+            has_key = getattr(store, "has_key", None)
+            if callable(has_key):
+                return bool(has_key(card.id))
+            return bool(store.key_for(card.id))
+        except Exception:
+            logger.warning("manager_ready(%s): credential lookup failed",
+                           project_id, exc_info=True)
+            return False
+
+    def available_worker_slugs(self, project_id: str, *,
+                               project: dict | None = None) -> list[str]:
+        """Worker slugs a pinned send in this project could reach right now.
+
+        Same per-agent test the dispatch gate (``SubAgentManager``) and
+        ``/agents/available``'s ``ready`` apply — installed, dependencies met,
+        signed in (``credentials_configured``), not below the version floor —
+        minus the project's ``disabled_sub_agents``. In the setup engine's
+        registry order. Stale-ok (spec 101): an expired probe result is served
+        while a background sweep refreshes it.
+        """
+        if project is None:
+            project = (self._project_store.get_project(project_id)
+                       if self._project_store is not None else None)
+        engine = self._setup_engine
+        if project is None or engine is None:
+            return []
+        disabled = set(project.get("disabled_sub_agents") or [])
+        out: list[str] = []
+        try:
+            for status in engine.check_all(allow_stale=True):
+                slug = getattr(status, "slug", None)
+                if (not isinstance(slug, str) or not slug
+                        or slug == "built-in" or slug in disabled):
+                    continue
+                if getattr(status, "installed", False) is not True:
+                    continue
+                if getattr(status, "dependencies_met", True) is False:
+                    continue
+                if getattr(status, "credentials_configured", True) is False:
+                    continue
+                if getattr(status, "update_needed", False) is True:
+                    continue
+                out.append(slug)
+        except Exception:
+            logger.warning("available_worker_slugs(%s): setup check failed",
+                           project_id, exc_info=True)
+            return []
+        return out
+
+    def effective_pinned_target(self, project_id: str, *,
+                                ready: bool | None = None) -> str | None:
+        """The slug a NEW session in this project starts pinned to, or None.
+
+        The project's ``default_pinned_target`` when that worker is available
+        here; otherwise, only when the management agent cannot run
+        (``manager_ready`` false), the first available worker — a keyless
+        project must never start a session on an agent that cannot answer;
+        otherwise None (Orbital). Computed on read, never persisted.
+        ``ready`` lets a caller that already resolved ``manager_ready`` skip
+        the second lookup.
+        """
+        project = (self._project_store.get_project(project_id)
+                   if self._project_store is not None else None)
+        if project is None:
+            return None
+        default = project.get("default_pinned_target") or None
+        if default is None:
+            if ready is None:
+                ready = self.manager_ready(project_id)
+            if ready:
+                return None
+        available = self.available_worker_slugs(project_id, project=project)
+        if default is not None and default in available:
+            return default
+        if ready is None:
+            ready = self.manager_ready(project_id)
+        if not ready and available:
+            return available[0]
+        return None
+
+    def set_default_pinned_target(self, project_id: str,
+                                  target: str | None) -> None:
+        """Remember ``target`` as the project's sticky pin (last choice wins).
+
+        Called by the session pin PATCH on the event loop, after the session
+        meta write succeeded (that write runs in a worker thread; the project
+        store has no lock for its dict, so this write stays on the loop).
+        """
+        if self._project_store is None:
+            return
+        project = self._project_store.get_project(project_id)
+        if project is None:
+            return
+        target = target or None
+        if project.get("default_pinned_target") == target:
+            return
+        self._project_store.update_project(
+            project_id, {"default_pinned_target": target})
+
     def _build_agent_config_from_project(self, project_id: str) -> AgentConfig:
         """Construct an AgentConfig for ``project_id`` from the project store.
 
@@ -2252,6 +2380,13 @@ class AgentManager:
                            if self._project_store else None)
                 workspace = (project or {}).get("workspace", "") if project else ""
                 session = Session.new(resolved, workspace)
+                # A session whose FIRST message is a targeted send is pinned
+                # to that worker (every targeted send is a pin since spec
+                # 091). Stamped on the pending session_start meta, so it lands
+                # with the first write — the client's follow-up pin PATCH is
+                # no longer the only thing that records it.
+                if user_msg.get("target"):
+                    session.set_pinned_target(user_msg["target"])
         session.append(user_msg)
         return resolved
 
@@ -3950,10 +4085,24 @@ class AgentManager:
         # Telemetry's ``session_created`` + ``first_session`` ride the uuid
         # mint primitive (``_mint_session_uuid``), not this method — see the
         # note there (spec 063 §3 → spec 111 A3).
+        #
+        # ``pinned_target``: who the new session starts talking to (the
+        # project's sticky pin, or the first worker on a keyless project).
+        # Seeding only — nothing is written; the first inject (a targeted
+        # send) materializes the session pinned to it. Off the loop: the
+        # availability check may read the setup cache and the Keychain.
+        try:
+            pinned_target = await asyncio.to_thread(
+                self.effective_pinned_target, project_id)
+        except Exception:
+            logger.warning("new_session(%s): pin seeding failed", project_id,
+                           exc_info=True)
+            pinned_target = None
         return {
             "status": "ok",
             "session_id": new_session_uuid,
             "session_uuid": new_session_uuid,
+            "pinned_target": pinned_target,
         }
 
     async def cancel_message(self, project_id: str, *,

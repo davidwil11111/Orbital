@@ -142,6 +142,8 @@ class UpdateSettingsRequest(BaseModel):
     user_memory_enabled: bool | None = None
     scratch_workspace: str | None = None
     telemetry_enabled: bool | None = None
+    # First-run wizard "Skip for now" (keyless mode). Omitted = untouched.
+    setup_api_key_skipped: bool | None = None
 
 
 class SetApiKeyRequest(BaseModel):
@@ -441,6 +443,8 @@ async def update_settings(req: UpdateSettingsRequest):
         current.user_memory_enabled = req.user_memory_enabled
     if req.telemetry_enabled is not None:
         current.telemetry_enabled = req.telemetry_enabled
+    if req.setup_api_key_skipped is not None:
+        current.setup_api_key_skipped = req.setup_api_key_skipped
 
     # Write user preferences content to file
     if req.user_preferences_content is not None:

@@ -147,6 +147,11 @@ class GlobalSettings(BaseModel):
     # pick up the default. Only daily aggregates ever transmit (see
     # agent_os/telemetry/).
     telemetry_enabled: bool = True
+    # First-run wizard: the user chose "Skip for now — talk to my agents
+    # directly" instead of giving Orbital its own LLM key. The wizard gate is
+    # ``!llm.api_key_set && !setup.api_key_skipped``. Saving a key later does
+    # not reset it — once a key exists the flag is simply irrelevant.
+    setup_api_key_skipped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +295,14 @@ class SettingsStore:
         self._data_dir = data_dir
         self._credential_store = credential_store
         self._project_store = project_store
-        self._cards = card_key_store if card_key_store is not None else CardKeyStore()
+        # Every key write goes through ``_cards.set``/``delete``; the wrapper
+        # drops that card's ``has_key`` answer so the cache never outlives a
+        # write made through this store.
+        self._has_key_cache: dict[str, tuple[bool, float]] = {}
+        self._cards = _InvalidatingKeys(
+            card_key_store if card_key_store is not None else CardKeyStore(),
+            self._has_key_cache,
+        )
         # The pre-cards single-slot API (PUT /settings/api-key and friends)
         # is a shim over the DEFAULT card; wiring it here means no call site
         # has to know about the back-reference.
@@ -435,6 +447,28 @@ class SettingsStore:
     def key_for(self, card_id: str | None) -> str:
         """The raw key for ``card_id``, or "" — the ONE key lookup."""
         return self._cards.get(card_id) or "" if card_id else ""
+
+    def has_key(self, card_id: str | None) -> bool:
+        """Whether ``card_id`` carries a non-empty key — cached.
+
+        For callers that only need yes/no on every row of a list (project
+        rows' ``manager_ready``): one Keychain read per card per
+        ``_HAS_KEY_TTL_S``, instead of one per row per request. Writes made
+        through this store invalidate at once; the TTL only bounds a change
+        made behind the daemon's back (an item deleted in Keychain Access).
+        The env card is answered from the environment, uncached.
+        """
+        if not card_id:
+            return False
+        if card_id == ENV_CARD_ID:
+            return bool(self._cards.get(ENV_CARD_ID))
+        now = time.monotonic()
+        hit = self._has_key_cache.get(card_id)
+        if hit is not None and now < hit[1]:
+            return hit[0]
+        value = bool(self._cards.get(card_id))
+        self._has_key_cache[card_id] = (value, now + _HAS_KEY_TTL_S)
+        return value
 
     def key_source(self, card_id: str | None) -> str:
         return self._cards.source(card_id) if card_id else "none"
@@ -662,6 +696,11 @@ class SettingsStore:
         data["credential_cards"] = self.masked_cards()
         data["default_card_id"] = self.effective_default_card_id()
         data["llm"] = self._derived_llm()
+        # Wire shape of the wizard skip flag (contract: a top-level ``setup``
+        # block), not a flat settings field.
+        data["setup"] = {
+            "api_key_skipped": bool(data.pop("setup_api_key_skipped", False)),
+        }
 
         # Read user preferences file content
         prefs_path = data.get("user_preferences_path")
@@ -959,6 +998,37 @@ class SettingsStore:
 
 def _card_error(code: str, message: str, status: int | None = None) -> dict:
     return {"status": status, "code": code, "message": message, "at": _now_iso()}
+
+
+# How long a ``has_key`` answer is trusted without a write through the store.
+_HAS_KEY_TTL_S = 60.0
+
+
+class _InvalidatingKeys:
+    """The card key store, with writes dropping the ``has_key`` cache entry.
+
+    Every other attribute (reads, the legacy single-slot helpers) passes
+    straight through, so the wrapped store's behaviour is unchanged.
+    """
+
+    def __init__(self, inner, cache: dict):
+        self._inner = inner
+        self._cache = cache
+
+    def set(self, card_id, key):
+        try:
+            return self._inner.set(card_id, key)
+        finally:
+            self._cache.pop(card_id, None)
+
+    def delete(self, card_id):
+        try:
+            return self._inner.delete(card_id)
+        finally:
+            self._cache.pop(card_id, None)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class _Desc:

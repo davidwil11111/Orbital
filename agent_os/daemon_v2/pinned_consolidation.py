@@ -177,6 +177,18 @@ class PinnedConsolidationCoordinator:
         )
 
         project_id, session_id = key
+        # Keyless project (the user skipped Orbital's own key and talks to
+        # workers directly): there is no provider to run the memory editor
+        # with. Skip quietly — building one would raise missing_api_key on
+        # every pinned quiet period.
+        ready = getattr(self._agent_manager, "manager_ready", None)
+        if callable(ready) and ready(project_id) is False:
+            logger.info(
+                "pinned consolidation (%s) skipped for %s/%s: no "
+                "management-agent key configured", reason, project_id,
+                session_id,
+            )
+            return
         session = self._resolve_session(project_id, session_id)
         if session is None:
             logger.info(
