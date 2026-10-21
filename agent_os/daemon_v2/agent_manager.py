@@ -1288,7 +1288,7 @@ class AgentManager:
 
         # 11. Session-end callback.
         # Providers are resolved at CALL time from the live handle (not
-        # closure-captured from session start) so the memory flush / state
+        # closure-captured from session start) so the record turn / state
         # refresh runs on the provider the project CURRENTLY configures —
         # _start_loop may have live-resolved a switch since this session began.
         def _live_providers():
