@@ -1780,7 +1780,11 @@ def process_on_write(workspace: str, resolved_path: str, content: str, *, today:
     today = today or _today()
     if key == ASKS_KEY:
         from agent_os.agent import asks
-        return asks.process_write(_read(resolved_path), content, today=today)
+        from agent_os.agent.project_paths import ProjectPaths
+        return asks.process_write(
+            _read(resolved_path), content, today=today,
+            sessions_dir=ProjectPaths(workspace).sessions_dir,
+        )
     if key in ARCHIVE_KEYS:
         return with_contents_table(content), []
     content = ensure_format_header(content, key)

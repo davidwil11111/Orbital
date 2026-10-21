@@ -96,3 +96,63 @@ def test_the_append_only_guard_restores_a_dropped_open_line(ws):
     out = WriteTool(workspace).execute(path="orbital/ASKS.md", content="# ASKS\n")
     assert '"status": "success"' in out.content
     assert _state(orbital, ask_id).state == "open"
+
+
+# ---------------------------------------------------------------------------
+# follow-up (coordinator 2026-10-21): a cited session verifies the quote
+# ---------------------------------------------------------------------------
+
+def _asks_text(orbital):
+    return open(os.path.join(orbital, "ASKS.md"), encoding="utf-8").read()
+
+
+def test_close_citing_a_session_with_the_users_real_words_is_applied(ws):
+    workspace, orbital, ask_id = ws
+    out = WriteTool(workspace).execute(
+        path="orbital/ASKS.md",
+        content=_asks_text(orbital)
+        + f'- done {ask_id} session:proj_aaaa1111 "the webinar  will be   in English, final"\n',
+    )
+    assert '"status": "success"' in out.content and "not closed" not in out.content
+    ask = _state(orbital, ask_id)
+    assert ask.state == "done" and ask.closed_by == "agent"
+    assert "session:proj_aaaa1111" in ask.note
+
+
+@pytest.mark.parametrize("session, quote, why", [
+    ("proj_aaaa1111", "English it is, and I will ship it today", "the assistant's words"),
+    ("proj_aaaa1111", "the webinar will be in Spanish", "fabricated"),
+    ("proj_bbbb2222", "the webinar will be in English", "another session"),
+    ("proj_missing", "the webinar will be in English", "no such session"),
+    ("../proj_aaaa1111", "the webinar will be in English", "path escape"),
+])
+def test_close_citing_a_session_whose_user_rows_lack_the_quote_is_dropped(ws, session, quote, why):
+    workspace, orbital, ask_id = ws
+    before = _asks_text(orbital)
+    out = WriteTool(workspace).execute(
+        path="orbital/ASKS.md",
+        content=before + f'- done {ask_id} session:{session} "{quote}"\n',
+    )
+    assert '"status": "success"' in out.content, why
+    assert f"ask {ask_id} not closed: the quoted words are not in session {session}" in out.content, why
+    assert _state(orbital, ask_id).state == "open", why
+    assert _asks_text(orbital) == before, why           # the file is otherwise intact
+
+
+def test_close_without_a_cited_session_keeps_the_old_behaviour(ws):
+    workspace, orbital, ask_id = ws
+    out = WriteTool(workspace).execute(
+        path="orbital/ASKS.md",
+        content=_asks_text(orbital) + f'- done {ask_id} "made-up words"\n',
+    )
+    assert '"status": "success"' in out.content and "not closed" not in out.content
+    assert _state(orbital, ask_id).state == "done"       # applied, as before
+    out = WriteTool(workspace).execute(
+        path="orbital/ASKS.md", content=_asks_text(orbital) + "- open Pick a venue\n- done 000000 no quote\n")
+    assert "without quoting the user" not in out.content   # unknown id: unchanged "no ask with id" path
+
+
+def test_the_asks_header_documents_the_session_citation(ws):
+    workspace, orbital, _ = ws
+    assert "session:<session_uuid>" in asks.FORMAT_HEADER
+    assert _asks_text(orbital).startswith(asks.FORMAT_HEADER)

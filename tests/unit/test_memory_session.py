@@ -825,3 +825,52 @@ async def test_the_pass_waits_for_the_triggering_runs_first_call(tmp_path):
     started = asyncio.get_running_loop().time()
     await mgr._wait_for_first_call(sk, 5.0)
     assert asyncio.get_running_loop().time() - started < 0.5
+
+
+# ---------------------------------------------------------------------------
+# 10. follow-up (coordinator 2026-10-21): no memory file through the shell
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("command", [
+    "cat orbital/PROJECT_STATE.md",
+    "cd /tmp/ws && python3 - <<'EOF'\nopen('orbital/DECISIONS.md','w').write('x')\nEOF",
+    "grep -n foo /abs/path/orbital/LESSONS.md",
+    "printf 'x' >> ./orbital/INDEX.md",
+    "echo '- done abc123' >> orbital/ASKS.md",
+    "cp orbital/backups/memory-editor-20261021T024742670407Z/PROJECT_STATE.md /tmp/x",
+    "tail -5 orbital/PROJECT_STATE_ARCHIVE.md",
+    "sed -i '' 's/a/b/' LESSONS_ARCHIVE.md",
+])
+def test_shell_commands_naming_a_memory_file_are_refused(tmp_path, command):
+    guard = E.memory_tool_guard(str(tmp_path))
+    err = guard({"name": "shell", "arguments": {"command": command}})
+    assert err and err.startswith("Error")
+    assert "Memory files are edited with the edit/write tools only" in err
+    assert "run this command without them" in err
+    assert "read" in err and "grep" in err          # reads go through the read/grep tools
+
+
+@pytest.mark.parametrize("command", [
+    "ls orbital/",
+    "git status",
+    "cat README.md",
+    "grep -rn index.html src/",
+    "python3 -c 'print(1)'",
+    "wc -l orbital/sessions/x.jsonl",
+])
+def test_shell_commands_not_naming_a_memory_file_are_allowed(tmp_path, command):
+    guard = E.memory_tool_guard(str(tmp_path))
+    assert guard({"name": "shell", "arguments": {"command": command}}) is None
+    assert guard({"name": "shell", "arguments": {}}) is None
+    assert guard({"name": "edit", "arguments": {"path": "orbital/PROJECT_STATE.md"}}) is None
+    assert guard({"name": "write", "arguments": {"path": "orbital/DECISIONS_ARCHIVE.md"}}) is None
+
+
+def test_task_message_says_edit_and_write_never_the_shell_once():
+    text = E.build_task_message(
+        sizes=_sizes(), folded=[], over=["state"], forced=False, pointer_paths=[],
+        last_pass=None, sessions=[], today=TODAY, tool_cap=12,
+    )
+    sentence = "Edit these files only with edit and write; never through the shell."
+    assert text.count(sentence) == 1
+    assert ("<!--mem …--> lines.\n" + sentence + "\n\nSIZES (bullet lines only") in text

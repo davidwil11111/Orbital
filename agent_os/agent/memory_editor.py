@@ -322,6 +322,7 @@ _TASK_HEAD = (
     "the files directly with read, grep, read_session, edit and write. The daemon\n"
     "stamps ids and maintains the archive contents tables; you never touch\n"
     "<!--mem …--> lines.\n"
+    "Edit these files only with edit and write; never through the shell.\n"
     "\n"
     "SIZES (bullet lines only; indented detail does not count toward soft)\n"
 )
@@ -461,20 +462,42 @@ def build_task_message(
 # ---------------------------------------------------------------------------
 
 _GUARDED_TOOLS = ("edit", "write")
+# A shell command that names any memory file by basename — any path form,
+# the backups folder included — is refused outright. Reads are not told
+# apart from writes (a heredoc or a `python -` body cannot be classified
+# cheaply); the read and grep tools cover reads. Both live smoke passes had
+# the agent rewrite PROJECT_STATE through `cat >>` / `python`, skipping the
+# write chokepoint (normalise, stamp, conservation).
+_MEMORY_FILE_IN_SHELL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:PROJECT_STATE|DECISIONS|LESSONS|INDEX|ASKS|[A-Z_]+_ARCHIVE)\.md(?![A-Za-z0-9_])"
+)
+_SHELL_REFUSAL = (
+    "Error: Memory files are edited with the edit/write tools only (the daemon "
+    "stamps ids and keeps the archive tables); run this command without them. "
+    "Every shell command that names PROJECT_STATE.md, DECISIONS.md, LESSONS.md, "
+    "INDEX.md, ASKS.md or an *_ARCHIVE.md is refused, reads included — use the "
+    "read and grep tools to look at them."
+)
 
 
 def memory_tool_guard(workspace: str):
-    """A deterministic path check for the Memory session's loop: ``edit``
-    and ``write`` may only target ``<workspace>/orbital/*.md`` (the live
-    files, their archives, ASKS.md). Every other tool is unrestricted.
-    Returns the error text to hand back as the tool result, or None."""
+    """A deterministic check for the Memory session's loop: ``edit`` and
+    ``write`` may only target ``<workspace>/orbital/*.md`` (the live files,
+    their archives, ASKS.md), and ``shell`` may not name a memory file at
+    all. Every other tool is unrestricted. Returns the error text to hand
+    back as the tool result, or None."""
     orbital = os.path.realpath(os.path.join(workspace, "orbital"))
     root = os.path.realpath(workspace)
 
     def guard(tc: dict) -> str | None:
+        args = tc.get("arguments") or {}
+        if tc.get("name") == "shell":
+            command = args.get("command") if isinstance(args, dict) else None
+            if isinstance(command, str) and _MEMORY_FILE_IN_SHELL_RE.search(command):
+                return _SHELL_REFUSAL
+            return None
         if tc.get("name") not in _GUARDED_TOOLS:
             return None
-        args = tc.get("arguments") or {}
         raw = args.get("path") if isinstance(args, dict) else None
         if not raw or not isinstance(raw, str):
             return None   # the tool reports its own missing argument

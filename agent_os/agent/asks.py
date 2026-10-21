@@ -108,9 +108,11 @@ FORMAT_HEADER = (
     "ASKS.md reaches the user's Workbench. To open one, add a line "
     "`- open <text>` or `- open due:YYYY-MM-DD <text>` — Orbital stamps the "
     "id and date. When the user answers or completes one, add "
-    "`- done <id> \"<the user's own words>\"`; when the user declines it, "
-    "`- dropped <id> \"<their words>\"`. Close only with the user's words; "
-    "never re-propose a dropped ask. An ask's state is its last line.-->"
+    "`- done <id> session:<session_uuid> \"<the user's own words>\"`; when the "
+    "user declines it, `- dropped <id> session:<session_uuid> \"<their words>\"`. "
+    "Close only with the user's words; Orbital checks the quote against the "
+    "cited session's user messages and drops a close it cannot find there. "
+    "Never re-propose a dropped ask. An ask's state is its last line.-->"
 )
 
 _ID_RE = r"[0-9a-fA-F]{6}"
@@ -510,8 +512,70 @@ def append_event(
 # Append-only write path (agent write/edit tools)
 # ---------------------------------------------------------------------------
 
+_QUOTE_CHARS = ('"', "“", "”", "「", "」", "『", "』")
+# A close may cite the session the user's words come from (spec 124 §3.7
+# follow-up): ``session:<uuid>`` anywhere in the note.
+_SESSION_CITE_RE = re.compile(r"(?<!\S)session[:=](?P<uuid>\S+)")
+_SESSION_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_MAX_QUOTE_CHARS = 500
+
+
 def _has_quote(note: str) -> bool:
-    return any(q in note for q in ('"', "“", "”", "「", "」", "『", "』"))
+    return any(q in note for q in _QUOTE_CHARS)
+
+
+def _quoted_text(note: str) -> str:
+    """The words between the first and last quote characters of ``note``,
+    whitespace-normalised ("" when there is no quoted span)."""
+    positions = [i for i, ch in enumerate(note) if ch in _QUOTE_CHARS]
+    if len(positions) < 2:
+        return ""
+    return _norm(note[positions[0] + 1:positions[-1]])
+
+
+def _session_user_texts(sessions_dir: str, stem: str) -> list[str]:
+    """The user's own messages in ``<sessions_dir>/<stem>.jsonl`` (not
+    injected or daemon rows), whitespace-normalised. [] when unreadable."""
+    if not _SESSION_STEM_RE.match(stem):
+        return []
+    texts: list[str] = []
+    try:
+        with open(os.path.join(sessions_dir, stem + ".jsonl"), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or row.get("role") != "user":
+                    continue
+                if row.get("source") not in (None, "user"):
+                    continue
+                content = row.get("content")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                if isinstance(content, str) and content:
+                    texts.append(_norm(content))
+    except OSError:
+        return []
+    return texts
+
+
+def _cited_quote_verified(note: str, sessions_dir: str | None) -> tuple[str | None, bool]:
+    """``(cited session, verified)``: the session the note cites (None when
+    none) and whether its user rows contain the quoted words verbatim
+    (whitespace-normalised). A cite without a readable sessions dir, without
+    a quote, or with an oversized one is not verified."""
+    m = _SESSION_CITE_RE.search(note)
+    if not m:
+        return None, False
+    stem = m.group("uuid")
+    quote = _quoted_text(note)
+    if not sessions_dir or not quote or len(quote) > _MAX_QUOTE_CHARS:
+        return stem, False
+    return stem, any(quote in t for t in _session_user_texts(sessions_dir, stem))
 
 
 def _legacy_open(line: str) -> Event | None:
@@ -529,6 +593,7 @@ def _legacy_open(line: str) -> Event | None:
 
 def process_write(
     prev: str | None, new: str, *, today: str | None = None,
+    sessions_dir: str | None = None,
 ) -> tuple[str, list[str]]:
     """Enforce append-only on an agent's write of ASKS.md.
 
@@ -536,8 +601,11 @@ def process_write(
     write/edit tool computed. Every line of ``prev`` survives in place (the
     agent is told when it tried to remove or alter one); every line of
     ``new`` that ``prev`` does not already contain is validated, stamped
-    (``id`` + today's date, ``by:agent``) and appended. Returns
-    ``(content_to_write, warnings)``.
+    (``id`` + today's date, ``by:agent``) and appended. A close that cites a
+    session (``session:<uuid>``) is appended only when its quoted words are
+    verbatim in that session's user rows under ``sessions_dir``; otherwise
+    it is dropped and the Note says so. Returns ``(content_to_write,
+    warnings)``.
     """
     today = today or _today()
     prev_text = prev or ""
@@ -625,7 +693,14 @@ def process_write(
         if ev.kind == "reopen" and ask.is_open:
             warnings.append(f"ASKS.md: [{ask.id}] is already open.")
             continue
-        if ev.kind in CLOSE_KINDS and not _has_quote(ev.text):
+        cited, verified = _cited_quote_verified(ev.text, sessions_dir) if ev.kind in CLOSE_KINDS else (None, False)
+        if cited is not None and not verified:
+            warnings.append(
+                f"ASKS.md: ask {ask.id} not closed: the quoted words are not in "
+                f"session {cited} (the user's own messages there); the ask stays open."
+            )
+            continue
+        if ev.kind in CLOSE_KINDS and cited is None and not _has_quote(ev.text):
             warnings.append(
                 f"ASKS.md: closed [{ask.id}] without quoting the user — close "
                 "an ask only with the user's own words in quotes."
