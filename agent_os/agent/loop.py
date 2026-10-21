@@ -2311,7 +2311,7 @@ class AgentLoop:
             ws = self._workspace() or ""
             if os.path.isabs(shown) and ws:
                 try:
-                    shown = os.path.relpath(shown, ws)
+                    shown = os.path.relpath(shown, ws).replace(os.sep, "/")  # POSIX form on every platform (the row text is prompt bytes)
                 except ValueError:
                     pass
             if shown not in self._run_changed_files:

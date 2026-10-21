@@ -557,7 +557,7 @@ async def test_tool_guard_refuses_a_write_outside_orbital_without_executing(tmp_
     assert not os.path.exists(os.path.join(str(tmp_path), "README.md"))
     results = [m for m in session.get_messages() if m.get("role") == "tool"]
     assert results[0]["content"].startswith("Error") and "orbital/*.md" in results[0]["content"]
-    assert "- src/ — code" in open(os.path.join(str(tmp_path), "orbital", "INDEX.md")).read()
+    assert "- src/ — code" in open(os.path.join(str(tmp_path), "orbital", "INDEX.md"), encoding="utf-8").read()
 
 
 @pytest.mark.asyncio

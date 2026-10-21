@@ -116,7 +116,7 @@ def worker_turn_changed_files(tool_rows: list[dict], workspace: str) -> tuple[li
             shown = path
             if os.path.isabs(shown) and workspace:
                 try:
-                    shown = os.path.relpath(shown, workspace)
+                    shown = os.path.relpath(shown, workspace).replace(os.sep, "/")  # POSIX form on every platform (the row text is prompt bytes)
                 except ValueError:
                     pass
             if shown not in changed:

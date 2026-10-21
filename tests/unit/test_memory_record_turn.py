@@ -326,7 +326,7 @@ async def test_text_reply_end_appends_the_memory_row_and_the_loop_records(tmp_pa
     assert ("edit", {"path": "orbital/PROJECT_STATE.md",
                      "old_text": "- next: write copy",
                      "new_text": "- next: review the copy the user approved"}) in tools.executed
-    with open(os.path.join(str(tmp_path), "orbital", "PROJECT_STATE.md")) as fh:
+    with open(os.path.join(str(tmp_path), "orbital", "PROJECT_STATE.md"), encoding="utf-8") as fh:
         assert "review the copy the user approved" in fh.read()
     # The loop reads what it needs and nothing else: the run began once.
     assert loop._context_manager.begin_run.call_count == 1
