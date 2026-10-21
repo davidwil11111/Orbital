@@ -54,6 +54,11 @@ DEFAULT_PROJECT_FIELDS: dict = {
     # was created under the sandbox — it stays in safe mode (downgrade-safe:
     # an older build ignores the key and sandboxes everything).
     "safe_mode": True,
+    # The project's sticky pin: the worker slug a NEW session in this project
+    # starts pinned to (last choice wins — the session pin PATCH writes it).
+    # None = Orbital's own agent. ``effective_pinned_target`` is derived from
+    # it on read and never stored.
+    "default_pinned_target": None,
 }
 
 # Pre-cards per-project LLM fields (spec 082 §3.7 step 5). They still LOAD —
