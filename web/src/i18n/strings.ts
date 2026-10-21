@@ -855,6 +855,7 @@ export const STRINGS = {
   "sessionItem.deleteConfirm.title": { en: "Delete this session?", zh: "删除此会话？" },
   "sessionItem.kind.attachment": { en: "Attachment", zh: "附件" },
   "sessionItem.kind.fileWatch": { en: "File watch", zh: "监听任务" },
+  "sessionItem.kind.memory": { en: "Memory", zh: "记忆" },
   "sessionItem.kind.queue": { en: "Queue task", zh: "队列任务" },
   "sessionItem.kind.schedule": { en: "Scheduled", zh: "定时任务" },
   "sessionItem.optionsAria": { en: "Options for session {label}", zh: "会话 {label} 的选项" },

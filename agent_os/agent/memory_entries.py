@@ -40,6 +40,7 @@ import hashlib
 import logging
 import os
 import re
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -1600,20 +1601,53 @@ def restore_missing(
     return "\n".join(out), [b.id for b in missing]
 
 
-def conserve_ids(
-    prev: str | None, new: str | None, archive: set[str],
-) -> tuple[str, list[str]]:
-    """Write-path conservation (spec 124 §3.10): an entry that vanished from
-    the file without anything taking its place comes back.
+# The ids of PROJECT_STATE the running loop has seen (its run-start
+# snapshot plus what its own writes produced), bound per task by the loop
+# (``bind_seen_state_ids`` at every snapshot segment). The value is a mutable
+# set so ``process_on_write`` — which runs in a worker thread with a COPY of
+# the context — can add the ids a write just produced. None (no loop, an
+# external writer, the Memory session reading from disk) falls back to the
+# gap rule.
+_SEEN_STATE_IDS: ContextVar[set[str] | None] = ContextVar("orbital_seen_state_ids", default=None)
 
-    A dropped id is left out only when it is in the archive (the writer
-    archived it first) or when a NEW entry was written in the same gap of
-    the file — a reworded line, a replaced status — because that is an
-    overwrite, which PROJECT_STATE's contract asks for. Everything else
-    (a lost update from a stale snapshot, a bare deletion) is restored.
+
+def bind_seen_state_ids(ids) -> Token:
+    """Bind the seen-set for the current task; returns the reset token."""
+    return _SEEN_STATE_IDS.set(set(ids))
+
+
+def unbind_seen_state_ids(token: Token) -> None:
+    _SEEN_STATE_IDS.reset(token)
+
+
+def seen_state_ids() -> set[str] | None:
+    return _SEEN_STATE_IDS.get()
+
+
+def conserve_ids(
+    prev: str | None, new: str | None, archive: set[str], *,
+    key: str = "state", seen: set[str] | None = None,
+) -> tuple[str, list[str]]:
+    """Write-path conservation (spec 124 §3.10): an entry never leaves a live
+    file except through its archive — per file:
+
+    - DECISIONS / LESSONS are STRICT: every id ``prev`` had and ``new`` lacks
+      must be in ``archive``, else its block comes back.
+    - PROJECT_STATE's contract is overwrite, so only ids the writer NEVER SAW
+      are protected: with ``seen`` (the loop's snapshot plus its own writes)
+      an id on disk but outside that set is restored on drop; everything the
+      writer saw may be dropped. Without ``seen`` (an external writer, the
+      Memory session reading from disk) the gap rule applies: a dropped id
+      is left out only when it is archived or a NEW entry was written in the
+      same gap of the file (a reworded line, a replaced status); a lost
+      update from a stale snapshot or a bare deletion is restored.
     """
     if not prev or not new:
         return new or "", []
+    if key in DURABLE_KEYS:
+        return restore_missing(prev, new, archive)
+    if seen is not None:
+        return restore_missing(prev, new, archive | set(seen))
     prev_lines, prev_blocks = state_blocks.parse(prev)
     new_lines, new_blocks = state_blocks.parse(new)
     prev_ids = {b.id for b in prev_blocks if b.id}
@@ -1785,7 +1819,12 @@ def process_on_write(workspace: str, resolved_path: str, content: str, *, today:
         merged, w = stamp(content, prev, key, today=today, archive_ids=ids_in_archive)
         warnings.extend(w)
 
-    merged, restored = conserve_ids(prev, merged, ids_in_archive)
+    seen = seen_state_ids() if key == "state" else None
+    merged, restored = conserve_ids(prev, merged, ids_in_archive, key=key, seen=seen)
+    if seen is not None:
+        # The writer has now seen what it produced (the restored entries it
+        # has not: they came back without its knowledge).
+        seen.update(b.id for b in state_blocks.parse(merged)[1] if b.id and b.id not in restored)
     if restored:
         logger.info(
             "memory write guard: %s dropped %d entr%s not in its archive; restored id=%s",

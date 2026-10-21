@@ -177,27 +177,28 @@ class TestLiveSubAgentDeploymentInstructions:
 
 
 class TestSessionEndConsolidation:
-    """Spec 089: the session-end pass is the memory editor — it chooses by id
-    and never regenerates a file, so existing memory cannot be silently
-    dropped by the pass (the intent these tests always guarded)."""
+    """Spec 124 §3.7: the session-end pass is the Memory session's turn — it
+    moves whole entries into archives and never regenerates a file, so
+    existing memory cannot be silently dropped by the pass (the intent these
+    tests always guarded)."""
 
     def _prompt(self):
         from agent_os.agent import memory_editor
-        return memory_editor.build_prompt(
-            {"state": "- a", "decisions": "", "lessons": "", "index": ""},
-            today="2026-09-19", since=None, sessions=[],
+        return memory_editor.build_task_message(
+            sizes={k: (1, 10, 5) for k in memory_editor.LIVE_KEYS}, folded=[], over=["state"],
+            forced=False, pointer_paths=[], last_pass=None, sessions=[], today="2026-09-19", tool_cap=12,
         )
 
-    def test_editor_prompt_asks_for_choices_by_id_not_files(self):
+    def test_task_asks_for_moves_not_whole_files(self):
         prompt = self._prompt()
-        assert "BY ID" in prompt or "by id" in prompt
+        assert "Move entries intact" in prompt
         assert '"project_state"' not in prompt
         assert "COMPLETE updated" not in prompt
 
-    def test_editor_prompt_never_deletes(self):
-        lower = self._prompt().lower()
-        assert "nothing is ever deleted" in lower
-        assert "never a source of new facts" in lower
+    def test_task_never_deletes_or_invents(self):
+        prompt = self._prompt()
+        assert "Archive only what is no longer true or no longer live" in prompt
+        assert "Never add facts." in prompt
 
 
 # ===========================================================================

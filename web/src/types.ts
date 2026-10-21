@@ -530,11 +530,13 @@ export interface SessionListEntry {
    * the list API (agent_manager.list_sessions). 'chat' is the default for
    * manually started sessions; 'queue' marks dispatcher-minted sessions and
    * drives the queue kind-chip in SessionListItem; 'cold_start' marks the
-   * onboarding session. Trigger-fired sessions are NOT distinguished here
-   * (they arrive as 'chat') — the UI detects them from the '[Triggered by …'
-   * name prefix instead (lib/sessionLabel.ts).
+   * onboarding session; 'memory' is the project's Memory session (spec 124
+   * §3.7: the tidy pass's own session, one per project, named "Memory").
+   * Trigger-fired sessions are NOT distinguished here (they arrive as
+   * 'chat') — the UI detects them from the '[Triggered by …' name prefix
+   * instead (lib/sessionLabel.ts).
    */
-  origin?: 'chat' | 'queue' | 'cold_start';
+  origin?: 'chat' | 'queue' | 'cold_start' | 'memory';
   /**
    * Automation kind (spec 066 4b): 'schedule' / 'file_watch' when a trigger
    * fired this session, else null. Stamped on the session_start meta from the

@@ -93,6 +93,28 @@ describe('classifySessionName', () => {
     expect(r.displayName).toBe('notes.md');
   });
 
+  // ---------------------------------------------------------------- memory
+  it('memory session via origin: the fixed daemon name renders as chip only', () => {
+    const r = classifySessionName('Memory', 'memory');
+    expect(r.kind).toBe('memory');
+    expect(r.displayName).toBeNull();
+  });
+
+  it('memory session without a name is still the memory kind', () => {
+    expect(classifySessionName(null, 'memory')).toEqual({ kind: 'memory', displayName: null });
+  });
+
+  it('renamed memory session keeps the kind and shows the rename', () => {
+    const r = classifySessionName('记忆整理', 'memory');
+    expect(r.kind).toBe('memory');
+    expect(r.displayName).toBe('记忆整理');
+  });
+
+  it('memory origin wins over a machine-looking name', () => {
+    const r = classifySessionName("[Triggered by schedule 'x'", 'memory');
+    expect(r.kind).toBe('memory');
+  });
+
   it('non-leading markup is user text, not a machine prefix', () => {
     const r = classifySessionName("please explain [Triggered by schedule 'x'] syntax");
     expect(r.kind).toBe('plain');

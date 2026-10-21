@@ -211,6 +211,11 @@ class ContextManager:
         # pruning for callers that never call begin_run()).
         self._layer1_snapshot: dict[str, _Layer1Snap] | None = None
         self._run_start_turn: int | None = None
+        # Spec 124 §3.7: Layer-1 rows handed over by another run (the Memory
+        # session starts from the triggering run's ``layer1_snapshot()``).
+        # Consumed by the next ``begin_run()`` — one run only; later runs
+        # read the disk again.
+        self._adopted_layer1: list[tuple[str, str]] | None = None
         self._last_usage_pct: float = 0.0
         self._last_used_tokens: float = 0.0
         self._window_factor: float = 1.0
@@ -433,10 +438,29 @@ class ContextManager:
         only the bytes injected into the prompt are frozen between boundaries.
         """
         self._layer1_snapshot = None
+        if self._adopted_layer1 is not None:
+            self._layer1_snapshot = self._install_adopted(self._adopted_layer1)
+            self._adopted_layer1 = None
         self._run_start_turn = sum(
             1 for m in self._session.get_model_messages()
             if m.get("role") == "assistant"
         )
+
+    def adopt_layer1_snapshot(self, rows: list[tuple[str, str]]) -> None:
+        """Start the NEXT run from these ``(filename, row_text)`` rows instead
+        of rendering the files (spec 124 §3.7): the Memory session injects
+        the triggering run's rows byte-for-byte so its first call rides that
+        run's prefix. The drift note still compares the disk against the
+        bytes as they are now, so a file that changed since is named."""
+        self._adopted_layer1 = list(rows)
+
+    def _install_adopted(self, rows: list[tuple[str, str]]) -> dict[str, _Layer1Snap]:
+        by_name = {filename: row_text for filename, row_text in rows}
+        snapshot: dict[str, _Layer1Snap] = {}
+        for key, filename in _LAYER1_FILES:
+            content = self._workspace_files.read(key) if self._workspace_files is not None else None
+            snapshot[key] = _Layer1Snap(filename, by_name.get(filename), _content_hash(content))
+        return snapshot
 
     def layer1_snapshot(self) -> list[tuple[str, str]]:
         """The current run's injected Layer-1 rows as ``(filename, row_text)``.

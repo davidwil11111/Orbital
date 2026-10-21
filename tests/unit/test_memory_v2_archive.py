@@ -225,28 +225,38 @@ def test_every_archive_write_path_regenerates_the_table(tmp_path):
     ws.write("state", "- live\n[archived 2026-08-03] legacy stub → PROJECT_STATE_ARCHIVE.md\n")
     archive = ws.read("state_archive")
     assert "## [pointers folded " in archive and archive.count(M.CONTENTS_OPEN) == 1
-    # editor apply
+    # the Memory agent's edit (archive first, then the live file) + the
+    # pass's postpass refresh of the INDEX archive line
     ws.write("decisions", "# D\n" + _bullet("retire me", "ret001") + "\n" + _bullet("stay", "stay01") + "\n")
-    import time
-    baselines = {k: WF._stat_mtime_ns(ws._file_path(k)) for k in E.LIVE_KEYS}
-    snapshot = {k: ws.read(k) or "" for k in E.LIVE_KEYS}
-    result = E.apply_choices(ws, {"archive": [{"file": "DECISIONS.md", "id": "ret001"}]},
-                             baselines=baselines, snapshot=snapshot, today=TODAY)
-    assert result.outcome == "edited"
+    WF._append_archive_section(ws, "decisions_archive", f"## [archived {TODAY}]", _bullet("retire me", "ret001"))
+    out = WriteTool(str(tmp_path)).execute(
+        path="orbital/DECISIONS.md", content="# D\n" + _bullet("stay", "stay01") + "\n")
+    assert '"status": "success"' in out.content and "put back" not in out.content
+    WF.refresh_index_archive_lines(ws)
     assert "- id:ret001 · archived 2026-10-20 · retire me" in ws.read("decisions_archive")
     assert "ret001" not in ws.read("decisions") and "[archived" not in ws.read("decisions")
     assert "- orbital/DECISIONS_ARCHIVE.md — 1 archived entry" in ws.read("index")
 
 
 def test_merge_leaves_one_bullet_with_a_fresh_id_and_archives_the_originals(tmp_path):
+    """The merge the task message asks for: the merged entry written in the
+    live file (the daemon stamps it), then the originals moved under a
+    ``[merged DATE into id:<new>]`` section; the write guard lets the two
+    originals go only because the archive has them."""
     ws = _ws(tmp_path)
     ws.write("state", "## Now\n" + _bullet("radar 9/18: none", "r18") + "\n" + _bullet("radar 9/17: none", "r17") + "\n")
-    baselines = {k: WF._stat_mtime_ns(ws._file_path(k)) for k in E.LIVE_KEYS}
     snapshot = {k: ws.read(k) or "" for k in E.LIVE_KEYS}
-    result = E.apply_choices(ws, {"merge": [{"file": "PROJECT_STATE.md", "ids": ["r18", "r17"],
-                                             "text": "- radar 9/17–18: none"}]},
-                             baselines=baselines, snapshot=snapshot, today=TODAY)
-    assert result.outcome == "edited" and result.restored == []
+    originals = "\n".join(b.raw for b in state_blocks.parse(ws.read("state"))[1])
+    tool = WriteTool(str(tmp_path))
+    out = tool.execute(path="orbital/PROJECT_STATE.md",
+                       content="## Now\n- radar 9/17–18: none\n" + originals + "\n")
+    assert '"status": "success"' in out.content
+    new_id = [b.id for b in state_blocks.parse(ws.read("state"))[1] if b.id not in ("r18", "r17")][0]
+    WF._append_archive_section(ws, "state_archive", f"## [merged {TODAY} into id:{new_id}]", originals)
+    merged_only = [b for b in state_blocks.parse(ws.read("state"))[1] if b.id == new_id][0]
+    out = tool.execute(path="orbital/PROJECT_STATE.md", content="## Now\n" + merged_only.raw + "\n")
+    assert '"status": "success"' in out.content and "put back" not in out.content
+    assert WF.postpass_conservation(ws, snapshot, ["state"]) == []
     live = ws.read("state")
     blocks = state_blocks.parse(live)[1]
     assert len(blocks) == 1 and blocks[0].text == "radar 9/17–18: none"
@@ -266,8 +276,9 @@ def test_the_pointer_and_age_machinery_is_gone():
     for name in ("pointer_line", "pointer_summary", "demote_with_pointers", "floor_state",
                  "split_out_pointer_lines", "PROTECT_OLDEST", "ENTRY_MARKERS", "STATE_PROBATION_DAYS"):
         assert not hasattr(M, name), name
-    for name in ("_clean_pointer", "plan_durable", "plan_state", "normalise_ids", "_pointer_summary"):
+    for name in ("_clean_pointer", "plan_durable", "plan_state", "normalise_ids", "_pointer_summary",
+                 "build_prompt", "_SYSTEM", "apply_choices", "plan_entries"):
         assert not hasattr(E, name), name
     import inspect
-    src = inspect.getsource(E.build_prompt)
-    assert "pointer" not in src.lower()
+    src = inspect.getsource(E.build_task_message)
+    assert "pointer_line" not in src.lower()

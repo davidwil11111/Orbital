@@ -69,6 +69,7 @@ const KIND_CHIP_KEY: Partial<Record<SessionKind, StringKey>> = {
   queue: 'sessionItem.kind.queue',
   schedule: 'sessionItem.kind.schedule',
   file_watch: 'sessionItem.kind.fileWatch',
+  memory: 'sessionItem.kind.memory',
 };
 
 function SessionListItemBase({

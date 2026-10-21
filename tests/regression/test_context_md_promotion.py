@@ -102,21 +102,21 @@ class TestIndexMdInLayer1:
 # ---------------------------------------------------------------------------
 
 class TestSessionEndPromptFormat:
-    """Spec 089: the session-end pass is the memory editor. It frames INDEX.md
-    as a navigation map and asks for choices by id — never whole files."""
+    """Spec 124 §3.7: the session-end pass is the Memory session's turn. Its
+    task message frames INDEX.md as folders and topics and never asks for a
+    whole file back."""
 
     def _prompt(self):
         from agent_os.agent import memory_editor
-        return memory_editor.build_prompt(
-            {"state": "", "decisions": "", "lessons": "", "index": "# INDEX\n"},
-            today="2026-09-19", since=None, sessions=[],
+        return memory_editor.build_task_message(
+            sizes={k: (1, 10, 5) for k in memory_editor.LIVE_KEYS}, folded=[], over=["index"],
+            forced=False, pointer_paths=[], last_pass=None, sessions=[], today="2026-09-19", tool_cap=12,
         )
 
-    def test_prompt_defines_index_as_navigation_map(self, tmp_path):
+    def test_prompt_defines_index_as_folders_and_topics(self, tmp_path):
         prompt = self._prompt()
-        assert "INDEX.md" in prompt
-        assert "navigation map" in prompt
-        assert '"index"' in prompt
+        assert "INDEX.md lists folders and topics, not dated files." in prompt
+        assert "INDEX.md is over: merge lines upward into folder or topic lines" in prompt
         assert '"project_state"' not in prompt
 
     def test_prompt_drops_old_entry_cap_and_token_language_for_index(self, tmp_path):

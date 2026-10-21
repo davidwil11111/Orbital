@@ -149,6 +149,19 @@ def _sanitize_project_name(name: str) -> str:
     return s[:30] if s else 'project'
 
 
+# Spec 124 §3.7: how long the pass waits for the triggering run's first LLM
+# call to finish before starting the Memory turn (the call that primes the
+# provider's prefix cache). Generous: a long first call is exactly the case
+# where sharing the prefix pays.
+_MEMORY_TURN_PREFIX_WAIT_S = 300.0
+
+
+def _is_memory_session(session) -> bool:
+    """Spec 124 §3.7: a session born with origin ``memory`` is the project's
+    Memory session — the pass's own session, run beside the slot."""
+    return getattr(session, "origin", None) == "memory"
+
+
 @dataclass
 class ProjectHandle:
     session: object
@@ -1003,8 +1016,15 @@ class AgentManager:
                           queue_state: str = "chat",
                           session: "Session | None" = None,
                           cold_start: bool = False,
-                          cold_start_skeleton: str | None = None) -> None:
+                          cold_start_skeleton: str | None = None,
+                          layer1_rows: list[tuple[str, str]] | None = None,
+                          cache_session_id: str | None = None) -> None:
         """Wire all components and start the loop.
+
+        ``layer1_rows`` / ``cache_session_id`` are for the Memory session
+        (spec 124 §3.7, ``run_memory_turn``): the triggering run's Layer-1
+        rows, injected byte-for-byte, and that run's session id, which the
+        gateway session header carries so the provider prefix is shared.
 
         ``session_id`` is the canonical session id (seam 3 / D1+D2: id == uuid
         == handle key, no "default" sentinel). Resolution:
@@ -1036,7 +1056,11 @@ class AgentManager:
         # triggers, and internal auto-starts. session_id is already resolved
         # (None → DEFAULT_SESSION_ID above), so a None-session caller is checked
         # too. See REPORT-subagent-leak-and-slot-gap.md Q4.
-        holder = self.current_holder_session_id(project_id)
+        # Spec 124 §3.7: the Memory session (origin "memory") is the one
+        # loop allowed beside the slot — single-flight per project through
+        # memory_editor.claim, never through the holder.
+        is_memory = _is_memory_session(session)
+        holder = None if is_memory else self.current_holder_session_id(project_id)
         if holder is not None and holder != session_id:
             raise ValueError(f"Slot held by session {holder}")
 
@@ -1274,7 +1298,35 @@ class AgentManager:
                 session_uuid=session.session_uuid,
                 project_id=project_id,
                 list_sessions=lambda: self.list_sessions(project_id),
+                run_turn=_memory_turn_runner("session_end"),
+                trigger="session_end",
             )
+
+        def _memory_turn_runner(trigger_name: str):
+            """The pass's LLM step (spec 124 §3.7): one turn of the project's
+            Memory session. While THIS run is still live its Layer-1 rows
+            are handed over byte-for-byte (and its session id for the
+            gateway's routing header) so the first call rides this run's
+            prefix; otherwise the Memory session renders the files itself."""
+            async def run_turn(task_text: str):
+                # The prefix only exists on the provider once THIS run's
+                # first call has been served (the trigger fires inside that
+                # call's prepare()). Wait for it, bounded; a run that ends
+                # first just means the Memory session renders from disk.
+                await self._wait_for_first_call(sk, _MEMORY_TURN_PREFIX_WAIT_S)
+                h = self._handles.get(sk)
+                live = (h is not None and h.loop is not None
+                        and bool(getattr(h.loop, "is_running", False)))
+                rows = None
+                if live:
+                    snap = getattr(h.context_manager, "layer1_snapshot", None)
+                    rows = snap() if callable(snap) else None
+                return await self.run_memory_turn(
+                    project_id, task_text, trigger=trigger_name,
+                    layer1_rows=rows or None,
+                    cache_session_id=session.session_uuid if live else None,
+                )
+            return run_turn
 
         # 11a. Memory-pass callback (over-budget / agent-decided /
         # token-pressure triggers) — runs the memory editor then the size
@@ -1311,6 +1363,8 @@ class AgentManager:
                     list_sessions=lambda: self.list_sessions(project_id),
                     # An explicit checkpoint_state runs even under budget.
                     force=trigger_name in ("agent_decided", "agent_decided_coalesced"),
+                    run_turn=_memory_turn_runner(trigger_name),
+                    trigger=trigger_name,
                 )
                 self._broadcast(project_id, {
                     "type": "state_refresh.lifecycle",
@@ -1417,6 +1471,7 @@ class AgentManager:
                 )
 
         # 12. Loop
+        from agent_os.agent import memory_editor as _memory_editor
         loop = AgentLoop(
             session, provider, registry, context_manager, interceptor,
             utility_provider=utility_provider,
@@ -1429,7 +1484,9 @@ class AgentManager:
             token_budget=config.token_budget,
             get_budget_config=get_budget_config,
             on_session_end=session_end_callback,
-            on_session_end_refresh=session_end_refresh_callback,
+            # The Memory session never schedules a pass of its own (spec 124
+            # §3.7): its over-budget writes are the pass.
+            on_session_end_refresh=None if is_memory else session_end_refresh_callback,
             # Per-project token ledger root: resolved by ProjectPaths to
             # {workspace}/orbital/ledger/usage.jsonl. Also the dir the
             # pre-flight guard reads ledger spend from.
@@ -1439,7 +1496,22 @@ class AgentManager:
             on_budget_event=emit_budget_event,
             # Card health sink (spec 082 §3.5) — 401/402/403 only.
             on_credential_error=record_credential_error,
+            # Spec 124 §3.7 — the Memory session: no record turn, edit/write
+            # confined to orbital/*.md, the turn ends at the tool cap.
+            memory_record_enabled=not is_memory,
+            tool_guard=_memory_editor.memory_tool_guard(config.workspace) if is_memory else None,
+            tool_call_cap=_memory_editor.EDITOR_MAX_CALLS if is_memory else None,
         )
+        if is_memory:
+            loop._cache_session_id = cache_session_id
+            self._apply_memory_session_traits(
+                [provider, utility_provider, auth_fallback_provider, *fallback_providers],
+                cache_session_id,
+            )
+            if layer1_rows:
+                adopt = getattr(context_manager, "adopt_layer1_snapshot", None)
+                if callable(adopt):
+                    adopt(layer1_rows)
 
         # 12-queue. When the dispatcher starts a session to run a queue item it
         # passes queue_state="running" so the loop enforces the queue
@@ -2494,7 +2566,8 @@ class AgentManager:
         return resolved, self._load_session_from_disk(project_id, resolved)
 
     def _start_rejection(self, project_id: str,
-                         session_id: str) -> ValueError | None:
+                         session_id: str,
+                         session: "Session | None" = None) -> ValueError | None:
         """Return the ``ValueError`` ``start_agent`` would raise for this
         session right now, or None if the start would be admitted.
 
@@ -2510,6 +2583,8 @@ class AgentManager:
         handle = self._handles.get(make_session_key(project_id, session_id))
         if handle is not None and handle.task is not None and not handle.task.done():
             return ValueError("Agent already running for this project")
+        if _is_memory_session(session):
+            return None          # spec 124 §3.7: runs beside the slot
         holder = self.current_holder_session_id(project_id)
         if holder is not None and holder != session_id:
             return ValueError(f"Slot held by session {holder}")
@@ -2550,7 +2625,7 @@ class AgentManager:
         # not a failure: the inject route turns it into a 202 and enqueues the
         # message as a pending inject (spec 006), which appends it for real
         # when the slot frees. Persisting here as well would render it twice.
-        rejection = self._start_rejection(project_id, session_id)
+        rejection = self._start_rejection(project_id, session_id, session)
         if rejection is not None:
             raise rejection
 
@@ -2923,6 +2998,150 @@ class AgentManager:
             return False
         return handle.task is not None and not handle.task.done()
 
+    # ── Spec 124 §3.7: the Memory session ───────────────────────────────
+
+    MEMORY_SESSION_NAME = "Memory"
+
+    def memory_session(self, project_id: str) -> "Session | None":
+        """The project's one Memory session (origin ``memory``, named
+        "Memory"): the live handle's session, else the one on disk, else a
+        freshly minted one (materialised on its first row). None when the
+        project has no workspace."""
+        project = self._project_store.get_project(project_id) if self._project_store else None
+        workspace = (project or {}).get("workspace", "") if project else ""
+        if not workspace:
+            return None
+        for (pid, _sid), handle in self._handles.items():
+            if pid == project_id and _is_memory_session(handle.session):
+                return handle.session
+        for entry in self.list_sessions(project_id):
+            if entry.get("origin") != "memory" or not entry.get("session_uuid"):
+                continue
+            loaded = self._load_session_from_disk(project_id, entry["session_uuid"])
+            if loaded is not None:
+                return loaded
+        uuid = self._mint_session_uuid(project_id)
+        provider = model = sdk = "unknown"
+        try:
+            cfg = self._build_agent_config_from_project(project_id)
+            provider, model, sdk = cfg.provider, cfg.model, cfg.sdk
+        except Exception:  # noqa: BLE001 — identity meta is best effort
+            pass
+        session = Session.new(
+            uuid, workspace, session_id=uuid, provider=provider, model=model,
+            sdk=sdk, origin="memory",
+        )
+        session.set_name(self.MEMORY_SESSION_NAME)
+        return session
+
+    @staticmethod
+    def _loop_providers(loop) -> list:
+        return [getattr(loop, "_provider", None), getattr(loop, "_utility_provider", None),
+                getattr(loop, "_auth_fallback_provider", None),
+                *(getattr(loop, "_fallback_providers", None) or [])]
+
+    async def _wait_for_first_call(self, sk, timeout_s: float) -> None:
+        """Block until the loop under ``sk`` has completed one LLM call in
+        its current run (its prefix is then cached provider-side), or it is
+        no longer running, or ``timeout_s`` elapses."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            h = self._handles.get(sk)
+            loop = getattr(h, "loop", None) if h is not None else None
+            if loop is None or not getattr(loop, "is_running", False):
+                return
+            stats = getattr(loop, "last_run_stats", None) or {}
+            if int(stats.get("llm_calls") or 0) >= 1:
+                return
+            await asyncio.sleep(0.5)
+
+    @staticmethod
+    def _apply_memory_session_traits(providers, cache_sid: str | None) -> None:
+        """Stamp the Memory session's providers: ``caller=memory`` on their
+        cache-audit lines and, when the pass was triggered by a live run,
+        that run's session id on the gateway routing header (OpenCode Go
+        keys its prefix cache by it)."""
+        for prov in providers:
+            if prov is None:
+                continue
+            try:
+                prov.cache_audit_caller = "memory"
+            except Exception:  # noqa: BLE001 — a stand-in provider
+                pass
+            bind = getattr(prov, "bind_session_id", None)
+            if cache_sid and callable(bind):
+                bind(lambda _sid=cache_sid: _sid)
+
+    async def run_memory_turn(self, project_id: str, task_text: str, *,
+                              trigger: str = "over_budget",
+                              layer1_rows: list[tuple[str, str]] | None = None,
+                              cache_session_id: str | None = None):
+        """The pass's LLM step (spec 124 §3.7): append ``task_text`` to the
+        project's Memory session as a daemon user row, run ONE bounded turn
+        of its loop (started beside the slot, or hot-resumed), wait for it,
+        and report the turn's numbers. Returns None when the Memory session
+        is busy (the user is mid-turn there) or the project has none."""
+        from agent_os.agent import memory_editor as _memory_editor
+
+        session = self.memory_session(project_id)
+        if session is None:
+            return None
+        sk = make_session_key(project_id, session.session_uuid)
+        handle = self._handles.get(sk)
+        if handle is not None and handle.task is not None and not handle.task.done():
+            logger.info("memory session: busy with a turn; pass declined (project=%s)", project_id)
+            return None
+        config = await self._abuild_agent_config_from_project(project_id)
+        if self._handles.get(sk) is not handle:
+            return None     # started meanwhile (a user message); not ours
+        self._wire_session_observers(session, project_id, session.session_uuid)
+        session.append({
+            "role": "user",
+            "content": task_text,
+            "source": "daemon",
+            "_meta": {"event": "memory_task", "trigger": trigger},
+        })
+        mode = "snapshot" if layer1_rows else "disk"
+        if handle is not None:
+            if layer1_rows:
+                adopt = getattr(handle.context_manager, "adopt_layer1_snapshot", None)
+                if callable(adopt):
+                    adopt(layer1_rows)
+            handle.loop._cache_session_id = cache_session_id
+            self._apply_memory_session_traits(
+                [handle.provider, *self._loop_providers(handle.loop)[1:]], cache_session_id)
+            await self._start_loop(project_id, session_id=session.session_uuid)
+        else:
+            await self.start_agent(
+                project_id, config, session=session, session_id=session.session_uuid,
+                layer1_rows=layer1_rows, cache_session_id=cache_session_id,
+            )
+        handle = self._handles.get(sk)
+        task = handle.task if handle is not None else None
+        ended = "not_started"
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    raise            # the pass itself was cancelled
+                ended = "cancelled"  # the user stopped the Memory session
+            except Exception:        # noqa: BLE001 — recorded by _on_loop_done
+                ended = "error"
+        stats = dict(getattr(getattr(handle, "loop", None), "last_run_stats", None) or {})
+        provider = getattr(handle, "provider", None) if handle is not None else None
+        return _memory_editor.TurnResult(
+            mode=mode,
+            llm_calls=int(stats.get("llm_calls") or 0),
+            tool_calls=int(stats.get("tool_calls") or 0),
+            input_tokens=int(stats.get("input_tokens") or 0),
+            cached_tokens=int(stats.get("cached_tokens") or 0),
+            output_tokens=int(stats.get("output_tokens") or 0),
+            ended=str(stats.get("ended") or ended),
+            provider=str(getattr(provider, "provider", "") or getattr(config, "provider", "") or ""),
+            model=str(getattr(provider, "model", "") or getattr(config, "model", "") or ""),
+        )
+
     def current_holder_session_id(self, project_id: str) -> str | None:
         """Return the F1 ``session_id`` that currently holds the project's
         active-loop slot, or None if no session in the project is running.
@@ -2958,6 +3177,10 @@ class AgentManager:
         """
         for (pid, sid), handle in self._handles.items():
             if pid != project_id:
+                continue
+            # Spec 124 §3.7: the Memory session runs beside the slot, never
+            # in it — a tidy pass must not block the user's next message.
+            if _is_memory_session(handle.session):
                 continue
             # Condition 1: main loop active.
             if handle.task is not None and not handle.task.done():
@@ -5714,6 +5937,9 @@ class AgentManager:
                 "_start_loop(%s): live-resolved LLM provider -> %s/%s",
                 project_id, fresh_cfg.provider, fresh_cfg.model,
             )
+            if _is_memory_session(handle.session):
+                self._apply_memory_session_traits(
+                    self._loop_providers(loop), getattr(loop, "_cache_session_id", None))
         else:
             if fresh_cfg is not None:
                 fresh_key = fresh_cfg.api_key

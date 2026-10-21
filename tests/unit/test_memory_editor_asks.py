@@ -2,13 +2,14 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Spec 089 v2 §6: the memory editor may close an ask only with the user's words.
+"""Spec 089 v2 §6 under spec 124 §3.7: the Memory session may close an ask
+only with the user's words.
 
-The editor sees the open asks and the sessions since its last run. It may
-close an ask it can quote the user answering; the daemon checks that the quote
-is verbatim in a USER message of the session it cites before appending
-``done <id> … by:editor "<quote>"`` through the asks module. Anything else is
-rejected and the ask stays open.
+The editor's ``close_asks`` JSON field is gone; the Memory session edits
+``orbital/ASKS.md`` itself. Two things keep the rule: the task message
+states it, and the ASKS write chokepoint (``asks.process_write``, reached
+through the write tool like every other ``orbital/*.md`` write) appends the
+close stamped ``by:agent`` and warns when no user words are quoted.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import pytest
 from agent_os.agent import asks
 from agent_os.agent import memory_editor as E
 from agent_os.agent.project_paths import ProjectPaths
+from agent_os.agent.tools.write import WriteTool
 from agent_os.agent.workspace_files import WorkspaceFileManager
 
 TODAY = "2026-09-19"
@@ -52,8 +54,6 @@ def ws(tmp_path):
     with open(os.path.join(sessions, "proj_aaaa1111.jsonl"), "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    with open(os.path.join(sessions, "proj_bbbb2222.jsonl"), "w", encoding="utf-8") as f:
-        f.write(json.dumps({"role": "user", "content": "unrelated", "source": "user"}) + "\n")
     return workspace, orbital, ask.id
 
 
@@ -61,99 +61,38 @@ def _state(orbital, ask_id):
     return {a.id: a for a in asks.read_asks(orbital)}[ask_id]
 
 
-def test_close_with_a_verbatim_user_quote(ws):
+def test_task_message_states_the_quote_rule():
+    text = E.build_task_message(
+        sizes={k: (1, 10, 5) for k in E.LIVE_KEYS}, folded=[], over=["state"], forced=False,
+        pointer_paths=[], last_pass=None, sessions=[], today=TODAY, tool_cap=12,
+    )
+    assert ("- Close an ask in orbital/ASKS.md only with the user's own words quoted, as\n"
+            "  that file's header says.\n") in text
+
+
+def test_the_memory_session_closes_an_ask_through_the_write_tool(ws):
     workspace, orbital, ask_id = ws
-    applied, rejected = E.apply_ask_closes(workspace, orbital, [
-        {"id": ask_id, "session": "proj_aaaa1111",
-         "quote": "the webinar will be in English, final"},
-    ], today=TODAY)
-    assert rejected == []
-    assert applied == [{"kind": "close_ask", "id": ask_id, "session": "proj_aaaa1111"}]
+    assert E.memory_tool_guard(workspace)({"name": "write", "arguments": {"path": "orbital/ASKS.md"}}) is None
+    current = open(os.path.join(orbital, "ASKS.md"), encoding="utf-8").read()
+    out = WriteTool(workspace).execute(
+        path="orbital/ASKS.md",
+        content=current + f'- done {ask_id} "the webinar will be in English, final"\n',
+    )
+    assert '"status": "success"' in out.content
     ask = _state(orbital, ask_id)
-    assert ask.state == "done" and ask.closed_by == "editor"
+    assert ask.state == "done" and ask.closed_by == "agent"
     assert '"the webinar will be in English, final"' in ask.note
 
 
-def test_quote_matching_ignores_whitespace_differences(ws):
+def test_a_close_without_the_users_words_is_warned_about(ws):
     workspace, orbital, ask_id = ws
-    applied, _ = E.apply_ask_closes(workspace, orbital, [
-        {"id": ask_id, "session": "proj_aaaa1111",
-         "quote": "the webinar  will be\nin English, final"},
-    ], today=TODAY)
-    assert len(applied) == 1
+    current = open(os.path.join(orbital, "ASKS.md"), encoding="utf-8").read()
+    out = WriteTool(workspace).execute(path="orbital/ASKS.md", content=current + f"- done {ask_id} settled\n")
+    assert "without quoting the user" in out.content
 
 
-@pytest.mark.parametrize("item, why", [
-    ({"session": "proj_aaaa1111", "quote": "English it is"}, "assistant words"),
-    ({"session": "proj_bbbb2222", "quote": "the webinar will be in English"}, "other session"),
-    ({"session": "proj_missing", "quote": "the webinar will be in English"}, "missing session"),
-    ({"session": "../proj_aaaa1111", "quote": "the webinar will be in English"}, "path escape"),
-    ({"session": "proj_aaaa1111", "quote": ""}, "empty quote"),
-    ({"session": "proj_aaaa1111", "quote": "x" * 600}, "quote too long"),
-])
-def test_rejected_closes_leave_the_ask_open(ws, item, why):
+def test_the_append_only_guard_restores_a_dropped_open_line(ws):
     workspace, orbital, ask_id = ws
-    applied, rejected = E.apply_ask_closes(workspace, orbital, [{"id": ask_id, **item}],
-                                           today=TODAY)
-    assert applied == [], why
-    assert len(rejected) == 1, why
-    assert _state(orbital, ask_id).state == "open", why
-
-
-def test_unknown_and_already_closed_ids_are_rejected(ws):
-    workspace, orbital, ask_id = ws
-    asks.append_event(orbital, "done", ask_id, "by user", "user", today=TODAY)
-    applied, rejected = E.apply_ask_closes(workspace, orbital, [
-        {"id": ask_id, "session": "proj_aaaa1111", "quote": "in English, final"},
-        {"id": "ffffff", "session": "proj_aaaa1111", "quote": "in English, final"},
-        "not an object",
-    ], today=TODAY)
-    assert applied == []
-    assert len(rejected) == 3
-    assert _state(orbital, ask_id).closed_by == "user"
-
-
-def test_no_close_asks_key_is_a_no_op(ws):
-    workspace, orbital, ask_id = ws
-    assert E.apply_ask_closes(workspace, orbital, None, today=TODAY) == ([], [])
+    out = WriteTool(workspace).execute(path="orbital/ASKS.md", content="# ASKS\n")
+    assert '"status": "success"' in out.content
     assert _state(orbital, ask_id).state == "open"
-
-
-def test_prompt_lists_open_asks_only_when_there_are_some(ws):
-    workspace, orbital, ask_id = ws
-    contents = {k: "" for k in E.LIVE_KEYS}
-    open_asks = [a for a in asks.read_asks(orbital) if a.is_open]
-    with_asks = E.build_prompt(contents, today=TODAY, since=None, sessions=[],
-                               open_asks=open_asks)
-    assert f"[{ask_id}] Decide the webinar language" in with_asks
-    assert '"close_asks"' in with_asks
-    without = E.build_prompt(contents, today=TODAY, since=None, sessions=[])
-    assert "OPEN ASKS" not in without
-
-
-@pytest.mark.asyncio
-async def test_run_editor_applies_a_quote_backed_close(ws):
-    from types import SimpleNamespace
-
-    workspace, orbital, ask_id = ws
-    reply = json.dumps({"close_asks": [
-        {"id": ask_id, "session": "proj_aaaa1111", "quote": "the webinar will be in English, final"},
-    ]})
-
-    class _LLM:
-        model = "fake"
-
-        def __init__(self):
-            self.prompts = []
-
-        async def complete(self, messages, tools=None, **_kw):
-            self.prompts.append(messages[-1]["content"])
-            return SimpleNamespace(text=reply, raw_message={"role": "assistant", "content": reply},
-                                   tool_calls=[], has_tool_calls=False)
-
-    llm = _LLM()
-    result = await E.run_editor(WorkspaceFileManager(workspace), llm, today=TODAY)
-    assert f"[{ask_id}]" in llm.prompts[0]
-    assert result.outcome == "edited"
-    assert {"kind": "close_ask", "id": ask_id, "session": "proj_aaaa1111"} in result.applied
-    assert _state(orbital, ask_id).closed_by == "editor"

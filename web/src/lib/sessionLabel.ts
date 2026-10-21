@@ -20,6 +20,10 @@
  *   attachment"<attached_files>\n- path (mime, size)…"
  *             (agent_os/api/routes/_attachment_formatter.py — the file
  *             basename is recoverable)
+ *   memory    the project's Memory session (spec 124 §3.7): origin
+ *             `memory`, named "Memory" by the daemon; the chip carries the
+ *             kind, so the fixed name renders as chip only and a user
+ *             rename shows as the label.
  *
  * All patterns must tolerate mid-token truncation: the stored name is capped
  * at 50 chars, so closing quotes/brackets may be missing and a `…` may sit
@@ -31,7 +35,7 @@
  * signal is the origin field, and the renamed text then wins as the label.
  */
 
-export type SessionKind = 'plain' | 'queue' | 'schedule' | 'file_watch' | 'attachment';
+export type SessionKind = 'plain' | 'queue' | 'schedule' | 'file_watch' | 'attachment' | 'memory';
 
 export interface SessionLabelInfo {
   kind: SessionKind;
@@ -45,6 +49,8 @@ export interface SessionLabelInfo {
   detail?: string;
 }
 
+/** The daemon's fixed name for a project's Memory session (agent_manager.py). */
+const MEMORY_SESSION_NAME = 'Memory';
 const TRIGGER_RE = /^\[Triggered by (schedule|file_watch) '([^'\n]*)/;
 const QUEUE_RE = /^\[QUEUE ITEM/;
 const ATTACHED_RE = /^<attached_files>/;
@@ -79,6 +85,10 @@ export function classifySessionName(
   origin?: string,
 ): SessionLabelInfo {
   const n = (name ?? '').trim();
+
+  if (origin === 'memory') {
+    return { kind: 'memory', displayName: n && n !== MEMORY_SESSION_NAME ? n : null };
+  }
 
   const isQueue = origin === 'queue' || QUEUE_RE.test(n);
 

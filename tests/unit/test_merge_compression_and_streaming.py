@@ -9,24 +9,22 @@ file bigger than it started and archived nothing — the prompt stated the
 target but never the file's CURRENT size, so the model always concluded it was
 fine. (The second defect of that incident — a 15-minute non-streaming
 whole-file merge dropping its connection — went away with the whole-file
-merge: the memory editor's replies are short id lists.)
+merge: the Memory session's turn is bounded by the daemon's tool cap.)
 
 Invariants:
   - consolidation_target(key) sits a real margin BELOW the soft budget, so a
     pass that lands on target does not re-trip the flag on the next append.
-  - The editor prompt carries MEASURED sizes and an explicit amount to cut.
-  - The floor never moves an entry (spec 124): when the editor declines the
+  - The task message carries MEASURED sizes, the soft budget and the target,
+    and names the over-budget file as the thing to work on.
+  - The floor never moves an entry (spec 124): when the turn declines the
     file stays whole and the injected view folds instead.
 """
 
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from tests.testutils import streamable
 
 from agent_os.agent import memory_editor
 from agent_os.agent import memory_entries as _mem
@@ -36,24 +34,12 @@ from agent_os.agent.workspace_files import (
     run_session_end_routine,
 )
 
-
-def _mock_session(session_id="sess_compress"):
-    session = MagicMock()
-    session.session_id = session_id
-    session.session_uuid = session_id
-    session.get_messages.return_value = []
-    return session
+TODAY = "2026-10-21"
 
 
-def _declining_editor():
-    """An editor model that looks and chooses nothing."""
-    provider = streamable(AsyncMock())
-    resp = MagicMock()
-    resp.text = "{}"
-    resp.raw_message = {"role": "assistant", "content": "{}"}
-    resp.tool_calls = []
-    provider.complete.return_value = resp
-    return provider
+async def _declining_turn(task_text):
+    """A Memory turn that looks and changes nothing."""
+    return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=2, ended="text_complete")
 
 
 @pytest.fixture(autouse=True)
@@ -78,10 +64,13 @@ def _over_soft_workspace(tmp_path) -> WorkspaceFileManager:
     return ws
 
 
-def _prompt(ws) -> str:
-    return memory_editor.build_prompt(
-        {k: ws.read(k) or "" for k in memory_editor.LIVE_KEYS},
-        today="2026-09-19", since=None, sessions=[],
+def _task(ws) -> str:
+    sizes = memory_editor._sizes(ws)
+    over = [k for k in memory_editor.LIVE_KEYS if _mem.over_soft_budget(ws.read(k), k)]
+    return memory_editor.build_task_message(
+        sizes=sizes, folded=memory_editor._folded(ws), over=over, forced=False,
+        pointer_paths=[], last_pass=None, sessions=[], today=TODAY,
+        tool_cap=memory_editor.EDITOR_MAX_CALLS,
     )
 
 
@@ -114,41 +103,43 @@ def test_target_is_below_soft_for_every_layer1_file():
 
 
 # ---------------------------------------------------------------------------
-# 2. The editor prompt states MEASURED sizes and an explicit amount to cut
+# 2. The task message states MEASURED sizes, the budget and the target
 # ---------------------------------------------------------------------------
 
-def test_prompt_states_measured_size_and_quota_for_over_budget_files(tmp_path):
+def test_task_states_measured_size_budget_and_target_for_over_budget_files(tmp_path):
     ws = _over_soft_workspace(tmp_path)
-    prompt = _prompt(ws)
+    task = _task(ws)
 
-    dec_now = _mem.est_tokens(_mem._budget_text(ws.read("decisions"), "decisions"))
+    dec_now = int(_mem.est_tokens(_mem._budget_text(ws.read("decisions"), "decisions")))
+    dec_soft = _mem.FILE_BUDGETS["decisions"]["soft"]
     dec_target = _mem.consolidation_target("decisions")
 
-    assert "exact counts" in prompt
-    assert f"{int(dec_now)} tokens" in prompt
-    assert f"target {dec_target}" in prompt
-    assert f"cut ~{int(dec_now) - dec_target}" in prompt
+    assert "SIZES (bullet lines only" in task
+    assert f"- DECISIONS.md: {dec_now:,} tokens (soft {dec_soft:,}, target {dec_target:,}) — OVER" in task
+    assert "DECISIONS.md is over" in task and "LESSONS.md is over" in task
 
 
-def test_prompt_does_not_ask_the_model_to_estimate_its_own_size(tmp_path):
+def test_task_does_not_ask_the_model_to_estimate_its_own_size(tmp_path):
     """The '(~4 chars/token)' self-estimate is what made archiving never fire."""
-    assert "4 chars/token" not in _prompt(_over_soft_workspace(tmp_path))
+    assert "4 chars/token" not in _task(_over_soft_workspace(tmp_path))
 
 
-def test_prompt_marks_within_target_files_as_needing_no_action(tmp_path):
+def test_task_marks_within_budget_files_as_within(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.ensure_dir()
     ws.write("decisions", "- 2026-07-01: Tiny. Chose A.\n")
-    assert "within target" in _prompt(ws).lower()
+    task = _task(ws)
+    assert "- DECISIONS.md: " in task and "— within" in task and "DECISIONS.md is over" not in task
+    assert "Never force cuts." in task
 
 
 # ---------------------------------------------------------------------------
-# 4. When the editor declines, the floor moves nothing — the view folds
+# 4. When the turn declines, the floor moves nothing — the view folds
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_a_declining_editor_leaves_the_file_whole_and_the_view_folds(tmp_path, caplog):
-    """An editor that archives nothing leaves the file over budget on disk
+async def test_a_declining_turn_leaves_the_file_whole_and_the_view_folds(tmp_path, caplog):
+    """A turn that archives nothing leaves the file over budget on disk
     (archiving is its judgement, never the daemon's); the injected view
     folds the overflow and the floor logs it."""
     ws = _over_soft_workspace(tmp_path)
@@ -156,10 +147,11 @@ async def test_a_declining_editor_leaves_the_file_whole_and_the_view_folds(tmp_p
     assert _mem.over_soft_budget(before, "decisions")  # guard
 
     with caplog.at_level(logging.INFO):
-        await run_session_end_routine(
-            _mock_session("s_floor"), _declining_editor(), ws, session_uuid="s_floor"
+        out = await run_session_end_routine(
+            None, None, ws, session_uuid="s_floor", run_turn=_declining_turn,
         )
 
+    assert out == "no_change"
     assert ws.read("decisions") == before
     assert not ws.exists("decisions_archive")
     # over soft, under hard: the floor has nothing to say, the view injects

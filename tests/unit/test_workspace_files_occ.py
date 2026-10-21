@@ -2,38 +2,35 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Unit tests for OCC protection of the Layer-1 files during a memory pass.
+"""Unit tests: concurrent writes during a memory pass.
 
-Verifies the Optimistic Concurrency Control that protects PROJECT_STATE.md,
-DECISIONS.md, LESSONS.md and INDEX.md from being clobbered when the agent, the
-user, or any other writer edits one of them while the memory editor's model
-calls are in flight (spec 089 §4.2: OCC per file).
+Under spec 124 §3.7 the pass shell writes no live file itself: the Memory
+session edits with the exact-match ``edit`` tool (OCC by construction — a
+file that changed under it makes the edit fail, and the agent re-reads), and
+the shell only puts back entries that left a live file without reaching the
+archive and keeps INDEX's archive lines. So a user's or another writer's
+edit that lands while the turn runs is still on disk afterwards.
 
-Pattern under test:
-  1. capture st_mtime_ns of each Layer-1 file BEFORE the editor's first call
-  2. the editor returns choices by id
-  3. re-stat just before writing each file (no await in between)
-  4. unchanged: append the moved entries to the archive, then write the file
-  5. changed: skip that file (its archive untouched) with a structured
-     WARNING carrying project_id, file_path, baseline_mtime, observed_mtime,
-     cache_thrash_telemetry=True — the other files still apply
+``_occ_write_metadata`` (the mtime-gated metadata write) is still a helper
+for callers that write whole files; its abort message must say WHO wrote.
 """
 
-import json
 import logging
 import os
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from tests.testutils import streamable
-
 from agent_os.agent import memory_editor
+from agent_os.agent import memory_entries as _mem
+from agent_os.agent import state_blocks
 from agent_os.agent import workspace_files as wsf_module
 from agent_os.agent.workspace_files import (
     WorkspaceFileManager,
     run_session_end_routine,
 )
+
+TODAY = "2026-10-21"
 
 
 # ---------------------------------------------------------------------------
@@ -48,16 +45,8 @@ def _mock_session(session_id="sess_occ"):
     return session
 
 
-def _resp(payload: dict):
-    resp = MagicMock()
-    resp.text = json.dumps(payload)
-    resp.raw_message = {"role": "assistant", "content": resp.text}
-    resp.tool_calls = []
-    return resp
-
-
-def _seed(ws) -> dict:
-    """Four Layer-1 files, each with one entry the editor will archive."""
+def _seed(ws) -> None:
+    """Four Layer-1 files, each with one entry the turn will archive."""
     ws.write("state", "## Now\n- state entry to archive\n- state entry to keep\n")
     ws.write("decisions", (
         "- Keep A\n  <!--mem id:keep-a created:2026-08-01 touched:2026-08-01-->\n  x\n\n"
@@ -69,27 +58,28 @@ def _seed(ws) -> dict:
         "- Archive this.\n  <!--mem id:les-go created:2026-08-01 touched:2026-08-01-->\n"
     ))
     ws.write("index", "# INDEX\n- a.md — a\n")
-    state_id = ws.read("state").split("id:")[1].split()[0]
-    return {"archive": [
-        {"file": "PROJECT_STATE.md", "id": state_id, "pointer": "p1"},
-        {"file": "DECISIONS.md", "id": "dec-go", "pointer": "p2"},
-        {"file": "LESSONS.md", "id": "les-go", "pointer": "p3"},
-    ], "index": "# INDEX\n- b.md — b\n"}
 
 
-def _bump_mtime_by(path: str, delta_seconds: float = 5.0) -> int:
-    st = os.stat(path)
-    os.utime(path, (st.st_atime + delta_seconds, st.st_mtime + delta_seconds))
-    return os.stat(path).st_mtime_ns
+def _archive(ws, key, eid):
+    live = ws.read(key)
+    b = [b for b in state_blocks.parse(live)[1] if b.id == eid][0]
+    wsf_module._append_archive_section(ws, _mem.ARCHIVE_OF[key], f"## [archived {TODAY}]", b.raw)
+    ws.write(key, live.replace(b.raw + "\n", ""))
 
 
-def _provider_that(side_effect=None, payload=None):
-    provider = streamable(AsyncMock())
-    if side_effect is not None:
-        provider.complete.side_effect = side_effect
-    else:
-        provider.complete.return_value = _resp(payload)
-    return provider
+def _turn_that(ws, during=None):
+    """A Memory turn that archives one entry per file and rewrites INDEX,
+    after ``during`` (the concurrent writer) has run."""
+    async def run_turn(task_text):
+        if during is not None:
+            during()
+        state_id = ws.read("state").split("id:")[1].split()[0]
+        _archive(ws, "state", state_id)
+        _archive(ws, "decisions", "dec-go")
+        _archive(ws, "lessons", "les-go")
+        ws.write("index", "# INDEX\n- b.md — b\n")
+        return memory_editor.TurnResult(mode="disk", llm_calls=2, tool_calls=7, ended="text_complete")
+    return run_turn
 
 
 @pytest.fixture(autouse=True)
@@ -100,139 +90,117 @@ def _reset_module_state():
     wsf_module._completed_session_ends.clear()
 
 
-async def _run(ws, provider, sid, project_id):
+async def _run(ws, run_turn, sid, project_id):
     return await run_session_end_routine(
-        _mock_session(sid), provider, ws,
-        session_uuid=sid, project_id=project_id, force=True,
+        _mock_session(sid), None, ws,
+        session_uuid=sid, project_id=project_id, force=True, run_turn=run_turn,
     )
 
 
 # ---------------------------------------------------------------------------
-# 1. clean baseline → every chosen edit lands
+# 1. clean baseline → every move lands
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_clean_baseline_writes_all_layer1_files(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
-    choices = _seed(ws)
-    out = await _run(ws, _provider_that(payload=choices), "sess_clean", "proj_clean")
+    _seed(ws)
+    out = await _run(ws, _turn_that(ws), "sess_clean", "proj_clean")
     assert out == "edited"
     assert "state entry to archive" not in ws.read("state")
     assert "- Archive me" not in ws.read("decisions")
     assert "Archive this." not in ws.read("lessons")
     assert "- b.md — b" in ws.read("index")
+    for key in ("state", "decisions", "lessons"):
+        assert "- id:" in (ws.read(_mem.ARCHIVE_OF[key]) or "")
 
 
 # ---------------------------------------------------------------------------
-# 2. an edit during the model call → that file is skipped, content survives
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_user_edit_during_llm_aborts_state_write(tmp_path, caplog):
-    ws = WorkspaceFileManager(str(tmp_path))
-    choices = _seed(ws)
-    state_path = ws._file_path("state")
-    user_edited_bytes = ws.read("state") + "## USER ADDED\nhand-written note\n"
-
-    async def _llm_side_effect(*args, **kwargs):
-        with open(state_path, "w", encoding="utf-8") as f:
-            f.write(user_edited_bytes)
-        _bump_mtime_by(state_path, delta_seconds=2.0)
-        return _resp(choices)
-
-    with caplog.at_level(logging.WARNING, logger="agent_os.agent.workspace_files"):
-        await _run(ws, _provider_that(side_effect=_llm_side_effect), "sess_edit_state", "proj_edit")
-
-    assert ws.read("state") == user_edited_bytes
-    assert not ws.exists("state_archive"), "a skipped file must not be half-moved"
-
-    matching = [r for r in caplog.records if "OCC abort" in r.message and "state" in r.message]
-    assert matching, [r.message for r in caplog.records]
-    rec = matching[0]
-    assert getattr(rec, "project_id", None) == "proj_edit"
-    assert getattr(rec, "file_path", None) == state_path
-    assert getattr(rec, "cache_thrash_telemetry", None) is True
-    assert getattr(rec, "baseline_mtime", None) != getattr(rec, "observed_mtime", None)
-
-
-# ---------------------------------------------------------------------------
-# 3. one file aborts, the others still write
+# 2. a user edit during the turn, on a file the turn then edits exactly
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_one_file_aborts_others_still_write(tmp_path, caplog):
+async def test_user_edit_during_the_turn_survives_on_a_file_the_turn_edits(tmp_path):
+    """The turn's moves are exact-match edits (here: replace the block), so
+    a line the user added meanwhile stays; nothing is half-moved."""
     ws = WorkspaceFileManager(str(tmp_path))
-    choices = _seed(ws)
-    lessons_path = ws._file_path("lessons")
-    user_lessons = ws.read("lessons") + "- user-additional-lesson-during-llm\n"
+    _seed(ws)
 
-    async def _llm_side_effect(*args, **kwargs):
-        with open(lessons_path, "w", encoding="utf-8") as f:
+    def user_edit():
+        with open(ws._file_path("state"), "a", encoding="utf-8") as f:
+            f.write("## USER ADDED\nhand-written note\n")
+
+    out = await _run(ws, _turn_that(ws, during=user_edit), "sess_edit_state", "proj_edit")
+    assert out == "edited"
+    state = ws.read("state")
+    assert "hand-written note" in state and "state entry to archive" not in state
+    assert "- id:" in ws.read("state_archive")
+
+
+# ---------------------------------------------------------------------------
+# 3. a user edit on a file the turn leaves alone is untouched by the shell
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_file_the_turn_does_not_touch_keeps_the_users_edit(tmp_path):
+    ws = WorkspaceFileManager(str(tmp_path))
+    _seed(ws)
+    user_lessons = ws.read("lessons") + "- user-additional-lesson-during-turn\n"
+
+    async def run_turn(task_text):
+        with open(ws._file_path("lessons"), "w", encoding="utf-8") as f:
             f.write(user_lessons)
-        _bump_mtime_by(lessons_path, delta_seconds=2.0)
-        return _resp(choices)
+        _archive(ws, "decisions", "dec-go")
+        return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=2, ended="text_complete")
 
-    with caplog.at_level(logging.WARNING, logger="agent_os.agent.workspace_files"):
-        await _run(ws, _provider_that(side_effect=_llm_side_effect), "sess_multi", "proj_multi")
-
+    out = await _run(ws, run_turn, "sess_multi", "proj_multi")
+    assert out == "edited"
     assert ws.read("lessons") == user_lessons
     assert "- Archive me" not in ws.read("decisions")
-    assert "- b.md — b" in ws.read("index")
-    aborts = [r for r in caplog.records if "OCC abort" in r.message]
-    assert len(aborts) == 1
-    assert "lessons" in aborts[0].message
 
 
 # ---------------------------------------------------------------------------
-# 4. a file created during the model call is protected too
+# 4. a file the user rewrote during the turn is not undone by the shell
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_user_creates_file_during_llm_aborts_index_write(tmp_path, caplog):
+async def test_user_rewrites_index_during_the_turn_and_keeps_it(tmp_path):
     ws = WorkspaceFileManager(str(tmp_path))
     ws.write("state", "## Now\n- a\n")
-    index_path = ws._file_path("index")
-    user_content = "user-wrote-this-while-the-editor-was-running\n"
+    user_content = "# INDEX\n- user-wrote-this-while-the-pass-was-running\n"
 
-    async def _llm_side_effect(*args, **kwargs):
-        with open(index_path, "w", encoding="utf-8") as f:
+    async def run_turn(task_text):
+        with open(ws._file_path("index"), "w", encoding="utf-8") as f:
             f.write(user_content)
-        return _resp({"index": "# INDEX\n- editor.md — editor\n"})
+        return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=0, ended="text_complete")
 
-    with caplog.at_level(logging.WARNING, logger="agent_os.agent.workspace_files"):
-        await _run(ws, _provider_that(side_effect=_llm_side_effect), "sess_create_race", "proj_create")
-
-    assert ws.read("index") == user_content
-    aborts = [r for r in caplog.records if "OCC abort" in r.message and "index" in r.message]
-    assert aborts
+    out = await _run(ws, run_turn, "sess_create_race", "proj_create")
+    assert out == "index_only"
+    assert "user-wrote-this-while-the-pass-was-running" in ws.read("index")
 
 
 # ---------------------------------------------------------------------------
-# 5. structured fields on the abort record
+# 5. a bare deletion mid-turn (no archive) is put back and logged
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_log_includes_all_required_structured_fields(tmp_path, caplog):
+async def test_a_mid_turn_deletion_without_archive_is_restored_and_logged(tmp_path, caplog):
     ws = WorkspaceFileManager(str(tmp_path))
-    choices = _seed(ws)
-    decisions_path = ws._file_path("decisions")
+    _seed(ws)
 
-    async def _llm_side_effect(*args, **kwargs):
-        _bump_mtime_by(decisions_path, delta_seconds=2.0)
-        return _resp(choices)
+    async def run_turn(task_text):
+        live = ws.read("decisions")
+        b = [b for b in state_blocks.parse(live)[1] if b.id == "keep-b"][0]
+        with open(ws._file_path("decisions"), "w", encoding="utf-8") as f:
+            f.write(live.replace(b.raw + "\n", ""))
+        return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=1, ended="text_complete")
 
     with caplog.at_level(logging.WARNING, logger="agent_os.agent.workspace_files"):
-        await _run(ws, _provider_that(side_effect=_llm_side_effect), "sess_struct", "proj_struct_log")
-
-    matching = [r for r in caplog.records if "OCC abort" in r.message and "decisions" in r.message]
-    assert matching
-    rec = matching[0]
-    assert getattr(rec, "project_id", None) == "proj_struct_log"
-    assert getattr(rec, "file_path", None) == decisions_path
-    assert isinstance(getattr(rec, "baseline_mtime", None), int)
-    assert isinstance(getattr(rec, "observed_mtime", None), int)
-    assert getattr(rec, "cache_thrash_telemetry", None) is True
-    assert rec.levelno == logging.WARNING
+        out = await _run(ws, run_turn, "sess_struct", "proj_struct_log")
+    assert out == "restored"
+    assert "id:keep-b" in ws.read("decisions")
+    matching = [r for r in caplog.records if "restored=['keep-b']" in r.getMessage()]
+    assert matching and matching[0].levelno == logging.WARNING
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ Provides:
   - prepass / postpass_conservation: the deterministic halves of a tidy pass
     (spec 124 §3.7): normalise + stamp + archive contents tables + INDEX
     archive lines before, id conservation after
-  - run_session_end_routine: the memory editor (choices by id, see
+  - run_session_end_routine: the Memory session's turn (spec 124 §3.7, see
     memory_editor.py) between those two steps; the size floor only logs
 
 The active model (MiniMax-M3) has a 1,000,000-token window; bounds here exist for
@@ -541,35 +541,39 @@ async def run_session_end_routine(
     project_id: str = "",
     list_sessions=None,
     force: bool = False,
+    run_turn=None,
+    trigger: str = "over_budget",
 ) -> str:
-    """One memory-tidy pass: the editor (by id), then the deterministic floor.
+    """One memory-tidy pass: the Memory session's turn (spec 124 §3.7)
+    between the deterministic prepass and postpass, then the size floor.
 
     Returns an outcome string the loop surfaces to the agent (hygiene flag +
     status line):
 
-    - ``"edited"`` — the editor ran and applied at least one choice;
-    - ``"no_change"`` — the editor ran and chose nothing (or only choices that
-      could not be applied);
-    - ``"backstop_only"`` — the editor could not run (model error, timeout,
-      no usable JSON); only the floor ran;
+    - ``"edited"`` — the Memory turn changed an entry file;
+    - ``"index_only"`` — only INDEX changed;
+    - ``"restored"`` — an entry left a live file without reaching its
+      archive and was put back from the backup;
+    - ``"no_change"`` — the turn ran and changed nothing;
+    - ``"skipped"`` — the turn did not run (no runner, or the Memory
+      session was busy with a user turn); the files stay dirty;
+    - ``"backstop_only"`` — the turn failed (model error, timeout); only
+      the floor ran;
     - ``"no_delta"`` — no live file changed since the last pass;
     - ``"not_needed"`` — nothing is over its soft budget and the pass was not
       explicitly requested;
     - ``"in_flight"`` — another pass on this project is running;
     - ``"skipped_idempotent"`` — this session already completed its pass.
 
-    The whole-file LLM merge this used to run is gone (spec 089 §4.2): it
-    regenerated PROJECT_STATE / DECISIONS / LESSONS from a size-capped view and
-    so silently dropped whatever it never saw. ``session`` is kept for the
-    callers' signature; the editor reads sessions itself, through read-only
-    tools, from the time of its last successful run.
-
-    ``force`` (an explicit ``checkpoint_state``) runs the editor even when no
-    file is over its soft budget.
+    ``provider`` / ``utility_provider`` / ``session`` are kept for the
+    callers' signature; the turn runs on the project's own provider inside
+    the Memory session, which ``run_turn(task_text)`` (supplied by the agent
+    manager) starts. ``force`` (an explicit ``checkpoint_state``) runs the
+    pass even when no file is over its soft budget.
     """
     from agent_os.agent import memory_editor
 
-    del session
+    del session, provider, utility_provider
     if not bypass_idempotency and session_uuid in _completed_session_ends:
         logger.info("session_end skipped: already completed for %s", session_uuid)
         return "skipped_idempotent"
@@ -577,7 +581,7 @@ async def run_session_end_routine(
     # No-delta gate: skip entirely (no LLM) when nothing changed since the last
     # successful pass. Persisted, so it survives daemon restarts.
     if not _has_cleanup_delta(workspace_files):
-        logger.info("memory editor: no change since the last pass; skipping (no LLM call)")
+        logger.info("memory pass: no change since the last pass; skipping (no LLM call)")
         return "no_delta"
 
     over = [
@@ -588,27 +592,29 @@ async def run_session_end_routine(
         return "not_needed"
 
     if not memory_editor.claim(workspace_files.workspace):
-        logger.info("memory editor: a pass is already running for %s", project_id or workspace_files.workspace)
+        logger.info("memory pass: a pass is already running for %s", project_id or workspace_files.workspace)
         return "in_flight"
     try:
         started = datetime.now(timezone.utc)
-        llm = utility_provider if utility_provider is not None else provider
         logger.info(
-            "memory editor: starting (project=%s over_budget=%s forced=%s model=%s)",
-            project_id, over, force, getattr(llm, "model", "?"),
+            "memory pass: starting (project=%s over_budget=%s forced=%s trigger=%s runner=%s)",
+            project_id, over, force, trigger, "memory session" if run_turn else "none",
         )
-        result = await memory_editor.run_editor(
-            workspace_files, llm, list_sessions=list_sessions, project_id=project_id,
+        if run_turn is None:
+            async def run_turn(_task_text):   # noqa: E306 — no Memory session here
+                return None
+        result = await memory_editor.run_pass(
+            workspace_files, run_turn, list_sessions=list_sessions, project_id=project_id,
+            over_keys=over, forced=force, trigger=trigger,
         )
         # The size floor never moves an entry (spec 124 §3.5): it only logs
         # what is still past its hard cap. The existing over-budget trigger
         # stays armed: the next change to a memory file is a delta again.
         _apply_hard_caps(workspace_files)
-        if result.ok and not result.skipped_files:
-            # Only a pass whose editor ran — over every file it chose to edit
-            # — counts: stamping the files "clean" after a failure, or after
-            # a file was skipped because someone wrote it mid-run, would
-            # disarm the retry.
+        if result.ok and result.outcome != "skipped":
+            # Only a pass whose turn actually ran counts: stamping the files
+            # "clean" after a failure or a declined turn would disarm the
+            # retry.
             memory_editor.write_marker(workspace_files.dir, editor_ran_at=started)
     finally:
         memory_editor.release(workspace_files.workspace)

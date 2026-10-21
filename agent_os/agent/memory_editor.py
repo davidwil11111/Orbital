@@ -2,36 +2,35 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""The memory editor (spec 089 §4.2, interim until spec 124 §3.7's Memory
-session replaces it): tidies Layer-1 memory by id.
+"""The memory pass (spec 124 §3.7): the deterministic shell around ONE turn
+of the project's Memory session.
 
-It replaced the whole-file LLM merge, which regenerated PROJECT_STATE /
-DECISIONS / LESSONS from a size-capped view and so silently dropped whatever
-it never saw. The editor never writes a file whole (INDEX, small and
-regenerable, is the one exception). It is a short read-only agent loop on the
-project's utility model that returns CHOICES by id:
+The memory editor this replaced was a separate read-only agent loop on the
+utility model that returned choices by id and paid a full prompt miss on
+every run. The Memory session is a real session of the project (source
+``memory``, visible in the session list, the user can type into it): same
+system prompt, same tool registry, Layer-1 rows byte-identical to the
+triggering run's snapshot, so its first call rides the main loop's prefix.
+It works on the files directly with edit/write (confined to ``orbital/*.md``
+by ``memory_tool_guard``); the daemon stamps ids, keeps the archive contents
+tables, and bounds the turn (``EDITOR_MAX_CALLS`` tool calls).
 
-- ``archive`` — move one entry, byte-exact, to the file's archive; nothing
-  is left in the live file (spec 124 §3.5 — file-level pointers in INDEX
-  and the archive's contents table are the route back);
-- ``merge`` — replace several entries with one condensed entry; the originals
-  go to the archive byte-exact under ``## [merged DATE into id:<new>]``;
-- ``index`` — a complete new INDEX.md.
+What stays deterministic, in order (``run_pass``):
 
-All three files share one entry shape (``state_blocks``), so one planner
-serves them. Before the editor looks, ``workspace_files.prepass`` has
-normalised the files and stamped every entry; after it applied,
-``postpass_conservation`` puts back any id that left a live file without
-reaching the archive.
+1. ``backup_live_files`` — the four live files into a rolling backup (last 5);
+2. ``workspace_files.prepass`` — normalise, stamp, contents tables, INDEX
+   archive lines;
+3. the task message (``build_task_message``) appended to the Memory session
+   as a user row, then one bounded turn (the runner the agent manager
+   supplies);
+4. ``postpass_conservation`` — every id the pass started with is still live
+   or in its archive, else it comes back from the snapshot; INDEX keeps its
+   ``*_ARCHIVE.md`` lines;
+5. the outcome (``edited`` / ``no_change`` / ``index_only`` / ``restored`` /
+   ``skipped`` / ``failed``), the run record next to the backup, and one
+   summary log line with the turn's token numbers and cost.
 
-Sessions since the last run are evidence of whether a line is still live,
-done or replaced — never a source of new facts. Nothing is deleted.
-
-Safety: the four live files are copied into a rolling backup (last 5) before
-anything is touched; every file is written only if it is unchanged since the
-editor read it (OCC — an agent write during the run makes the editor skip
-that file); archives are written before the live file shrinks; the apply
-step has no awaits, so a cancelled run never half-applies.
+Nothing is deleted: an entry only leaves a live file through its archive.
 """
 
 from __future__ import annotations
@@ -41,26 +40,22 @@ import json
 import logging
 import os
 import re
-import secrets
 import shutil
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from agent_os.agent import memory_entries as _mem
-from agent_os.agent import state_blocks, user_flags
 
 logger = logging.getLogger(__name__)
 
 LIVE_KEYS = ("state", "decisions", "lessons", "index")
 EDITABLE_KEYS = ("state", "decisions", "lessons")
 
-# At most this many model calls per run (tool rounds + the final answer).
+# The Memory turn's tool cap: the daemon ends the turn when it is reached.
 EDITOR_MAX_CALLS = 12
-EDITOR_CALL_TIMEOUT_S = 240.0
+# The whole pass (one turn) is bounded; a hung provider never holds the
+# single-flight slot for good.
 EDITOR_TOTAL_TIMEOUT_S = 900.0
-# A tool result is evidence, not a document: cap what one call can add.
-EDITOR_TOOL_RESULT_CHARS = 12_000
 # Automatic (over-budget) runs are at most this often per project. An
 # explicit checkpoint_state request is not bound by it.
 EDITOR_AUTO_INTERVAL_S = 30 * 60
@@ -74,14 +69,6 @@ WATERMARK_KEY = "editor_last_run"
 _MARKER_FILE = ".memory_cleanup.json"
 _SESSIONS_FALLBACK_DAYS = 7
 _MAX_SESSIONS_LISTED = 30
-# PROJECT_STATE bullets younger than this are "recent" in the prompt: the
-# editor archives one only when a session shows it is done (never by age).
-_RECENT_DAYS = 14
-# Quote-backed ask closes (spec 089 v2 §6): the quote must be the user's own
-# words, verbatim in a user message of the session the editor cites.
-_MAX_QUOTE_CHARS = 500
-_MAX_ASKS_LISTED = 30
-_SESSION_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 FILE_BY_KEY = {
     "state": "PROJECT_STATE.md",
@@ -100,7 +87,7 @@ _RUNNING: set[str] = set()
 
 
 def claim(workspace: str) -> bool:
-    """Take the project's editor slot. Synchronous, so it is race-free."""
+    """Take the project's pass slot. Synchronous, so it is race-free."""
     key = os.path.realpath(workspace)
     if key in _RUNNING:
         return False
@@ -149,7 +136,7 @@ def _parse_iso(value) -> datetime | None:
 
 
 def watermark(orbital_dir: str) -> datetime | None:
-    """When the editor last finished successfully.
+    """When the pass last finished successfully.
 
     A project upgraded from before the editor has a marker without the key;
     the marker file's own mtime is when its last successful cleanup ran,
@@ -208,16 +195,16 @@ def write_marker(orbital_dir: str, *, editor_ran_at: datetime | None) -> None:
             json.dump(data, f)
         os.replace(tmp, _marker_path(orbital_dir))
     except OSError as e:
-        logger.warning("memory editor: could not write the cleanup marker (%s)", e)
+        logger.warning("memory pass: could not write the cleanup marker (%s)", e)
 
 
 def auto_run_due(orbital_dir: str, *, now: datetime | None = None) -> bool:
     """Gate for the AUTOMATIC over-budget trigger (cheap: stats + one JSON).
 
-    Due only when a live file changed since the last pass (the editor already
+    Due only when a live file changed since the last pass (the pass already
     saw these exact bytes otherwise) and the last successful run is at least
     ``EDITOR_AUTO_INTERVAL_S`` old — a file that stays over budget because its
-    content is recent and live must not buy an editor run on every write.
+    content is recent and live must not buy a pass on every write.
     """
     if not has_delta(orbital_dir):
         return False
@@ -235,7 +222,7 @@ def auto_run_due(orbital_dir: str, *, now: datetime | None = None) -> bool:
 def backup_live_files(orbital_dir: str, *, now: datetime | None = None) -> str | None:
     """Copy the four live files into ``orbital/backups/memory-editor-<ts>/``.
 
-    Keeps the newest ``BACKUP_KEEP`` backups (only this editor's own dirs are
+    Keeps the newest ``BACKUP_KEEP`` backups (only this pass's own dirs are
     ever pruned). Returns the directory, or None when there was nothing to
     back up or the copy failed — in which case the caller must not edit.
     """
@@ -254,7 +241,7 @@ def backup_live_files(orbital_dir: str, *, now: datetime | None = None) -> str |
             shutil.rmtree(dest, ignore_errors=True)
             return None
     except OSError as e:
-        logger.warning("memory editor: backup failed (%s); not editing", e)
+        logger.warning("memory pass: backup failed (%s); not editing", e)
         return None
     try:
         mine = sorted(
@@ -269,143 +256,7 @@ def backup_live_files(orbital_dir: str, *, now: datetime | None = None) -> str |
 
 
 # ---------------------------------------------------------------------------
-# The prompt
-# ---------------------------------------------------------------------------
-
-_SYSTEM = (
-    "You are the memory editor for an AI agent's project. You tidy its "
-    "memory files by choosing entries to archive or merge, BY ID. You never "
-    "add facts. When done, reply with ONLY the JSON object described."
-)
-
-
-def _size_lines(contents: dict[str, str]) -> list[str]:
-    out = []
-    for key in LIVE_KEYS:
-        raw = contents.get(key) or ""
-        now = int(_mem.est_tokens(_mem._budget_text(raw, key)))
-        soft = _mem.FILE_BUDGETS[key]["soft"]
-        target = _mem.consolidation_target(key)
-        if now > soft:
-            verdict = f"OVER its soft budget — bring it to about {target} (cut ~{now - target})"
-        elif now > target:
-            verdict = "under the soft budget; tidy only what is clearly stale"
-        else:
-            verdict = "within target — leave it unless something is plainly done"
-        out.append(
-            f"- {FILE_BY_KEY[key]}: {now} tokens (soft budget {soft}, target {target}) — {verdict}"
-        )
-    return out
-
-
-def build_prompt(
-    contents: dict[str, str],
-    *,
-    today: str,
-    since: datetime | None,
-    sessions: list[dict],
-    open_asks: list | None = None,
-) -> str:
-    since_txt = since.isoformat(timespec="minutes") if since else "never"
-    if sessions:
-        session_lines = "\n".join(
-            f"- {s.get('session_uuid')}  last_activity={s.get('last_activity_at')}  "
-            f"{(s.get('name') or '')[:80]}"
-            for s in sessions
-        )
-    else:
-        session_lines = "(none)"
-    cutoff = (
-        datetime.fromisoformat(today) - timedelta(days=_RECENT_DAYS)
-    ).date().isoformat()
-    files = []
-    for key in LIVE_KEYS:
-        raw = _mem.strip_format_header(contents.get(key) or "").strip()
-        files.append(f"=== {FILE_BY_KEY[key]} ===\n{raw or '(empty)'}")
-    # INDEX is the one file the editor may rewrite, so its format drift rides
-    # along here (report-only lint; never a trigger of its own).
-    drift = _mem.shape_report(contents.get("index"), "index")
-    formatting_block = (
-        f"\nINDEX FORMATTING TO FIX (if you rewrite INDEX): {drift}\n"
-        f"  Contract: {_mem.FORMAT_HEADERS['index']}\n"
-    ) if drift else ""
-
-    asks_block = ""
-    if open_asks:
-        ask_lines = "\n".join(
-            f"- [{a.id}] {' '.join(str(a.text).split())[:200]}"
-            for a in open_asks[:_MAX_ASKS_LISTED]
-        )
-        asks_block = f"""
-OPEN ASKS (waiting on the user, in orbital/ASKS.md — never edit that file):
-{ask_lines}
-If a session below shows the USER answering or completing one of these, you
-may close it in "close_asks": the ask id, the session_uuid, and the user's own
-words copied exactly from their message as "quote". Only the user's words
-count, never the assistant's. The daemon checks the quote against that
-session and ignores the close if it is not there. If unsure, leave it open.
-"""
-
-    return f"""Today is {today}. Tidy this project's memory so each file gets back toward its target.
-
-HOW EDITS WORK
-The daemon moves the exact bytes by id; you only choose. An archived entry
-keeps its full text and id in the archive file; the live file keeps nothing
-of it (INDEX names what each archive holds, and the archive has a contents
-table at its top). Ids: every entry carries `<!--mem id:… created:…-->` on
-the line under its bullet, in all three files.
-
-SIZES (bullet lines only, exact counts, do not estimate):
-{chr(10).join(_size_lines(contents))}
-{formatting_block}
-RULES
-1. Archive what is no longer live: finished work, superseded status, dormant
-   threads, decisions superseded in practice — never because it is old. Keep
-   what a future session needs now — including every line that names a file
-   as the source of truth for a kind of output that is still produced.
-2. The sessions below are EVIDENCE of whether a line is still live, done, or
-   replaced. They are never a source of new facts: add nothing that is not
-   already written in these files.
-3. Nothing is ever deleted — archived entries keep their full text and id in
-   the archive file.
-4. merge: only for entries that say the same thing twice or where one
-   supersedes another. The merged text may only condense what the originals
-   say and must be shorter than them combined. It is one bullet (`- …`) with
-   optional indented detail, for every file.
-5. PROJECT_STATE bullets created on or after {cutoff} are recent: archive or
-   merge one only when a session shows it is done or replaced.
-6. Never choose an entry tagged `tag:pinned`.
-7. INDEX.md is a navigation map. Return a complete new INDEX.md as "index"
-   only if it is over budget, stale, or has formatting to fix; keep every
-   *_ARCHIVE.md line.
-8. If nothing needs to change, return {{}}.
-
-{asks_block}
-TOOLS (read-only; at most {EDITOR_MAX_CALLS - 1} tool rounds): read, grep,
-list_sessions, read_session. The four live files are already below in full,
-with their ids — do not read them again. Use the tools for evidence: the
-sessions (read_session with `since`, `grep` and a small `limit`) and the
-archives. Never read an archive file whole — grep it for an id or a topic and
-read only the matching lines with offset/limit. Fewer, targeted calls are
-better; answer as soon as you can decide.
-
-LAST EDITOR RUN: {since_txt}
-SESSIONS ACTIVE SINCE THEN (newest first):
-{session_lines}
-
-OUTPUT — ONLY this JSON (omit keys you do not use):
-{{"archive": [{{"file": "PROJECT_STATE.md", "id": "…"}}],
- "merge": [{{"file": "DECISIONS.md", "ids": ["…", "…"], "text": "…"}}],
- "close_asks": [{{"id": "…", "session": "…", "quote": "…"}}],
- "index": "<complete INDEX.md>"}}
-
---- THE LIVE FILES, IN FULL ---
-{chr(10).join(files)}
-"""
-
-
-# ---------------------------------------------------------------------------
-# The read-only tool set
+# Sessions since the last pass (evidence for "finished")
 # ---------------------------------------------------------------------------
 
 def _disk_sessions(workspace: str) -> list[dict]:
@@ -440,31 +291,20 @@ def _disk_sessions(workspace: str) -> list[dict]:
     return rows
 
 
-def build_tools(workspace: str, list_sessions) -> dict:
-    from agent_os.agent.tools.grep_tool import GrepTool
-    from agent_os.agent.tools.read import ReadTool
-    from agent_os.agent.tools.sessions_tool import ListSessionsTool, ReadSessionTool
-
-    rows = list_sessions or (lambda: _disk_sessions(workspace))
-    tools = [
-        ReadTool(workspace=workspace),
-        GrepTool(workspace=workspace),
-        ListSessionsTool(list_sessions=rows, current_session_id=None),
-        ReadSessionTool(workspace=workspace, list_sessions=rows),
-    ]
-    return {t.name: t for t in tools}
-
-
 def sessions_since(list_sessions, workspace: str, since: datetime | None) -> list[dict]:
+    """Sessions active since ``since`` (newest first), the Memory session
+    itself excluded — its own turns are not evidence."""
     rows_fn = list_sessions or (lambda: _disk_sessions(workspace))
     try:
         rows = [r for r in rows_fn() if isinstance(r, dict) and r.get("session_uuid")]
     except Exception:  # noqa: BLE001 — evidence is optional
-        logger.warning("memory editor: could not list sessions", exc_info=True)
+        logger.warning("memory pass: could not list sessions", exc_info=True)
         return []
     floor = since or (datetime.now(timezone.utc) - timedelta(days=_SESSIONS_FALLBACK_DAYS))
     picked = []
     for r in rows:
+        if r.get("origin") == "memory":
+            continue
         at = _parse_iso(r.get("last_activity_at"))
         if at is not None and at >= floor:
             picked.append((at, r))
@@ -472,246 +312,186 @@ def sessions_since(list_sessions, workspace: str, since: datetime | None) -> lis
     return [r for _at, r in picked[:_MAX_SESSIONS_LISTED]]
 
 
-def _raw_message(response) -> dict:
-    raw = getattr(response, "raw_message", None)
-    return raw if isinstance(raw, dict) else {}
-
-
-def _normalize_calls(response) -> list[dict]:
-    raw = _raw_message(response).get("tool_calls") or []
-    if not raw:
-        fallback = getattr(response, "tool_calls", None)
-        raw = fallback if isinstance(fallback, list) else []
-    calls = []
-    for tc in raw:
-        if not isinstance(tc, dict):
-            tc = tc.model_dump() if hasattr(tc, "model_dump") else {
-                "id": getattr(tc, "id", ""),
-                "function": {
-                    "name": getattr(getattr(tc, "function", None), "name", ""),
-                    "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
-                },
-            }
-        fn = tc.get("function") or {}
-        name = fn.get("name") or tc.get("name") or ""
-        args = fn.get("arguments", tc.get("arguments", {}))
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except (json.JSONDecodeError, ValueError):
-                args = {}
-        calls.append({
-            "id": tc.get("id") or f"call_{secrets.token_hex(4)}",
-            "name": name,
-            "arguments": args if isinstance(args, dict) else {},
-        })
-    return calls
-
-
-# File tools (ripgrep, disk reads) run off the event loop.
-_THREAD_SAFE_TOOLS = frozenset({"read", "grep"})
-
-
-async def _run_tool(tools: dict, name: str, arguments: dict) -> str:
-    tool = tools.get(name)
-    if tool is None:
-        return f"Error: '{name}' is not available to the memory editor (read-only tools: {', '.join(tools)})."
-    try:
-        if name in _THREAD_SAFE_TOOLS:
-            result = await asyncio.to_thread(tool.execute, **arguments)
-        else:
-            # The session tools read the agent manager's live registries,
-            # which only the event loop may touch.
-            result = tool.execute(**arguments)
-    except Exception as e:  # noqa: BLE001 — a tool error is just a result
-        return f"Error: {e}"
-    content = result.content
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False)[:EDITOR_TOOL_RESULT_CHARS]
-    if len(content) > EDITOR_TOOL_RESULT_CHARS:
-        content = (
-            content[:EDITOR_TOOL_RESULT_CHARS]
-            + f"\n[... cut at {EDITOR_TOOL_RESULT_CHARS} chars — narrow the query ...]"
-        )
-    return content
-
-
-def parse_choices(text: str | None) -> dict | None:
-    """The editor's JSON reply, tolerant of fences and surrounding prose."""
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else ""
-        if cleaned.rstrip().endswith("```"):
-            cleaned = cleaned.rstrip()[:-3]
-    for candidate in (cleaned, cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]):
-        if not candidate:
-            continue
-        try:
-            value = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
 # ---------------------------------------------------------------------------
-# Applying choices (pure planning + an await-free write step)
+# The task message (spec 124 §3.7): fixed bytes, filled fields
 # ---------------------------------------------------------------------------
 
-@dataclass
-class FilePlan:
-    key: str
-    content: str                       # new live content
-    # (heading, text) sections appended to the archive, in order
-    archived: list[tuple[str, str]] = field(default_factory=list)
-    applied: list[dict] = field(default_factory=list)
-    rejected: list[str] = field(default_factory=list)
+_TASK_HEAD = (
+    "Tidy this project's memory. You are in the project's own context: the system\n"
+    "prompt, tools and memory files above are what the working agent sees. Work on\n"
+    "the files directly with read, grep, read_session, edit and write. The daemon\n"
+    "stamps ids and maintains the archive contents tables; you never touch\n"
+    "<!--mem …--> lines.\n"
+    "\n"
+    "SIZES (bullet lines only; indented detail does not count toward soft)\n"
+)
+
+_DO_OVER = {
+    "state": (
+        "PROJECT_STATE.md is over: move entries that are finished or superseded to\n"
+        "   PROJECT_STATE_ARCHIVE.md; merge entries that say the same thing; fold\n"
+        "   indented detail into its line. The sessions listed below are your evidence\n"
+        "   for \"finished\" (read_session with since=…, grep, small limits)."
+    ),
+    "decisions": (
+        "DECISIONS.md is over: move decisions that were superseded in practice to\n"
+        "   DECISIONS_ARCHIVE.md; merge entries that say the same thing; fold indented\n"
+        "   detail into its line. The sessions listed below are your evidence for\n"
+        "   \"superseded\" (read_session with since=…, grep, small limits)."
+    ),
+    "lessons": (
+        "LESSONS.md is over: move lessons that no longer apply to LESSONS_ARCHIVE.md;\n"
+        "   merge entries that say the same thing; fold indented detail into its line.\n"
+        "   The sessions listed below are your evidence (read_session with since=…,\n"
+        "   grep, small limits)."
+    ),
+    "index": (
+        "INDEX.md is over: merge lines upward into folder or topic lines; a file gets\n"
+        "   its own line only if it is the source of truth for something."
+    ),
+}
+
+_DO_FOLDED = (
+    "{filename}'s bullet lines do not fit the injected view, which folds it by\n"
+    "   section: group its entries under `## topic` headings and merge same-topic\n"
+    "   entries into one line."
+)
+
+_DO_POINTERS = (
+    "These paths lost their only live mention since the last pass:\n"
+    "   {paths}\n"
+    "   Decide whether INDEX.md needs a line for them. Folder or topic granularity;\n"
+    "   a file gets its own line only if it is the source of truth for something."
+)
+
+_DO_FORCED = (
+    "This pass was requested explicitly (checkpoint_state); nothing is over its\n"
+    "   soft budget. Look for entries that are finished or superseded and archive\n"
+    "   or merge only those."
+)
+
+_DO_ARCHIVE_LINE = (
+    "If you archive into a file, update that archive's line in INDEX.md: the\n"
+    "   one-sentence description of what is in it. The daemon fills count and dates."
+)
+
+_DO_NOTHING = "If nothing is finished or superseded, say so and stop. Never force cuts."
+
+_RULES = (
+    "RULES\n"
+    "- Archive only what is no longer true or no longer live, never because it is\n"
+    "  old. A standing decision or lesson stays, however old.\n"
+    "- Move entries intact: the bullet line, its mem comment line, its indented\n"
+    "  detail, appended under `## [archived {today}]` in the archive. Write the\n"
+    "  archive first, then remove from the live file. For a merge, write the merged\n"
+    "  entry in the live file, then move the originals under\n"
+    "  `## [merged {today} into id:<new id>]`.\n"
+    "- A merged entry is shorter than its parts and says only what they said.\n"
+    "  Never add facts. Never touch entries tagged tag:pinned.\n"
+    "- Do not read an archive whole; grep it.\n"
+    "- Close an ask in orbital/ASKS.md only with the user's own words quoted, as\n"
+    "  that file's header says.\n"
+    "- INDEX.md lists folders and topics, not dated files. Keep every *_ARCHIVE.md line.\n"
+)
+
+_TASK_TAIL = "At most {cap} tool calls. Finish with one line saying what moved and where."
 
 
-def _as_list(value) -> list:
-    return value if isinstance(value, list) else []
+def _minutes(value) -> str:
+    at = _parse_iso(value)
+    if at is None:
+        return str(value or "?")
+    return at.strftime("%Y-%m-%dT%H:%M")
 
 
-def _key_for(file_value) -> str | None:
-    name = str(file_value or "").strip()
-    name = os.path.basename(name)
-    if name in _KEY_BY_NAME:
-        return _KEY_BY_NAME[name]
-    return name.lower() if name.lower() in FILE_BY_KEY else None
+def build_task_message(
+    *, sizes: dict[str, tuple[int, int, int]], folded: list[str], over: list[str],
+    forced: bool, pointer_paths: list[str], last_pass: datetime | None,
+    sessions: list[dict], today: str, tool_cap: int,
+) -> str:
+    """The daemon-generated user row that starts a Memory turn.
 
-
-def group_choices(choices: dict) -> tuple[dict[str, list[dict]], list[str]]:
-    """Split raw choices per editable file; returns (per_key, rejected)."""
-    per_key: dict[str, list[dict]] = {k: [] for k in EDITABLE_KEYS}
-    rejected: list[str] = []
-    for kind in ("merge", "archive"):
-        for c in _as_list(choices.get(kind)):
-            if not isinstance(c, dict):
-                rejected.append(f"{kind}: not an object")
-                continue
-            key = _key_for(c.get("file"))
-            if key not in EDITABLE_KEYS:
-                rejected.append(f"{kind}: file {c.get('file')!r} cannot be edited by id")
-                continue
-            per_key[key].append({**c, "_kind": kind})
-    return per_key, rejected
-
-
-def _merge_lines(text: str, prefix: str, comment: str) -> list[str]:
-    """The merged entry as lines: one bullet, its mem-comment, indented detail."""
-    lines = [ln.rstrip() for ln in str(text).strip().split("\n") if ln.strip()]
-    first = lines[0].lstrip()
-    if not re.match(r"^(?:-|\d+[.)])\s+\S", first):
-        first = prefix + first
-    rest = [ln if ln[:1] in (" ", "\t") else "  " + ln.lstrip() for ln in lines[1:]]
-    return [first, state_blocks.COMMENT_INDENT + comment, *rest]
-
-
-def plan_entries(key: str, content: str, items: list[dict], *, today: str,
-                 archive_ids: set[str] | None = None) -> FilePlan:
-    """Plan archive / merge choices against ``content`` for any entry file.
-
-    The live file keeps nothing of an archived entry; a merge leaves the
-    merged bullet (fresh id) where the first original was. Pinned entries
-    and unknown ids are rejected, never moved.
+    ``sizes`` maps each live file key to ``(now, soft, target)`` tokens;
+    ``over`` lists the keys over their soft budget (the trigger reason);
+    ``folded`` the filenames whose injected view folds; ``pointer_paths``
+    the paths folded legacy pointers named (prepass). Everything but these
+    fields, the date in RULES, LAST PASS and the session list is fixed
+    bytes.
     """
-    lines, blocks = state_blocks.parse(content)
-    by_id = {b.id: b for b in blocks if b.id}
-    plan = FilePlan(key, content)
-    claimed: set[str] = set()
-    replaced: dict[int, tuple[int, list[str]]] = {}
-    taken = set(by_id) | set(archive_ids or ())
-
-    for item in sorted(items, key=lambda c: c["_kind"] != "merge"):
-        if item["_kind"] == "merge":
-            ids = [str(i) for i in _as_list(item.get("ids"))]
-            text = str(item.get("text") or "").strip()
-            origs = [by_id.get(i) for i in ids]
-            if not ids or not text or any(b is None for b in origs) or claimed & set(ids) \
-                    or len(set(ids)) != len(ids):
-                plan.rejected.append(f"merge {ids}: unknown, repeated or already-used id, or empty text")
-                continue
-            if any(b.fields.get("tag") == "pinned" for b in origs):
-                plan.rejected.append(f"merge {ids}: a pinned entry never moves")
-                continue
-            total = sum(len(b.text) for b in origs)
-            if len(" ".join(text.split())) > total * 1.1 + 20:
-                plan.rejected.append(f"merge {ids}: merged text is longer than the originals")
-                continue
-            merged_blocks = state_blocks.parse(text)[1]
-            if len(merged_blocks) > 1:
-                plan.rejected.append(f"merge {ids}: text is not exactly one entry")
-                continue
-            origs.sort(key=lambda b: b.start)
-            first = origs[0]
-            title = " ".join(text.split("\n", 1)[0].split())
-            new_id = (
-                _mem.new_entry_id(title, taken) if key != "state"
-                else _fresh_state_id(taken)
-            )
-            taken.add(new_id)
-            comment = user_flags.render_comment(
-                {"id": new_id, "created": today, "touched": today})
-            replaced[first.start] = (first.end, _merge_lines(text, first.prefix, comment))
-            for b in origs[1:]:
-                replaced[b.start] = (b.end, [])
-            plan.archived.append((
-                f"## [merged {today} into id:{new_id}]",
-                "\n".join(b.raw for b in origs),
-            ))
-            claimed.update(ids)
-            plan.applied.append({"kind": "merge", "file": FILE_BY_KEY[key], "ids": ids, "new_id": new_id})
+    lines = [_TASK_HEAD]
+    for key in LIVE_KEYS:
+        now, soft, target = sizes[key]
+        if key in over:
+            lines.append(f"- {FILE_BY_KEY[key]}: {now:,} tokens (soft {soft:,}, target {target:,}) — OVER\n")
         else:
-            eid = str(item.get("id") or "")
-            b = by_id.get(eid)
-            if b is None or eid in claimed:
-                plan.rejected.append(f"archive {eid!r}: unknown or already-used id")
-                continue
-            if b.fields.get("tag") == "pinned":
-                plan.rejected.append(f"archive {eid!r}: a pinned entry never moves")
-                continue
-            replaced[b.start] = (b.end, [])
-            plan.archived.append((f"## [archived {today}]", b.raw))
-            claimed.add(eid)
-            plan.applied.append({"kind": "archive", "file": FILE_BY_KEY[key], "id": eid})
-
-    if not replaced:
-        return plan
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        if i in replaced:
-            end, repl = replaced[i]
-            out.extend(repl)
-            i = end + 1
-            continue
-        out.append(lines[i])
-        i += 1
-    plan.content = "\n".join(out)
-    # Consecutive "archived" sections collapse into one.
-    merged_sections: list[tuple[str, str]] = []
-    for heading, text in plan.archived:
-        if merged_sections and merged_sections[-1][0] == heading:
-            merged_sections[-1] = (heading, merged_sections[-1][1] + "\n" + text)
-        else:
-            merged_sections.append((heading, text))
-    plan.archived = merged_sections
-    return plan
+            lines.append(f"- {FILE_BY_KEY[key]}: {now:,} (soft {soft:,}) — within\n")
+    lines.append(f"Folded in the injected view: {', '.join(folded) if folded else 'none'}.\n")
+    lines.append("\nDO\n")
+    items: list[str] = []
+    for key in LIVE_KEYS:
+        if key in over:
+            items.append(_DO_OVER[key])
+    for filename in folded:
+        items.append(_DO_FOLDED.format(filename=filename))
+    if pointer_paths:
+        items.append(_DO_POINTERS.format(paths=", ".join(pointer_paths)))
+    if forced and not over:
+        items.append(_DO_FORCED)
+    if any(k in over for k in EDITABLE_KEYS) or forced:
+        items.append(_DO_ARCHIVE_LINE)
+    items.append(_DO_NOTHING)
+    for n, item in enumerate(items, 1):
+        lines.append(f"{n}. {item}\n")
+    lines.append("\n" + _RULES.format(today=today) + "\n")
+    last = last_pass.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M") if last_pass else "never"
+    lines.append(f"LAST PASS: {last}\n")
+    lines.append("SESSIONS ACTIVE SINCE THEN (newest first):\n")
+    if sessions:
+        for s in sessions:
+            name = " ".join(str(s.get("name") or "").split())[:80]
+            lines.append(f"- {s.get('session_uuid')}  last_activity={_minutes(s.get('last_activity_at'))}  {name}\n")
+    else:
+        lines.append("(none)\n")
+    lines.append("\n" + _TASK_TAIL.format(cap=tool_cap))
+    return "".join(lines)
 
 
-def _fresh_state_id(taken: set[str]) -> str:
-    while True:
-        eid = user_flags.new_entry_id()
-        if eid not in taken:
-            return eid
+# ---------------------------------------------------------------------------
+# The tool guard: edit/write confined to <workspace>/orbital/*.md
+# ---------------------------------------------------------------------------
+
+_GUARDED_TOOLS = ("edit", "write")
 
 
-def _index_ok(new_index, old_index: str) -> bool:
-    return isinstance(new_index, str) and bool(new_index.strip()) and new_index.strip() != (old_index or "").strip()
+def memory_tool_guard(workspace: str):
+    """A deterministic path check for the Memory session's loop: ``edit``
+    and ``write`` may only target ``<workspace>/orbital/*.md`` (the live
+    files, their archives, ASKS.md). Every other tool is unrestricted.
+    Returns the error text to hand back as the tool result, or None."""
+    orbital = os.path.realpath(os.path.join(workspace, "orbital"))
+    root = os.path.realpath(workspace)
 
+    def guard(tc: dict) -> str | None:
+        if tc.get("name") not in _GUARDED_TOOLS:
+            return None
+        args = tc.get("arguments") or {}
+        raw = args.get("path") if isinstance(args, dict) else None
+        if not raw or not isinstance(raw, str):
+            return None   # the tool reports its own missing argument
+        target = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+        if os.path.dirname(target) == orbital and target.endswith(".md"):
+            return None
+        return (
+            f"Error: the Memory session may only edit or write orbital/*.md "
+            f"(the memory files, their archives and ASKS.md); {raw!r} is outside that."
+        )
+
+    return guard
+
+
+# ---------------------------------------------------------------------------
+# INDEX: archive lines survive a rewrite
+# ---------------------------------------------------------------------------
 
 _ARCHIVE_NAME_RE = re.compile(r"[A-Z_]+_ARCHIVE\.md")
 
@@ -733,212 +513,95 @@ def _keep_archive_lines(new_index: str, old_index: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# The pass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TurnResult:
+    """What the agent manager reports back from one Memory turn."""
+    mode: str                       # "snapshot" (live run's Layer-1 rows) | "disk"
+    llm_calls: int = 0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
+    ended: str = ""                 # the loop's exit path ("text", "tool_cap", …)
+    provider: str = ""
+    model: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "mode": self.mode, "llm_calls": self.llm_calls, "tool_calls": self.tool_calls,
+            "input_tokens": self.input_tokens, "cached_tokens": self.cached_tokens,
+            "output_tokens": self.output_tokens, "ended": self.ended,
+            "provider": self.provider, "model": self.model,
+        }
+
+
 @dataclass
 class EditorResult:
-    ok: bool                            # the editor produced parseable choices
-    outcome: str                        # "edited" | "no_change" | "failed"
+    ok: bool                            # the turn ran (or was declined) without error
+    outcome: str                        # edited | no_change | index_only | restored | skipped | failed
     calls: int = 0
-    choices: dict | None = None
-    applied: list[dict] = field(default_factory=list)
-    rejected: list[str] = field(default_factory=list)
-    skipped_files: list[str] = field(default_factory=list)
-    written: list[str] = field(default_factory=list)      # file keys the editor wrote
+    turn: TurnResult | None = None
+    written: list[str] = field(default_factory=list)      # file keys that changed
     restored: list[str] = field(default_factory=list)     # ids put back by conservation
     backup_dir: str | None = None
     error: str | None = None
 
 
-def apply_choices(
-    workspace_files, choices: dict, *, baselines: dict[str, int | None],
-    snapshot: dict[str, str], today: str, project_id: str = "",
-) -> EditorResult:
-    """Apply the editor's choices. NO awaits in here — all or per-file nothing.
+def _cost_usd(turn: TurnResult) -> float:
+    try:
+        from agent_os.agent.pricing import resolve_rates
+        rates = resolve_rates(turn.provider or "custom", turn.model or "")
+        fresh = max(0, turn.input_tokens - turn.cached_tokens)
+        return (
+            fresh * rates.input_per_1m
+            + turn.cached_tokens * rates.cached_input_per_1m
+            + turn.output_tokens * rates.output_per_1m
+        ) / 1_000_000
+    except Exception:  # noqa: BLE001 — a pricing gap never hides the pass
+        return 0.0
 
-    Per file: plan against the exact bytes the editor saw; if the file changed
-    since (OCC), skip it; otherwise append the moved entries to the archive
-    FIRST, then write the smaller live file.
+
+def _sizes(workspace_files) -> dict[str, tuple[int, int, int]]:
+    out = {}
+    for key in LIVE_KEYS:
+        raw = workspace_files.read(key) or ""
+        now = int(_mem.est_tokens(_mem._budget_text(raw, key)))
+        out[key] = (now, _mem.FILE_BUDGETS[key]["soft"], _mem.consolidation_target(key))
+    return out
+
+
+def _folded(workspace_files) -> list[str]:
+    """Entry files whose injected view folds (a section count line appears)."""
+    out = []
+    for key in _mem.ENTRY_KEYS:
+        raw = workspace_files.read(key)
+        if not raw:
+            continue
+        view = _mem.inject_view(raw, key, _mem.FILE_BUDGETS[key]["hard"]) or ""
+        if "not shown — read " in view:
+            out.append(FILE_BY_KEY[key])
+    return out
+
+
+async def run_pass(
+    workspace_files, run_turn, *, list_sessions=None, project_id: str = "",
+    today: str | None = None, now: datetime | None = None,
+    over_keys=(), forced: bool = False, trigger: str = "over_budget",
+) -> EditorResult:
+    """One pass: backup → prepass → task message → one Memory turn →
+    conservation → outcome. Never raises for model/tool trouble — that comes
+    back as ``ok=False``.
+
+    ``run_turn(task_text)`` is supplied by the agent manager: it appends the
+    text to the Memory session, runs one bounded turn and returns a
+    ``TurnResult`` (None when it declined, e.g. the user is mid-turn there).
     """
     from agent_os.agent import workspace_files as _wf
 
-    result = EditorResult(ok=True, outcome="no_change", choices=choices)
-    per_key, rejected = group_choices(choices)
-    result.rejected.extend(rejected)
-
-    plans: list[FilePlan] = []
-    for key in EDITABLE_KEYS:
-        if not per_key[key]:
-            continue
-        archive_key = _mem.ARCHIVE_OF[key]
-        plan = plan_entries(
-            key, snapshot.get(key) or "", per_key[key], today=today,
-            archive_ids=_mem.archive_ids(workspace_files.read(archive_key)),
-        )
-        result.rejected.extend(plan.rejected)
-        if plan.archived:
-            plans.append(plan)
-
-    # INDEX first: the moves below refresh the archive lines in INDEX, and a
-    # rewrite checked after them would read the editor's own write as a
-    # concurrent one.
-    new_index = choices.get("index")
-    if new_index is not None:
-        if not _index_ok(new_index, snapshot.get("index") or ""):
-            result.rejected.append("index: empty or unchanged")
-        elif not _wf._occ_unchanged(workspace_files, "index", baselines.get("index"),
-                                    project_id=project_id):
-            result.skipped_files.append(FILE_BY_KEY["index"])
-        else:
-            workspace_files.write("index", _keep_archive_lines(
-                new_index, snapshot.get("index") or ""))
-            _wf.refresh_index_archive_lines(workspace_files)
-            result.applied.append({"kind": "index", "file": FILE_BY_KEY["index"]})
-
-    for plan in plans:
-        if not _wf._occ_unchanged(workspace_files, plan.key, baselines.get(plan.key),
-                                  project_id=project_id):
-            result.skipped_files.append(FILE_BY_KEY[plan.key])
-            continue
-        archive_key = _mem.ARCHIVE_OF[plan.key]
-        try:
-            for heading, text in plan.archived:
-                _wf._append_archive_section(workspace_files, archive_key, heading, text)
-            workspace_files.write(plan.key, plan.content)
-        except OSError as e:
-            logger.warning("memory editor: could not apply %s (%s)", plan.key, e)
-            result.skipped_files.append(FILE_BY_KEY[plan.key])
-            continue
-        result.written.append(plan.key)
-        _wf.refresh_index_archive_lines(workspace_files)
-        result.applied.extend(plan.applied)
-
-    if result.applied:
-        result.outcome = "edited"
-    return result
-
-
-def _norm_ws(text) -> str:
-    return " ".join(str(text or "").split())
-
-
-def _user_texts(session_path: str) -> list[str]:
-    """The user's own messages in a session log (not injected/system rows)."""
-    texts: list[str] = []
-    try:
-        with open(session_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(row, dict) or row.get("role") != "user":
-                    continue
-                if row.get("source") not in (None, "user"):
-                    continue
-                content = row.get("content")
-                if isinstance(content, list):
-                    content = " ".join(
-                        b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                if isinstance(content, str) and content:
-                    texts.append(_norm_ws(content))
-    except OSError:
-        return []
-    return texts
-
-
-def apply_ask_closes(
-    workspace: str, orbital_dir: str, items, *, today: str,
-) -> tuple[list[dict], list[str]]:
-    """Close asks the editor can quote the user answering (spec 089 v2 §6).
-
-    Each item is ``{"id", "session", "quote"}``. The close is appended as
-    ``done <id> <today> by:editor "<quote>"`` only when the quote is verbatim
-    (whitespace-normalised) in a USER message of that session; otherwise it is
-    rejected and the ask stays open. Returns ``(applied, rejected)``.
-    """
-    from agent_os.agent import asks as _asks
-    from agent_os.agent.project_paths import ProjectPaths
-
-    applied: list[dict] = []
-    rejected: list[str] = []
-    items = _as_list(items)
-    if not items:
-        return applied, rejected
-    try:
-        open_ids = {a.id for a in _asks.read_asks(orbital_dir) if a.is_open}
-    except Exception:  # noqa: BLE001 — an unreadable log closes nothing
-        return applied, ["close_asks: ASKS.md unreadable"]
-    sessions_dir = ProjectPaths(workspace).sessions_dir
-    for item in items:
-        if not isinstance(item, dict):
-            rejected.append("close_asks: not an object")
-            continue
-        ask_id = str(item.get("id") or "").strip().lower()
-        session = str(item.get("session") or "").strip()
-        quote = _norm_ws(item.get("quote"))
-        if ask_id not in open_ids:
-            rejected.append(f"close_asks {ask_id or '?'}: not an open ask")
-            continue
-        if not quote or len(quote) > _MAX_QUOTE_CHARS:
-            rejected.append(f"close_asks {ask_id}: missing or oversized quote")
-            continue
-        if not _SESSION_STEM_RE.match(session):
-            rejected.append(f"close_asks {ask_id}: bad session {session!r}")
-            continue
-        if not any(quote in t for t in _user_texts(os.path.join(sessions_dir, session + ".jsonl"))):
-            rejected.append(f"close_asks {ask_id}: quote not in the user's messages of {session}")
-            continue
-        try:
-            line = _asks.append_event(orbital_dir, "done", ask_id, f'"{quote}"', "editor",
-                                      today=today)
-        except (KeyError, ValueError, OSError) as e:
-            rejected.append(f"close_asks {ask_id}: {e}")
-            continue
-        if line is None:
-            continue  # closed meanwhile
-        open_ids.discard(ask_id)
-        applied.append({"kind": "close_ask", "id": ask_id, "session": session})
-    return applied, rejected
-
-
-# ---------------------------------------------------------------------------
-# The run
-# ---------------------------------------------------------------------------
-
-# Provider errors worth one more try: gateway hiccups (5xx, 429, dropped
-# connections). An auth or request error would fail the same way again.
-_RETRY_DELAY_S = 2.0
-
-
-async def _complete_once_or_retry(llm, messages, tools, deadline: float):
-    """One model call, bounded by the per-call and whole-run deadlines, retried
-    once on a transient provider error (a single gateway 500 used to discard
-    every call the run had already made)."""
-    from agent_os.agent.providers.types import ErrorCategory, LLMError
-
-    for attempt in (1, 2):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise asyncio.TimeoutError("editor exceeded its total budget")
-        try:
-            return await asyncio.wait_for(
-                llm.complete(messages, tools=tools),
-                timeout=min(EDITOR_CALL_TIMEOUT_S, remaining),
-            )
-        except LLMError as e:
-            if attempt == 2 or e.category == ErrorCategory.ABORT:
-                raise
-            logger.info("memory editor: transient provider error (%s); retrying once", e)
-            await asyncio.sleep(_RETRY_DELAY_S)
-
-
-async def run_editor(
-    workspace_files, llm, *, list_sessions=None, project_id: str = "",
-    today: str | None = None, now: datetime | None = None,
-) -> EditorResult:
-    """One editor pass: backup → ids → read-only loop → apply. Never raises
-    for model/tool trouble — that comes back as ``ok=False``."""
     now = now or datetime.now(timezone.utc)
     today = today or datetime.now().date().isoformat()
     orbital_dir = workspace_files.dir
@@ -946,105 +609,78 @@ async def run_editor(
     backup_dir = backup_live_files(orbital_dir, now=now)
     if backup_dir is None and any(workspace_files.exists(k) for k in LIVE_KEYS):
         return EditorResult(ok=False, outcome="failed", error="backup failed")
-    from agent_os.agent import workspace_files as _wf
-    _wf.prepass(workspace_files, today=today)
+    pre = _wf.prepass(workspace_files, today=today)
 
     snapshot = {k: workspace_files.read(k) or "" for k in LIVE_KEYS}
-    baselines = {k: _wf._stat_mtime_ns(workspace_files._file_path(k)) for k in LIVE_KEYS}
     since = watermark(orbital_dir)
     sessions = sessions_since(list_sessions, workspace_files.workspace, since)
-    tools = build_tools(workspace_files.workspace, list_sessions)
-    schemas = [t.schema() for t in tools.values()]
-    try:
-        from agent_os.agent import asks as _asks
-        open_asks = [a for a in _asks.read_asks(orbital_dir) if a.is_open]
-    except Exception:  # noqa: BLE001 — asks are optional input
-        open_asks = []
+    over = [k for k in LIVE_KEYS if k in set(over_keys)] or [
+        k for k in LIVE_KEYS if _mem.over_soft_budget(snapshot[k], k)]
+    task_text = build_task_message(
+        sizes=_sizes(workspace_files), folded=_folded(workspace_files), over=over,
+        forced=forced, pointer_paths=list(pre.pointer_paths), last_pass=since,
+        sessions=sessions, today=today, tool_cap=EDITOR_MAX_CALLS,
+    )
 
-    messages: list[dict] = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": build_prompt(
-            snapshot, today=today, since=since, sessions=sessions,
-            open_asks=open_asks)},
-    ]
-    calls = 0
-    choices: dict | None = None
-    deadline = time.monotonic() + EDITOR_TOTAL_TIMEOUT_S
+    result = EditorResult(ok=True, outcome="no_change", backup_dir=backup_dir)
     try:
-        while calls < EDITOR_MAX_CALLS:
-            last = calls == EDITOR_MAX_CALLS - 1
-            if last:
-                messages.append({"role": "user", "content": (
-                    "Tool budget used up. Reply now with ONLY the JSON choices.")})
-            response = await _complete_once_or_retry(
-                llm, messages, None if last else schemas, deadline)
-            calls += 1
-            tool_calls = [] if last else _normalize_calls(response)
-            if tool_calls:
-                assistant = {
-                    "role": "assistant",
-                    "content": response.text if isinstance(response.text, str) else "",
-                    "tool_calls": [{
-                        "id": c["id"], "type": "function",
-                        "function": {"name": c["name"],
-                                     "arguments": json.dumps(c["arguments"], ensure_ascii=False)},
-                    } for c in tool_calls],
-                }
-                reasoning = _raw_message(response).get("reasoning_content")
-                if reasoning:
-                    assistant["reasoning_content"] = reasoning
-                messages.append(assistant)
-                for c in tool_calls:
-                    logger.info("memory editor tool call: %s %s", c["name"],
-                                json.dumps(c["arguments"], ensure_ascii=False)[:300])
-                    messages.append({
-                        "role": "tool", "tool_call_id": c["id"],
-                        "content": await _run_tool(tools, c["name"], c["arguments"]),
-                    })
-                continue
-            text = response.text if isinstance(response.text, str) else None
-            choices = parse_choices(text)
-            if choices is not None:
-                break
-            messages.append({"role": "assistant", "content": text or ""})
-            messages.append({"role": "user", "content": (
-                "That was not a JSON object. Reply with ONLY the JSON choices.")})
+        turn = await asyncio.wait_for(run_turn(task_text), timeout=EDITOR_TOTAL_TIMEOUT_S)
     except asyncio.CancelledError:
         raise
-    except Exception as e:  # noqa: BLE001 — the floor still runs; report and move on
-        logger.warning("memory editor: model call failed after %d call(s) (%s)", calls, e)
-        return EditorResult(ok=False, outcome="failed", calls=calls,
-                            backup_dir=backup_dir, error=str(e))
+    except asyncio.TimeoutError:
+        logger.warning("memory session: the turn exceeded %.0fs; giving up on this pass",
+                       EDITOR_TOTAL_TIMEOUT_S)
+        result.ok, result.outcome, result.error = False, "failed", "turn timed out"
+        turn = None
+    except Exception as e:  # noqa: BLE001 — the shell reports, never crashes the caller
+        logger.warning("memory session: the turn failed (%s)", e)
+        result.ok, result.outcome, result.error = False, "failed", str(e)
+        turn = None
+    result.turn = turn
+    result.calls = turn.llm_calls if turn else 0
 
-    if choices is None:
-        logger.warning("memory editor: no usable JSON after %d call(s)", calls)
-        return EditorResult(ok=False, outcome="failed", calls=calls,
-                            backup_dir=backup_dir, error="no JSON choices")
+    # Post-pass, whatever happened in the turn: INDEX keeps its archive
+    # lines, the archive lines' counts/dates are refreshed, and every id the
+    # pass started with is still live or archived.
+    current_index = workspace_files.read("index") or ""
+    if current_index != snapshot["index"]:
+        kept = _keep_archive_lines(current_index, snapshot["index"])
+        if kept.strip() != current_index.strip():
+            workspace_files.write("index", kept)
+    _wf.refresh_index_archive_lines(workspace_files)
+    changed = [k for k in EDITABLE_KEYS if (workspace_files.read(k) or "") != snapshot[k]]
+    result.restored = _wf.postpass_conservation(workspace_files, snapshot, changed)
+    result.written = [k for k in LIVE_KEYS if (workspace_files.read(k) or "") != snapshot[k]]
 
-    result = apply_choices(workspace_files, choices, baselines=baselines,
-                           snapshot=snapshot, today=today, project_id=project_id)
-    # Id conservation (spec 124 §3.5): every id the pass started with is still
-    # live or in its archive, else its entry comes back from the snapshot.
-    result.restored = _wf.postpass_conservation(workspace_files, snapshot, result.written)
-    closes, close_rejects = apply_ask_closes(
-        workspace_files.workspace, orbital_dir, choices.get("close_asks"), today=today)
-    result.applied.extend(closes)
-    result.rejected.extend(close_rejects)
-    if closes and result.outcome == "no_change":
-        result.outcome = "edited"
-    result.calls = calls
-    result.backup_dir = backup_dir
-    logger.info(
-        "memory editor: %s in %d call(s) — applied=%s rejected=%s skipped=%s restored=%s",
-        result.outcome, calls, json.dumps(result.applied, ensure_ascii=False),
-        result.rejected, result.skipped_files, result.restored,
-    )
-    _write_run_record(backup_dir, result)
+    if result.ok:
+        if turn is None:
+            result.outcome = "skipped"
+        elif result.restored:
+            result.outcome = "restored"
+        elif any(k in EDITABLE_KEYS for k in result.written):
+            result.outcome = "edited"
+        elif "index" in result.written:
+            result.outcome = "index_only"
+        else:
+            result.outcome = "no_change"
+    if turn is not None:
+        logger.info(
+            "memory session: mode=%s calls=%d input=%d cached=%d output=%d cost=$%.4f "
+            "(project=%s trigger=%s tool_calls=%d ended=%s outcome=%s written=%s restored=%s)",
+            turn.mode, turn.llm_calls, turn.input_tokens, turn.cached_tokens,
+            turn.output_tokens, _cost_usd(turn), project_id, trigger, turn.tool_calls,
+            turn.ended, result.outcome, result.written, result.restored,
+        )
+    else:
+        logger.info("memory pass: %s (project=%s trigger=%s written=%s restored=%s error=%s)",
+                    result.outcome, project_id, trigger, result.written, result.restored,
+                    result.error)
+    _write_run_record(backup_dir, result, trigger=trigger)
     return result
 
 
-def _write_run_record(backup_dir: str | None, result: EditorResult) -> None:
-    """Keep the run's choices next to its backup, for audit."""
+def _write_run_record(backup_dir: str | None, result: EditorResult, *, trigger: str = "") -> None:
+    """Keep the pass's outcome next to its backup, for audit."""
     if not backup_dir:
         return
     try:
@@ -1052,11 +688,11 @@ def _write_run_record(backup_dir: str | None, result: EditorResult) -> None:
             json.dump({
                 "outcome": result.outcome,
                 "calls": result.calls,
-                "choices": result.choices,
-                "applied": result.applied,
-                "rejected": result.rejected,
-                "skipped_files": result.skipped_files,
+                "trigger": trigger,
+                "turn": result.turn.as_dict() if result.turn else None,
+                "written": result.written,
                 "restored": result.restored,
+                "error": result.error,
             }, f, ensure_ascii=False, indent=2)
     except OSError:
         pass

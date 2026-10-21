@@ -285,6 +285,8 @@ class AgentLoop:
         on_budget_event=None,
         on_credential_error=None,
         memory_record_enabled: bool = True,
+        tool_guard=None,
+        tool_call_cap: int | None = None,
     ):
         self._session = session
         self._provider = provider
@@ -415,6 +417,21 @@ class AgentLoop:
         self._run_memory_written: bool = False
         self._memory_record_done: bool = False
         self._memory_record_active: bool = False
+
+        # Spec 124 §3.7 — the Memory session's loop. ``tool_guard(tc)`` is a
+        # deterministic check run before any interceptor: an error string is
+        # handed back as the tool result and the tool never executes (the
+        # Memory session confines edit/write to orbital/*.md with it).
+        # ``tool_call_cap`` bounds the executed tool calls of ONE run; when
+        # it is reached the rest of the batch is skipped and the run ends.
+        # ``last_run_stats`` is what the pass reports (calls, tokens, exit).
+        self._tool_guard = tool_guard
+        self._tool_call_cap = tool_call_cap
+        self._run_tool_calls: int = 0
+        self.last_run_stats: dict = self._fresh_run_stats()
+        # Spec 124 §3.10 — the PROJECT_STATE ids this run has seen, bound
+        # per snapshot segment for the write path's conservation guard.
+        self._seen_ids_token = None
 
         # Queue integration (Phase 2 — exit_reason; Phase 3 — queue_state)
         # Reset to defaults at the start of every run().
@@ -1006,6 +1023,8 @@ class AgentLoop:
         self._cancellation_marker_appended_this_turn = False
         # Diagnostics: track exit path + appended-row delta for this run.
         self._loop_exit_path = None
+        self.last_run_stats = self._fresh_run_stats()
+        self._run_tool_calls = 0
         rows_at_run_start = None  # set before the while; guarded in finally
         iteration = 0  # bound here so the except-backstop can always report it
         # Spec 112: a run is one snapshot segment. The Layer-1 rendering and
@@ -1394,6 +1413,11 @@ class AgentLoop:
                     self._prompt_input_tokens_total += response.usage.input_tokens
                     self._cache_read_tokens_total += response.usage.cache_read_tokens
                     self._llm_call_count += 1
+                    stats = self.last_run_stats
+                    stats["llm_calls"] += 1
+                    stats["input_tokens"] += response.usage.input_tokens
+                    stats["cached_tokens"] += response.usage.cache_read_tokens
+                    stats["output_tokens"] += response.usage.output_tokens
 
                 # Token ledger (Budget Piece 1): append one disjoint-token event
                 # per management LLM response. Attribution uses `active_provider`
@@ -1582,6 +1606,36 @@ class AgentLoop:
                         )
                         continue
 
+                    # Spec 124 §3.7: the run's tool cap. Reached → this call
+                    # and the rest of the batch get a skip result and the
+                    # run ends; the daemon, not the model, ends the turn.
+                    if (self._tool_call_cap is not None
+                            and self._run_tool_calls >= self._tool_call_cap):
+                        for rest in tool_calls:
+                            if rest["id"] in _signal_tc_ids or not rest["id"]:
+                                continue
+                            if rest["id"] in self._session.pending_tool_calls:
+                                self._session.append_tool_result(
+                                    rest["id"],
+                                    f"Skipped: this turn's tool budget ({self._tool_call_cap} "
+                                    "calls) is used up; the turn ends here.",
+                                )
+                        self._note_exit("tool_cap", iteration)
+                        exit_outer = True
+                        break
+
+                    # Spec 124 §3.7: deterministic guard (path confinement
+                    # for the Memory session). Before the interceptor so a
+                    # refused write never asks for approval.
+                    if self._tool_guard is not None:
+                        try:
+                            refusal = self._tool_guard(tc)
+                        except Exception as e:  # noqa: BLE001 — fail closed
+                            refusal = f"Error: tool guard failed ({e}); the tool was not executed."
+                        if refusal:
+                            self._session.append_tool_result(tc["id"], refusal)
+                            continue
+
                     # Interceptor check (fail-closed)
                     if self._interceptor is not None:
                         try:
@@ -1667,6 +1721,8 @@ class AgentLoop:
                         continue
 
                     # Execute tool (async-aware)
+                    self._run_tool_calls += 1
+                    self.last_run_stats["tool_calls"] += 1
                     try:
                         if self._tool_registry.is_async(tc["name"]):
                             result: ToolResult = await self._tool_registry.execute_async(
@@ -2033,6 +2089,8 @@ class AgentLoop:
             )
 
             self._running = False
+            self.last_run_stats["ended"] = self._loop_exit_path
+            self._unbind_seen_state_ids()
             # The turn is over: settle the spend corner on the FINAL figure now
             # rather than leaving the debouncer's pending payload to fire (or
             # not) up to a second later. The run's last append almost always
@@ -2181,10 +2239,17 @@ class AgentLoop:
     # Spec 112 A6 — end-of-run memory record turn
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fresh_run_stats() -> dict:
+        return {"llm_calls": 0, "tool_calls": 0, "input_tokens": 0,
+                "cached_tokens": 0, "output_tokens": 0, "ended": None}
+
     def _begin_snapshot_segment(self) -> None:
         """Run start / post-compaction: refresh the Layer-1 snapshot and the
-        media-pruning horizon (spec 112 A1/A5) and reset the per-segment
-        record-turn bookkeeping."""
+        media-pruning horizon (spec 112 A1/A5), reset the per-segment
+        record-turn bookkeeping, and bind the PROJECT_STATE ids this segment
+        starts from (spec 124 §3.10: the write path protects only ids the
+        writer never saw)."""
         begin = getattr(self._context_manager, "begin_run", None)
         if callable(begin):
             try:
@@ -2194,6 +2259,35 @@ class AgentLoop:
         self._run_changed_files = []
         self._run_memory_written = False
         self._memory_record_done = False
+        self._bind_seen_state_ids()
+
+    def _bind_seen_state_ids(self) -> None:
+        from agent_os.agent import memory_entries as _mem
+        from agent_os.agent import state_blocks as _blocks
+        self._unbind_seen_state_ids()
+        workspace = self._workspace()
+        if not workspace:
+            return
+        try:
+            path = os.path.join(workspace, "orbital", "PROJECT_STATE.md")
+            with open(path, "r", encoding="utf-8") as fh:
+                ids = {b.id for b in _blocks.parse(fh.read())[1] if b.id}
+        except OSError:
+            ids = set()
+        except Exception:  # noqa: BLE001 — a parse bug must not break a turn
+            logger.warning("seen-set binding failed", exc_info=True)
+            return
+        self._seen_ids_token = _mem.bind_seen_state_ids(ids)
+
+    def _unbind_seen_state_ids(self) -> None:
+        if self._seen_ids_token is None:
+            return
+        from agent_os.agent import memory_entries as _mem
+        try:
+            _mem.unbind_seen_state_ids(self._seen_ids_token)
+        except ValueError:
+            pass  # bound in another context (tests driving run() across tasks)
+        self._seen_ids_token = None
 
     def _workspace(self) -> str | None:
         base = getattr(self._context_manager, "_base_ctx", None)

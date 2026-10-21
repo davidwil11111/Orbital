@@ -122,19 +122,14 @@ def test_hard_cap_never_demotes(tmp_path, monkeypatch):
     assert not wf.exists("decisions_archive")
 
 
-def test_editor_cannot_archive_pinned(tmp_path, monkeypatch):
+def test_the_task_message_forbids_touching_pinned_entries():
     from agent_os.agent import memory_editor
-    wf = _wf(tmp_path)
-    entries = _decisions(8)
-    entries = entries.replace(
-        "id:d5 created:2026-01-05 touched:2026-01-05",
-        "id:d5 created:2026-01-05 touched:2000-01-01 tag:pinned",
+    text = memory_editor.build_task_message(
+        sizes={k: (1, 10, 5) for k in memory_editor.LIVE_KEYS}, folded=[], over=["decisions"],
+        forced=False, pointer_paths=[], last_pass=None, sessions=[], today="2026-06-18", tool_cap=12,
     )
-    wf.write("decisions", entries)
-    plan = memory_editor.plan_entries("decisions", wf.read("decisions"),
-                                      [{"_kind": "archive", "id": "d5"}], today="2026-06-18")
-    assert plan.archived == [] and any("pinned" in r for r in plan.rejected)
-    assert "Decision 5 " in plan.content
+    assert "Never touch entries tagged tag:pinned." in text
+    assert "never because it is\n  old" in text
 
 
 # ---------------------------------------------------------------------------
@@ -183,29 +178,20 @@ def test_no_delta_gate(tmp_path):
 # Gate 7 — contradiction dedup via the session-end pass (fake provider)
 # ---------------------------------------------------------------------------
 
-class _FakeResp:
-    def __init__(self, text):
-        self.text = text
+class _FakeTurn:
+    """A Memory turn runner (spec 124 §3.7) that applies ``moves(wf)`` the
+    way the agent's edits would, and counts its calls."""
 
-
-class _FakeProvider:
-    def __init__(self, payload):
-        self._payload = payload
+    def __init__(self, moves=None):
+        self._moves = moves
         self.calls = 0
 
-    async def complete(self, messages, tools=None, disable_reasoning=False):
+    async def __call__(self, task_text):
+        from agent_os.agent import memory_editor
         self.calls += 1
-        return _FakeResp(json.dumps(self._payload))
-
-    async def stream(self, messages, tools=None, **kwargs):
-        # The merge streams (a 15-min idle connection is unreliable); replay
-        # complete()'s payload as chunks so this test keeps its own subject.
-        from agent_os.agent.providers.types import StreamChunk, TokenUsage
-        resp = await self.complete(messages)
-        text = getattr(resp, "text", "") or ""
-        for i in range(0, len(text), 256):
-            yield StreamChunk(text=text[i:i + 256])
-        yield StreamChunk(is_final=True, usage=TokenUsage(input_tokens=1, output_tokens=1))
+        if self._moves is not None:
+            self._moves()
+        return memory_editor.TurnResult(mode="disk", llm_calls=1, tool_calls=2, ended="text_complete")
 
 
 class _FakeSession:
@@ -218,9 +204,11 @@ class _FakeSession:
 
 @pytest.mark.asyncio
 async def test_session_end_merges_supersedes(tmp_path):
-    """Spec 089: superseding is a MERGE BY ID — the contradiction pair leaves
-    the live file (both originals archived verbatim, a pointer left) and one
-    condensed entry takes its place."""
+    """Spec 124 §3.7: superseding is a MERGE the Memory session writes — the
+    contradiction pair leaves the live file (both originals archived
+    verbatim under a [merged …] section) and one condensed entry takes its
+    place."""
+    from agent_os.agent import state_blocks
     wf = _wf(tmp_path)
     # the real contradiction pair from the reports
     wf.write("decisions",
@@ -232,17 +220,33 @@ async def test_session_end_merges_supersedes(tmp_path):
         "- 2026-06-15: Use Orbital Name (Not QClaw) for Outreach\n"
         "  **Chose:** Orbital indie builder.\n  **Rejected:** QClaw PM identity (superseded).\n"
     )
-    prov = _FakeProvider({"merge": [{
-        "file": "DECISIONS.md", "ids": ["qclaw", "orbital-name"], "text": merged,
-    }]})
+
+    def moves():
+        # the merged entry in the live file first, then the originals under
+        # a [merged …] section (what the task message asks for)
+        from agent_os.agent import state_blocks
+        live = wf.read("decisions")
+        blocks = {b.id: b for b in state_blocks.parse(live)[1] if b.id}
+        new_live = live.replace(blocks["qclaw"].raw + "\n\n", "").replace(
+            blocks["orbital-name"].raw + "\n", merged)
+        wf.write("decisions", new_live)
+        # the daemon stamps the merged entry: a title it already knows keeps
+        # its id (orbital-name here), a new title gets a fresh one
+        new_id = state_blocks.parse(wf.read("decisions"))[1][0].id
+        WF._append_archive_section(
+            wf, "decisions_archive", f"## [merged 2026-06-18 into id:{new_id}]",
+            blocks["qclaw"].raw + "\n" + blocks["orbital-name"].raw)
+
+    prov = _FakeTurn(moves)
     await WF.run_session_end_routine(
-        _FakeSession(), prov, wf, utility_provider=None,
-        session_uuid="u1", bypass_idempotency=True, project_id="p1", force=True,
+        _FakeSession(), None, wf, utility_provider=None,
+        session_uuid="u1", bypass_idempotency=True, project_id="p1", force=True, run_turn=prov,
     )
     out = wf.read("decisions")
     assert "Use Orbital Name" in out
     assert "QClaw PM Identity for Outreach" not in out   # superseded entry left
     assert "id:qclaw" not in out and "[archived" not in out   # nothing left behind
+    assert len(state_blocks.parse(out)[1]) == 1
     archive = wf.read("decisions_archive")
     assert "- 2026-06-15: QClaw PM Identity for Outreach\n  <!--mem id:qclaw" in archive
     assert "## [merged " in archive and "into id:" in archive
@@ -254,10 +258,10 @@ async def test_session_end_no_delta_skips_llm(tmp_path):
     wf = _wf(tmp_path)
     wf.write("decisions", _decisions(2))
     WF._write_cleanup_marker(wf)  # mark as already cleaned
-    prov = _FakeProvider({"decisions": "x"})
+    prov = _FakeTurn()
     await WF.run_session_end_routine(
-        _FakeSession(), prov, wf, session_uuid="u2",
-        bypass_idempotency=True, project_id="p1",
+        _FakeSession(), None, wf, session_uuid="u2",
+        bypass_idempotency=True, project_id="p1", run_turn=prov,
     )
     assert prov.calls == 0  # no-delta → no LLM call
 
@@ -267,21 +271,18 @@ async def test_session_end_survives_llm_timeout_and_leaves_the_file_whole(tmp_pa
     """LLM times out → no propagation; the floor runs but moves nothing."""
     from agent_os.agent import memory_editor
     monkeypatch.setitem(M.FILE_BUDGETS, "decisions", {"soft": 120, "hard": 180})
-    monkeypatch.setattr(memory_editor, "EDITOR_CALL_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(memory_editor, "EDITOR_TOTAL_TIMEOUT_S", 0.01)
     wf = _wf(tmp_path)
     wf.write("decisions", _decisions(12, body="x" * 20))
     before = wf.read("decisions")
 
-    class _Timeout:
-        model = "hangs"
-
-        async def complete(self, messages, tools=None, disable_reasoning=False):
-            import asyncio
-            await asyncio.sleep(999)
+    async def _hangs(task_text):
+        import asyncio
+        await asyncio.sleep(999)
 
     out = await WF.run_session_end_routine(
-        _FakeSession(), _Timeout(), wf, session_uuid="u3",
-        bypass_idempotency=True, project_id="p1",
+        _FakeSession(), None, wf, session_uuid="u3",
+        bypass_idempotency=True, project_id="p1", run_turn=_hangs,
     )
     assert out == "backstop_only"
     # the floor never moves an entry: the file is whole, there is no archive
