@@ -56,7 +56,13 @@ _CHAINED_FRAME = (
 # with retries).
 _SUMMARY_TIMEOUT_S = 90.0
 
-MEMORY_FLUSH_PROMPT = (
+# The pre-compaction "memory flush" turn was removed (2026-10-21): spec 112's
+# record turn runs before every compaction and does its job. Sessions written
+# by earlier versions still carry the flush's system row followed by the
+# agent's reply, and ``_task_rows`` must not mistake that reply for the end
+# of a turn, so the exact old text stays here for that check only. Never
+# append it to a session again.
+_LEGACY_FLUSH_PROMPT = (
     "Pre-compaction memory flush. "
     "Your context window is nearly full and history will be summarised shortly. "
     "Write any critical working state — current task position, active decisions, "
@@ -142,7 +148,8 @@ def _task_rows(messages: list[dict], split: int) -> list[int]:
     """User messages before ``split`` that must reach the model verbatim.
 
     The current turn starts after the last finished one (an assistant reply
-    with no tool calls; the pre-compaction flush reply does not count). Its
+    with no tool calls; a reply to the legacy pre-compaction flush prompt,
+    found in sessions written before 2026-10-21, does not count). Its
     user messages are the task. A turn started by a daemon event has none, so
     the latest user message stands in for the task.
     """
@@ -150,7 +157,7 @@ def _task_rows(messages: list[dict], split: int) -> list[int]:
     for i in range(len(messages) - 1, 0, -1):
         m = messages[i]
         if (m.get("role") == "assistant" and not m.get("tool_calls")
-                and messages[i - 1].get("content") != MEMORY_FLUSH_PROMPT):
+                and messages[i - 1].get("content") != _LEGACY_FLUSH_PROMPT):
             turn_start = i + 1
             break
     rows = [i for i in range(turn_start, split) if messages[i].get("role") == "user"]
