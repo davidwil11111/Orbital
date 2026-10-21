@@ -46,3 +46,9 @@ class AgentSetupStatus:
     # token file and cannot see the expiry (1018 bench item 9). The card asks
     # the user to sign in again. Not a dispatch gate.
     auth_expired: bool = False
+    # The locate card: the launcher the user chose for this agent (None when
+    # detection found it on its own). ``override_missing`` is that file
+    # having disappeared since — the agent reads not-detected, the card says
+    # which file is gone, and detection never quietly falls back to PATH.
+    override_path: str | None = None
+    override_missing: bool = False

@@ -12,6 +12,7 @@ import glob
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -141,6 +142,13 @@ class SetupEngine:
         # both need a path that survives a cwd change mid-daemon.
         self._data_dir = os.path.abspath(data_dir)
         self._resolved_paths: dict[str, str] = {}  # slug -> resolved binary path
+        # The locate card (user-chosen location). ``_override_hits`` holds
+        # the slugs whose resolved path came from the override;
+        # ``_override_missing`` the override path when its file is gone —
+        # reported, never silently replaced by a PATH hit (the stale-path
+        # bug hid behind exactly that fallback).
+        self._override_hits: set[str] = set()
+        self._override_missing: dict[str, str] = {}
         # In-memory cache of the last check_all() result. Tuple of
         # (results, expires_at_monotonic). None when empty or invalidated.
         self._check_all_cache: tuple[list[AgentSetupStatus], float] | None = None
@@ -237,12 +245,22 @@ class SetupEngine:
         # Resolve binary
         binary = self.resolve_binary(manifest)
         installed = binary is not None
+        override = self._override_for(manifest.slug)
+        override_missing = manifest.slug in self._override_missing
+        override_path = (self._override_missing.get(manifest.slug)
+                         or (override["binary"] if override and manifest.slug in self._override_hits
+                             else None))
 
         # Check version via check_command
         version = None
         if installed and manifest.setup.check_command:
             cmd = self._substitute_binary(manifest.setup.check_command, manifest.runtime.command, binary)
-            version = self._run_check_command(cmd)
+            check_env = (self._override_env(override)
+                         if manifest.slug in self._override_hits else None)
+            # Positional-only when there is nothing to add: test seams stub
+            # this method with a one-argument callable.
+            version = (self._run_check_command(cmd, env=check_env)
+                       if check_env is not None else self._run_check_command(cmd))
 
         # Spec 116 D1/D4: the manifest's version floor, checked offline
         # against the version just read. No version → no floor (the agent
@@ -287,6 +305,8 @@ class SetupEngine:
             update_needed=update_needed,
             min_version=min_version,
             auth_expired=auth_expired,
+            override_path=override_path,
+            override_missing=override_missing,
         )
 
     @classmethod
@@ -400,11 +420,99 @@ class SetupEngine:
         changes what is on disk for ``slug``.
         """
         self._resolved_paths.pop(slug, None)
+        self._override_hits.discard(slug)
+        self._override_missing.pop(slug, None)
+
+    # ------------------------------------------------------------------
+    # The locate card: user-chosen location
+    # ------------------------------------------------------------------
+
+    def _override_for(self, slug: str) -> dict | None:
+        store = self._sub_agent_config_store
+        get = getattr(store, "get_override", None) if store is not None else None
+        if not callable(get):
+            return None
+        try:
+            return get(slug)
+        except Exception:  # noqa: BLE001 — a broken store must not hide the agent
+            logger.warning("Failed to read the location override for %s", slug, exc_info=True)
+            return None
+
+    @staticmethod
+    def _prepend_path(path_prepend: list[str], base: str | None = None) -> str:
+        """``path_prepend`` in front of ``base`` (the daemon PATH by default),
+        each directory once."""
+        existing = [p for p in (base if base is not None
+                                else os.environ.get("PATH", "")).split(os.pathsep) if p]
+        front = [p for p in path_prepend if p]
+        return os.pathsep.join(front + [p for p in existing if p not in front])
+
+    def _override_env(self, override: dict | None) -> dict[str, str] | None:
+        """The daemon env with the override's PATH entries in front, for the
+        version check and the Test button. None when there is nothing to add."""
+        if not override or not override.get("path_prepend"):
+            return None
+        env = dict(os.environ)
+        env["PATH"] = self._prepend_path(list(override["path_prepend"]))
+        return env
+
+    def test_override(self, slug: str, binary: str,
+                      path_prepend: list[str] | None = None) -> dict:
+        """Run the manifest's ``check_command`` against ``binary`` with
+        ``path_prepend`` in front of PATH — the locate card's Test. No shell:
+        the binary is argv[0] (a path with spaces survives), the rest of the
+        check command is split like a shell would.
+
+        Returns ``{"ok", "version_output"}`` or ``{"ok": False, "error"}``
+        with the CLI's own words."""
+        manifest = self._registry.get(slug)
+        if manifest is None:
+            return {"ok": False, "error": f"Unknown agent: {slug}"}
+        if not os.path.isfile(binary):
+            return {"ok": False, "error": f"No file at {binary}."}
+        check = manifest.setup.check_command or ""
+        command = manifest.runtime.command or ""
+        rest = ""
+        if check and command and (check == command or check.startswith(command + " ")):
+            rest = check[len(command):]
+        elif check:
+            # A check command that does not start with the agent's own
+            # command (unusual) — run the binary with no arguments.
+            rest = ""
+        try:
+            argv = [binary] + shlex.split(rest)
+        except ValueError as exc:
+            return {"ok": False, "error": f"Bad check command: {exc}"}
+        env = dict(os.environ)
+        env["PATH"] = self._prepend_path(list(path_prepend or []))
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=15, env=env,
+                creationflags=win_no_window_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"{os.path.basename(binary)} did not answer within 15 s."}
+        except PermissionError:
+            return {"ok": False, "error": f"{binary} is not executable."}
+        except (FileNotFoundError, OSError) as exc:
+            return {"ok": False, "error": f"Could not run {binary}: {exc}"}
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if result.returncode != 0:
+            tail = (err or out).splitlines()[-3:]
+            return {"ok": False, "error": " ".join(tail) or
+                    f"{os.path.basename(binary)} exited with code {result.returncode}."}
+        if not out and not err:
+            return {"ok": False, "error": f"{os.path.basename(binary)} printed nothing."}
+        return {"ok": True, "version_output": out or err}
 
     def resolve_binary(self, manifest: AgentManifest) -> str | None:
         """Find the agent binary.
 
         Strategy:
+        0. The user-chosen location (the locate card). Its file gone → None,
+           reported as ``override_missing``; never a fallback to 1–3.
         1. shutil.which(command) — works if PATH is correct
         2. Expand and probe auto_detect paths for current OS
         3. Try check_command via subprocess
@@ -414,6 +522,23 @@ class SetupEngine:
         # Check cache first
         if manifest.slug in self._resolved_paths:
             return self._resolved_paths[manifest.slug]
+
+        # Strategy 0: the user chose the location.
+        override = self._override_for(manifest.slug)
+        if override is not None:
+            chosen = override["binary"]
+            if os.path.isfile(chosen):
+                self._override_missing.pop(manifest.slug, None)
+                self._override_hits.add(manifest.slug)
+                self._resolved_paths[manifest.slug] = chosen
+                # D3 rule, same reason as strategy 2: the dependency checks
+                # (``node --version``) run on the daemon PATH.
+                for directory in override.get("path_prepend") or []:
+                    _append_to_daemon_path(directory)
+                return chosen
+            self._override_missing[manifest.slug] = chosen
+            self._override_hits.discard(manifest.slug)
+            return None
 
         command = manifest.runtime.command
         if not command:
@@ -751,6 +876,7 @@ class SetupEngine:
 
         # Build env from manifest credentials + overrides
         env: dict[str, str] = {}
+        location = self._override_for(slug) if slug in self._override_hits else None
         for cred in manifest.setup.credentials:
             if cred.type == "model_provider":
                 # Only the key for the configured model's provider, under the
@@ -767,6 +893,17 @@ class SetupEngine:
                 value = os.environ.get(cred.env_var or cred.key, "")
             if value and cred.env_var:
                 env[cred.env_var] = value
+
+        # The locate card: the user's PATH entries go in front of the
+        # daemon's PATH for this spawn, and the variables the agent asked
+        # for ride along — under a credential the manifest injects, never
+        # over it.
+        if location is not None:
+            if location.get("path_prepend"):
+                env["PATH"] = self._prepend_path(list(location["path_prepend"]))
+            for name, value in (location.get("env") or {}).items():
+                if value and name not in env:
+                    env[name] = value
 
         # Merge daemon-level sub-agent config (model/effort/etc.) into argv.
         # Persisted overrides win when no manifest arg conflicts; we simply
@@ -799,7 +936,8 @@ class SetupEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_check_command(self, command: str) -> str | None:
+    def _run_check_command(self, command: str,
+                           env: dict[str, str] | None = None) -> str | None:
         """Run a check command and return its stripped stdout, or None on failure."""
         try:
             result = subprocess.run(
@@ -810,6 +948,7 @@ class SetupEngine:
                 encoding="utf-8",
                 errors="replace",
                 timeout=10,
+                env=env,
                 creationflags=win_no_window_flags(),
             )
             if result.returncode == 0 and result.stdout.strip():

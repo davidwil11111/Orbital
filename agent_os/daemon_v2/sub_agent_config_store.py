@@ -19,10 +19,24 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 
+from agent_os.daemon_v2.models import detect_os
+
 logger = logging.getLogger(__name__)
+
+
+# The user-chosen agent location (the locate card). Kept in the same per-slug
+# JSON object as the CLI params, under keys no param schema may use, so the
+# override follows the user account exactly like the params do. ``binary`` is
+# the launcher to run, ``path_prepend`` the directories for the front of
+# PATH (a version manager's node, say), ``env`` the variables the agent said
+# it needs (names from the agent, values from the user, possibly empty).
+OVERRIDE_KEYS = ("binary", "path_prepend", "env")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_WINDOWS_SHIMS = (".cmd", ".bat", ".ps1")
 
 
 # Per-sub-agent stable parameter schema. Each entry maps a slug to a dict of
@@ -270,7 +284,8 @@ class SubAgentConfigStore:
     def __init__(self, path: str) -> None:
         self._path = path
         self._lock = threading.Lock()
-        self._data: dict[str, dict[str, str]] = {}
+        # slug -> {param: str, plus the OVERRIDE_KEYS in their native shapes}
+        self._data: dict[str, dict[str, object]] = {}
         self._load()
 
     @property
@@ -285,14 +300,28 @@ class SubAgentConfigStore:
             with open(self._path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw, dict):
-                # Coerce values to dict[str, str]; drop anything malformed.
-                cleaned: dict[str, dict[str, str]] = {}
+                # Coerce param values to str; the override keys keep their
+                # native shapes (str / list[str] / dict[str, str]); drop
+                # anything malformed.
+                cleaned: dict[str, dict[str, object]] = {}
                 for slug, params in raw.items():
-                    if isinstance(params, dict):
-                        cleaned[slug] = {
-                            str(k): str(v) for k, v in params.items()
-                            if isinstance(v, (str, int, float, bool))
-                        }
+                    if not isinstance(params, dict):
+                        continue
+                    entry: dict[str, object] = {}
+                    for k, v in params.items():
+                        k = str(k)
+                        if k == "binary" and isinstance(v, str) and v:
+                            entry[k] = v
+                        elif k == "path_prepend" and isinstance(v, list):
+                            entry[k] = [str(x) for x in v if isinstance(x, str) and x]
+                        elif k == "env" and isinstance(v, dict):
+                            entry[k] = {str(a): str(b) for a, b in v.items()
+                                        if isinstance(a, str) and _ENV_NAME.match(a)}
+                        elif k in OVERRIDE_KEYS:
+                            continue
+                        elif isinstance(v, (str, int, float, bool)):
+                            entry[k] = str(v)
+                    cleaned[slug] = entry
                 self._data = cleaned
             else:
                 logger.warning(
@@ -311,15 +340,110 @@ class SubAgentConfigStore:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, self._path)
 
+    @staticmethod
+    def _params_of(entry: dict[str, object]) -> dict[str, str]:
+        return {k: str(v) for k, v in entry.items() if k not in OVERRIDE_KEYS}
+
     def get(self, slug: str) -> dict[str, str]:
-        """Return the persisted config for ``slug``, or empty dict."""
+        """Return the persisted CLI params for ``slug``, or empty dict. The
+        location override is not a param: see :meth:`get_override`."""
         with self._lock:
-            return dict(self._data.get(slug, {}))
+            return self._params_of(self._data.get(slug, {}))
 
     def all(self) -> dict[str, dict[str, str]]:
-        """Return a snapshot of every persisted slug's config."""
+        """Return a snapshot of every persisted slug's params."""
         with self._lock:
-            return {k: dict(v) for k, v in self._data.items()}
+            return {k: self._params_of(v) for k, v in self._data.items()}
+
+    # ------------------------------------------------------------------
+    # Location override (the locate card)
+    # ------------------------------------------------------------------
+
+    def get_override(self, slug: str) -> dict | None:
+        """``{"binary", "path_prepend", "env"}`` for ``slug``, or None when
+        the user has not chosen a location."""
+        with self._lock:
+            entry = self._data.get(slug, {})
+            binary = entry.get("binary")
+            if not isinstance(binary, str) or not binary:
+                return None
+            return {
+                "binary": binary,
+                "path_prepend": list(entry.get("path_prepend") or []),
+                "env": dict(entry.get("env") or {}),
+            }
+
+    @staticmethod
+    def validate_override(binary: str, path_prepend: list[str] | None = None,
+                          env: dict[str, str] | None = None) -> dict:
+        """Cleaned override or :class:`SubAgentConfigError`.
+
+        The binary must be an absolute path to an existing file. On Windows
+        an npm ``.cmd``/``.bat``/``.ps1`` shim is refused with the real
+        executable named: ``cmd.exe`` re-parses the arguments and a stopped
+        shim leaves its ``node`` child running (spec 116 hit this for claude).
+        PATH entries must be absolute; env keys must be variable names.
+        """
+        binary = (binary or "").strip()
+        if not binary:
+            raise SubAgentConfigError("No executable path given.")
+        if not os.path.isabs(binary):
+            raise SubAgentConfigError(
+                f"'{binary}' is not an absolute path to the executable.")
+        if detect_os() == "windows" and binary.lower().endswith(_WINDOWS_SHIMS):
+            base = os.path.basename(binary)
+            stem = os.path.splitext(base)[0]
+            raise SubAgentConfigError(
+                f"{base} is a Windows shim script; Orbital cannot run it. Paste "
+                f"the real executable instead (for example {stem}.exe, or the "
+                f"file the shim points to).")
+        if not os.path.isfile(binary):
+            raise SubAgentConfigError(f"'{binary}' is not a file on this machine.")
+        cleaned_path: list[str] = []
+        for entry in path_prepend or []:
+            entry = str(entry).strip()
+            if not entry:
+                continue
+            if not os.path.isabs(entry):
+                raise SubAgentConfigError(
+                    f"PATH entry '{entry}' is not an absolute directory.")
+            if entry not in cleaned_path:
+                cleaned_path.append(entry)
+        cleaned_env: dict[str, str] = {}
+        for name, value in (env or {}).items():
+            name = str(name).strip()
+            if not _ENV_NAME.match(name):
+                raise SubAgentConfigError(
+                    f"'{name}' is not an environment variable name.")
+            cleaned_env[name] = "" if value is None else str(value)
+        return {"binary": binary, "path_prepend": cleaned_path, "env": cleaned_env}
+
+    def set_override(self, slug: str, *, binary: str,
+                     path_prepend: list[str] | None = None,
+                     env: dict[str, str] | None = None) -> dict:
+        """Validate and persist the user-chosen location for ``slug``,
+        leaving its CLI params as they are."""
+        cleaned = self.validate_override(binary, path_prepend, env)
+        with self._lock:
+            entry = dict(self._data.get(slug, {}))
+            entry.update(cleaned)
+            self._data[slug] = entry
+            self._save()
+        return dict(cleaned)
+
+    def clear_override(self, slug: str) -> None:
+        """Forget the user-chosen location; params stay."""
+        with self._lock:
+            entry = dict(self._data.get(slug, {}))
+            if not any(k in entry for k in OVERRIDE_KEYS):
+                return
+            for k in OVERRIDE_KEYS:
+                entry.pop(k, None)
+            if entry:
+                self._data[slug] = entry
+            else:
+                self._data.pop(slug, None)
+            self._save()
 
     def set(self, slug: str, params: dict[str, str], *,
             extra_allowed: dict[str, list[str]] | None = None) -> dict[str, str]:
@@ -334,8 +458,13 @@ class SubAgentConfigStore:
         """
         validated = self.validate(slug, params, extra_allowed=extra_allowed)
         with self._lock:
-            if validated:
-                self._data[slug] = validated
+            # The location override lives beside the params; a params
+            # write replaces only the params.
+            kept = {k: v for k, v in self._data.get(slug, {}).items()
+                    if k in OVERRIDE_KEYS}
+            merged: dict[str, object] = {**kept, **validated}
+            if merged:
+                self._data[slug] = merged
             else:
                 self._data.pop(slug, None)
             self._save()
