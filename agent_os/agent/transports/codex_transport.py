@@ -51,6 +51,28 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_CODEX_VERSION = "0.157.1"
 
+# The app-server's refusal when another app-server (the Codex desktop app
+# with the thread loaded, typically) holds the thread's writer lock. Spec 126:
+# only this exact refusal is answered with a thread/fork.
+_ACTIVE_WRITER_REFUSAL = "already has an active writer"
+
+
+class CodexRpcError(RuntimeError):
+    """A JSON-RPC error reply to one of our requests. ``str()`` is unchanged
+    from the plain RuntimeError it replaces; ``code``/``message`` are the
+    reply's fields when it had the standard shape."""
+
+    def __init__(self, method: str, error) -> None:
+        super().__init__(f"codex {method} failed: {error}")
+        self.method = method
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        self.message = (str(error.get("message") or "") if isinstance(error, dict)
+                        else str(error))
+
+    def is_active_writer_refusal(self) -> bool:
+        return _ACTIVE_WRITER_REFUSAL in self.message
+
 # Autonomy preset -> (approvalPolicy, thread/start sandbox string enum).
 # FINDINGS A4a: `untrusted` is NOT "ask me everything" — it silently
 # auto-REJECTS all escalation without asking. It must never appear here.
@@ -118,6 +140,12 @@ class CodexTransport(AgentTransport):
         self._thread_id: str | None = None
         self._rollout_path: str | None = None
         self._effective_model: str | None = None
+        # How the thread was opened, in the manager's taxonomy
+        # (_provider_confirmed_resume_outcome): ("resumed", None) after a
+        # resume or a fork of a held thread (full history either way),
+        # ("fresh", "resume_failed") when the fork failed too and a fresh
+        # thread had to be started.
+        self._resume_outcome: tuple[str, str | None] = ("fresh", None)
         # In-flight turn — REQUIRED for turn/interrupt (FINDINGS R2: both
         # threadId AND turnId; missing turnId -> -32600). Cleared on
         # turn/completed, so interrupt-without-turnId is impossible by
@@ -545,7 +573,7 @@ class CodexTransport(AgentTransport):
         finally:
             self._response_futures.pop(rid, None)
         if "error" in msg:
-            raise RuntimeError(f"codex {method} failed: {msg['error']}")
+            raise CodexRpcError(method, msg["error"])
         return msg.get("result") or {}
 
     async def read_rate_limits(self, timeout: float = 10.0) -> dict | None:
@@ -706,6 +734,11 @@ class CodexTransport(AgentTransport):
         self._rate_limit_task = asyncio.create_task(
             self._publish_rate_limits(), name=f"codex-ratelimits-{id(self)}")
 
+        await self._open_thread(workspace)
+
+    async def _open_thread(self, workspace: str) -> None:
+        """Open the handle's thread: resume, fork when the resume is refused
+        because another app-server holds the thread, else start."""
         if self._model is None and not self._resume_session_id:
             # Never open a FRESH thread on the unqualified server default
             # (cold-start 400 on ChatGPT auth). Resume stays omit-when-no-
@@ -714,7 +747,15 @@ class CodexTransport(AgentTransport):
             self._model = await self._resolve_startup_model()
 
         method, params = self._thread_open_request(workspace)
-        result = await self._request(method, params)
+        try:
+            result = await self._request(method, params)
+        except CodexRpcError as e:
+            if method != "thread/resume" or not e.is_active_writer_refusal():
+                raise
+            result = await self._fork_held_thread(params)
+        else:
+            self._resume_outcome = (
+                ("resumed", None) if method == "thread/resume" else ("fresh", None))
         thread = result.get("thread") or {}
         self._thread_id = thread.get("id")
         self._rollout_path = thread.get("path")
@@ -722,6 +763,37 @@ class CodexTransport(AgentTransport):
         if not self._thread_id:
             raise RuntimeError(
                 f"codex thread/start returned no thread id: {result}")
+
+    async def _fork_held_thread(self, params: dict) -> dict:
+        """Spec 126 B: the thread is held by another app-server (the Codex
+        desktop app keeps the writer lock while it has the thread loaded,
+        not only during a turn), so take a writable copy with the full
+        history: ``thread/fork`` with the SAME governance params as the
+        resume (fork applies its own defaults for omitted ones). The fork's
+        id goes out on turn_complete as the resume record, so later fires
+        resume the fork instead of forking again. If the fork fails too, a
+        fresh thread keeps the automation running and ``resume_outcome``
+        says the history was lost."""
+        held = params.get("threadId")
+        try:
+            # Forking copies the rollout (tens of MB for an old thread).
+            result = await self._request("thread/fork", dict(params), timeout=120.0)
+        except CodexRpcError as e:
+            logger.warning(
+                "CodexTransport: codex thread %s is held by another app-server "
+                "and thread/fork failed (%s) — starting a fresh thread", held, e)
+            fresh = {k: v for k, v in params.items() if k != "threadId"}
+            if not fresh.get("model"):
+                self._model = await self._resolve_startup_model()
+                fresh["model"] = self._model
+            result = await self._request("thread/start", fresh)
+            self._resume_outcome = ("fresh", "resume_failed")
+            return result
+        forked = (result.get("thread") or {}).get("id")
+        logger.info("CodexTransport: codex thread %s is held by another "
+                    "app-server; forked to %s", held, forked)
+        self._resume_outcome = ("resumed", None)
+        return result
 
     async def _drain_stderr(self) -> None:
         try:
@@ -958,6 +1030,10 @@ class CodexTransport(AgentTransport):
     @property
     def session_id(self) -> str | None:
         return self._thread_id
+
+    @property
+    def resume_outcome(self) -> tuple[str, str | None]:
+        return self._resume_outcome
 
     # ------------------------------------------------------------------
     # resume pre-check

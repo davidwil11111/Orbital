@@ -346,7 +346,8 @@ def test_lazy_sync_failure_never_breaks_the_list(env, monkeypatch):
 
 def test_sync_imports_on_the_manager(env):
     result = env["mgr"].sync_imports(env["pid"])
-    assert result == {"sessions": 2, "automations": {"imported": 0, "skipped": 0}}
+    assert result == {"sessions": 2, "automations": {
+        "imported": 0, "skipped": 0, "taken_over": [], "takeover_failed": []}}
 
 
 def test_create_project_runs_the_sync(env, tmp_path):

@@ -11,7 +11,9 @@ by calling agent_manager.start_agent(), and updates trigger state
 """
 
 import asyncio
+import contextlib
 import fnmatch
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -553,8 +555,19 @@ class TriggerManager:
         minting one — materialized first if it was never opened, then the
         live handle's session or the on-disk log. A session that no longer
         exists falls back to minting, so the automation still runs.
+
+        Spec 126 C: the row is written first because the dispatch reads the
+        session from disk (the recap block) and the dispatch marker lands
+        after it; when the send fails before any worker ran, the row is
+        retracted again so a refused start leaves no orphan user row.
         """
         from agent_os.agent.session import persist_user_row
+
+        sub_mgr = self._agent_manager.get_sub_agent_manager()
+        if sub_mgr is None:
+            raise RuntimeError(
+                f"no sub-agent manager available to run '{agent}'"
+            )
 
         session = None
         if session_id:
@@ -570,18 +583,18 @@ class TriggerManager:
             self._agent_manager._wire_session_observers(
                 session, project_id, session_id,
             )
-        persist_user_row(session, initial_message)
+        row = persist_user_row(session, initial_message)
 
-        sub_mgr = self._agent_manager.get_sub_agent_manager()
-        if sub_mgr is None:
-            raise RuntimeError(
-                f"no sub-agent manager available to run '{agent}'"
+        try:
+            result = await sub_mgr.send(
+                project_id, agent, initial_message,
+                session_id=session_id, initiator="queue_item",
             )
-        result = await sub_mgr.send(
-            project_id, agent, initial_message,
-            session_id=session_id, initiator="queue_item",
-        )
+        except BaseException:
+            _retract_user_row(session, row)
+            raise
         if isinstance(result, str) and result.startswith("Error"):
+            _retract_user_row(session, row)
             raise RuntimeError(result)
         logger.info(
             "Trigger %s dispatched directly to '%s' (session=%s)",
@@ -751,6 +764,57 @@ class TriggerManager:
         """Broadcast a WebSocket event if ws_manager is available."""
         if self._ws is not None:
             self._ws.broadcast(project_id, event)
+
+
+def _retract_user_row(session, row: dict) -> None:
+    """Undo ``persist_user_row`` for a worker fire that never started (spec
+    126 C): drop ``row`` from the session's in-memory list and from its
+    JSONL. Matches the LAST line with the row's role, timestamp and content
+    so an identical earlier message is never the one removed. The file
+    rewrite is atomic (temp file + ``os.replace``, the session's own
+    meta-rewrite pattern) under the session's locks. Best effort: a session
+    without a real file (tests' mocks) or a read error leaves things as they
+    are, and nothing here raises into the fire's error path.
+    """
+    messages = getattr(session, "_messages", None)
+    if isinstance(messages, list):
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i] is row:
+                del messages[i]
+                break
+    path = getattr(session, "_filepath", None)
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return
+    lock = getattr(session, "_lock", None)
+    file_lock = getattr(session, "_file_lock", None)
+    try:
+        with (lock or contextlib.nullcontext()), (file_lock or contextlib.nullcontext()):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for idx in range(len(lines) - 1, -1, -1):
+                stripped = lines[idx].strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if (rec.get("role") == row.get("role")
+                        and rec.get("timestamp") == row.get("timestamp")
+                        and rec.get("content") == row.get("content")):
+                    del lines[idx]
+                    break
+            else:
+                return
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+    except Exception:
+        logger.warning("Trigger: could not retract the user row from %s", path,
+                       exc_info=True)
 
 
 class _DebouncedHandler(FileSystemEventHandler):

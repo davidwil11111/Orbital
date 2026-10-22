@@ -7,7 +7,12 @@ date with its folder's native agent history.
 
 Sessions need no persisting step — the session list lists the folder's native
 sessions on every read and materializes one on first open — so a sync only
-counts them. Codex automations are imported as triggers here, once each.
+counts them. Codex automations are imported as triggers here, once each, and
+Orbital takes them over (spec 126): the trigger is persisted first, then the
+Codex-side automation is paused with one write; a failed write flips the
+trigger disabled so the two schedulers never both run. The result names each
+automation taken over (``taken_over``) and each left to Codex
+(``takeover_failed``) so the caller can tell the user.
 
 Called at the end of project creation, lazily on the first session list of a
 project per daemon lifetime, and by ``POST /projects/{pid}/imports/sync``.
@@ -26,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 def _zero() -> dict:
-    return {"imported": 0, "skipped": 0}
+    return {"imported": 0, "skipped": 0, "taken_over": [], "takeover_failed": []}
 
 
 class ImportCoordinator:
@@ -80,17 +85,31 @@ class ImportCoordinator:
             new, skipped = codex_automations.plan_automation_imports(
                 workspace, existing_triggers=triggers)
             if not new:
-                return {"imported": 0, "skipped": skipped}
+                return dict(_zero(), skipped=skipped)
             self._project_store.update_project(project_id, {"triggers": triggers + new})
+            # Take-over AFTER the trigger exists on disk: a pause with no
+            # Orbital trigger would be a silently dead automation, whereas a
+            # trigger whose pause failed is flipped disabled right here.
+            taken_over, takeover_failed = codex_automations.take_over_imported(new)
+            if takeover_failed:
+                self._project_store.update_project(project_id, {"triggers": triggers + new})
         tm = self._trigger_manager()
         for trigger in new:
-            logger.info("session import: Codex automation %s → trigger %s (%s, enabled=%s)",
-                        trigger["imported_from"]["codex_automation_id"], trigger["id"],
-                        trigger["schedule"]["cron"], trigger["enabled"])
+            imported_from = trigger["imported_from"]
+            if imported_from.get("paused_in_codex"):
+                ownership = "Orbital now runs it; paused in Codex"
+            elif trigger["name"] in takeover_failed:
+                ownership = "could not pause it in Codex; imported disabled"
+            else:
+                ownership = "left as is in Codex"
+            logger.info("session import: Codex automation %s → trigger %s (%s, enabled=%s; %s)",
+                        imported_from["codex_automation_id"], trigger["id"],
+                        trigger["schedule"]["cron"], trigger["enabled"], ownership)
             if tm is not None:
                 try:
                     tm.register_trigger(project_id, trigger)
                 except Exception:
                     logger.warning("session import: could not register trigger %s",
                                    trigger["id"], exc_info=True)
-        return {"imported": len(new), "skipped": skipped}
+        return {"imported": len(new), "skipped": skipped,
+                "taken_over": taken_over, "takeover_failed": takeover_failed}
