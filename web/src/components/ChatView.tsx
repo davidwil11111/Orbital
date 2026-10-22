@@ -627,6 +627,17 @@ function cancelFrame(id: number): void {
 // markdown bubbles, well within the already-reachable full-session ceiling.
 const CHAT_PAGE_SIZE = 100;
 const REST_FALLBACK_DELAY_MS = 500;
+/**
+ * Spec 131 A: rows the idle catch-up asks for. The end-of-run memory record
+ * turn (spec 112 A6) appends tagged rows behind the real reply — the
+ * `[MEMORY]` ask, the model's edit call, one or two edit results and a
+ * closing text, five rows in the live evidence — so the tail must reach past
+ * them for the catch-up to still find an UNTAGGED reply when the stream was
+ * lost mid-turn. Six covers the "one or two edits" the record prompt asks
+ * for; a longer record turn just means nothing is recovered (never a wrong
+ * row), and the full refreshRawMessages that follows covers that case.
+ */
+const REST_FALLBACK_LIMIT = 6;
 
 // Bug #48 (fix C): per-session chat-history cache, mirroring useSessions'
 // module-level `sessionsCache`. Switching back to a recently-viewed session
@@ -1205,6 +1216,14 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
    * Used when streaming deltas are missed (tunnel drop, late subscribe, etc.)
    * to recover the agent's response. Scoped to the viewed session so a
    * recovered message lands in the right conversation.
+   *
+   * Kind-aware (spec 131 A): only an UNTAGGED row is ever recovered. Rows
+   * tagged `_kind` (the daemon's memory record / tidy turns) are rendered
+   * by the persisted transform alone — they stream nothing live by design,
+   * and recovering their closing text here is exactly what painted a
+   * second reply after the memory capsule. The merge itself gates on
+   * `_kind` too; the pick below is the belt that still finds the real reply
+   * when the record turn has already appended behind it.
    */
   const fetchLatestMessage = useCallback(() => {
     const sid = sessionIdRef.current;
@@ -1216,13 +1235,24 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       // source: 'assistant' crept in and split one management turn into
       // two speakers (INVESTIGATION-two-speakers).
       api<ChatMessageRow[]>(
-        `/api/v2/agents/${encodeURIComponent(projectId)}/chat?limit=1${sessionParam}`,
+        `/api/v2/agents/${encodeURIComponent(projectId)}/chat?limit=${REST_FALLBACK_LIMIT}${sessionParam}`,
       )
         .then((messages) => {
           if (!messages || messages.length === 0) return;
-          const latest = messages[messages.length - 1];
-          if (latest.role !== 'assistant') return;
-          const restReasoning = (latest.reasoning_content ?? '').trim();
+          // The last row without a `_kind` tag — the newest row the live
+          // path was ever going to show. A window of only tagged rows
+          // recovers nothing, never a wrong row.
+          let latest: ChatMessageRow | undefined;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (!messages[i]._kind) {
+              latest = messages[i];
+              break;
+            }
+          }
+          if (!latest || latest.role !== 'assistant') return;
+          // Gated on the tag as well (spec 131 A4): a record-turn row with
+          // reasoning_content must never spawn a stray thinking capsule.
+          const restReasoning = latest._kind ? '' : (latest.reasoning_content ?? '').trim();
           // Carry reasoning_content like the primary refreshRawMessages path:
           // a recovered reasoning turn is a COMPLETED turn, so emit it as a
           // closed (collapsed) agent_run capsule containing a reasoning_block,

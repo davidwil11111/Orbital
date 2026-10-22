@@ -1785,11 +1785,20 @@ export function truncateResult(
  *    content with the full persisted text.
  * 3. Insert: add the recovered message before any trailing user messages so
  *    a recovered reply lands before follow-up questions.
+ *
+ * Gate (spec 131 A): a row carrying `_kind` (memory_record, memory_tidy, and
+ * whatever daemon-tagged kind comes next) is never merged — the persisted
+ * transform owns rendering for tagged rows (a collapsed capsule for the
+ * edits, nothing for the text). The live path is silent for them by design,
+ * so the idle catch-up's tail fetch lands on the record turn's closing text,
+ * which the model often writes as a restatement of the reply; without this
+ * gate it became a second bubble that only a reload removed.
  */
 export function mergeRecoveredAssistantMessage(
   prevItems: DisplayItem[],
   row: ChatMessage,
 ): DisplayItem[] {
+  if (row._kind) return prevItems;
   const text = row.content;
   if (!text) return prevItems;
 

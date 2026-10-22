@@ -226,17 +226,66 @@ class TestPatchWritesDefault:
         tc.patch(f"/api/v2/agents/{pid}/sessions/{sid}", json={"name": "hi"})
         assert deps["project_store"].get_project(pid)["default_pinned_target"] == "codex"
 
-    def test_a_failed_patch_leaves_the_default(self, tmp_path):
+    def test_a_rejected_pin_leaves_the_default(self, tmp_path):
         tc, deps, row = _project(tmp_path, keyed=True)
         pid = row["project_id"]
-        r = tc.patch(f"/api/v2/agents/{pid}/sessions/no-such-session",
-                     json={"pinned_target": "codex"})
-        assert r.status_code == 404
-        assert deps["project_store"].get_project(pid)["default_pinned_target"] is None
         r = tc.patch(f"/api/v2/agents/{pid}/sessions/whatever",
                      json={"pinned_target": "not-an-agent"})
         assert r.status_code == 422
         assert deps["project_store"].get_project(pid)["default_pinned_target"] is None
+        r = tc.patch(f"/api/v2/agents/{pid}/sessions/whatever",
+                     json={"pinned_target": "orbital"})
+        assert r.status_code == 422
+        assert deps["project_store"].get_project(pid)["default_pinned_target"] is None
+        r = tc.patch("/api/v2/agents/no-such-project/sessions/whatever",
+                     json={"pinned_target": "codex"})
+        assert r.status_code == 404
+
+    # Spec 131 B: "+ new session" mints an id and writes no file; the session
+    # materializes on the first send. The composer PATCHes that id the moment
+    # the user picks a target. The session itself is still 404 (nothing to
+    # patch, and the frontend's re-persist-after-first-send logic relies on
+    # that), but the project's sticky pin must follow the pick regardless —
+    # Orbital (null) included. Before the fix the sticky write sat behind the
+    # session write, so a worker pick landed only via the pinned first send
+    # and an Orbital pick on a fresh session never landed at all.
+    def test_an_orbital_pick_on_a_fresh_session_clears_the_default(self, tmp_path):
+        tc, deps, row = _project(tmp_path, keyed=True)
+        pid = row["project_id"]
+        tc.put(f"/api/v2/projects/{pid}", json={"default_pinned_target": "claude-code"})
+        sid = tc.post(f"/api/v2/agents/{pid}/new-session").json()["session_id"]
+        r = tc.patch(f"/api/v2/agents/{pid}/sessions/{sid}",
+                     json={"pinned_target": None})
+        assert r.status_code == 404
+        assert deps["project_store"].get_project(pid)["default_pinned_target"] is None
+        got = tc.get(f"/api/v2/projects/{pid}").json()
+        assert got["default_pinned_target"] is None
+        assert got["effective_pinned_target"] is None
+        assert tc.post(f"/api/v2/agents/{pid}/new-session").json()["pinned_target"] is None
+        assert not os.path.exists(os.path.join(
+            row["workspace"], "orbital", "sessions", f"{sid}.jsonl"))
+
+    def test_a_worker_pick_on_a_fresh_session_writes_the_default(self, tmp_path):
+        tc, deps, row = _project(tmp_path, keyed=True)
+        pid = row["project_id"]
+        sid = tc.post(f"/api/v2/agents/{pid}/new-session").json()["session_id"]
+        r = tc.patch(f"/api/v2/agents/{pid}/sessions/{sid}",
+                     json={"pinned_target": "codex"})
+        assert r.status_code == 404
+        assert deps["project_store"].get_project(pid)["default_pinned_target"] == "codex"
+        assert tc.get(f"/api/v2/projects/{pid}").json()["effective_pinned_target"] == "codex"
+        assert tc.post(f"/api/v2/agents/{pid}/new-session").json()["pinned_target"] == "codex"
+        assert not os.path.exists(os.path.join(
+            row["workspace"], "orbital", "sessions", f"{sid}.jsonl"))
+
+    def test_a_fresh_session_patch_without_pinned_target_writes_nothing(self, tmp_path):
+        tc, deps, row = _project(tmp_path, keyed=True)
+        pid = row["project_id"]
+        tc.put(f"/api/v2/projects/{pid}", json={"default_pinned_target": "codex"})
+        sid = tc.post(f"/api/v2/agents/{pid}/new-session").json()["session_id"]
+        r = tc.patch(f"/api/v2/agents/{pid}/sessions/{sid}", json={"name": "hi"})
+        assert r.status_code == 404
+        assert deps["project_store"].get_project(pid)["default_pinned_target"] == "codex"
 
 
 # ---------------------------------------------------------------------------
