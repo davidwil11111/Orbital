@@ -72,6 +72,7 @@ export const SUB_AGENTS_RUNNING_EVENTS = [
   'sub_agent.dispatched',
   'sub_agent.started',
   'sub_agent.completed',
+  'sub_agent.continued',
   'sub_agent.error',
   'sub_agent.failed',
   'sub_agent.stopped',

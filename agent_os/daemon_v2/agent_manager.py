@@ -44,6 +44,11 @@ from agent_os.daemon_v2.autonomy import (
 )
 from agent_os.daemon_v2.sub_agent_visibility import resolve_visible_sub_agent_slugs
 from agent_os.daemon_v2.session_index import read_session_f1, resolve_session_uuid
+from agent_os.utils.file_lock import (
+    FileLockError,
+    retry_session_lock,
+    retry_session_lock_sync,
+)
 from agent_os.daemon_v2.provider_errors import (
     ProviderConfigError,
     classify_llm_error,
@@ -268,6 +273,13 @@ class AgentManager:
         # marker and its terminal row get ``_kind: memory_record`` and the
         # terminal clears the key, so the reminder never asks again.
         self._worker_memory_records: set[tuple[str, str | None, str]] = set()
+        # Spec 129 §5E: one asyncio.Lock per session key around every
+        # daemon-internal hydrate of a disk-only session, so the daemon
+        # never contends with itself on the session file's advisory lock
+        # (the terminal-event inject and the memory reminder's persist
+        # loaded the same JSONL 28 ms apart, 2026-10-22). See
+        # ``_hydration_lock``.
+        self._hydration_locks: dict[SessionKey, asyncio.Lock] = {}
         # Strong references for fire-and-forget tasks this manager starts
         # (the event loop only holds tasks weakly — an unreferenced task can
         # be garbage-collected mid-flight with "Task was destroyed but it is
@@ -2407,8 +2419,7 @@ class AgentManager:
             # second half. Hydrate the on-disk session, append the event
             # FIRST (durable even if the wake fails), then start the loop so
             # an awaiting management session actually processes it.
-            loaded = await asyncio.to_thread(
-                self._load_session_from_disk, project_id, session_id)
+            loaded = await self._hydrate_session(project_id, session_id)
             if self._handles.get(make_session_key(project_id, session_id)) is not None:
                 # Hydrated by another request while the load ran off-loop:
                 # deliver through the live handle instead of a second copy.
@@ -2435,7 +2446,7 @@ class AgentManager:
                 **({"_meta": meta} if meta else {}),
                 **({"_kind": row_kind} if row_kind else {}),
             }
-            loaded.append(row)
+            await retry_session_lock(lambda: loaded.append(row))
             self._maybe_schedule_worker_memory_record(
                 project_id, session_id, loaded, row)
             if suppress_wake:
@@ -2468,7 +2479,7 @@ class AgentManager:
                 **({"_meta": meta} if meta else {}),
                 **({"_kind": row_kind} if row_kind else {}),
             }
-            handle.session.append(row)
+            await retry_session_lock(lambda: handle.session.append(row))
             self._maybe_schedule_worker_memory_record(
                 project_id, session_id, handle.session, row)
             if suppress_wake:
@@ -2506,6 +2517,37 @@ class AgentManager:
         it too — so the first record with a ``session_id`` field is the F1.
         Delegates to the shared head-only reader (spec 107)."""
         return read_session_f1(filepath)
+
+    def _hydration_lock(self, sk: SessionKey) -> asyncio.Lock:
+        """The per-session-key lock around daemon-internal hydration (spec
+        129 §7.1). Lazily built so an AgentManager constructed without
+        ``__init__`` (tests) still gets one."""
+        locks = getattr(self, "_hydration_locks", None)
+        if locks is None:
+            locks = self._hydration_locks = {}
+        lock = locks.get(sk)
+        if lock is None:
+            lock = locks[sk] = asyncio.Lock()
+        return lock
+
+    async def _hydrate_session(self, project_id: str, session_id: str):
+        """Load a disk-only session off the loop, serialized per session
+        key and retried through lock contention (spec 129 §5E).
+
+        Returns ``None`` when a live handle appeared while waiting for the
+        key's lock (the caller takes the live-handle path) or when no JSONL
+        matches. The session file's advisory lock is non-blocking: two
+        hydrates of one session in the same process used to collide
+        (``FileLockError`` on the second, the row dropped). The asyncio lock
+        removes the same-process collision; the retry covers a second
+        process on the same workspace (a dev daemon).
+        """
+        sk = make_session_key(project_id, session_id)
+        async with self._hydration_lock(sk):
+            if self._handles.get(sk) is not None:
+                return None
+            return await retry_session_lock(lambda: asyncio.to_thread(
+                self._load_session_from_disk, project_id, session_id))
 
     def _load_session_from_disk(self, project_id: str, identifier: str):
         """Resolve an F1 or F2 identifier to an on-disk session and load it.
@@ -2555,6 +2597,11 @@ class AgentManager:
         if key not in self._worker_memory_records:
             return None
         if meta.get("event") == "sub_agent_terminal":
+            if meta.get("kind") == "continued":
+                # Spec 129: a turn the worker started on its own is never
+                # the reminder's reply; only the reminder dispatch's own
+                # boundary closes it.
+                return None
             self._worker_memory_records.discard(key)
             return MEMORY_RECORD_KIND
         if meta.get("dispatch_id"):
@@ -2570,8 +2617,19 @@ class AgentManager:
         transport = getattr(adapter, "_transport", None) if adapter is not None else None
         return transport is not None and type(transport).__name__ in _WORKER_RECORD_TRANSPORTS
 
-    def _worker_last_turn_tool_rows(self, project_id: str, session_id: str | None,
-                                    handle: str) -> list[dict] | None:
+    def _worker_run_tool_rows(self, project_id: str, session_id: str | None,
+                              handle: str, session) -> list[dict] | None:
+        """Tool rows of every worker turn since the last record row (spec
+        129 §5D) — the turns a reminder has not yet covered.
+
+        The record row is the reminder's dispatch marker in the management
+        session (``_kind == MEMORY_RECORD_KIND`` with a ``dispatch_id``); the
+        transcript turn it closed is found by that id and every turn after
+        it counts, including the worker's self-initiated turns (no dispatch
+        id of their own). With no record row yet, the run starts at this
+        session's first dispatch to the worker. Falls back to the last
+        completed turn when neither anchor is found in the transcript.
+        """
         transcripts = getattr(self._sub_agent_manager, "_transcripts", None)
         if not isinstance(transcripts, dict):
             return None
@@ -2588,26 +2646,94 @@ class AgentManager:
         completed = [t for t in (turns or []) if not t.get("in_flight")]
         if not completed:
             return None
-        return list(completed[-1].get("tool_rows") or [])
+
+        record_id: str | None = None
+        session_ids: list[str] = []
+        try:
+            rows = session.get_messages() if session is not None else []
+        except Exception:  # noqa: BLE001 — a mock session is "no anchor"
+            rows = []
+        for row in rows:
+            meta = row.get("_meta") if isinstance(row, dict) else None
+            if not isinstance(meta, dict) or not meta.get("dispatch_id"):
+                continue
+            if meta.get("handle") not in (None, handle):
+                continue
+            if row.get("_kind") == MEMORY_RECORD_KIND:
+                record_id = meta["dispatch_id"]
+            else:
+                session_ids.append(meta["dispatch_id"])
+
+        start: int | None = None
+        if record_id is not None:
+            for idx in range(len(completed) - 1, -1, -1):
+                if completed[idx].get("dispatch_id") == record_id:
+                    start = idx + 1
+                    break
+        if start is None and session_ids:
+            wanted = set(session_ids)
+            for idx, turn in enumerate(completed):
+                if turn.get("dispatch_id") in wanted:
+                    start = idx
+                    break
+        if start is None:
+            start = len(completed) - 1
+        rows_out: list[dict] = []
+        for turn in completed[start:]:
+            rows_out.extend(turn.get("tool_rows") or [])
+        return rows_out
+
+    def _worker_quiescent(self, project_id: str, session_id: str | None,
+                          handle: str) -> bool:
+        """Spec 129 §5D: nothing live under the worker and nothing about to
+        run on it — no registered background shell still alive, no user
+        prompt queued behind the turn that just ended, no dispatch pending
+        on its transport. Decidable from daemon state at the terminal; no
+        timers, no "went quiet" inference. Unknown shapes (mocks, transports
+        without the flag) read as quiescent, i.e. today's behaviour."""
+        from agent_os.daemon_v2.background_work import BackgroundWorkRegistry
+        registry = getattr(self._process_manager, "background_work", None)
+        if (isinstance(registry, BackgroundWorkRegistry)
+                and registry.live_commands(project_id, session_id or "", handle)):
+            return False
+        queues = getattr(self._sub_agent_manager, "_prompt_queues", None)
+        if isinstance(queues, dict) and queues.get((project_id, session_id, handle)):
+            return False
+        adapters = getattr(self._sub_agent_manager, "_adapters", None)
+        if isinstance(adapters, dict):
+            adapter = adapters.get(make_session_key(project_id, session_id), {}).get(handle)
+            transport = getattr(adapter, "_transport", None) if adapter is not None else None
+            if getattr(transport, "dispatch_pending", False) is True:
+                return False
+        return True
 
     def _maybe_schedule_worker_memory_record(self, project_id: str,
                                              session_id: str | None,
                                              session, row: dict) -> None:
-        """After a pinned direct-chat worker's turn completes, send it the
+        """After a pinned direct-chat worker's run goes quiet, send it the
         worker variant of the record row as its next turn (spec 112 A6).
 
         Only for the worker the session is pinned to (``pinned_target``): a
         worker the manager dispatched is not asked — the manager records on
         its wake run. Only on transports that report tool names and paths.
         Not for the reminder's own completion, not for error/stop terminals,
-        and not when the turn itself already wrote a memory file. Never
+        and not when the run itself already wrote a memory file. Never
         raises: the completion row is already persisted.
+
+        Spec 129 §5D: the trigger is the first ``completed`` OR ``continued``
+        terminal at which the worker is quiescent (``_worker_quiescent``):
+        a turn that ended to wait for a background shell is not the end of
+        the run, and the reminder would otherwise be answered by the shell's
+        self-wake turn. A terminal that arrives while a shell is live sends
+        nothing; the next terminal re-evaluates. The files list spans every
+        turn since the last record row.
         """
         try:
             meta = row.get("_meta") or {}
             if (not isinstance(meta, dict)
                     or meta.get("event") != "sub_agent_terminal"
-                    or meta.get("kind") != "completed"
+                    or meta.get("kind") not in ("completed", "continued")
+                    or (meta.get("kind") == "continued" and meta.get("cause") == "error")
                     or row.get("_kind") in (MEMORY_RECORD_KIND, MEMORY_TIDY_KIND)):
                 return
             handle = _terminal_handle(meta, row.get("content"))
@@ -2615,10 +2741,12 @@ class AgentManager:
                 return
             if not self._worker_record_transport_eligible(project_id, session_id, handle):
                 return
+            if not self._worker_quiescent(project_id, session_id, handle):
+                return
             project = (self._project_store.get_project(project_id)
                        if self._project_store else None)
             workspace = (project or {}).get("workspace", "") if isinstance(project, dict) else ""
-            tool_rows = self._worker_last_turn_tool_rows(project_id, session_id, handle)
+            tool_rows = self._worker_run_tool_rows(project_id, session_id, handle, session)
             changed, wrote_memory = worker_turn_changed_files(tool_rows or [], workspace)
             if wrote_memory:
                 return
@@ -2654,6 +2782,14 @@ class AgentManager:
             if isinstance(result, str) and result.startswith("Error"):
                 self._worker_memory_records.discard(key)
                 logger.warning("memory reminder to %s not sent: %s", handle, result)
+        except FileLockError as exc:
+            # Spec 129 §7.2: best-effort by contract — dropped, no re-queue;
+            # the next quiet terminal asks again. One line naming the
+            # session and the file, not a 12-frame traceback.
+            self._worker_memory_records.discard(key)
+            logger.warning(
+                "memory reminder to %s dropped: session %s/%s is lock-contended "
+                "past the retry budget (%s)", handle, project_id, session_id, exc)
         except Exception:  # noqa: BLE001
             self._worker_memory_records.discard(key)
             logger.warning("memory reminder to %s failed", handle, exc_info=True)
@@ -2688,8 +2824,7 @@ class AgentManager:
         if handle is not None:
             session = handle.session
         else:
-            session = await asyncio.to_thread(
-                self._load_session_from_disk, project_id, resolved)
+            session = await self._hydrate_session(project_id, resolved)
             handle = self._handles.get(key)
             if handle is not None:
                 # Hydrated by another request while we were off the loop.
@@ -2706,7 +2841,7 @@ class AgentManager:
                 # no longer the only thing that records it.
                 if user_msg.get("target"):
                     session.set_pinned_target(user_msg["target"])
-        session.append(user_msg)
+        await retry_session_lock(lambda: session.append(user_msg))
         return resolved
 
     def peek_chat_session(self, project_id: str, session_id: str | None):
@@ -2923,8 +3058,7 @@ class AgentManager:
             # The meta F1 is still preserved on the loaded Session object
             # (loaded.session_id) for display/back-compat; it is simply no
             # longer the routing key. See REPORT-streaming-status-frontend.md.
-            loaded = await asyncio.to_thread(
-                self._load_session_from_disk, project_id, session_id)
+            loaded = await self._hydrate_session(project_id, session_id)
             if self._handles.get(sk) is not None:
                 # Another request started this session while we were off the
                 # loop: take the live-handle path (queue / hot resume) rather
@@ -3178,7 +3312,12 @@ class AgentManager:
         for entry in self.list_sessions(project_id, include_memory=True):
             if entry.get("origin") != "memory" or not entry.get("session_uuid"):
                 continue
-            loaded = self._load_session_from_disk(project_id, entry["session_uuid"])
+            # Spec 129 §5E: a bounded blocking retry — this lookup is sync
+            # and the Memory session's file is rarely contended (the pass
+            # and the user chatting in it), so a short pause beats dropping
+            # the pass.
+            loaded = retry_session_lock_sync(
+                lambda: self._load_session_from_disk(project_id, entry["session_uuid"]))
             if loaded is not None:
                 return loaded
         uuid = self._mint_session_uuid(project_id)

@@ -70,7 +70,15 @@ def _make_transport():
     transport._workspace = ""
     transport._pending_approvals = {}
     transport._event_queue = asyncio.Queue()
-    transport._needs_flush = False
+    # Spec 129 persistent-reader fields (the tests bypass __init__).
+    transport._reader_task = None
+    transport._pending_dispatch = False
+    transport._outstanding = set()
+    transport._last_result_is_error = False
+    transport._budget_handle = None
+    transport._dispatch_done = None
+    transport._dispatch_text = []
+    transport._session_cost_seen = 0.0
     return transport
 
 
@@ -121,7 +129,7 @@ async def test_message_arrives_at_read_stream_before_send_completes():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     # --- Simulate ProcessManager background consumer ---
     collected_chunks: list[OutputChunk] = []
@@ -196,7 +204,7 @@ async def test_multiple_messages_stream_in_order():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     collected: list[str] = []
     got_both = asyncio.Event()
@@ -249,7 +257,7 @@ async def test_tool_use_and_message_events_interleaved():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     collected: list[tuple[str, str]] = []  # (chunk_type, text)
     all_received = asyncio.Event()
@@ -304,7 +312,7 @@ async def test_consumer_receives_events_concurrently_with_send():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     consumer_event_time = None
     send_complete_time = None
@@ -360,7 +368,7 @@ async def test_send_return_value_still_contains_message_text():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     async def drain_consumer():
         """Drain read_stream to prevent queue backup."""

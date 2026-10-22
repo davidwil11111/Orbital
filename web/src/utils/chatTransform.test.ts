@@ -2519,6 +2519,80 @@ describe('transformChatHistory — import and worker-onboarding rows', () => {
   });
 });
 
+describe('transformChatHistory — spec 129 continued rows (self-initiated worker turns)', () => {
+  const daemon = (content: string, _meta: Record<string, unknown>, timestamp = TS): ChatMessage => ({
+    role: 'system', source: 'daemon', content, timestamp, _meta,
+  } as ChatMessage);
+  const user = (content: string, timestamp: string): ChatMessage => ({
+    role: 'user', source: 'user', content, timestamp,
+  } as ChatMessage);
+  const continued = (handle: string, text: string, timestamp: string): ChatMessage => daemon(
+    `[Sub-agent] ${handle} continued. Summary: ${text}. Transcript: /t/x.jsonl. This turn was started by the sub-agent itself.`,
+    {
+      event: 'sub_agent_terminal', kind: 'continued', handle, reply: text, cause: 'success',
+      display_content: `[Sub-agent] ${handle} continued. Summary: ${text}. Transcript: /t/x.jsonl.`,
+      suppress_wake: true,
+    },
+    timestamp,
+  );
+  const completed = (handle: string, text: string, timestamp: string): ChatMessage => daemon(
+    `[Sub-agent] ${handle} completed. Summary: ${text}. Transcript: /t/x.jsonl.`,
+    {
+      event: 'sub_agent_terminal', kind: 'completed', handle, reply: text,
+      display_content: `[Sub-agent] ${handle} completed. Summary: ${text}. Transcript: /t/x.jsonl.`,
+      suppress_wake: true,
+    },
+    timestamp,
+  );
+
+  it('a continued row with a reply is the worker\'s own bubble, even after its reply to the user', () => {
+    const items = transformChatHistory([
+      user('run the render in the background and tell me when it is done', TS),
+      { role: 'assistant', source: 'sub_agent', sub_agent_handle: 'claude-code', content: 'Started it; I will report when it finishes.', timestamp: TS2 } as ChatMessage,
+      completed('claude-code', 'Started it; I will report when it finishes.', TS3),
+      continued('claude-code', 'The render finished: v2 is at out/v2.mp4.', TS4),
+    ]);
+    expect(items.map((it) => it.type)).toEqual([
+      'user_message', 'agent_message', 'sub_agent_activity', 'agent_message',
+    ]);
+    expect(items[3]).toMatchObject({
+      type: 'agent_message', source: 'claude-code',
+      content: 'The render finished: v2 is at out/v2.mp4.', timestamp: TS4,
+    });
+  });
+
+  it('a continued row is never paired as the reply to the preceding user row', () => {
+    // The user's prompt is still unanswered (its dispatch is in flight):
+    // the continued bubble must not be mistaken for the reply, and the
+    // completed row that follows still gets its own one-liner.
+    const items = transformChatHistory([
+      user('how is it going?', TS),
+      continued('claude-code', 'Re-ran ffmpeg with the fixed flags.', TS2),
+      { role: 'assistant', source: 'sub_agent', sub_agent_handle: 'claude-code', content: 'Going well, nearly done.', timestamp: TS3 } as ChatMessage,
+      completed('claude-code', 'Going well, nearly done.', TS4),
+    ]);
+    expect(items.map((it) => it.type)).toEqual([
+      'user_message', 'agent_message', 'agent_message', 'sub_agent_activity',
+    ]);
+    expect(items[1]).toMatchObject({ source: 'claude-code', content: 'Re-ran ffmpeg with the fixed flags.' });
+    expect(items[2]).toMatchObject({ source: 'claude-code', content: 'Going well, nearly done.' });
+    expect(items[3]).toMatchObject({ type: 'sub_agent_activity', action: 'completed' });
+  });
+
+  it('a continued row without text is a one-line marker with its own action', () => {
+    const items = transformChatHistory([
+      user('hi', TS),
+      daemon('[Sub-agent] claude-code continued. Summary: (no output). Transcript: /t/x.jsonl.', {
+        event: 'sub_agent_terminal', kind: 'continued', handle: 'claude-code',
+        reply: '(no output)', cause: 'error', suppress_wake: true,
+        display_content: '[Sub-agent] claude-code continued. Summary: (no output). Transcript: /t/x.jsonl.',
+      }, TS2),
+    ]);
+    expect(items.map((it) => it.type)).toEqual(['user_message', 'sub_agent_activity']);
+    expect(items[1]).toMatchObject({ type: 'sub_agent_activity', action: 'continued', handle: 'claude-code' });
+  });
+});
+
 describe('transformChatHistory — worker onboarding hides its setup-instruction marker', () => {
   const onboarding: ChatMessage = {
     role: 'system', source: 'daemon', content: '[Onboarding] codex is setting up this project', timestamp: TS,

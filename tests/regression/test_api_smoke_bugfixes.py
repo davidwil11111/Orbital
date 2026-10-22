@@ -351,7 +351,15 @@ class TestBug005a_StreamingAPI:
         transport._workspace = ""
         transport._pending_approvals = {}
         transport._event_queue = asyncio.Queue()
-        transport._needs_flush = False
+        # Spec 129 persistent-reader fields (the tests bypass __init__).
+        transport._reader_task = None
+        transport._pending_dispatch = False
+        transport._outstanding = set()
+        transport._last_result_is_error = False
+        transport._budget_handle = None
+        transport._dispatch_done = None
+        transport._dispatch_text = []
+        transport._session_cost_seen = 0.0
 
         adapter = CLIAdapter(handle="claude-code", display_name="Claude Code", transport=transport)
 
@@ -365,7 +373,7 @@ class TestBug005a_StreamingAPI:
             yield result_msg
 
         transport._client.query = AsyncMock()
-        transport._client.receive_response = mock_receive
+        transport._client.receive_messages = mock_receive
 
         with patch.multiple(
             "agent_os.agent.transports.sdk_transport",

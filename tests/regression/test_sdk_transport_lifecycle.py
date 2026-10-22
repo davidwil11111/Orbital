@@ -2,9 +2,9 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Regression tests for SDKTransport background-task lifecycle.
+"""Regression tests for SDKTransport reader lifecycle.
 
-These tests cover two coupled defects in
+Originally for two coupled defects in
 ``agent_os/agent/transports/sdk_transport.py`` (see
 ``TASK-fix-sdk-transport-lifecycle.md``):
 
@@ -14,6 +14,12 @@ These tests cover two coupled defects in
 2. ``stop()`` must cancel (and await) the background task BEFORE
    disconnecting the SDK client, so the task does not observe a None
    client mid-iteration and surface spurious errors.
+
+Spec 129 replaced the per-dispatch consumer with ONE persistent reader
+(``_reader_task``) started at connect and cancelled at stop; the same two
+guarantees now hold for it. A second dispatch while one is pending no longer
+cancels anything — it closes the prior dispatch's boundary as ``stopped``
+and the reader carries on.
 
 All tests use asyncio mocks — no real subprocess, no network, no SDK
 binary. Behavior is identical on macOS and Windows.
@@ -36,7 +42,7 @@ from agent_os.agent.transports.sdk_transport import SDKTransport
 
 
 class _SlowReceiveClient:
-    """Mock ClaudeSDKClient whose ``receive_response`` yields very slowly.
+    """Mock ClaudeSDKClient whose ``receive_messages`` yields very slowly.
 
     Each iteration step sleeps ``delay`` seconds. The generator never
     terminates on its own — useful for exercising cancellation paths.
@@ -52,7 +58,7 @@ class _SlowReceiveClient:
     async def query(self, message: str) -> None:
         self.query_calls.append(message)
 
-    def receive_response(self):
+    def receive_messages(self):
         return self._receive_gen()
 
     async def _receive_gen(self):
@@ -70,28 +76,6 @@ class _SlowReceiveClient:
         self.disconnect_called = True
 
 
-class _ImmediateFailClient:
-    """Mock client whose ``receive_response`` raises synchronously inside
-    the async-generator body. Used to exercise the error-logging path."""
-
-    def __init__(self, exc: BaseException) -> None:
-        self._exc = exc
-        self.disconnect_called = False
-
-    async def query(self, message: str) -> None:
-        pass
-
-    def receive_response(self):
-        return self._gen()
-
-    async def _gen(self):
-        raise self._exc
-        yield  # pragma: no cover - make it a generator
-
-    async def disconnect(self) -> None:
-        self.disconnect_called = True
-
-
 def _install_slow_client(transport: SDKTransport, delay: float = 0.05) -> _SlowReceiveClient:
     client = _SlowReceiveClient(delay=delay)
     transport._client = client  # type: ignore[assignment]
@@ -99,45 +83,40 @@ def _install_slow_client(transport: SDKTransport, delay: float = 0.05) -> _SlowR
     return client
 
 
+def _drain(transport):
+    events = []
+    while not transport._event_queue.empty():
+        events.append(transport._event_queue.get_nowait())
+    return events
+
+
 # --------------------------------------------------------------------- #
-# 1. Background task is strongly referenced
+# 1. The reader is strongly referenced
 # --------------------------------------------------------------------- #
 
 
-async def test_bg_task_strongly_referenced_after_dispatch():
-    """dispatch() must store the background task on the transport and
-    survive multiple gc.collect() cycles without being GC'd.
-
-    Fails on pre-fix code: orphan ``asyncio.create_task(...)`` only
-    weakly referenced by the loop can be collected under memory
-    pressure / gc."""
+async def test_reader_strongly_referenced_after_dispatch():
+    """dispatch() must leave the persistent reader referenced on the
+    transport and alive across gc cycles."""
     transport = SDKTransport()
     _install_slow_client(transport, delay=0.05)
 
     await transport.dispatch("hello")
 
-    # Strong reference exists and task is still running.
-    assert transport._bg_task is not None, "dispatch() must store bg task on self"
-    assert not transport._bg_task.done(), "bg task should still be running"
+    assert transport._reader_task is not None, "dispatch() must keep the reader on self"
+    assert not transport._reader_task.done(), "reader should still be running"
 
-    # Force three gc cycles. If the task were only weakly referenced (as
-    # on pre-fix code via a bare create_task() whose return value was
-    # discarded) the event loop still holds it, but any higher-level
-    # code that relies on a strong reference on `self` would fail here.
     for _ in range(3):
         gc.collect()
 
-    # Task is still live and visible in all_tasks().
-    assert transport._bg_task is not None
-    assert not transport._bg_task.done()
-    assert transport._bg_task in asyncio.all_tasks()
+    assert transport._reader_task is not None
+    assert not transport._reader_task.done()
+    assert transport._reader_task in asyncio.all_tasks()
 
-    # Clean up — cancel and let the event loop settle so the test
-    # doesn't leak a pending task into the next test.
-    transport._bg_task.cancel()
+    transport._reader_task.cancel()
     try:
         await asyncio.wait_for(
-            asyncio.gather(transport._bg_task, return_exceptions=True),
+            asyncio.gather(transport._reader_task, return_exceptions=True),
             timeout=2.0,
         )
     except asyncio.TimeoutError:
@@ -145,22 +124,20 @@ async def test_bg_task_strongly_referenced_after_dispatch():
 
 
 # --------------------------------------------------------------------- #
-# 2. stop() cancels the bg task within its timeout
+# 2. stop() cancels the reader within its timeout
 # --------------------------------------------------------------------- #
 
 
-async def test_stop_cancels_bg_task_within_timeout():
-    """stop() must cancel the in-flight background task and return
-    within the 5s budget. Fails on pre-fix stop() which never touched
-    the background task — the task lingered until GC."""
+async def test_stop_cancels_reader_within_timeout():
+    """stop() must cancel the reader and return within the 5s budget."""
     transport = SDKTransport()
     client = _install_slow_client(transport, delay=0.05)
 
     await transport.dispatch("hello")
-    bg_task = transport._bg_task
-    assert bg_task is not None
+    reader = transport._reader_task
+    assert reader is not None
 
-    # Wait until the receive_response generator has actually started so
+    # Wait until the receive_messages generator has actually started so
     # the cancellation path is exercised mid-iteration.
     await asyncio.wait_for(client._receive_started.wait(), timeout=2.0)
 
@@ -170,16 +147,17 @@ async def test_stop_cancels_bg_task_within_timeout():
     elapsed = loop.time() - started
 
     assert elapsed < 6.0, f"stop() took {elapsed:.2f}s, expected <6s"
-    assert bg_task.done(), "bg task should be done after stop()"
-    # Either cancelled cleanly OR finished (cancellation raced with
-    # natural completion). Both are acceptable outcomes per spec.
-    assert bg_task.cancelled() or bg_task.exception() is None
+    assert reader.done(), "reader should be done after stop()"
+    assert reader.cancelled() or reader.exception() is None
 
     # Transport state is fully torn down.
-    assert transport._bg_task is None
+    assert transport._reader_task is None
     assert transport._client is None
     assert transport._alive is False
     assert client.disconnect_called
+    # The pending dispatch's boundary was written on the way out.
+    tcs = [e for e in _drain(transport) if e.event_type == "turn_complete"]
+    assert [(t.data["origin"], t.data["cause"]) for t in tcs] == [("dispatch", "stopped")]
 
 
 # --------------------------------------------------------------------- #
@@ -189,7 +167,7 @@ async def test_stop_cancels_bg_task_within_timeout():
 
 async def test_stop_without_dispatch_is_noop():
     """Calling stop() before any dispatch() must complete quickly and
-    not raise — no bg task exists to cancel."""
+    not raise — no reader exists to cancel."""
     transport = SDKTransport()
 
     loop = asyncio.get_running_loop()
@@ -198,55 +176,40 @@ async def test_stop_without_dispatch_is_noop():
     elapsed = loop.time() - started
 
     assert elapsed < 1.0
-    assert transport._bg_task is None
+    assert transport._reader_task is None
     assert transport._alive is False
 
 
 # --------------------------------------------------------------------- #
-# 4. Background-task exceptions are logged, not silently swallowed
+# 4. Reader exceptions are logged, not silently swallowed
 # --------------------------------------------------------------------- #
 
 
-async def test_bg_task_exception_logged_not_swallowed(caplog):
-    """When the background task raises, the error and stack trace must
-    surface via ``logger.error(..., exc_info=...)`` and no
-    ``"Task was destroyed"`` warning must appear. Pre-fix: the orphan
-    task's exception was silently dropped by the event loop."""
+async def test_reader_exception_logged_not_swallowed(caplog):
+    """When the reader raises, the error and stack trace must surface via
+    ``logger.error(..., exc_info=...)`` and no ``"Task was destroyed"``
+    warning must appear."""
     transport = SDKTransport()
-
-    # Replace the consumer coroutine with one that raises a synthetic
-    # error immediately. We have to patch the bound method so dispatch()
-    # wires the same object.
     synthetic = RuntimeError("synthetic")
 
     async def boom() -> None:
         raise synthetic
 
-    transport._consume_response_background = boom  # type: ignore[assignment]
-
-    # Install a client with a no-op query so dispatch() reaches the
-    # create_task line.
+    transport._reader_loop = boom  # type: ignore[assignment]
     _install_slow_client(transport, delay=0.05)
 
     with caplog.at_level(logging.ERROR, logger="agent_os.agent.transports.sdk_transport"):
         await transport.dispatch("hello")
-
-        # Wait for the task to finish and the done-callback to fire.
-        assert transport._bg_task is not None
+        assert transport._reader_task is not None
         try:
             await asyncio.wait_for(
-                asyncio.gather(transport._bg_task, return_exceptions=True),
+                asyncio.gather(transport._reader_task, return_exceptions=True),
                 timeout=2.0,
             )
         except asyncio.TimeoutError:
-            pytest.fail("bg task did not terminate")
-
-        # Yield once so the loop can run the done-callback scheduled via
-        # add_done_callback (fires on the next iteration after .done()).
+            pytest.fail("reader did not terminate")
         await asyncio.sleep(0)
 
-    # The done-callback should have logged an ERROR containing our
-    # synthetic marker and a traceback (via exc_info).
     matching = [
         r for r in caplog.records
         if r.levelno >= logging.ERROR and "synthetic" in (r.getMessage() + repr(r.exc_info))
@@ -254,17 +217,12 @@ async def test_bg_task_exception_logged_not_swallowed(caplog):
     assert matching, (
         f"expected ERROR log with 'synthetic'; got {[r.getMessage() for r in caplog.records]}"
     )
-    # exc_info was supplied on the record.
-    assert any(r.exc_info is not None for r in matching), (
-        "expected at least one ERROR record to carry exc_info for a traceback"
-    )
-
-    # No "Task was destroyed but it is pending" must appear in the log.
+    assert any(r.exc_info is not None for r in matching)
     task_destroyed = [
         r for r in caplog.records
         if "Task was destroyed but it is pending" in r.getMessage()
     ]
-    assert not task_destroyed, "bg-task handling must not leak a GC warning"
+    assert not task_destroyed, "reader handling must not leak a GC warning"
 
 
 # --------------------------------------------------------------------- #
@@ -273,167 +231,78 @@ async def test_bg_task_exception_logged_not_swallowed(caplog):
 
 
 async def test_stop_is_idempotent():
-    """Calling stop() twice must not raise. The second call sees a None
-    bg_task / client and returns cleanly."""
     transport = SDKTransport()
     _install_slow_client(transport, delay=0.05)
 
     await transport.dispatch("hello")
     await transport.stop()
-
-    # Second stop is a no-op — bg_task is None, client is None.
     await transport.stop()
 
-    assert transport._bg_task is None
+    assert transport._reader_task is None
     assert transport._client is None
     assert transport._alive is False
 
 
 # --------------------------------------------------------------------- #
-# 6. dispatch() overwrites pending _bg_task — prior task is cancelled
+# 6. dispatch() while a dispatch is pending — the prior boundary closes
+#    as stopped; the reader is NOT cancelled
 # --------------------------------------------------------------------- #
 
 
-async def test_dispatch_overwrite_cancels_prior_bg_task(caplog):
-    """A second dispatch() while the prior _bg_task is still pending must
-    cancel the prior task and await its termination before creating a new
-    one. Without the preflight guard the prior task loses its strong
-    reference and triggers 'Task was destroyed but it is pending'."""
-    transport = SDKTransport()
-    client = _install_slow_client(transport, delay=5.0)  # very slow — won't finish naturally
-
-    # First dispatch starts a slow background task.
-    await transport.dispatch("first")
-    prior_task = transport._bg_task
-    assert prior_task is not None
-    assert not prior_task.done()
-
-    # Wait until the background consumer has actually started iterating so
-    # we hit the mid-stream cancellation path.
-    await asyncio.wait_for(client._receive_started.wait(), timeout=2.0)
-
-    with caplog.at_level(logging.WARNING, logger="agent_os.agent.transports.sdk_transport"):
-        # Second dispatch — prior task should be cancelled inside dispatch().
-        await transport.dispatch("second")
-
-        # Force GC to surface any "Task destroyed but it is pending" warnings.
-        gc.collect()
-        await asyncio.sleep(0)  # let done callbacks fire
-
-    # Prior task must be cancelled, not just orphaned.
-    assert prior_task.done(), "prior bg_task must be done after second dispatch"
-    assert prior_task.cancelled(), "prior bg_task must be cancelled by dispatch preflight"
-
-    # New task is now referenced on the transport.
-    assert transport._bg_task is not None
-    assert transport._bg_task is not prior_task
-
-    # No "Task was destroyed" GC warning must appear.
-    destroyed_warnings = [
-        r for r in caplog.records
-        if "Task was destroyed but it is pending" in r.getMessage()
-    ]
-    assert not destroyed_warnings, "dispatch overwrite must not leak a GC warning"
-
-    # Clean up the second task.
-    transport._bg_task.cancel()
-    await asyncio.gather(transport._bg_task, return_exceptions=True)
-
-
-# --------------------------------------------------------------------- #
-# 7. dispatch() with idle (done) prior _bg_task — no cancel/gather called
-# --------------------------------------------------------------------- #
-
-
-async def test_dispatch_overwrite_with_idle_prior(caplog):
-    """If the prior _bg_task is already done when a second dispatch arrives,
-    the preflight guard must skip cancel-and-gather entirely — only pending
-    tasks need cancellation. The new task must run normally."""
-    transport = SDKTransport()
-    client = _install_slow_client(transport, delay=0.01)
-
-    # First dispatch with a fast-finishing task. Manually cancel and await
-    # it so it is done before the second dispatch.
-    await transport.dispatch("first")
-    first_task = transport._bg_task
-    first_task.cancel()
-    await asyncio.gather(first_task, return_exceptions=True)
-    assert first_task.done()
-
-    with caplog.at_level(logging.WARNING, logger="agent_os.agent.transports.sdk_transport"):
-        # Second dispatch — prior is already done, so no cancel/gather needed.
-        await transport.dispatch("second")
-
-    second_task = transport._bg_task
-    assert second_task is not None
-    assert second_task is not first_task
-    assert not second_task.done(), "new bg_task should still be running"
-
-    # Positive proof the dispatch path actually ran end-to-end — both queries
-    # reached the SDK client. Without this, the negative caplog claim below
-    # could pass vacuously if caplog captured nothing.
-    assert client.query_calls == ["first", "second"]
-
-    # Preflight branch must be SKIPPED (prior was already done) — no warning.
-    assert not any(
-        "dispatch overwriting pending _bg_task" in record.message
-        for record in caplog.records
-    ), "preflight should be skipped when prior task is already done"
-
-    # Clean up.
-    second_task.cancel()
-    await asyncio.gather(second_task, return_exceptions=True)
-
-
-# --------------------------------------------------------------------- #
-# 8. dispatch() while prior task is already cancel()-requested but not yet
-#    awaited — gather waits for cancellation to settle before proceeding
-# --------------------------------------------------------------------- #
-
-
-async def test_dispatch_overwrite_during_cancel_in_flight(caplog):
-    """If _bg_task.cancel() is called externally (e.g. by stop()) but not
-    yet awaited, a subsequent dispatch() must still call gather to let the
-    cancellation settle. No GC warning must appear."""
+async def test_dispatch_while_pending_closes_prior_boundary_and_keeps_the_reader(caplog):
     transport = SDKTransport()
     client = _install_slow_client(transport, delay=5.0)
 
     await transport.dispatch("first")
-    prior_task = transport._bg_task
-    assert prior_task is not None
-
-    # Wait until the consumer is actually iterating.
+    reader = transport._reader_task
+    assert reader is not None and not reader.done()
     await asyncio.wait_for(client._receive_started.wait(), timeout=2.0)
 
-    # Externally cancel but do NOT await — mimic a partial stop().
-    prior_task.cancel()
-
     with caplog.at_level(logging.WARNING, logger="agent_os.agent.transports.sdk_transport"):
-        # dispatch() must detect the pending (not-yet-done) cancelled task
-        # and gather it before assigning the new one.
         await transport.dispatch("second")
-
         gc.collect()
         await asyncio.sleep(0)
 
-    # Prior task must be done (cancellation settled inside dispatch()).
-    assert prior_task.done(), "prior task must be done after dispatch preflight gather"
-
-    # Preflight branch MUST have executed — task was pending (cancel-requested
-    # but not yet done), so the warning log line must appear. This is the
-    # signal that distinguishes "preflight ran" from "preflight skipped".
-    assert any(
-        "dispatch overwriting pending _bg_task; cancelling prior" in record.message
-        for record in caplog.records
-    ), "preflight branch must execute when prior task is pending (even if cancel-requested)"
-
-    # No GC warning.
+    assert transport._reader_task is reader and not reader.done()
+    assert client.query_calls == ["first", "second"]
+    tcs = [e for e in _drain(transport) if e.event_type == "turn_complete"]
+    assert [(t.data["origin"], t.data["cause"]) for t in tcs] == [("dispatch", "stopped")]
+    assert transport.dispatch_pending is True
+    assert any("dispatch while a dispatch is pending" in r.message for r in caplog.records)
     destroyed_warnings = [
         r for r in caplog.records
         if "Task was destroyed but it is pending" in r.getMessage()
     ]
-    assert not destroyed_warnings, "in-flight cancel must not leak a GC warning"
+    assert not destroyed_warnings
 
-    # Clean up new task.
-    transport._bg_task.cancel()
-    await asyncio.gather(transport._bg_task, return_exceptions=True)
+    reader.cancel()
+    await asyncio.gather(reader, return_exceptions=True)
+
+
+# --------------------------------------------------------------------- #
+# 7. dispatch() after the reader ended — it is started again
+# --------------------------------------------------------------------- #
+
+
+async def test_dispatch_restarts_a_finished_reader(caplog):
+    transport = SDKTransport()
+    client = _install_slow_client(transport, delay=0.01)
+
+    await transport.dispatch("first")
+    first_reader = transport._reader_task
+    first_reader.cancel()
+    await asyncio.gather(first_reader, return_exceptions=True)
+    assert first_reader.done()
+    _drain(transport)
+
+    with caplog.at_level(logging.WARNING, logger="agent_os.agent.transports.sdk_transport"):
+        await transport.dispatch("second")
+
+    second_reader = transport._reader_task
+    assert second_reader is not None
+    assert second_reader is not first_reader
+    assert not second_reader.done()
+    assert client.query_calls == ["first", "second"]
+
+    second_reader.cancel()
+    await asyncio.gather(second_reader, return_exceptions=True)

@@ -14,16 +14,20 @@ a second ``ResultMessage``), which carries the real result, was stranded on
 the SDK channel and dropped. The management session was told "completed" with
 only the preamble; the actual result never surfaced.
 
-Wire-confirmed (claude-agent-sdk 0.1.58): the continuation turn streams on the
-SAME session with no new ``query()``; calling ``receive_response()`` AGAIN
-yields it. Fix: the consumer keeps reading successive turns while an awaited
-(non ``local_bash``) background task is still outstanding, emitting ONE
-terminal ``turn_complete`` (preserving the one-boundary-per-dispatch marker↔
-transcript-slice pairing).
+Spec 129 rewrote the contract: ONE reader lives for the client's life and
+reads the SDK's unbounded iterator (``receive_messages()``) whether or not a
+dispatch is pending. The awaited-task rule is unchanged and now asserted
+against that reader: while an awaited (non ``local_bash``) task is
+outstanding the dispatch stays pending across results and emits ONE terminal
+``turn_complete`` (preserving the one-boundary-per-dispatch marker↔
+transcript-slice pairing), bounded by ``CONTINUATION_BUDGET_S``.
 
 Fire-and-forget ``run_in_background`` shells (``task_type='local_bash'``) are
 the BackgroundWorkRegistry's domain and are intentionally NOT awaited — the
-turn ends as before so a never-exiting dev server can't pin the dispatch.
+turn ends as before so a never-exiting dev server can't pin the dispatch. The
+shell's exit still reaches the reader: the CLI's own follow-up turn is read
+live and ends as a self-initiated turn (``origin="self"``), no longer
+stranded.
 """
 
 from __future__ import annotations
@@ -80,37 +84,39 @@ def _task_notification(*, task_id: str, status: str = "completed"):
 class _FakeSDKClient:
     """Mimics ClaudeSDKClient over a persistent message channel.
 
-    ``receive_response()`` yields messages up to and INCLUDING the next
-    ``ResultMessage`` then returns; a subsequent call resumes where the prior
-    one stopped — exactly the SDK's single-channel, one-turn-per-call shape
-    that strands continuation turns from a one-shot consumer.
+    ``receive_messages()`` yields every scripted message in order and then
+    stays open (a live CLI), exactly the SDK's single unbounded iterator.
     """
 
     def __init__(self, messages):
         self._messages = list(messages)
-        self._idx = 0
+        self.release = asyncio.Event()
 
     async def query(self, *a, **k):
         return None
 
-    async def receive_response(self):
-        while self._idx < len(self._messages):
-            msg = self._messages[self._idx]
-            self._idx += 1
+    async def receive_messages(self):
+        for msg in self._messages:
             yield msg
-            from claude_agent_sdk.types import ResultMessage
-            if isinstance(msg, ResultMessage):
-                return
+            await asyncio.sleep(0)
+        await self.release.wait()
+
+    async def disconnect(self):
+        self.release.set()
 
 
 async def _dispatch_and_drain(messages, *, workspace="") -> list[TransportEvent]:
     transport = SDKTransport()
-    transport._client = _FakeSDKClient(messages)
+    client = _FakeSDKClient(messages)
+    transport._client = client
     transport._alive = True
     transport._workspace = workspace  # real path → display-only usage ledger is quiet
     await transport.dispatch("go")
-    await asyncio.wait_for(
-        asyncio.gather(transport._bg_task, return_exceptions=True), timeout=5.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    client.release.set()
+    transport._reader_task.cancel()
+    await asyncio.gather(transport._reader_task, return_exceptions=True)
     events = []
     while not transport._event_queue.empty():
         events.append(transport._event_queue.get_nowait())
@@ -154,19 +160,22 @@ async def test_awaited_workflow_continuation_is_surfaced(tmp_path):
     tcs = _turn_completes(events)
     assert len(tcs) == 1, f"expected one turn_complete, got {len(tcs)}"
     assert tcs[0].data.get("cause") == "success"
+    assert tcs[0].data.get("origin") == "dispatch"
 
 
 async def test_fire_and_forget_local_bash_is_not_awaited(tmp_path):
     """A run_in_background shell (task_type='local_bash') is fire-and-forget —
-    the BackgroundWorkRegistry's domain. The consumer must NOT block waiting for
-    its continuation (so a never-exiting dev server can't pin the dispatch):
-    the foreground turn ends with one turn_complete and the (here, present)
-    continuation is left for the registry path, not awaited."""
+    the BackgroundWorkRegistry's domain. The dispatch must NOT stay pending
+    for its continuation (so a never-exiting dev server can't pin the
+    dispatch): the foreground turn ends with the dispatch's one turn_complete.
+    Spec 129: the continuation is still READ — the CLI runs it as a turn of
+    its own when the shell exits — and ends as a self-initiated turn, never
+    as a second dispatch boundary and never stranded."""
     messages = [
         _assistant("Started the dev server in the background."),
         _task_started(task_id="bg1", task_type="local_bash"),
         _result(is_error=False),                       # foreground turn ends
-        # A continuation exists on the channel but must NOT be awaited here:
+        # The shell exits and the CLI speaks unprompted:
         _task_notification(task_id="bg1", status="completed"),
         _assistant("server process exited"),
         _result(is_error=False),
@@ -176,16 +185,16 @@ async def test_fire_and_forget_local_bash_is_not_awaited(tmp_path):
     texts = _texts(events)
 
     assert any("dev server" in t for t in texts)
-    assert not any("server process exited" in t for t in texts), (
-        "local_bash continuation must not be awaited/surfaced by the dispatch")
+    assert any("server process exited" in t for t in texts), (
+        "the self-initiated continuation must be read, not stranded")
     tcs = _turn_completes(events)
-    assert len(tcs) == 1
-    assert tcs[0].data.get("cause") == "success"
+    assert [(t.data.get("origin"), t.data.get("cause")) for t in tcs] == [
+        ("dispatch", "success"), ("self", "success")]
 
 
 async def test_plain_turn_unchanged_single_turn_complete(tmp_path):
     """Control: a normal turn with no background task behaves exactly as before
-    — one receive_response() turn, one success turn_complete."""
+    — one turn, one success turn_complete."""
     messages = [_assistant("here is the answer"), _result(is_error=False)]
 
     events = await _dispatch_and_drain(messages, workspace=str(tmp_path))
@@ -194,3 +203,4 @@ async def test_plain_turn_unchanged_single_turn_complete(tmp_path):
     tcs = _turn_completes(events)
     assert len(tcs) == 1
     assert tcs[0].data.get("cause") == "success"
+    assert tcs[0].data.get("origin") == "dispatch"

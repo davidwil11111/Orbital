@@ -87,7 +87,15 @@ def _make_transport():
     transport._workspace = ""
     transport._pending_approvals = {}
     transport._event_queue = asyncio.Queue()
-    transport._needs_flush = False
+    # Spec 129 persistent-reader fields (the tests bypass __init__).
+    transport._reader_task = None
+    transport._pending_dispatch = False
+    transport._outstanding = set()
+    transport._last_result_is_error = False
+    transport._budget_handle = None
+    transport._dispatch_done = None
+    transport._dispatch_text = []
+    transport._session_cost_seen = 0.0
     return transport
 
 
@@ -186,7 +194,7 @@ class TestBug005a_SDKTransportStreaming:
             yield result_msg
 
         transport._client.query = AsyncMock()
-        transport._client.receive_response = mock_receive
+        transport._client.receive_messages = mock_receive
 
         # --- Simulate ProcessManager ---
         ws_manager = MagicMock()
@@ -258,7 +266,7 @@ class TestBug005a_SDKTransportStreaming:
             yield result_msg
 
         transport._client.query = AsyncMock()
-        transport._client.receive_response = mock_receive
+        transport._client.receive_messages = mock_receive
 
         with _patch_sdk_types():
             send_task = asyncio.create_task(transport.send("hello"))
