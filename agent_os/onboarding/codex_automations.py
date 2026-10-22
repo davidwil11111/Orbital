@@ -9,14 +9,24 @@ Codex keeps each automation at ``<codex_dir>/automations/<id>/automation.toml``
 ``target_thread_id``). One whose target thread ran in the project's folder is
 imported as a schedule trigger assigned to ``codex`` that fires into that
 thread's imported session (contract §6), so the automation keeps continuing
-the same conversation. Read-only against ``~/.codex``; idempotent on
-``imported_from.codex_automation_id``.
+the same conversation. Idempotent on ``imported_from.codex_automation_id``.
+
+Ownership (spec 126): after import exactly one scheduler runs the automation.
+An ACTIVE automation imported enabled is paused on the Codex side with ONE
+write — its ``status`` line becomes ``"PAUSED"`` (``pause_codex_automation``,
+atomic, every other byte preserved). That is the only time Orbital ever
+writes into ``~/.codex``: disabling or deleting the trigger later does not
+hand the automation back (the user re-enables it in Codex if they want it
+there). When that write fails the trigger is imported disabled with a
+caption saying Codex still runs it, so two schedulers never run silently.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+import tempfile
 import tomllib
 from datetime import datetime, timezone
 
@@ -26,6 +36,15 @@ logger = logging.getLogger(__name__)
 
 # The disabled fallback schedule for an RRULE that has no cron equivalent.
 FALLBACK_CRON = "0 9 * * *"
+
+# Caption suffix of a trigger imported disabled because the Codex-side
+# automation could not be paused (spec 126 A).
+CODEX_STILL_RUNS_SUFFIX = " (Codex still runs this)"
+
+# A top-level ``status = "ACTIVE"`` line (either quote style, any case of the
+# value); groups: prefix, quote, rest of line.
+_STATUS_ACTIVE_LINE = re.compile(r'^(\s*status\s*=\s*)(["\'])(?i:active)\2(.*)$',
+                                 re.MULTILINE)
 
 _DAYS = {"SU": 0, "MO": 1, "TU": 2, "WE": 3, "TH": 4, "FR": 5, "SA": 6}
 _DAY_NAMES = {0: "Sun", 1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat"}
@@ -125,13 +144,14 @@ def _int_list(value: str, lo: int, hi: int) -> list[int]:
     return out
 
 
-def load_automations(codex_dir: str | None = None) -> list[dict]:
-    """Every parseable ``automation.toml`` under ``<codex_dir>/automations``,
-    sorted by id. A file that does not parse, or has no id, is skipped."""
+def _automation_files(codex_dir: str | None = None) -> list[tuple[str, dict]]:
+    """``(path, parsed)`` of every parseable ``automation.toml`` under
+    ``<codex_dir>/automations``, in directory order. A file that does not
+    parse, or has no id, is skipped."""
     root = os.path.join(si.codex_home(codex_dir), "automations")
     if not os.path.isdir(root):
         return []
-    out: list[dict] = []
+    out: list[tuple[str, dict]] = []
     try:
         names = sorted(os.listdir(root))
     except OSError:
@@ -148,8 +168,112 @@ def load_automations(codex_dir: str | None = None) -> list[dict]:
             continue
         if not isinstance(data, dict) or not data.get("id"):
             continue
-        out.append(data)
+        out.append((path, data))
     return out
+
+
+def load_automations(codex_dir: str | None = None) -> list[dict]:
+    """Every parseable ``automation.toml`` under ``<codex_dir>/automations``,
+    sorted by id. A file that does not parse, or has no id, is skipped."""
+    return [data for _path, data in _automation_files(codex_dir)]
+
+
+def pause_codex_automation(automation_id: str, codex_dir: str | None = None) -> bool:
+    """Flip ``status = "ACTIVE"`` to ``"PAUSED"`` in the automation's TOML.
+
+    The one take-over write (spec 126 A). Textual: only the status line
+    changes, so comments and keys this code does not know survive byte for
+    byte. Each candidate line is tried in turn and accepted only when the
+    rewritten file parses to the original document with ``status`` now
+    ``PAUSED`` — a ``status = "ACTIVE"`` inside a multi-line prompt string is
+    never the one replaced. Atomic (temp file + ``os.replace``).
+
+    Returns True when the file was written, False when it already says
+    PAUSED (a second install importing the same automation does not rewrite
+    it). Raises ``FileNotFoundError`` for an unknown id, ``RuntimeError`` when
+    no status line can be rewritten safely, and ``OSError`` on I/O failure —
+    the caller imports the trigger disabled on any of them.
+    """
+    for path, data in _automation_files(codex_dir):
+        if str(data.get("id")) == str(automation_id):
+            break
+    else:
+        raise FileNotFoundError(f"codex automation {automation_id!r} not found")
+    if str(data.get("status") or "").upper() == "PAUSED":
+        return False
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        text = fh.read()
+    want = dict(data, status="PAUSED")
+    rewritten: str | None = None
+    for m in _STATUS_ACTIVE_LINE.finditer(text):
+        candidate = (text[:m.start()] + m.group(1) + m.group(2) + "PAUSED" + m.group(2)
+                     + m.group(3) + text[m.end():])
+        try:
+            parsed = tomllib.loads(candidate)
+        except tomllib.TOMLDecodeError:
+            continue
+        if parsed == want:
+            rewritten = candidate
+            break
+    if rewritten is None:
+        raise RuntimeError(f"no rewritable status line in {path}")
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".automation.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(rewritten)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp_path, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def take_over_imported(triggers: list[dict],
+                       codex_dir: str | None = None) -> tuple[list[str], list[str]]:
+    """Pause, on the Codex side, every automation in ``triggers`` that was
+    imported ENABLED from an ACTIVE one; returns ``(taken over, failed)`` as
+    trigger names.
+
+    Mutates the records: a paused automation's trigger gets
+    ``imported_from.paused_in_codex = True``; one whose file could not be
+    written is flipped to ``enabled = False`` with the
+    ``CODEX_STILL_RUNS_SUFFIX`` caption (never two schedulers silently). A
+    PAUSED or unmappable automation imported disabled is left alone.
+    """
+    taken_over: list[str] = []
+    failed: list[str] = []
+    for trigger in triggers:
+        imported_from = trigger.get("imported_from")
+        if not isinstance(imported_from, dict) or not trigger.get("enabled"):
+            continue
+        if str(imported_from.get("codex_status") or "").upper() != "ACTIVE":
+            continue
+        aid = str(imported_from.get("codex_automation_id"))
+        name = str(trigger.get("name") or aid)
+        try:
+            pause_codex_automation(aid, codex_dir)
+        except Exception as e:
+            logger.warning("codex automation import: could not pause %s in Codex (%s); "
+                           "importing the trigger disabled", aid, e)
+            trigger["enabled"] = False
+            schedule = trigger.get("schedule")
+            if isinstance(schedule, dict):
+                schedule["human"] = str(schedule.get("human") or "") + CODEX_STILL_RUNS_SUFFIX
+            failed.append(name)
+            continue
+        imported_from["paused_in_codex"] = True
+        taken_over.append(name)
+    return taken_over, failed
 
 
 def _local_tz_name() -> str:
@@ -162,10 +286,14 @@ def build_trigger(automation: dict, *, session_id: str, tz: str,
     """The Orbital trigger record for one Codex automation (contract §6).
 
     Same field set the create route writes, plus ``session_id`` (fires
-    continue the imported thread) and ``imported_from``."""
+    continue the imported thread) and ``imported_from`` — the automation id
+    and ``codex_status``, the Codex-side status at import time (what a later
+    hand-back would restore; ``take_over_imported`` adds ``paused_in_codex``
+    once the take-over write landed)."""
     from agent_os.daemon_v2.trigger_manager import generate_trigger_id
     cron, human, mappable = rrule_to_cron(automation.get("rrule") or "")
-    active = str(automation.get("status") or "").upper() == "ACTIVE"
+    status = str(automation.get("status") or "")
+    active = status.upper() == "ACTIVE"
     return {
         "id": generate_trigger_id(),
         "name": str(automation.get("name") or automation["id"]),
@@ -178,7 +306,8 @@ def build_trigger(automation: dict, *, session_id: str, tz: str,
         "agent": "codex",
         "schedule": {"cron": cron, "human": human, "timezone": tz},
         "session_id": session_id,
-        "imported_from": {"codex_automation_id": str(automation["id"])},
+        "imported_from": {"codex_automation_id": str(automation["id"]),
+                          "codex_status": status},
     }
 
 

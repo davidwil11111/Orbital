@@ -131,7 +131,8 @@ def test_plan_imports_only_automations_targeting_this_folder(setup):
                               "created_at")} == {
         "name": "Daily radar", "type": "schedule",
         "task": "Reply with the single word PONG", "agent": "codex", "enabled": True,
-        "session_id": CODEX_SID, "imported_from": {"codex_automation_id": "mine"},
+        "session_id": CODEX_SID,
+        "imported_from": {"codex_automation_id": "mine", "codex_status": "ACTIVE"},
         "last_triggered": None, "trigger_count": 0,
         "created_at": "2026-10-21T00:00:00+00:00",
     }
@@ -212,14 +213,16 @@ def test_sync_imports_counts_and_registers(setup):
     _write_automation(setup["codex_dir"], "mine")
     coord, store, pid, tm = _coordinator(setup)
     result = coord.sync_imports(pid)
-    assert result == {"sessions": 1, "automations": {"imported": 1, "skipped": 0}}
+    assert result == {"sessions": 1, "automations": {
+        "imported": 1, "skipped": 0, "taken_over": ["Daily radar"], "takeover_failed": []}}
     triggers = store.get_project(pid)["triggers"]
     assert len(triggers) == 1 and triggers[0]["session_id"] == CODEX_SID
     tm.register_trigger.assert_called_once()
     assert tm.register_trigger.call_args.args == (pid, triggers[0])
     # Second sync: no duplicate.
     assert coord.sync_imports(pid) == {
-        "sessions": 1, "automations": {"imported": 0, "skipped": 1}}
+        "sessions": 1, "automations": {"imported": 0, "skipped": 1,
+                                       "taken_over": [], "takeover_failed": []}}
     assert len(store.get_project(pid)["triggers"]) == 1
 
 
@@ -228,10 +231,9 @@ def test_sync_imports_never_raises(setup, monkeypatch):
     monkeypatch.setattr(ca, "plan_automation_imports",
                         MagicMock(side_effect=RuntimeError("boom")))
     coord._agent_manager.list_sessions.side_effect = RuntimeError("boom")
-    assert coord.sync_imports(pid) == {
-        "sessions": 0, "automations": {"imported": 0, "skipped": 0}}
-    assert coord.sync_imports("proj_missing") == {
-        "sessions": 0, "automations": {"imported": 0, "skipped": 0}}
+    zero = {"imported": 0, "skipped": 0, "taken_over": [], "takeover_failed": []}
+    assert coord.sync_imports(pid) == {"sessions": 0, "automations": zero}
+    assert coord.sync_imports("proj_missing") == {"sessions": 0, "automations": zero}
 
 
 def test_sync_route(setup):
@@ -248,5 +250,123 @@ def test_sync_route(setup):
     client = TestClient(app)
     resp = client.post(f"/api/v2/projects/{pid}/imports/sync")
     assert resp.status_code == 200
-    assert resp.json() == {"sessions": 1, "automations": {"imported": 1, "skipped": 0}}
+    assert resp.json() == {"sessions": 1, "automations": {
+        "imported": 1, "skipped": 0, "taken_over": ["Daily radar"], "takeover_failed": []}}
     assert client.post("/api/v2/projects/proj_nope/imports/sync").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Spec 126 A — Orbital takes the automation over: the one write into Codex
+# --------------------------------------------------------------------------
+
+
+def _toml_path(setup, aid):
+    return os.path.join(setup["codex_dir"], "automations", aid, "automation.toml")
+
+
+def _stat_sig(path):
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_ino, st.st_size)
+
+
+def test_takeover_pauses_the_codex_automation_with_one_write(setup):
+    """An ACTIVE automation imported enabled is paused on the Codex side:
+    only its status line changes, every other byte of the file survives,
+    and the record remembers what it was imported from."""
+    _write_automation(setup["codex_dir"], "mine")
+    path = _toml_path(setup, "mine")
+    before = open(path, encoding="utf-8").read()
+    coord, store, pid, tm = _coordinator(setup)
+    result = coord.sync_imports(pid)
+    assert result["automations"]["taken_over"] == ["Daily radar"]
+    assert result["automations"]["takeover_failed"] == []
+    after = open(path, encoding="utf-8").read()
+    assert after == before.replace('status = "ACTIVE"', 'status = "PAUSED"')
+    import tomllib
+    with open(path, "rb") as fh:
+        assert tomllib.load(fh)["status"] == "PAUSED"
+    (trigger,) = store.get_project(pid)["triggers"]
+    assert trigger["enabled"] is True
+    assert trigger["imported_from"] == {
+        "codex_automation_id": "mine", "codex_status": "ACTIVE", "paused_in_codex": True}
+    assert trigger["schedule"]["human"] == "Daily at 10:30"
+    # The registered trigger is the persisted one (enabled).
+    assert tm.register_trigger.call_args.args == (pid, trigger)
+
+
+def test_takeover_never_touches_the_file_again(setup):
+    """After the one take-over write Orbital leaves the Codex file alone: a
+    second sync (idempotent on the automation id) and a later run of the
+    importer over the now-PAUSED file write nothing."""
+    _write_automation(setup["codex_dir"], "mine")
+    path = _toml_path(setup, "mine")
+    coord, store, pid, tm = _coordinator(setup)
+    coord.sync_imports(pid)
+    sig = _stat_sig(path)
+    assert coord.sync_imports(pid)["automations"]["taken_over"] == []
+    assert _stat_sig(path) == sig
+    # A second install importing the same automation sees PAUSED and does
+    # not write (PAUSED -> PAUSED is a no-op, not a rewrite).
+    assert ca.pause_codex_automation("mine", setup["codex_dir"]) is False
+    assert _stat_sig(path) == sig
+
+
+def test_paused_or_unmappable_automations_are_not_written(setup):
+    _write_automation(setup["codex_dir"], "paused", status="PAUSED")
+    _write_automation(setup["codex_dir"], "monthly",
+                      rrule="RRULE:FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=9")
+    paths = {aid: _toml_path(setup, aid) for aid in ("paused", "monthly")}
+    sigs = {aid: _stat_sig(p) for aid, p in paths.items()}
+    contents = {aid: open(p, encoding="utf-8").read() for aid, p in paths.items()}
+    coord, store, pid, tm = _coordinator(setup)
+    result = coord.sync_imports(pid)
+    assert result["automations"] == {"imported": 2, "skipped": 0,
+                                     "taken_over": [], "takeover_failed": []}
+    for aid, p in paths.items():
+        assert _stat_sig(p) == sigs[aid]
+        assert open(p, encoding="utf-8").read() == contents[aid]
+    by_id = {t["imported_from"]["codex_automation_id"]: t
+             for t in store.get_project(pid)["triggers"]}
+    assert by_id["paused"]["enabled"] is False
+    assert by_id["paused"]["imported_from"] == {
+        "codex_automation_id": "paused", "codex_status": "PAUSED"}
+    assert by_id["monthly"]["enabled"] is False
+    assert by_id["monthly"]["imported_from"] == {
+        "codex_automation_id": "monthly", "codex_status": "ACTIVE"}
+
+
+def test_takeover_write_failure_imports_the_trigger_disabled(setup, monkeypatch):
+    """Never two schedulers silently: when Codex's file cannot be written,
+    the trigger lands disabled with a caption saying Codex still runs it,
+    and the import itself still succeeds."""
+    _write_automation(setup["codex_dir"], "mine")
+    monkeypatch.setattr(ca, "pause_codex_automation",
+                        MagicMock(side_effect=OSError("read-only")))
+    coord, store, pid, tm = _coordinator(setup)
+    result = coord.sync_imports(pid)
+    assert result["automations"] == {"imported": 1, "skipped": 0,
+                                     "taken_over": [], "takeover_failed": ["Daily radar"]}
+    (trigger,) = store.get_project(pid)["triggers"]
+    assert trigger["enabled"] is False
+    assert trigger["schedule"]["human"] == "Daily at 10:30 (Codex still runs this)"
+    assert trigger["imported_from"] == {"codex_automation_id": "mine", "codex_status": "ACTIVE"}
+    # What the trigger manager registers is the disabled record.
+    assert tm.register_trigger.call_args.args[1]["enabled"] is False
+    # And it is not retried on the next sync (idempotent on the id).
+    assert coord.sync_imports(pid)["automations"]["imported"] == 0
+
+
+def test_pause_preserves_unknown_keys_and_comments(setup):
+    d = os.path.join(setup["codex_dir"], "automations", "odd")
+    os.makedirs(d)
+    path = os.path.join(d, "automation.toml")
+    text = ('# a comment Codex may write one day\nversion = 1\nid = "odd"\n'
+            'status = "ACTIVE"   # trailing comment\nfuture_key = { nested = true }\n'
+            'prompt = """\nstatus = "ACTIVE" inside a string must not change\n"""\n')
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    assert ca.pause_codex_automation("odd", setup["codex_dir"]) is True
+    assert open(path, encoding="utf-8").read() == text.replace(
+        'status = "ACTIVE"   # trailing', 'status = "PAUSED"   # trailing')
+    with pytest.raises(FileNotFoundError):
+        ca.pause_codex_automation("nope", setup["codex_dir"])
