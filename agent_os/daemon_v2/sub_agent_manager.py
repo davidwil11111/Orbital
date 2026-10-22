@@ -393,6 +393,15 @@ class SubAgentManager:
         template_path = os.path.join(
             data_dir, "agents", manifest.slug, manifest.runtime.config_template,
         )
+        if not os.path.isfile(template_path):
+            # The launcher was chosen on the locate card (a hand-installed
+            # tree; spec 127 V4): the Orbital install dir never got the
+            # template staged, but the build ships it with the manifest.
+            from agent_os.agents.installer import bundled_asset_path
+            bundled = bundled_asset_path(
+                manifest.slug, manifest.runtime.config_template)
+            if bundled is not None:
+                template_path = bundled
 
         out_dir = ProjectPaths(workspace).sub_agent_dir(handle)
         # Opportunistic: renders whose adapter never reached the stop path

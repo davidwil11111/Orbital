@@ -1030,6 +1030,32 @@ describe('SubAgentSettings — Orbital-managed install', () => {
     );
   });
 
+  it('does not re-enter the installing state when the job fails before the POST resolves', async () => {
+    // Spec 127 V4 on Windows (2026-10-22): the preflight ("no node on PATH")
+    // fails within milliseconds, so `sub_agent_install_failed` reaches the
+    // card over the WS before the 202 does. The spinner must not come back
+    // beside the error.
+    let resolvePost: (v: unknown) => void = () => {};
+    api.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/settings') return { llm: { provider: 'deepseek', api_key_set: true } };
+      if (path === LIST_PATH) return [makeDshEntry()];
+      if (path.endsWith('/install')) return new Promise(r => { resolvePost = r; });
+      throw new Error(`unexpected api call: ${path}`);
+    });
+
+    render(<SubAgentSettings />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Install' }));
+
+    emit('sub_agent_install_failed', { slug: 'dsh', job_id: 'job-1', error: 'needs Node.js 20.12+' });
+    await act(async () => {
+      resolvePost({ job_id: 'job-1', slug: 'dsh', state: 'installing' });
+    });
+
+    expect(screen.getByTestId('sub-agent-install-error-dsh')).toHaveTextContent('needs Node.js 20.12+');
+    expect(screen.queryByTestId('sub-agent-install-spinner-dsh')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry install' })).toBeInTheDocument();
+  });
+
   it('ignores install events for a different agent', async () => {
     mockList([makeDshEntry()]);
 

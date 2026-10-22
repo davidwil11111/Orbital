@@ -296,7 +296,7 @@ def _codex_index_rows(index_path: str) -> list[tuple[str, int | None]] | None:
         for cwd, updated_at in cur.fetchall():
             if isinstance(cwd, str) and cwd:
                 ts = updated_at if isinstance(updated_at, (int, float)) else None
-                rows.append((cwd, ts))
+                rows.append((strip_extended_prefix(cwd), ts))
         return rows
     finally:
         con.close()
@@ -335,7 +335,7 @@ def _scan_codex_sessions(sessions_dir: str) -> list[ImportCandidate]:
             if not fname.endswith(".jsonl"):
                 continue
             fpath = os.path.join(root, fname)
-            cwd = _codex_session_cwd(fpath)
+            cwd = strip_extended_prefix(_codex_session_cwd(fpath))
             if not cwd:
                 continue
             g = grouped.setdefault(cwd, {"count": 0, "latest": None})
@@ -486,6 +486,29 @@ def _dedupe(candidates: list[ImportCandidate]) -> list[ImportCandidate]:
     return list(merged.values())
 
 
+_EXTENDED_PREFIX = "\\\\?\\"
+_EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
+
+
+def strip_extended_prefix(path: str) -> str:
+    """Drop the Windows extended-length prefix Codex writes into its index.
+
+    Codex (Rust ``canonicalize``) records thread working directories as
+    ``\\\\?\\D:\\proj`` / ``\\\\?\\UNC\\server\\share``. Python's ``realpath``
+    and ``isdir`` do not treat that form as the same folder as ``D:\\proj``
+    (2026-10-22: the import list showed ``\\\\?\\`` paths, stored them as
+    project workspaces verbatim and listed the same folder twice), so every
+    Codex-sourced cwd goes through here before it is compared or shown.
+    """
+    if not isinstance(path, str):
+        return path
+    if path.startswith(_EXTENDED_UNC_PREFIX):
+        return "\\\\" + path[len(_EXTENDED_UNC_PREFIX):]
+    if path.startswith(_EXTENDED_PREFIX):
+        return path[len(_EXTENDED_PREFIX):]
+    return path
+
+
 def _path_key(path: str) -> str:
     """Identity key for a folder: realpath, then normcase.
 
@@ -494,7 +517,7 @@ def _path_key(path: str) -> str:
     same key decides dedup and the already-imported match (spec 084) so the
     two can never disagree about which folder is which.
     """
-    return os.path.normcase(os.path.realpath(path))
+    return os.path.normcase(os.path.realpath(strip_extended_prefix(path)))
 
 
 def path_key(path: str) -> str:

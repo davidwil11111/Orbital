@@ -374,15 +374,39 @@ class SubAgentConfigStore:
             }
 
     @staticmethod
+    def manifest_launches_via_shim(manifest) -> bool:
+        """True when every Windows launcher the manifest knows is a
+        ``.cmd``/``.bat``/``.ps1`` shim — dsh's npm-installed
+        ``dsh-acp-demo.cmd`` is the only spawn target it has. For such an
+        agent a pasted shim is the same file Orbital itself runs, and "paste
+        the real executable instead" names a file that does not exist, so
+        the shim refusal below would reject the only path that works (spec
+        127 V4 on Windows, 2026-10-22). An agent that also ships a real
+        executable (claude-code's ``claude.exe``) keeps the refusal: there
+        the spec 116 failure mode — a stopped shim leaving its node child
+        running — has a better answer."""
+        try:
+            entries = [e for e in (manifest.setup.auto_detect.get("windows", []) or [])
+                       if isinstance(e, str) and e.strip()]
+        except AttributeError:
+            return False
+        return bool(entries) and all(
+            e.lower().endswith(_WINDOWS_SHIMS) for e in entries
+        )
+
+    @staticmethod
     def validate_override(binary: str, path_prepend: list[str] | None = None,
-                          env: dict[str, str] | None = None) -> dict:
+                          env: dict[str, str] | None = None, *,
+                          allow_shim: bool = False) -> dict:
         """Cleaned override or :class:`SubAgentConfigError`.
 
         The binary must be an absolute path to an existing file. On Windows
         an npm ``.cmd``/``.bat``/``.ps1`` shim is refused with the real
         executable named: ``cmd.exe`` re-parses the arguments and a stopped
         shim leaves its ``node`` child running (spec 116 hit this for claude).
-        PATH entries must be absolute; env keys must be variable names.
+        ``allow_shim`` lifts that for an agent whose manifest launches via a
+        shim anyway (:meth:`manifest_launches_via_shim`). PATH entries must
+        be absolute; env keys must be variable names.
         """
         binary = (binary or "").strip()
         if not binary:
@@ -390,7 +414,8 @@ class SubAgentConfigStore:
         if not os.path.isabs(binary):
             raise SubAgentConfigError(
                 f"'{binary}' is not an absolute path to the executable.")
-        if detect_os() == "windows" and binary.lower().endswith(_WINDOWS_SHIMS):
+        if (not allow_shim and detect_os() == "windows"
+                and binary.lower().endswith(_WINDOWS_SHIMS)):
             base = os.path.basename(binary)
             stem = os.path.splitext(base)[0]
             raise SubAgentConfigError(
@@ -420,10 +445,12 @@ class SubAgentConfigStore:
 
     def set_override(self, slug: str, *, binary: str,
                      path_prepend: list[str] | None = None,
-                     env: dict[str, str] | None = None) -> dict:
+                     env: dict[str, str] | None = None,
+                     allow_shim: bool = False) -> dict:
         """Validate and persist the user-chosen location for ``slug``,
         leaving its CLI params as they are."""
-        cleaned = self.validate_override(binary, path_prepend, env)
+        cleaned = self.validate_override(binary, path_prepend, env,
+                                         allow_shim=allow_shim)
         with self._lock:
             entry = dict(self._data.get(slug, {}))
             entry.update(cleaned)

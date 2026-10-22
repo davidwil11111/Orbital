@@ -147,6 +147,32 @@ from agent_os.queue.store import QueueStore
 logger = logging.getLogger(__name__)
 
 
+#: ``Session.load`` takes the session file lock non-blocking. On Windows the
+#: sentinel lock is per file descriptor, so a worker-thread read (recap build,
+#: hydrate-on-inject) can collide with the loop thread's own append on the
+#: same session and fail with ``FileLockError`` even though the writer holds
+#: it for milliseconds (spec 127 V2 run, 2026-10-22: "recap build failed —
+#: dispatching without"). Reads retry over a short window before giving up.
+_SESSION_LOAD_LOCK_ATTEMPTS = 20
+_SESSION_LOAD_LOCK_BACKOFF_S = 0.05
+
+
+def _load_session_with_lock_retry(target: str,
+                                  *, attempts: int = _SESSION_LOAD_LOCK_ATTEMPTS,
+                                  backoff_s: float = _SESSION_LOAD_LOCK_BACKOFF_S):
+    """``Session.load(target)`` that waits out a transiently held file lock."""
+    last: FileLockError | None = None
+    for i in range(max(1, attempts)):
+        try:
+            return Session.load(target)
+        except FileLockError as exc:
+            last = exc
+            if i + 1 < attempts:
+                time.sleep(backoff_s)
+    assert last is not None
+    raise last
+
+
 def _sanitize_project_name(name: str) -> str:
     """Sanitize project name for use in filenames."""
     s = re.sub(r'[^\w-]', '_', name.lower())
@@ -2574,7 +2600,7 @@ class AgentManager:
         if stem is None:
             return None
         target = os.path.join(sessions_dir, f"{stem}.jsonl")
-        session = Session.load(target)
+        session = _load_session_with_lock_retry(target)
         # Session.load sets session_id to the filename stem (F2); recover the
         # original F1 from the records so identity survives hydration.
         f1 = self._read_session_f1(target)

@@ -378,3 +378,34 @@ def test_claude_project_dirs_for_matches_by_recorded_cwd(home, tmp_path):
         return  # no symlink privilege (Windows): the realpath leg is covered elsewhere
     assert claude_project_dirs_for(projects, str(link)) == [d_target]
     assert claude_project_dirs_for(str(tmp_path / "none"), str(target)) == []
+
+
+# --------------------------------------------------------------------------
+# Codex writes `\\?\`-prefixed working directories on Windows (2026-10-22)
+# --------------------------------------------------------------------------
+
+
+def test_strip_extended_prefix_shapes():
+    from agent_os.onboarding.import_scanner import strip_extended_prefix
+    assert strip_extended_prefix("\\\\?\\D:\\proj") == "D:\\proj"
+    assert strip_extended_prefix("\\\\?\\UNC\\srv\\share\\x") == "\\\\srv\\share\\x"
+    assert strip_extended_prefix("D:\\proj") == "D:\\proj"
+    assert strip_extended_prefix("/home/x/proj") == "/home/x/proj"
+    assert strip_extended_prefix(None) is None  # type: ignore[arg-type]
+
+
+def test_codex_extended_prefix_cwd_is_normalised_and_deduped(home, tmp_path):
+    """A Codex thread whose cwd carries the Windows extended-length prefix
+    must show (and be stored) as the plain path, and must collapse into the
+    Claude Code candidate for the same folder instead of listing it twice."""
+    live = str(tmp_path / "shared-project")
+    os.makedirs(live)
+    _write_claude_project(str(home / ".claude" / "projects"), live, n_sessions=1)
+    prefixed = "\\\\?\\" + live
+    _write_codex_index(str(home / ".codex"), [(prefixed, 1_777_000_000)])
+
+    cands = _scan(home, tmp_path)
+    matching = [c for c in cands if os.path.normcase(c.path) == os.path.normcase(live)]
+    assert len(matching) == 1, [c.path for c in cands]
+    assert not any(c.path.startswith("\\\\?\\") for c in cands)
+    assert set(matching[0].sources) == {"claude-code", "codex"}

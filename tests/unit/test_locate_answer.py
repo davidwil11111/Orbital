@@ -134,3 +134,58 @@ class TestPrompt:
         for key in ("agent:", "command:", "target:", "version:", "env:", "path:"):
             assert key in p
         assert "command -v" in p
+
+
+class TestWindowsPathsWithSpaces:
+    """Reported 2026-10-22: ``C:\\Program Files\\...`` (and ``E:\\Minimax\\MiniMax
+    Code\\...``) were cut at the first space, so the card said
+    ``No file at C:\\Program``. The path is the whole value, quoted or not."""
+
+    def test_quoted_command_is_taken_verbatim(self):
+        a = parse_locate_answer(
+            "agent: Kimi Code\n" + r'command: "C:\Program Files\nodejs\node.exe"' + "\nversion: 1.0\n")
+        assert a.command == r"C:\Program Files\nodejs\node.exe"
+        assert a.target is None
+
+    def test_single_quoted_command_is_taken_verbatim(self):
+        a = parse_locate_answer(r"command: 'E:\Minimax\MiniMax Code\MiniMax Code.exe'" + "\n")
+        assert a.command == r"E:\Minimax\MiniMax Code\MiniMax Code.exe"
+
+    def test_unquoted_command_runs_to_the_end_of_the_line(self):
+        a = parse_locate_answer(
+            "agent: MiniMax Code\n" + r"command: E:\Minimax\MiniMax Code\MiniMax Code.exe" + "\n")
+        assert a.command == r"E:\Minimax\MiniMax Code\MiniMax Code.exe"
+
+    def test_unquoted_command_stops_at_a_parenthesised_note(self):
+        a = parse_locate_answer(r"command: C:\Program Files\nodejs\node.exe (the launcher)" + "\n")
+        assert a.command == r"C:\Program Files\nodejs\node.exe"
+
+    def test_program_files_x86_is_one_path(self):
+        a = parse_locate_answer(r"command: C:\Program Files (x86)\nodejs\node.exe" + "\n")
+        assert a.command == r"C:\Program Files (x86)\nodejs\node.exe"
+
+    def test_arrow_target_with_spaces_on_the_command_line(self):
+        a = parse_locate_answer(
+            r'command: "C:\Program Files\X\x.cmd" -> "C:\Program Files\X\node_modules\x\bin\x.js"' + "\n")
+        assert a.command == r"C:\Program Files\X\x.cmd"
+        assert a.target == r"C:\Program Files\X\node_modules\x\bin\x.js"
+
+    def test_unquoted_arrow_target_with_spaces(self):
+        a = parse_locate_answer(
+            r"command: C:\Program Files\X\x.cmd (shim) -> C:\Program Files\X\bin\x.js" + "\n")
+        assert a.command == r"C:\Program Files\X\x.cmd"
+        assert a.target == r"C:\Program Files\X\bin\x.js"
+
+    def test_target_key_with_spaces(self):
+        a = parse_locate_answer(
+            r"command: C:\Tools\x.cmd" + "\n" + r"target: C:\Program Files\X\bin\x.js" + "\n")
+        assert a.target == r"C:\Program Files\X\bin\x.js"
+
+    def test_posix_samples_still_parse_the_same(self):
+        a = parse_locate_answer(CLAUDE_ANSWER)
+        assert a.command == "/Users/x/.local/bin/claude"
+        assert a.target == "/Users/x/.local/share/claude/versions/2.1.306"
+
+    def test_prose_before_the_path_still_finds_it(self):
+        a = parse_locate_answer("command: the launcher is /opt/bin/codex here\n")
+        assert a.command == "/opt/bin/codex"

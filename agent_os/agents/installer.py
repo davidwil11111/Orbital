@@ -415,6 +415,18 @@ class SubAgentInstaller:
 # Module helpers
 # ---------------------------------------------------------------------------
 
+def bundled_asset_path(slug: str, name: str) -> str | None:
+    """Absolute path of ``agent_os/agents/assets/<slug>/<name>`` in this
+    build, or None when the build does not carry it. The dispatch renderer
+    falls back to it when the install dir has no staged copy (a launcher
+    chosen on the locate card instead of installed by Orbital)."""
+    assets = _resolve_assets_dir(slug)
+    if assets is None:
+        return None
+    candidate = os.path.join(assets, name)
+    return candidate if os.path.isfile(candidate) else None
+
+
 def _resolve_assets_dir(slug: str) -> str | None:
     """Locate the bundled ``agent_os/agents/assets/<slug>/`` directory.
 

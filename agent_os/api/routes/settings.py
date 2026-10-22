@@ -949,17 +949,22 @@ async def test_sub_agent_locate(slug: str, req: LocateRequest):
 async def put_sub_agent_locate(slug: str, req: LocateRequest):
     """Save the pasted location. The check is re-run on the exact inputs
     first (the card-save rule): a failing check is a 400, nothing is stored."""
-    _locate_manifest(slug)
+    manifest = _locate_manifest(slug)
     if _sub_agent_config_store is None:
         raise HTTPException(status_code=503, detail="Sub-agent config store not available")
-    from agent_os.daemon_v2.sub_agent_config_store import SubAgentConfigError
+    from agent_os.daemon_v2.sub_agent_config_store import (
+        SubAgentConfigError, SubAgentConfigStore,
+    )
     result = await asyncio.to_thread(_locate_test, slug, req.answer)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Test failed")
     try:
         _sub_agent_config_store.set_override(
             slug, binary=result["binary"], path_prepend=result["path_prepend"],
-            env={name: "" for name in result["env_names"]})
+            env={name: "" for name in result["env_names"]},
+            # An agent whose own Windows launcher is an npm .cmd (dsh) may be
+            # pointed at a hand-installed .cmd too; Test already accepted it.
+            allow_shim=SubAgentConfigStore.manifest_launches_via_shim(manifest))
     except SubAgentConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return await asyncio.to_thread(_fresh_sub_agent_entry, slug)

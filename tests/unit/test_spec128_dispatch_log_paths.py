@@ -259,6 +259,24 @@ class TestFormatSourceLogs:
     def test_empty_entries_render_nothing(self):
         assert format_source_logs([]) == ""
 
+    def test_windows_paths_render_with_forward_slashes_not_doubled_backslashes(self):
+        # 2026-10-22, Windows: JSON doubled every backslash
+        # ("D:\\\\proj\\\\..."), which is not a path an agent can open.
+        text = format_source_logs([
+            ("Orbital chat log", "D:\\orbital-1022\\orbital\\sessions\\k.jsonl"),
+            ("Original agent session log (codex)",
+             "C:\\Users\\me\\.codex\\sessions\\2026\\10\\23\\rollout-x.jsonl"),
+            ("UNC log", "\\\\server\\share\\log.jsonl"),
+        ])
+        assert '"D:/orbital-1022/orbital/sessions/k.jsonl"' in text
+        assert '"C:/Users/me/.codex/sessions/2026/10/23/rollout-x.jsonl"' in text
+        assert '"//server/share/log.jsonl"' in text
+        assert "\\\\" not in text
+
+    def test_posix_path_with_a_backslash_in_its_name_is_untouched(self):
+        text = format_source_logs([("Orbital chat log", "/tmp/odd\\name/log.jsonl")])
+        assert json.dumps("/tmp/odd\\name/log.jsonl") in text
+
 
 # ---------------------------------------------------------------------------
 # B. Dispatch — the block rides every dispatch, after the recap

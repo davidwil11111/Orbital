@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../config';
 import { useWebSocket } from '../hooks/useWebSocket';
 import MessageAvatar from './MessageAvatar';
@@ -500,6 +500,12 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
   // Install: `installing` starts from the entry so a page refresh mid-install
   // resumes the progress display without waiting for the next WS line.
   const [installing, setInstalling] = useState(entry.install?.state === 'installing');
+  // Jobs whose terminal event (done/failed) already arrived. A preflight
+  // failure (no Node on PATH) lands over the WS before the POST's 202
+  // resolves; without this the handler would re-enter `installing` after the
+  // error and the spinner would sit beside "Install failed" forever
+  // (spec 127 V4 on Windows, 2026-10-22).
+  const settledInstallJobs = useRef<Set<string>>(new Set());
   const [installBusy, setInstallBusy] = useState(false);
   const [installLine, setInstallLine] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
@@ -551,7 +557,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
   const entryInstallState = entry.install?.state;
   useEffect(() => {
     if (entryInstallState === 'installing') setInstalling(true);
-    else if (entryInstallState === 'installed') setInstalling(false);
+    else if (entryInstallState === 'installed' || entryInstallState === 'failed') setInstalling(false);
   }, [entryInstallState]);
 
   // Install job events are daemon-global and carry the slug, so one handler per
@@ -568,6 +574,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     const onDone = (event: WebSocketEvent) => {
       if (event.type !== 'sub_agent_install_done') return;
       if (event.slug !== entry.slug) return;
+      if (typeof event.job_id === 'string') settledInstallJobs.current.add(event.job_id);
       setInstalling(false);
       setInstallLine(null);
       setInstallError(null);
@@ -576,6 +583,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     const onFailed = (event: WebSocketEvent) => {
       if (event.type !== 'sub_agent_install_failed') return;
       if (event.slug !== entry.slug) return;
+      if (typeof event.job_id === 'string') settledInstallJobs.current.add(event.job_id);
       setInstalling(false);
       setInstallError(event.error);
       // Spec 127 D3: the daemon's job registry now says `failed`; refetch
@@ -660,11 +668,17 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
     setInstallError(null);
     setInstallLine(null);
     try {
-      await api(`/api/v2/settings/sub-agents/${encodeURIComponent(entry.slug)}/install`, {
-        method: 'POST',
-      });
-      // 202 — the job streams over the WS from here.
-      setInstalling(true);
+      const res = (await api(
+        `/api/v2/settings/sub-agents/${encodeURIComponent(entry.slug)}/install`,
+        { method: 'POST' },
+      )) as { job_id?: string } | undefined;
+      // 202 — the job streams over the WS from here. Unless its terminal
+      // event already arrived while this request was in flight: then the
+      // handlers above have the final word and the spinner must stay off.
+      const jobId = res?.job_id;
+      if (typeof jobId !== 'string' || !settledInstallJobs.current.has(jobId)) {
+        setInstalling(true);
+      }
     } catch (e) {
       setInstallError(e instanceof Error ? e.message : String(e));
     } finally {

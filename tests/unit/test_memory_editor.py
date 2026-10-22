@@ -137,7 +137,12 @@ def test_write_marker_records_watermark_and_preserves_it(wf):
     WF._write_cleanup_marker(wf)            # a later floor-only marker write
     assert E.watermark(wf.dir) == ran
     data = E.read_marker(wf.dir)
-    assert set(data) == {"state", "decisions", "lessons", "index", "editor_last_run"}
+    # The four mtimes, their byte sizes (same-tick rewrite guard) and the watermark.
+    assert set(data) == {
+        "state", "decisions", "lessons", "index",
+        "state_size", "decisions_size", "lessons_size", "index_size",
+        "editor_last_run",
+    }
 
 
 def test_auto_run_due_needs_a_change_and_an_old_enough_watermark(wf):
@@ -324,3 +329,42 @@ async def test_a_declined_turn_leaves_the_pass_unfinished_so_it_retries(wf):
     assert out == "skipped"
     assert "editor_last_run" not in E.read_marker(wf.dir)
     assert WF._has_cleanup_delta(wf)
+
+
+def test_same_tick_rewrite_with_a_different_size_is_a_delta(tmp_path):
+    """Windows NTFS rounds LastWriteTime to the system timer, so two writes
+    in one tick share an mtime; the size must still count as a change."""
+    from datetime import datetime, timezone
+    import os
+    from agent_os.agent import memory_editor as E
+
+    orbital = tmp_path / "orbital"
+    orbital.mkdir()
+    state = orbital / E.FILE_BY_KEY["state"]
+    state.write_text("one\n", encoding="utf-8")
+    E.write_marker(str(orbital), editor_ran_at=datetime.now(timezone.utc))
+    assert E.has_delta(str(orbital)) is False
+
+    st = os.stat(state)
+    state.write_text("one\ntwo\n", encoding="utf-8")
+    os.utime(state, ns=(st.st_atime_ns, st.st_mtime_ns))   # same tick, same mtime
+    assert E.has_delta(str(orbital)) is True
+
+
+def test_marker_without_size_keys_still_answers_from_mtimes(tmp_path):
+    """A marker written by an older daemon carries only the mtime keys."""
+    import json
+    from agent_os.agent import memory_editor as E
+
+    orbital = tmp_path / "orbital"
+    orbital.mkdir()
+    state = orbital / E.FILE_BY_KEY["state"]
+    state.write_text("one\n", encoding="utf-8")
+    E.write_marker(str(orbital), editor_ran_at=None)
+    marker = E._marker_path(str(orbital))
+    data = json.loads(open(marker, encoding="utf-8").read())
+    for k in list(data):
+        if k.endswith("_size"):
+            del data[k]
+    open(marker, "w", encoding="utf-8").write(json.dumps(data))
+    assert E.has_delta(str(orbital)) is False

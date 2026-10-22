@@ -147,6 +147,38 @@ class TestStoreOverride:
         assert "codex.cmd" in str(exc.value)
         assert "real executable" in str(exc.value)
 
+    def test_windows_shim_allowed_for_an_agent_that_launches_via_a_shim(self, store, tmp_path):
+        """dsh's only Windows launcher IS the npm .cmd (spec 127); the Save
+        must accept the same file the card's Test accepted (2026-10-22)."""
+        shim = tmp_path / "dsh-acp-demo.cmd"
+        shim.write_text("@echo off\n")
+        with patch("agent_os.daemon_v2.sub_agent_config_store.detect_os", return_value="windows"):
+            cleaned = store.set_override(SLUG, binary=str(shim), allow_shim=True)
+        assert cleaned["binary"] == str(shim)
+        assert store.get_override(SLUG)["binary"] == str(shim)
+
+    def test_manifest_launches_via_shim_reads_the_windows_auto_detect(self):
+        from types import SimpleNamespace as NS
+        from agent_os.daemon_v2.sub_agent_config_store import SubAgentConfigStore
+
+        def manifest(windows):
+            return NS(setup=NS(auto_detect={"windows": windows, "macos": ["/x/bin/dsh"]}))
+
+        # dsh: the npm shim is the only launcher there is.
+        assert SubAgentConfigStore.manifest_launches_via_shim(
+            manifest(["${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo.cmd"]))
+        # codex/pi/kimi/minimax: shims only, in two npm locations.
+        assert SubAgentConfigStore.manifest_launches_via_shim(
+            manifest(["%APPDATA%\\npm\\codex.cmd", "%PROGRAMFILES%\\nodejs\\codex.cmd"]))
+        # claude-code also ships claude.exe: a pasted shim is still refused
+        # (spec 116), the real executable is the answer.
+        assert not SubAgentConfigStore.manifest_launches_via_shim(
+            manifest(["%APPDATA%\\npm\\claude.cmd", "%USERPROFILE%\\.local\\bin\\claude.exe"]))
+        assert not SubAgentConfigStore.manifest_launches_via_shim(
+            manifest(["C:/Program Files/x/x.exe"]))
+        assert not SubAgentConfigStore.manifest_launches_via_shim(manifest([]))
+        assert not SubAgentConfigStore.manifest_launches_via_shim(NS(setup=None))
+
     def test_bad_env_name_and_relative_path_entry_rejected(self, store, tmp_path):
         binary = _fake_cli(tmp_path)
         with pytest.raises(SubAgentConfigError, match="environment variable"):

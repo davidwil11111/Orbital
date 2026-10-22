@@ -78,6 +78,53 @@ def _first_abs_path(value: str) -> str | None:
     return m.group(0).rstrip(".,;:")
 
 
+# Where an unquoted ``command:`` value stops being the path: the arrow or
+# parenthesis an agent appends ("(symlink) -> /real/file"), never whitespace —
+# ``C:\Program Files\...`` has spaces inside the path itself. A parenthesised
+# group that the path continues through (``Program Files (x86)\node``) is
+# part of the path and does not terminate it.
+_PATH_TERMINATOR = re.compile(r"\s+(?:->|→)(?=\s)|\s+\((?![^()]*\)[\\/])")
+
+
+def _path_value(value: str) -> str | None:
+    """The absolute path a ``command:``/``target:`` value names, whole.
+
+    A quoted value is taken verbatim (the quotes are the agent telling us
+    where the path ends). An unquoted value that starts with an absolute
+    path runs to the first arrow/parenthesis or the end of the line, so a
+    Windows path with spaces survives. Anything else falls back to the first
+    absolute path found in the text, as before.
+    """
+    v = value.strip()
+    if not v:
+        return None
+    if v[0] in "'\"":
+        end = v.find(v[0], 1)
+        if end > 1:
+            inner = v[1:end].strip()
+            return inner if is_absolute_path(inner) else None
+        return _first_abs_path(v)
+    if is_absolute_path(v):
+        m = _PATH_TERMINATOR.search(v)
+        head = v[:m.start()] if m else v
+        head = head.rstrip().rstrip(".,;:")
+        return head or None
+    return _first_abs_path(v)
+
+
+def _target_after_arrow(value: str, command: str) -> str | None:
+    """The target an agent writes after the command on the same line
+    (``/launcher (symlink) -> /real/file``), parsed like a path value."""
+    rest = value.strip()
+    idx = rest.find(command)
+    if idx >= 0:
+        rest = rest[idx + len(command):]
+    m = re.search(r"(?:->|→)\s*(.+)$", rest)
+    if m:
+        return _path_value(m.group(1))
+    return _first_abs_path(rest)
+
+
 def _strip_quotes(value: str) -> str:
     v = value.strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
@@ -236,7 +283,7 @@ def parse_locate_answer(text: str) -> LocateAnswer:
                 return LocateAnswer(command=lone)
         raise LocateAnswerError(
             "The answer has no `command:` line naming the executable.")
-    command = _first_abs_path(str(raw_command))
+    command = _path_value(str(raw_command))
     if command is None:
         raise LocateAnswerError(
             f"`command: {str(raw_command).strip()}` is not an absolute path. "
@@ -244,12 +291,11 @@ def parse_locate_answer(text: str) -> LocateAnswer:
             "output of `command -v` or `which`.")
 
     raw_target = fields.get("target")
-    target = _first_abs_path(str(raw_target)) if isinstance(raw_target, str) \
+    target = _path_value(str(raw_target)) if isinstance(raw_target, str) \
         and raw_target and not _is_placeholder(raw_target) else None
     # The Claude answer puts the target after an arrow on the command line.
     if target is None:
-        rest = str(raw_command)[str(raw_command).find(command) + len(command):]
-        target = _first_abs_path(rest)
+        target = _target_after_arrow(str(raw_command), command)
 
     raw_version = fields.get("version")
     version = _strip_quotes(str(raw_version)) if isinstance(raw_version, str) \

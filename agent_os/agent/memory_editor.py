@@ -166,13 +166,37 @@ def _mtimes(orbital_dir: str) -> dict[str, int | None]:
     return out
 
 
+def _byte_sizes(orbital_dir: str) -> dict[str, int | None]:
+    """Byte sizes beside the mtimes: two writes inside one filesystem
+    timestamp tick (Windows NTFS rounds LastWriteTime to the system timer)
+    leave ``st_mtime_ns`` identical, so a rewrite that changed the length
+    is still a delta."""
+    out: dict[str, int | None] = {}
+    for key, path in _layer1_paths(orbital_dir).items():
+        try:
+            out[_SIZE_KEY.format(key)] = os.stat(path).st_size
+        except OSError:
+            out[_SIZE_KEY.format(key)] = None
+    return out
+
+
+_SIZE_KEY = "{}_size"
+
+
 def has_delta(orbital_dir: str) -> bool:
     """True if any live file changed since the last successful pass."""
     stored = read_marker(orbital_dir)
     if not stored:
         return True
     current = _mtimes(orbital_dir)
-    return any(str(stored.get(k)) != str(current.get(k)) for k in LIVE_KEYS)
+    if any(str(stored.get(k)) != str(current.get(k)) for k in LIVE_KEYS):
+        return True
+    sizes = _byte_sizes(orbital_dir)
+    # Size keys were added later; a marker without them (older daemon) falls
+    # back to the mtime-only answer above.
+    return any(
+        k in stored and str(stored.get(k)) != str(v) for k, v in sizes.items()
+    )
 
 
 def write_marker(orbital_dir: str, *, editor_ran_at: datetime | None) -> None:
@@ -183,6 +207,7 @@ def write_marker(orbital_dir: str, *, editor_ran_at: datetime | None) -> None:
     marker's mtime.
     """
     data: dict = dict(_mtimes(orbital_dir))
+    data.update(_byte_sizes(orbital_dir))
     previous = read_marker(orbital_dir).get(WATERMARK_KEY)
     if editor_ran_at is not None:
         data[WATERMARK_KEY] = editor_ran_at.astimezone(timezone.utc).isoformat()

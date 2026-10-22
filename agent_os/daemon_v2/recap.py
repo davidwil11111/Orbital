@@ -282,12 +282,27 @@ def format_source_logs(entries: list[tuple[str, str | None]]) -> str:
     """Render the path block, or "" when there is nothing to point at.
 
     Paths are JSON-encoded so a quote or newline in a filename cannot break
-    the block; they are never truncated."""
+    the block; they are never truncated. Windows paths are rendered with
+    forward slashes first: JSON would otherwise double every backslash
+    (``"D:\\\\proj\\\\orbital\\\\sessions\\\\x.jsonl"``), which is not a path
+    an agent can open verbatim, while ``D:/proj/orbital/sessions/x.jsonl``
+    is accepted by every Windows file API and reads cleanly."""
     if not entries:
         return ""
     lines = [SOURCE_LOGS_HEADER]
     for label, path in entries:
-        value = (json.dumps(path, ensure_ascii=False)
+        value = (json.dumps(_portable_path(path), ensure_ascii=False)
                  if path else _UNAVAILABLE)
         lines.append(f"- {label}: {value}")
     return "\n".join(lines) + "\n\n"
+
+
+def _portable_path(path: str) -> str:
+    """``C:\\a\\b`` → ``C:/a/b``; POSIX paths are returned unchanged. Only a
+    drive-letter or UNC path is rewritten, so a POSIX filename that happens
+    to contain a backslash keeps it."""
+    if len(path) >= 3 and path[1] == ":" and path[2] in "\\/":
+        return path.replace("\\", "/")
+    if path.startswith("\\\\"):
+        return "//" + path[2:].replace("\\", "/")
+    return path

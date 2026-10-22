@@ -18,11 +18,17 @@ import json
 import logging
 import os
 import uuid
+from asyncio import subprocess as aio_subprocess
 from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from typing import Any
 
 import psutil
-from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process, text_block
+from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process, text_block  # noqa: F401 — spawn_agent_process kept importable for callers/tests
+from acp.stdio import ClientSideConnection
+from acp.transports import default_environment
+
+from agent_os.utils.subprocess_flags import win_no_window_flags
 from acp.schema import (
     AcceptElicitationResponse,
     AgentMessageChunk,
@@ -56,6 +62,75 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_ACP_SDK_VERSION = "0.11.0"
 _VALID_PERMISSION_MODES = {"auto", "ask"}
+
+
+@asynccontextmanager
+async def _spawn_agent_process_no_window(
+    to_client: Any,
+    command: str,
+    *args: str,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+    transport_kwargs: Mapping[str, Any] | None = None,
+    **connection_kwargs: Any,
+) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
+    """``acp.spawn_agent_process`` with Windows no-window creation flags.
+
+    The SDK's spawn (``acp.transports.spawn_stdio_transport``) has no
+    ``creationflags`` hook. An npm ``.cmd`` launcher — dsh's only spawn
+    target on Windows — runs through ``cmd.exe``, and without
+    ``CREATE_NO_WINDOW`` that cmd.exe owns a visible console for the whole
+    life of the agent process (spec 055; seen on the spec 127 V2 run,
+    2026-10-22). This mirrors the SDK helper, including its shutdown
+    sequence, and adds the flag.
+    """
+    merged_env = dict(default_environment())
+    if env:
+        merged_env.update(env)
+    kwargs = dict(transport_kwargs or {})
+    shutdown_timeout = float(kwargs.pop("shutdown_timeout", 2.0))
+    process = await asyncio.create_subprocess_exec(
+        command,
+        *args,
+        stdin=aio_subprocess.PIPE,
+        stdout=aio_subprocess.PIPE,
+        stderr=aio_subprocess.PIPE,
+        env=merged_env,
+        cwd=str(cwd) if cwd is not None else None,
+        creationflags=win_no_window_flags(),
+    )
+    if process.stdout is None or process.stdin is None:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("ACP agent spawn requires stdin/stdout pipes")
+    conn = ClientSideConnection(to_client, process.stdin, process.stdout,
+                                **connection_kwargs)
+    try:
+        yield conn, process
+    finally:
+        with contextlib.suppress(Exception):
+            await conn.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.write_eof()
+            except (AttributeError, OSError, RuntimeError):
+                process.stdin.close()
+            with contextlib.suppress(Exception):
+                await process.stdin.drain()
+            with contextlib.suppress(Exception):
+                process.stdin.close()
+            with contextlib.suppress(Exception):
+                await process.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=shutdown_timeout)
+        except asyncio.TimeoutError:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=shutdown_timeout)
+            except asyncio.TimeoutError:
+                process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
 
 
 class ACPSDKTransport(AgentTransport):
@@ -195,7 +270,7 @@ class ACPSDKTransport(AgentTransport):
         if env:
             merged_env.update(env)
 
-        self._stdio_context = spawn_agent_process(
+        self._stdio_context = _spawn_agent_process_no_window(
             self,
             command,
             *cleaned_args,
