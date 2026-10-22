@@ -242,6 +242,25 @@ class SDKTransport(AgentTransport):
         return _re.sub(r"[^A-Za-z0-9-]", "-", real)
 
     @staticmethod
+    def resume_source_path(workspace: str, session_id: str,
+                           *, projects_root: str | None = None) -> str | None:
+        """The native session JSONL a claude-code session id resolves to,
+        or None. Same lookup as ``resume_source_exists`` (cwd slug first,
+        then the glob fallback); metadata only, the file is never opened.
+        Shared with the spec 128 dispatch path block."""
+        import glob as _glob
+        root = projects_root or os.path.join(
+            os.environ.get("CLAUDE_CONFIG_DIR")
+            or os.path.join(os.path.expanduser("~"), ".claude"),
+            "projects")
+        slug = SDKTransport.claude_project_slug(workspace)
+        primary = os.path.join(root, slug, f"{session_id}.jsonl")
+        if os.path.isfile(primary):
+            return primary
+        matches = sorted(_glob.glob(os.path.join(root, "*", f"{session_id}.jsonl")))
+        return matches[0] if matches else None
+
+    @staticmethod
     def resume_source_exists(workspace: str, session_id: str,
                              *, projects_root: str | None = None) -> bool:
         """Pre-check that the resumable session state still exists on disk.
@@ -256,15 +275,8 @@ class SDKTransport(AgentTransport):
         Code's own override, honoured by the session importer too), else
         ``~/.claude/projects``.
         """
-        import glob as _glob
-        root = projects_root or os.path.join(
-            os.environ.get("CLAUDE_CONFIG_DIR")
-            or os.path.join(os.path.expanduser("~"), ".claude"),
-            "projects")
-        slug = SDKTransport.claude_project_slug(workspace)
-        if os.path.isfile(os.path.join(root, slug, f"{session_id}.jsonl")):
-            return True
-        return bool(_glob.glob(os.path.join(root, "*", f"{session_id}.jsonl")))
+        return SDKTransport.resume_source_path(
+            workspace, session_id, projects_root=projects_root) is not None
 
     async def start(self, command: str, args: list[str], workspace: str, env: dict | None = None) -> None:
         self._workspace = workspace
