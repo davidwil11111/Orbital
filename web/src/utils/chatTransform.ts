@@ -164,6 +164,12 @@ export type DisplayItem =
         | 'started'
         | 'sent'
         | 'completed'
+        /**
+         * Spec 129: a turn the worker ran on its own (a background command
+         * it was waiting on finished) ended. Never a reply to the preceding
+         * user row and never a dispatch boundary.
+         */
+        | 'continued'
         | 'failed'
         | 'error'
         | 'stopped'
@@ -173,7 +179,7 @@ export type DisplayItem =
         | 'queue_dropped';
       handle: string;
       timestamp: string;
-      /** Present for action='completed'. Trimmed; may be empty. */
+      /** Present for action='completed' | 'continued'. Trimmed; may be empty. */
       summary?: string;
       /** Present for action='sent'. The first chunk of the sent message. */
       preview?: string;
@@ -568,6 +574,9 @@ interface OpenCapsule {
 const SUB_AGENT_STARTED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+started\b/;
 const SUB_AGENT_SENT_RE = /^\[Sub-agent\]\s+Message sent to\s+([\w.-]+):\s*(.*)$/;
 const SUB_AGENT_COMPLETED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+completed\.\s*Summary:\s*([\s\S]*)$/;
+// Spec 129: the worker continued on its own (a background command it was
+// waiting on finished and the CLI ran a turn with no message from anyone).
+const SUB_AGENT_CONTINUED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+continued\.\s*Summary:\s*([\s\S]*)$/;
 const SUB_AGENT_FAILED_RE = /^\[Sub-agent\]\s+([\w.-]+)\s+failed:\s*([\s\S]*)$/;
 // b17edb8 (v0.16.0): a pinned send whose spawn failed writes a durable
 // "could not start" row; spec 116 gives it a rule (it rendered as nothing)
@@ -737,13 +746,24 @@ function isOnboardingInstructionMarker(msg: ChatMessage, prev: ChatMessage | und
  * The worker bubble for a `sub_agent_terminal` completed row carrying
  * `_meta.reply`, or null when the row has no reply or the worker's bubble for
  * this turn is already drawn (searching back to the user's last message).
+ *
+ * A `continued` row (spec 129) is the worker's own turn, started by a
+ * background command finishing, not by anyone's message: its reply is always
+ * its own bubble. It is never paired with the preceding user row, and no
+ * transcript join can draw it (the turn has no dispatch marker), so the
+ * "already drawn since the last user message" check does not apply.
  */
 function terminalReplyBubble(msg: ChatMessage, items: DisplayItem[]): DisplayItem | null {
   const meta = msg._meta;
-  if (!meta || meta.event !== 'sub_agent_terminal' || meta.kind !== 'completed') return null;
+  if (!meta || meta.event !== 'sub_agent_terminal') return null;
+  if (meta.kind !== 'completed' && meta.kind !== 'continued') return null;
   const reply = typeof meta.reply === 'string' ? meta.reply : '';
   const handle = typeof meta.handle === 'string' ? meta.handle : '';
   if (!reply.trim() || !handle) return null;
+  if (meta.kind === 'continued') {
+    if (reply.trim() === '(no output)') return null;
+    return { type: 'agent_message', content: reply, source: handle, timestamp: msg.timestamp };
+  }
   for (let k = items.length - 1; k >= 0; k--) {
     const it = items[k];
     if (it.type === 'user_message') break;
@@ -775,6 +795,15 @@ function parseSubAgentSystemMessage(
     return {
       type: 'sub_agent_activity',
       action: 'completed',
+      handle: m[1],
+      summary: m[2].trim(),
+      timestamp,
+    };
+  }
+  if ((m = content.match(SUB_AGENT_CONTINUED_RE))) {
+    return {
+      type: 'sub_agent_activity',
+      action: 'continued',
       handle: m[1],
       summary: m[2].trim(),
       timestamp,

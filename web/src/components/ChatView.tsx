@@ -2792,6 +2792,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     on('chat.sub_agent_message', handleSubAgentMessage);
     // Terminal family only — 'started' persists nothing a reseed could hide.
     on('sub_agent.completed', handleSubAgentTerminal);
+    // Spec 129: a self-initiated worker turn ended; its row and reply are
+    // on disk, so reseed from history like any other terminal.
+    on('sub_agent.continued', handleSubAgentTerminal);
     on('sub_agent.error', handleSubAgentTerminal);
     on('sub_agent.failed', handleSubAgentTerminal);
     on('sub_agent.stopped', handleSubAgentTerminal);
@@ -2821,6 +2824,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       off('approval.resolved', handleApprovalResolved);
       off('chat.sub_agent_message', handleSubAgentMessage);
       off('sub_agent.completed', handleSubAgentTerminal);
+      off('sub_agent.continued', handleSubAgentTerminal);
       off('sub_agent.error', handleSubAgentTerminal);
       off('sub_agent.failed', handleSubAgentTerminal);
       off('sub_agent.stopped', handleSubAgentTerminal);
@@ -3686,6 +3690,12 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                     return item.summary
                       ? t('chat.subActivity.completed', { summary: item.summary })
                       : t('chat.subActivity.completed', { summary: '' }).replace(/[:：]\s*$/, '');
+                  case 'continued':
+                    // Spec 129: the worker's own turn (a background command
+                    // it waited on finished) ended — not a reply to anyone.
+                    return item.summary
+                      ? t('chat.subActivity.continued', { summary: item.summary })
+                      : t('chat.subActivity.continued', { summary: '' }).replace(/[:：]\s*$/, '');
                   case 'error':
                     return item.error
                       ? t('chat.subActivity.error', { error: item.error })

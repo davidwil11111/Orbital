@@ -67,7 +67,9 @@ class _ScriptedSDKTransport:
 
 
 async def _transport_over(sdk_transport) -> SDKTransport:
-    """An SDKTransport as start() leaves it, over a real Query reader."""
+    """An SDKTransport as start() leaves it, over a real Query reader: the
+    SDK's stdout reader and Orbital's persistent reader (spec 129) both
+    running."""
     query = Query(transport=sdk_transport, is_streaming_mode=True)
     await query.start()
     client = ClaudeSDKClient(options=ClaudeAgentOptions())
@@ -76,7 +78,19 @@ async def _transport_over(sdk_transport) -> SDKTransport:
     transport = SDKTransport()
     transport._client = client
     transport._alive = True
+    transport._ensure_reader()
     return transport
+
+
+async def _reader_settled(transport) -> None:
+    """Wait for the persistent reader to end (a fatal stream error)."""
+    await asyncio.wait_for(
+        asyncio.gather(transport._reader_task, return_exceptions=True), timeout=5.0)
+
+
+async def _settle(n: int = 30) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
 
 
 def _drain(transport) -> list:
@@ -101,7 +115,8 @@ class TestFatalReaderError:
             raise_after=_BUFFER_OVERFLOW)
         transport = await _transport_over(sdk)
 
-        await transport._consume_response_background()
+        await transport.dispatch("read the screenshots")
+        await _reader_settled(transport)
         events = _drain(transport)
 
         # The loud part the user already sees stays exactly as it was.
@@ -110,6 +125,7 @@ class TestFatalReaderError:
         assert BUFFER_ERROR in errors[0].raw_text
         assert events[-1].event_type == "turn_complete"
         assert events[-1].data["cause"] == "error"
+        assert events[-1].data["origin"] == "dispatch"
         # The fix: a client whose reader is gone no longer claims to be alive,
         # so the manager rebuilds it instead of dispatching into silence.
         assert transport.is_alive() is False
@@ -125,7 +141,8 @@ class TestFatalReaderError:
 
         with patch("agent_os.agent.transports.process_kill.kill_process_tree",
                    new=AsyncMock()) as kill:
-            await transport._consume_response_background()
+            await transport.dispatch("go")
+            await _reader_settled(transport)
 
         kill.assert_awaited_once()
         assert kill.await_args.args[0] is transport._proc
@@ -138,30 +155,118 @@ class TestFatalReaderError:
             "Command failed with exit code 1"))
         transport = await _transport_over(sdk)
 
-        await transport._consume_response_background()
+        await transport.dispatch("go")
+        await _reader_settled(transport)
 
         assert transport.is_alive() is False
+
+    @pytest.mark.asyncio
+    async def test_reader_death_between_dispatches_is_a_self_boundary(self):
+        # Spec 129 §6.5: nothing is pending, so the boundary is the worker's
+        # own turn ending in error — and the verdict is the same: not alive,
+        # process killed, rebuilt with resume on the next send.
+        transport = await _transport_over(
+            _ScriptedSDKTransport(frames=[], raise_after=_BUFFER_OVERFLOW))
+        transport._proc = MagicMock(name="psutil.Process")
+
+        with patch("agent_os.agent.transports.process_kill.kill_process_tree",
+                   new=AsyncMock()) as kill:
+            await _reader_settled(transport)
+        events = _drain(transport)
+
+        assert [e.event_type for e in events] == ["error", "turn_complete"]
+        assert events[-1].data["cause"] == "error"
+        assert events[-1].data["origin"] == "self"
+        assert transport.is_alive() is False
+        kill.assert_awaited_once()
+
+
+class _TrickleSDKTransport(_ScriptedSDKTransport):
+    """Yields its frames one scheduler tick apart, like a CLI writing lines."""
+
+    async def _read(self):
+        for frame in self._frames:
+            yield frame
+            await asyncio.sleep(0)
+        await self.release.wait()
+
+
+class TestUnsolicitedBacklog:
+    """Spec 129 §6.4 / §2.3: the SDK's channel holds 100 messages and its
+    reader answers tool permissions inline, so 100 unread messages between
+    dispatches freeze the next tool call. The persistent reader keeps the
+    channel drained."""
+
+    @pytest.mark.asyncio
+    async def test_150_unsolicited_messages_are_emitted_and_the_channel_never_fills(self):
+        frames = [{"type": "assistant", "message": {
+            "model": "claude-fable-5",
+            "content": [{"type": "text", "text": f"self-wake line {i}"}]}}
+            for i in range(150)]
+        sdk = _TrickleSDKTransport(frames=frames)
+        transport = await _transport_over(sdk)
+        stats = transport._client._query._message_receive.statistics
+        buffered: list[int] = []
+        put = transport._event_queue.put
+
+        async def spy_put(event):
+            buffered.append(stats().current_buffer_used)
+            await put(event)
+
+        transport._event_queue.put = spy_put
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5.0
+            while transport._event_queue.qsize() < 150 and loop.time() < deadline:
+                await asyncio.sleep(0.005)
+            events = _drain(transport)
+            texts = [e.raw_text for e in events if e.event_type == "message"]
+            assert texts == [f"self-wake line {i}" for i in range(150)]
+            assert max(buffered) < 100, f"SDK channel filled: peak {max(buffered)}"
+            assert transport.is_alive() is True
+        finally:
+            sdk.release.set()
+            with patch("agent_os.agent.transports.process_kill.kill_process_tree",
+                       new=AsyncMock()):
+                await transport.stop()
 
 
 class TestNonFatalParseError:
     @pytest.mark.asyncio
-    async def test_malformed_frame_keeps_the_transport_alive(self):
+    async def test_malformed_frame_keeps_the_transport_alive_and_reading(self):
         # An assistant frame missing its content fails parse_message() in the
         # consumer; the SDK reader itself keeps running, so the client is
-        # still usable and must NOT be torn down.
-        sdk = _ScriptedSDKTransport(frames=[{"type": "assistant", "message": {}}])
+        # still usable and must NOT be torn down. Spec 129: the persistent
+        # reader reports the bad frame and keeps reading — the turn's own
+        # ResultMessage still closes the dispatch (no flush-on-next-send).
+        sdk = _ScriptedSDKTransport(frames=[
+            {"type": "assistant", "message": {}},
+            {"type": "assistant", "message": {
+                "model": "claude-fable-5",
+                "content": [{"type": "text", "text": "after the bad frame"}]}},
+            {"type": "result", "subtype": "success", "duration_ms": 1,
+             "duration_api_ms": 1, "is_error": False, "num_turns": 1,
+             "session_id": "s-parse", "total_cost_usd": 0.0, "usage": {},
+             "result": None},
+        ])
         transport = await _transport_over(sdk)
         transport._proc = MagicMock(name="psutil.Process")
 
         with patch("agent_os.agent.transports.process_kill.kill_process_tree",
                    new=AsyncMock()) as kill:
-            await transport._consume_response_background()
+            await transport.dispatch("go")
+            await _settle()
         events = _drain(transport)
 
-        assert [e.event_type for e in events] == ["error", "turn_complete"]
+        assert [e.event_type for e in events] == ["error", "message", "turn_complete"]
+        assert events[-1].data["cause"] == "success"
+        assert events[-1].data["origin"] == "dispatch"
         assert transport.is_alive() is True
         kill.assert_not_awaited()
         sdk.release.set()
+        with patch("agent_os.agent.transports.process_kill.kill_process_tree",
+                   new=AsyncMock()):
+            await transport.stop()
 
 
 class TestBufferCeiling:
@@ -204,7 +309,7 @@ class TestNextDispatchRebuilds:
     async def test_send_to_a_dead_handle_stops_it_and_respawns_with_resume(self):
         dead_transport = await _transport_over(
             _ScriptedSDKTransport(frames=[], raise_after=_BUFFER_OVERFLOW))
-        await dead_transport._consume_response_background()
+        await _reader_settled(dead_transport)
         assert dead_transport.is_alive() is False
 
         mgr = SubAgentManager(process_manager=MagicMock())
@@ -265,15 +370,16 @@ class TestDeadBeforeTurnComplete:
         transport = await _transport_over(
             _ScriptedSDKTransport(frames=[], raise_after=_BUFFER_OVERFLOW))
         alive_at_turn_complete = []
-        put = transport._event_queue.put
+        put_nowait = transport._event_queue.put_nowait
 
-        async def spy_put(event):
+        def spy_put(event):
             if event.event_type == "turn_complete":
                 alive_at_turn_complete.append(transport.is_alive())
-            await put(event)
+            put_nowait(event)
 
-        transport._event_queue.put = spy_put
-        await transport._consume_response_background()
+        transport._event_queue.put_nowait = spy_put
+        await transport.dispatch("go")
+        await _reader_settled(transport)
 
         assert alive_at_turn_complete == [False]
 

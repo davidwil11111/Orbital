@@ -272,6 +272,7 @@ export const STRINGS = {
   "chat.stop": { en: "Stop", zh: "停止" },
   "chat.subActivity.backgroundLost": { en: "teardown killed {n} background process(es): {commands} — this work did not finish", zh: "清理时终止了 {n} 个后台进程：{commands} —— 这些工作未完成" },
   "chat.subActivity.completed": { en: "completed: {summary}", zh: "已完成：{summary}" },
+  "chat.subActivity.continued": { en: "continued on its own: {summary}", zh: "自行继续：{summary}" },
   "chat.subActivity.error": { en: "stopped with error: {error}", zh: "因错误停止：{error}" },
   "chat.subActivity.failed": { en: "failed: {error}", zh: "失败：{error}" },
   "chat.subActivity.interactionRequired": { en: "waiting for your answer: {prompt}", zh: "等待你的回复：{prompt}" },

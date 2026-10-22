@@ -37,7 +37,11 @@ from agent_os.daemon_v2.agent_md_seeder import (
 from agent_os.daemon_v2.default_skills_installer import install_default_skills
 from agent_os.daemon_v2.sub_agent_transcript import read_sub_agent_summary
 from agent_os.daemon_v2.provider_errors import ProviderConfigError
-from agent_os.utils.file_lock import FileLockError
+from agent_os.utils.file_lock import (
+    FileLockError,
+    LOCK_RETRY_DELAYS as _LOCK_RETRY_DELAYS,
+    retry_session_lock,
+)
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.api.routes._attachment_formatter import (
     validate_attachments,
@@ -1642,30 +1646,15 @@ async def start_onboarding(project_id: str):
 # collider (the composer fires it fire-and-forget, so a send routinely lands
 # inside the burst). The lock itself is non-blocking with zero retries, so
 # the inject route absorbs contention here: brief exponential backoff, then
-# a clean retryable failure instead of an unhandled 500.
-_LOCK_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+# a clean retryable failure instead of an unhandled 500. The helper lives in
+# ``agent_os.utils.file_lock`` (spec 129 §5E: the daemon-internal paths use
+# the same one); this module keeps its name and its delay table so the
+# route's backoff can still be tuned here.
 
 
 async def _retry_session_lock(fn):
-    """Run ``fn``, retrying while the session file's lock is contended.
-
-    ``fn`` may return a plain value (sync call sites run each attempt on the
-    event loop, unchanged from before) or an awaitable (``asyncio.to_thread``
-    call sites); the backoff sleeps yield so the lock holder can finish. The
-    final attempt's ``FileLockError`` propagates to the caller.
-    """
-    import inspect
-
-    async def _attempt():
-        result = fn()
-        return await result if inspect.isawaitable(result) else result
-
-    for delay in _LOCK_RETRY_DELAYS:
-        try:
-            return await _attempt()
-        except FileLockError:
-            await asyncio.sleep(delay)
-    return await _attempt()
+    """``retry_session_lock`` with this module's ``_LOCK_RETRY_DELAYS``."""
+    return await retry_session_lock(fn, delays=_LOCK_RETRY_DELAYS)
 
 
 async def _materialize_if_imported(project_id: str, session_id: str | None) -> None:

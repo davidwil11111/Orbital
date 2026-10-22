@@ -140,13 +140,16 @@ async def _run_consumer(pm, adapter, transcript):
 class TestSDKTransportCause:
 
     async def _dispatch_and_drain(self, receive_factory):
+        # Spec 129: one persistent reader over receive_messages(); each
+        # scripted stream ends after its frames (the "end" sentinel), which
+        # is how the reader observes an external process death.
         transport = SDKTransport()
         mock_client = AsyncMock()
-        mock_client.receive_response = receive_factory
+        mock_client.receive_messages = receive_factory
         transport._client = mock_client
         transport._alive = True
         await transport.dispatch("go")
-        await asyncio.gather(transport._bg_task, return_exceptions=True)
+        await asyncio.gather(transport._reader_task, return_exceptions=True)
         return await _drain_queue(transport)
 
     async def test_success_turn_complete_carries_cause_success(self):
@@ -180,7 +183,7 @@ class TestSDKTransportCause:
         )
 
     async def test_stream_exception_yields_cause_error(self):
-        """Path (a): receive_response() raises mid-stream."""
+        """Path (a): the stream raises mid-turn (the SDK reader died)."""
 
         async def receive():
             raise RuntimeError("network dropped")
@@ -204,7 +207,7 @@ class TestSDKTransportCause:
         assert len(tcs) == 1
         assert tcs[0].data.get("cause") == "error"
 
-    async def test_cancelled_bg_task_yields_cause_stopped(self):
+    async def test_cancelled_reader_yields_cause_stopped(self):
         """Path (g), transport half: a deliberate stop (bg-task cancel) must
         tag its turn_complete as stopped so the consumer does not report it.
         """
@@ -215,13 +218,13 @@ class TestSDKTransportCause:
             await asyncio.sleep(30)
             yield  # pragma: no cover
 
-        mock_client.receive_response = lambda: hang()
+        mock_client.receive_messages = lambda: hang()
         transport._client = mock_client
         transport._alive = True
         await transport.dispatch("go")
         await asyncio.sleep(0.05)
-        transport._bg_task.cancel()
-        await asyncio.gather(transport._bg_task, return_exceptions=True)
+        transport._reader_task.cancel()
+        await asyncio.gather(transport._reader_task, return_exceptions=True)
 
         events = await _drain_queue(transport)
         tcs = _turn_completes(events)

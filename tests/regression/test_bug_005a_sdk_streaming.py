@@ -52,7 +52,15 @@ async def test_message_events_queued_for_read_stream():
     transport._workspace = ""
     transport._pending_approvals = {}
     transport._event_queue = asyncio.Queue()
-    transport._needs_flush = False
+    # Spec 129 persistent-reader fields (the tests bypass __init__).
+    transport._reader_task = None
+    transport._pending_dispatch = False
+    transport._outstanding = set()
+    transport._last_result_is_error = False
+    transport._budget_handle = None
+    transport._dispatch_done = None
+    transport._dispatch_text = []
+    transport._session_cost_seen = 0.0
 
     assistant_msg = _FakeAssistantMessage([_FakeTextBlock("Hello from Claude Code")])
     result_msg = _FakeResultMessage()
@@ -62,7 +70,7 @@ async def test_message_events_queued_for_read_stream():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     with patch("agent_os.agent.transports.sdk_transport.AssistantMessage", _FakeAssistantMessage), \
          patch("agent_os.agent.transports.sdk_transport.ResultMessage", _FakeResultMessage), \
@@ -91,7 +99,15 @@ async def test_tool_use_events_still_queued():
     transport._workspace = ""
     transport._pending_approvals = {}
     transport._event_queue = asyncio.Queue()
-    transport._needs_flush = False
+    # Spec 129 persistent-reader fields (the tests bypass __init__).
+    transport._reader_task = None
+    transport._pending_dispatch = False
+    transport._outstanding = set()
+    transport._last_result_is_error = False
+    transport._budget_handle = None
+    transport._dispatch_done = None
+    transport._dispatch_text = []
+    transport._session_cost_seen = 0.0
 
     assistant_msg = _FakeAssistantMessage([_FakeToolUseBlock("bash", "tc-1", {"command": "ls"})])
     result_msg = _FakeResultMessage()
@@ -101,7 +117,7 @@ async def test_tool_use_events_still_queued():
         yield result_msg
 
     transport._client.query = AsyncMock()
-    transport._client.receive_response = mock_receive
+    transport._client.receive_messages = mock_receive
 
     with patch("agent_os.agent.transports.sdk_transport.AssistantMessage", _FakeAssistantMessage), \
          patch("agent_os.agent.transports.sdk_transport.ResultMessage", _FakeResultMessage), \

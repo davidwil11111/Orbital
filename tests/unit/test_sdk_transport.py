@@ -94,7 +94,9 @@ class TestSDKTransportSend:
             yield real_assistant
             yield real_result
 
-        mock_client.receive_response = lambda: real_receive()
+        # Spec 129: one persistent reader over receive_messages(); the
+        # blocking send() rides it (no receive_response()).
+        mock_client.receive_messages = lambda: real_receive()
         transport._client = mock_client
         transport._alive = True
 
@@ -103,6 +105,7 @@ class TestSDKTransportSend:
         mock_client.query.assert_called_once_with("hello")
         assert response == "Hello from SDK!"
         assert transport.session_id == "sdk-session-1"
+        await transport.stop()
 
     @pytest.mark.asyncio
     async def test_send_no_client_returns_error(self):
@@ -132,12 +135,13 @@ class TestSDKTransportSend:
             return
             yield  # make it an async generator
 
-        mock_client.receive_response = lambda: empty_receive()
+        mock_client.receive_messages = lambda: empty_receive()
         transport._client = mock_client
         transport._alive = True
 
         response = await transport.send("hello")
         assert response == "(no response)"
+        await transport.stop()
 
 
 class TestSDKTransportLifecycle:
@@ -557,171 +561,6 @@ class TestSubAgentManagerApprovalRouting:
         result = await mgr.resolve_sub_agent_approval("proj_1", "req-123", approved=True)
 
         assert result is False
-
-
-class TestFlushStaleMessages:
-    """Test the defensive flush mechanism for unknown message types."""
-
-    @pytest.mark.asyncio
-    async def test_needs_flush_initially_false(self):
-        transport = SDKTransport()
-        assert transport._needs_flush is False
-
-    @pytest.mark.asyncio
-    async def test_send_sets_needs_flush_when_no_result_message(self):
-        """When receive_response() crashes before ResultMessage, _needs_flush is set."""
-        from claude_agent_sdk.types import AssistantMessage, TextBlock
-
-        transport = SDKTransport()
-        mock_client = AsyncMock()
-
-        real_text = TextBlock(text="partial answer")
-        real_assistant = AssistantMessage(
-            content=[real_text], model="claude-3",
-            parent_tool_use_id=None, error=None,
-        )
-
-        call_count = 0
-
-        async def crash_receive():
-            nonlocal call_count
-            call_count += 1
-            yield real_assistant
-            raise Exception("Unknown message type: rate_limit_event")
-
-        mock_client.receive_response = crash_receive
-        transport._client = mock_client
-        transport._alive = True
-
-        response = await transport.send("hello")
-
-        assert response == "partial answer"
-        assert transport._needs_flush is True
-
-    @pytest.mark.asyncio
-    async def test_send_clears_needs_flush_on_normal_response(self):
-        """When receive_response() completes with ResultMessage, _needs_flush stays False."""
-        from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
-
-        transport = SDKTransport()
-        mock_client = AsyncMock()
-
-        async def normal_receive():
-            yield AssistantMessage(
-                content=[TextBlock(text="answer")], model="claude-3",
-                parent_tool_use_id=None, error=None,
-            )
-            yield ResultMessage(
-                subtype="success", duration_ms=100, duration_api_ms=80,
-                is_error=False, num_turns=1, session_id="s1",
-                total_cost_usd=0.01, usage={}, result=None, structured_output=None,
-            )
-
-        mock_client.receive_response = lambda: normal_receive()
-        transport._client = mock_client
-        transport._alive = True
-
-        response = await transport.send("hello")
-
-        assert response == "answer"
-        assert transport._needs_flush is False
-
-    @pytest.mark.asyncio
-    async def test_flush_drains_stale_result_message(self):
-        """_flush_stale_messages() consumes a leftover ResultMessage."""
-        from claude_agent_sdk.types import ResultMessage
-
-        transport = SDKTransport()
-        mock_client = AsyncMock()
-        transport._needs_flush = True
-
-        stale_result = ResultMessage(
-            subtype="success", duration_ms=50, duration_api_ms=40,
-            is_error=False, num_turns=1, session_id="stale-sess",
-            total_cost_usd=0.01, usage={}, result=None, structured_output=None,
-        )
-
-        async def flush_receive():
-            yield stale_result
-
-        mock_client.receive_response = lambda: flush_receive()
-        transport._client = mock_client
-
-        await transport._flush_stale_messages()
-
-        assert transport._needs_flush is False
-        assert transport._session_id == "stale-sess"
-
-    @pytest.mark.asyncio
-    async def test_flush_called_before_query_when_needed(self):
-        """When _needs_flush is True, send() flushes before issuing query()."""
-        from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
-
-        transport = SDKTransport()
-        mock_client = AsyncMock()
-        transport._needs_flush = True
-        transport._client = mock_client
-        transport._alive = True
-
-        call_sequence = []
-
-        stale_result = ResultMessage(
-            subtype="success", duration_ms=50, duration_api_ms=40,
-            is_error=False, num_turns=1, session_id="stale-sess",
-            total_cost_usd=0.01, usage={}, result=None, structured_output=None,
-        )
-        fresh_assistant = AssistantMessage(
-            content=[TextBlock(text="correct answer")], model="claude-3",
-            parent_tool_use_id=None, error=None,
-        )
-        fresh_result = ResultMessage(
-            subtype="success", duration_ms=100, duration_api_ms=80,
-            is_error=False, num_turns=1, session_id="fresh-sess",
-            total_cost_usd=0.01, usage={}, result=None, structured_output=None,
-        )
-
-        receive_call = 0
-
-        async def multi_receive():
-            nonlocal receive_call
-            receive_call += 1
-            if receive_call == 1:
-                # Flush call: yield stale result
-                call_sequence.append("flush")
-                yield stale_result
-            else:
-                # Real response
-                call_sequence.append("response")
-                yield fresh_assistant
-                yield fresh_result
-
-        mock_client.receive_response = multi_receive
-
-        response = await transport.send("question 2")
-
-        assert response == "correct answer"
-        assert transport._needs_flush is False
-        assert transport._session_id == "fresh-sess"
-        assert call_sequence == ["flush", "response"]
-
-    @pytest.mark.asyncio
-    async def test_flush_handles_error_gracefully(self):
-        """_flush_stale_messages() handles errors without crashing."""
-        transport = SDKTransport()
-        mock_client = AsyncMock()
-        transport._needs_flush = True
-
-        async def error_receive():
-            raise Exception("stream broken")
-            yield  # make it async gen
-
-        mock_client.receive_response = error_receive
-        transport._client = mock_client
-
-        # Should not raise
-        await transport._flush_stale_messages()
-
-        assert transport._needs_flush is False
 
 
 class TestReadStream:

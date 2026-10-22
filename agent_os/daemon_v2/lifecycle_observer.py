@@ -404,6 +404,59 @@ class LifecycleObserver:
             "session_id": session_id,
         })
 
+    async def on_continued(self, project_id: str, handle: str, summary: str,
+                           transcript_path: str,
+                           *, session_id: str | None = None,
+                           cause: str = "success") -> None:
+        """A sub-agent ran a turn nobody dispatched and it ended (spec 129).
+
+        The claude-code CLI runs a turn of its own when a run_in_background
+        shell exits. Its end is the worker *continuing*: the row lands in
+        the management session with ``kind: "continued"`` and the turn's
+        final text as ``reply`` (same shape as ``completed``, so the chat
+        renders the worker's bubble on reload — there is no dispatch marker
+        for the transcript join to hang it on), but it is never a reply to
+        a prompt and never a dispatch boundary. ``suppress_wake`` is always
+        stamped: the management LLM is not woken for it; a later wake reads
+        what the worker did on its own. Pinned sessions get their quiescence
+        kick as for every other suppressed terminal. ``cause`` is
+        ``success`` or ``error`` (the reader died mid-turn), never stopped.
+        """
+        from agent_os.daemon_v2.recap import REPLY_CAP_CHARS
+
+        summary_text = summary[:500] if summary else "(no output)"
+        reply_text = summary.strip()[:REPLY_CAP_CHARS] if summary and summary.strip() else "(no output)"
+        display_content = (
+            f"[Sub-agent] {handle} continued. Summary: {summary_text}. "
+            f"Transcript: {transcript_path}."
+        )
+        content = (
+            f"[Sub-agent] {handle} continued. Summary: {reply_text}. "
+            f"Transcript: {transcript_path}."
+            " This turn was started by the sub-agent itself (a background "
+            "command it was waiting on finished), not by a message you sent."
+        )
+        pinned = self._is_pinned_dispatch(project_id, handle, session_id)
+        await self._inject(
+            project_id, content, session_id=session_id,
+            meta={"event": "sub_agent_terminal", "kind": "continued",
+                  "handle": handle,
+                  "display_content": display_content,
+                  "reply": reply_text,
+                  "cause": cause,
+                  "suppress_wake": True},
+        )
+        if pinned:
+            self._fire_pinned_terminal_hook(project_id, session_id)
+        self._ws.broadcast(project_id, {
+            "type": "sub_agent.continued",
+            "project_id": project_id,
+            "handle": handle,
+            "summary": summary_text,
+            "cause": cause,
+            "session_id": session_id,
+        })
+
     async def on_error(self, project_id: str, handle: str, error: str,
                        transcript_path: str,
                        *, session_id: str | None = None) -> None:

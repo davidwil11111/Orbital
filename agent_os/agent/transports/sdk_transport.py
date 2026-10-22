@@ -206,17 +206,30 @@ class SDKTransport(AgentTransport):
         self._pending_approval_data: dict[str, dict] = {}
         # Event queue for streaming events (tool use, permission requests)
         self._event_queue: asyncio.Queue[TransportEvent] = asyncio.Queue()
-        # Flush flag: set when receive_response() ends without a ResultMessage
-        # (e.g. the stream raised mid-turn). Next send() drains stale
-        # messages before issuing a new query.
-        self._needs_flush: bool = False
         # Autonomy preset for filtering permission requests.
         # When set, low-risk tools are auto-approved without surfacing to the user.
         self._autonomy: Autonomy | None = autonomy
-        # Strongly-referenced handle to the background response-consumption
-        # task so the event loop cannot GC it mid-stream. Also used by
-        # stop() to cancel in-flight iteration before disconnect().
-        self._bg_task: asyncio.Task | None = None
+        # Spec 129: ONE reader for the life of the process (strongly
+        # referenced so the loop cannot GC it; cancelled by stop()). It
+        # feeds _event_queue from the SDK's unbounded iterator whether or
+        # not a dispatch is pending — the CLI runs turns of its own when a
+        # run_in_background shell exits, and the SDK's 100-slot channel
+        # must never fill (its reader answers tool permissions inline).
+        self._reader_task: asyncio.Task | None = None
+        # Dispatch bookkeeping. A ResultMessage closes the pending dispatch
+        # when one is pending; otherwise it ends a self-initiated turn.
+        self._pending_dispatch: bool = False
+        # AWAITED background tasks (local_agent / local_workflow) started by
+        # the pending dispatch's turn: while non-empty the dispatch stays
+        # pending across results, bounded by CONTINUATION_BUDGET_S.
+        self._outstanding: set = set()
+        self._last_result_is_error: bool = False
+        self._budget_handle: "asyncio.TimerHandle | None" = None
+        # The blocking send() variant rides the same reader: it awaits this
+        # future (resolved by the dispatch-origin boundary) and returns the
+        # message text collected while the dispatch was pending.
+        self._dispatch_done: "asyncio.Future | None" = None
+        self._dispatch_text: list[str] = []
         # Direction B (own the kill): captured at connect() so stop() can
         # terminate the claude subprocess tree directly, independent of the
         # SDK's cross-task-failing graceful disconnect(). ``_proc`` is a
@@ -330,6 +343,7 @@ class SDKTransport(AgentTransport):
             raise
         self._alive = True
         self._capture_process_handle()
+        self._ensure_reader()
 
     def _capture_process_handle(self) -> None:
         """Capture the claude subprocess handle for own-the-kill teardown.
@@ -356,107 +370,80 @@ class SDKTransport(AgentTransport):
             logger.warning("SDKTransport: could not wrap subprocess pid=%s in "
                            "psutil.Process", pid, exc_info=True)
 
+    @property
+    def dispatch_pending(self) -> bool:
+        """True between ``dispatch()`` and the result that closes it."""
+        return self._pending_dispatch
+
     async def send(self, message: str) -> str | None:
+        """Blocking variant: dispatch, then wait for the dispatch-origin
+        boundary on the same reader (no second consumer of the SDK stream).
+        Events still flow to ``read_stream()``; the collected message text
+        is returned."""
         if self._client is None:
             return "Error: SDK client not initialized"
-
-        # If previous receive_response() ended abnormally (without ResultMessage),
-        # drain any stale messages left in the SDK buffer before querying again.
-        if self._needs_flush:
-            await self._flush_stale_messages()
-
         try:
-            await self._client.query(message)
+            await self.dispatch(message)
         except Exception as e:
             return f"Error: SDK query failed: {e}"
-
-        response_parts = []
-        got_result = False
-        try:
-            async for msg in self._client.receive_response():
-                if isinstance(msg, ResultMessage):
-                    got_result = True
-                events = self._message_to_events(msg)
-                for event in events:
-                    # Queue ALL events for read_stream consumers (enables real-time streaming)
-                    await self._event_queue.put(event)
-                    # Also collect message text for send() return value
-                    if event.event_type == "message":
-                        response_parts.append(event.raw_text)
-        except Exception as e:
-            # The SDK can raise mid-stream (a transport failure, or a
-            # MessageParseError on a malformed frame; unknown message types
-            # are skipped, and rate_limit_event is parsed, since SDK 0.1.58).
-            # If we already collected some response text, return it rather than failing.
-            if response_parts:
-                logger.warning("SDKTransport.send: partial response due to: %s", e)
-            else:
-                return f"Error: SDK receive failed: {e}"
-
-        # If iteration ended without a ResultMessage, the SDK's internal buffer
-        # may still contain the real ResultMessage. Flag for flush on next send().
-        if not got_result:
-            self._needs_flush = True
-            logger.warning("SDKTransport.send: response stream ended without ResultMessage; will flush on next send")
-        else:
-            self._needs_flush = False
-
-        if not response_parts:
+        done = self._dispatch_done
+        if done is None:
             return "(no response)"
-
-        return "\n".join(response_parts)
+        try:
+            await done
+        except asyncio.CancelledError:
+            raise
+        parts, self._dispatch_text = self._dispatch_text, []
+        if not parts:
+            return "(no response)"
+        return "\n".join(parts)
 
     async def dispatch(self, message: str) -> None:
-        """Send query without waiting for response. Events flow via read_stream()."""
+        """Send query without waiting for response. Events flow via read_stream().
+
+        Marks a dispatch pending; the reader's next ``ResultMessage`` closes
+        it (``turn_complete`` with ``origin="dispatch"``). A dispatch issued
+        while one is still pending closes the prior boundary as ``stopped``
+        first, as the per-dispatch consumer's cancel used to, so the
+        daemon's dispatch-id FIFO stays paired one boundary per dispatch.
+        """
         if self._client is None:
             raise RuntimeError("SDK client not initialized — call start() first")
 
-        if self._needs_flush:
-            await self._flush_stale_messages()
-
-        # Without this guard, the bare _bg_task assignment below drops the
-        # strong reference to the prior task, causing "Task destroyed but it
-        # is pending" at GC time. Before query() also prevents the prior
-        # consumer from reading events from the new query before being reaped.
-        if self._bg_task is not None and not self._bg_task.done():
-            logger.warning("dispatch overwriting pending _bg_task; cancelling prior")
-            self._bg_task.cancel()
-            await asyncio.gather(self._bg_task, return_exceptions=True)
+        if self._pending_dispatch:
+            logger.warning("dispatch while a dispatch is pending; closing the "
+                           "prior boundary as stopped")
+            self._close_dispatch("stopped")
 
         await self._client.query(message)
 
-        # Strongly reference the background task on self so it cannot be
-        # garbage-collected mid-stream (which produced "Task was destroyed
-        # but it is pending" warnings). The done-callback routes any
-        # non-cancellation exception to the logger instead of being lost.
-        self._bg_task = asyncio.create_task(
-            self._consume_response_background(),
-            name=f"sdk-consume-{id(self)}",
-        )
-        self._bg_task.add_done_callback(self._on_bg_task_done)
+        self._pending_dispatch = True
+        self._outstanding = set()
+        self._last_result_is_error = False
+        self._dispatch_text = []
+        self._dispatch_done = asyncio.get_running_loop().create_future()
+        self._ensure_reader()
 
-    def _on_bg_task_done(self, task: "asyncio.Task") -> None:
-        """Completion hook for the background consumer task.
+    def _ensure_reader(self) -> None:
+        """Start the persistent reader if it is not running."""
+        task = self._reader_task
+        if task is not None and not task.done():
+            return
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(), name=f"sdk-reader-{id(self)}")
+        self._reader_task.add_done_callback(self._on_reader_done)
 
-        Responsibilities:
-        - swallow CancelledError (expected on stop())
-        - log any other exception at ERROR with traceback so it does not
-          vanish into the void the way an orphan task's exception would.
-        """
+    def _on_reader_done(self, task: "asyncio.Task") -> None:
+        """Log a reader that died by exception (never silently)."""
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is None:
+        if exc is None or isinstance(exc, asyncio.CancelledError):
             return
-        if isinstance(exc, asyncio.CancelledError):
-            return
-        logger.error(
-            "SDKTransport: background response task raised",
-            exc_info=exc,
-        )
+        logger.error("SDKTransport: persistent reader raised", exc_info=exc)
 
-    # How long the dispatch consumer will keep "running" awaiting a background
-    # task's continuation turn before giving up (so a stuck/never-finishing task
+    # How long a dispatch stays pending awaiting a background task's
+    # continuation turn before giving up (so a stuck/never-finishing task
     # cannot pin the dispatch forever). Generous — real workflows run for
     # minutes. Fire-and-forget ``local_bash`` is excluded from the wait
     # entirely (see _track_background_task), so this only bounds genuinely
@@ -464,15 +451,16 @@ class SDKTransport(AgentTransport):
     CONTINUATION_BUDGET_S: float = 1800.0
 
     def _track_background_task(self, msg, outstanding: set) -> None:
-        """Track AWAITED background tasks by id so the dispatch consumer keeps
-        reading until they emit their continuation turn.
+        """Track AWAITED background tasks by id so the pending dispatch stays
+        open until they emit their continuation turn.
 
         ``TaskStartedMessage`` adds the id; ``TaskNotificationMessage``
         (terminal status: completed/failed/stopped) removes it. Fire-and-forget
         ``run_in_background`` shells (``task_type='local_bash'``) are the
         BackgroundWorkRegistry's domain and are intentionally NOT awaited — the
         foreground turn ends as before so a never-exiting dev server cannot pin
-        the dispatch.
+        the dispatch. The shell's exit still reaches the reader: the CLI's own
+        follow-up turn is read live and ends as a self-initiated turn.
         """
         if _TaskStarted and isinstance(msg, _TaskStarted):
             if getattr(msg, "task_type", None) != "local_bash":
@@ -484,112 +472,137 @@ class SDKTransport(AgentTransport):
             if tid:
                 outstanding.discard(tid)
 
-    async def _consume_response_background(self) -> None:
-        """Background task: consume the dispatch's response turn(s), feed events.
+    async def _reader_loop(self) -> None:
+        """Read the SDK stream for the life of the client (spec 129 §5A).
 
-        ``receive_response()`` reads exactly ONE turn (up to and including its
-        ``ResultMessage``). A normal turn is a single call. But when that turn
-        kicked off an AWAITED background task (e.g. a multi-agent workflow), the
-        agent's foreground turn ends immediately ("started it, will report when
-        done") and the real result is delivered in a LATER turn on the SAME
-        session stream (wire-confirmed: ``TaskNotification`` → ``AssistantMessage``
-        → ``ResultMessage``, with no new ``query()``). We keep calling
-        ``receive_response()`` while such a task is outstanding so the
-        continuation is surfaced instead of stranded — and emit exactly ONE
-        terminal ``turn_complete``: one boundary per dispatch keeps the
-        management session's i-th ``message_routed`` marker paired with the
-        i-th transcript slice (TASK-subagent-last-message-display).
+        Every message is turned into events exactly as the per-dispatch
+        consumer did. Attribution: a ``ResultMessage`` closes the pending
+        dispatch if one is pending (the "next result answers the dispatch"
+        semantic ``receive_response()`` had — the CLI merges queued user
+        messages into an in-flight turn, so no matching by id is attempted);
+        otherwise it ends a turn the CLI started on its own, emitted as
+        ``turn_complete(origin="self")`` with ``cause`` from ``is_error``.
 
-        The closing ``turn_complete`` carries an honest ``cause``:
+        The closing ``turn_complete`` of a dispatch carries an honest cause:
+        ``success`` (final result, ``is_error`` False), ``stopped`` (a
+        deliberate ``stop()``/reap, or a newer dispatch superseding it),
+        ``error`` (an error result, a stream exception, or the stream ending
+        with the dispatch open — external process death).
 
-        - ``success`` — the final ``ResultMessage`` arrived AND ``is_error`` is
-          False. NOT a bare got-result flag: ``ResultMessage(is_error=True)``
-          (context-window-exceeded, API errors) has a result but is a failure
-          (TASK-honest-subagent-completion-reporting, path b).
-        - ``stopped`` — this task was cancelled, i.e. a deliberate
-          ``stop()``/reap. Tagging it here is what stops the still-alive
-          consumer from reporting a phantom "completed" during the SIGTERM
-          grace window (path g).
-        - ``error`` — everything else: stream exception (path a), stream
-          ended without a ResultMessage (path c — external process death).
+        A ``MessageParseError`` is raised in the parse step while the SDK's
+        reader carries on: it is reported and reading resumes. Any other
+        exception ended the SDK reader (spec 098): emit error +
+        turn_complete, mark dead, kill the process so the next dispatch
+        rebuilds the client with resume.
         """
-        got_result = False
-        result_is_error = False
-        cause: str | None = None
-        outstanding: set = set()
         dead_reader_error: Exception | None = None
-
-        async def _consume_one_turn() -> None:
-            nonlocal got_result, result_is_error
-            async for msg in self._client.receive_response():
-                self._track_background_task(msg, outstanding)
-                if isinstance(msg, ResultMessage):
-                    got_result = True
-                    result_is_error = bool(getattr(msg, "is_error", False))
-                for event in self._message_to_events(msg):
-                    await self._event_queue.put(event)
-
         try:
-            try:
-                while True:
-                    if outstanding:
-                        # Awaiting a background task's continuation turn: bound
-                        # the wait so a stuck task can't pin the dispatch.
-                        await asyncio.wait_for(
-                            _consume_one_turn(),
-                            timeout=self.CONTINUATION_BUDGET_S,
-                        )
-                    else:
-                        await _consume_one_turn()
-                    if not outstanding:
-                        break
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "SDKTransport: awaited background task(s) %s did not finish "
-                    "within %.0fs; ending dispatch without the continuation",
-                    outstanding, self.CONTINUATION_BUDGET_S)
-            except Exception as e:
-                logger.warning("SDKTransport: background response consumption failed: %s", e)
-                await self._event_queue.put(TransportEvent(
-                    event_type="error",
-                    data={"error": str(e)},
-                    raw_text=f"Error: {e}",
-                ))
-                # Settled BEFORE turn_complete: the handle's queued-prompt
-                # drain runs on that event and must already see is_alive()
-                # False, or it dispatches into the dead client.
-                if await self._reader_died(e):
-                    dead_reader_error = e
-
-            if not got_result:
-                self._needs_flush = True
-                logger.warning("SDKTransport: background response ended without ResultMessage; will flush on next send")
-            else:
-                self._needs_flush = False
+            while True:
+                try:
+                    async for msg in self._client.receive_messages():
+                        await self._handle_message(msg)
+                    break  # "end": the stream closed (process exit / disconnect)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("SDKTransport: reader error: %s", e)
+                    await self._event_queue.put(TransportEvent(
+                        event_type="error",
+                        data={"error": str(e)},
+                        raw_text=f"Error: {e}",
+                    ))
+                    if isinstance(e, _MessageParseError):
+                        continue  # the SDK reader is fine; keep reading
+                    # Settled BEFORE turn_complete: the handle's queued-prompt
+                    # drain runs on that event and must already see
+                    # is_alive() False, or it dispatches into the dead client.
+                    if await self._reader_died(e):
+                        dead_reader_error = e
+                    break
+            if self._pending_dispatch:
+                logger.warning("SDKTransport: stream ended with a dispatch pending")
+                self._close_dispatch("error")
+            elif dead_reader_error is not None:
+                # Between dispatches: the worker's own turn (if any) is over.
+                self._emit_turn_complete(origin="self", cause="error")
         except asyncio.CancelledError:
-            cause = "stopped"
+            if self._pending_dispatch:
+                self._close_dispatch("stopped")
             raise
-        finally:
-            if cause is None:
-                cause = "success" if (got_result and not result_is_error) else "error"
-            # Always signal turn completion so adapter transitions to idle.
-            # Queue is unbounded, so this put() does not suspend — safe to
-            # run during cancellation cleanup. The event carries the thread's
-            # resume identity (session_id + model) so the daemon can persist
-            # it — nothing reads transport.session_id after the fact
-            # (TASK-resume-persistence).
-            await self._event_queue.put(TransportEvent(
-                event_type="turn_complete",
-                data={
-                    "cause": cause,
-                    "session_id": self._session_id,
-                    "model": self._last_model,
-                },
-            ))
         # After turn_complete, so the turn end reaches the user without
         # waiting on the kill.
         if dead_reader_error is not None:
             await self._kill_after_reader_death(dead_reader_error)
+
+    async def _handle_message(self, msg) -> None:
+        self._track_background_task(msg, self._outstanding)
+        for event in self._message_to_events(msg):
+            if self._pending_dispatch and event.event_type == "message":
+                self._dispatch_text.append(event.raw_text)
+            await self._event_queue.put(event)
+        if isinstance(msg, ResultMessage):
+            self._on_result(bool(getattr(msg, "is_error", False)))
+
+    def _on_result(self, is_error: bool) -> None:
+        if not self._pending_dispatch:
+            self._emit_turn_complete(
+                origin="self", cause="error" if is_error else "success")
+            return
+        self._last_result_is_error = is_error
+        if self._outstanding:
+            # Awaiting a background task's continuation turn (wire-confirmed:
+            # TaskNotification → AssistantMessage → ResultMessage on the same
+            # stream, no new query()). Bound the wait so a stuck task cannot
+            # pin the dispatch.
+            self._arm_budget()
+            return
+        self._close_dispatch("error" if is_error else "success")
+
+    def _arm_budget(self) -> None:
+        if self._budget_handle is not None:
+            return
+        loop = asyncio.get_running_loop()
+        self._budget_handle = loop.call_later(
+            self.CONTINUATION_BUDGET_S, self._on_budget_expired)
+
+    def _on_budget_expired(self) -> None:
+        self._budget_handle = None
+        if not self._pending_dispatch:
+            return
+        logger.warning(
+            "SDKTransport: awaited background task(s) %s did not finish "
+            "within %.0fs; ending dispatch without the continuation",
+            self._outstanding, self.CONTINUATION_BUDGET_S)
+        self._close_dispatch("error" if self._last_result_is_error else "success")
+
+    def _close_dispatch(self, cause: str) -> None:
+        """Emit the pending dispatch's boundary and clear it."""
+        if self._budget_handle is not None:
+            self._budget_handle.cancel()
+            self._budget_handle = None
+        self._pending_dispatch = False
+        self._outstanding = set()
+        self._emit_turn_complete(origin="dispatch", cause=cause)
+        done = self._dispatch_done
+        self._dispatch_done = None
+        if done is not None and not done.done():
+            done.set_result(cause)
+
+    def _emit_turn_complete(self, *, origin: str, cause: str) -> None:
+        """Queue is unbounded, so put_nowait never suspends — safe from the
+        cancellation path and from a timer callback. The event carries the
+        thread's resume identity (session_id + model) so the daemon can
+        persist it (TASK-resume-persistence), and ``origin`` so the consume
+        loop can tell a dispatch boundary from a self-initiated turn's end."""
+        self._event_queue.put_nowait(TransportEvent(
+            event_type="turn_complete",
+            data={
+                "cause": cause,
+                "origin": origin,
+                "session_id": self._session_id,
+                "model": self._last_model,
+            },
+        ))
 
     # The SDK reader's own shutdown (send "error", then "end") can still be in
     # flight when the consumer sees the error; allow it this long to finish.
@@ -653,34 +666,6 @@ class SDKTransport(AgentTransport):
         except Exception:
             logger.exception("SDKTransport: kill after reader death raised")
 
-    async def _flush_stale_messages(self) -> None:
-        """Drain leftover messages from the SDK buffer after a prior crash.
-
-        When receive_response() raises mid-stream (e.g. a MessageParseError on
-        a malformed frame), the ResultMessage may still be sitting in the
-        SDK's internal channel. We consume it here so the next query()
-        starts with a clean slate.
-        """
-        if self._client is None:
-            self._needs_flush = False
-            return
-
-        logger.info("SDKTransport: flushing stale messages from previous response")
-        try:
-            async for msg in self._client.receive_response():
-                if isinstance(msg, ResultMessage):
-                    self._session_id = getattr(msg, 'session_id', None)
-                    # Capture this stale turn's usage too (display-only,
-                    # never-raise) so a crash-then-flush doesn't silently drop
-                    # the prior turn's sub-agent tokens.
-                    self._capture_usage(msg)
-                    logger.info("SDKTransport: flushed stale ResultMessage (session=%s)", self._session_id)
-                    break
-        except Exception as e:
-            logger.warning("SDKTransport: flush encountered error (ignored): %s", e)
-
-        self._needs_flush = False
-
     async def read_stream(self) -> AsyncIterator[TransportEvent]:
         """Yield events from the queue. Waits for events while alive."""
         while self._alive:
@@ -698,24 +683,31 @@ class SDKTransport(AgentTransport):
         self._pending_approvals.clear()
         self._pending_approval_data.clear()
 
-        # Cancel the background response-consumption task BEFORE
-        # disconnecting the client. If the order were reversed, the task
-        # would observe a None/closed client mid-iteration and surface a
-        # spurious error.
-        bg_task = self._bg_task
-        if bg_task is not None and not bg_task.done():
-            bg_task.cancel()
+        # Cancel the persistent reader BEFORE disconnecting the client. If
+        # the order were reversed, the reader would observe a None/closed
+        # client mid-iteration and surface a spurious error. A pending
+        # dispatch gets its ``stopped`` boundary from the cancellation path.
+        reader = self._reader_task
+        if reader is not None and not reader.done():
+            reader.cancel()
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(bg_task, return_exceptions=True),
+                    asyncio.gather(reader, return_exceptions=True),
                     timeout=5.0,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "SDKTransport: background task did not cancel within 5s; "
+                    "SDKTransport: reader did not cancel within 5s; "
                     "proceeding with disconnect"
                 )
-        self._bg_task = None
+        self._reader_task = None
+        if self._pending_dispatch:
+            # The reader was cancelled before it ever ran (no body to emit
+            # from): the boundary still has to be written.
+            self._close_dispatch("stopped")
+        if self._budget_handle is not None:
+            self._budget_handle.cancel()
+            self._budget_handle = None
 
         # 1. Best-effort graceful disconnect. The SDK's Query.close() exits an
         #    anyio task group that was entered in a DIFFERENT task (the one that

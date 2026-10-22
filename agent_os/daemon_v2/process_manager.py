@@ -249,6 +249,17 @@ class ProcessManager:
                         #   error / missing → on_error
                         meta = getattr(chunk, "metadata", None) or {}
                         cause = meta.get("cause")
+                        # Spec 129: ``origin="self"`` is a turn the CLI ran
+                        # on its own (a run_in_background shell exited and
+                        # it enqueued its own task notification). Nothing
+                        # dispatched it, so it pops no dispatch id (that
+                        # would desync the FIFO), fires neither on_completed
+                        # nor on_error, and is recorded as the worker
+                        # CONTINUING. Resume identity, the transcript
+                        # boundary and the turn-closed hook still apply.
+                        # Transports that do not stamp origin (codex, ACP,
+                        # Pi) read as dispatch boundaries, unchanged.
+                        self_turn = meta.get("origin") == "self"
                         # Resume persistence: a completed turn (success OR
                         # error — a failed turn still has a live, resumable
                         # session) carries the thread's resume identity.
@@ -282,7 +293,15 @@ class ProcessManager:
                                 rollout_path=meta.get("rollout_path"),
                             )
                         if self._lifecycle and transcript is not None:
-                            if cause == "success":
+                            if self_turn:
+                                await self._lifecycle.on_continued(
+                                    project_id, handle,
+                                    summary=last_response_text or last_error_text or "",
+                                    transcript_path=transcript.filepath,
+                                    session_id=session_id,
+                                    cause=cause or "success",
+                                )
+                            elif cause == "success":
                                 await self._lifecycle.on_completed(
                                     project_id, handle,
                                     summary=last_response_text or "(no output)",
@@ -326,14 +345,14 @@ class ProcessManager:
                         self._close_worker_display(project_id, handle, session_id)
                         self._append_turn_boundary(
                             transcript, handle,
-                            self._pop_active_dispatch(key))
+                            None if self_turn else self._pop_active_dispatch(key))
                         last_response_text = ""  # reset for next turn
                         last_error_text = ""
                         self._turn_open[key] = False
                         if self.on_turn_closed is not None:
                             await self.on_turn_closed(
                                 project_id, handle, session_id=session_id,
-                                cause=cause,
+                                cause="continued" if self_turn else cause,
                             )
                         continue
                     if chunk.chunk_type == "thread_started":
@@ -408,7 +427,16 @@ class ProcessManager:
                         if display:
                             entry["metadata"] = display
                     current_dispatch = self._current_dispatch(key)
-                    if current_dispatch:
+                    # Spec 129: a queued id belongs to the NEXT dispatch
+                    # (set_active_dispatch precedes the recap build that
+                    # precedes the query). While the transport reports no
+                    # dispatch pending, the rows are a self-initiated
+                    # turn's and must not borrow that id. Transports without
+                    # the flag (codex, ACP, Pi) stamp as before.
+                    pending = getattr(
+                        getattr(adapter, "_transport", None),
+                        "dispatch_pending", None)
+                    if current_dispatch and pending is not False:
                         entry["dispatch_id"] = current_dispatch
                     # Write to sub-agent transcript (v5: never to management session)
                     if transcript is not None:
@@ -417,6 +445,13 @@ class ProcessManager:
                     # Any non-closure chunk means a turn is in flight; a
                     # stream that ends while one is open died abnormally.
                     self._turn_open[key] = True
+                    # Spec 129: a self-initiated turn has no dispatch to
+                    # clear the adapter's idle flag (dispatch does it for a
+                    # dispatched turn; the adapter sets it back at the
+                    # boundary), and the status endpoint reads is_idle().
+                    # Its first chunk is what makes it ``running``.
+                    if getattr(adapter, "_idle", None) is True:
+                        adapter._idle = False
 
                     # Piece 3 Part A — provenance capture: a Bash tool_use
                     # with run_in_background=true IS the registration of real

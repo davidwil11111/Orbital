@@ -386,3 +386,71 @@ def cleanup_orphaned_sentinels(workspaces) -> int:
                     sentinel_path, exc,
                 )
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry for same-file contention (spec 129 §5E)
+# ---------------------------------------------------------------------------
+
+# The session JSONL's advisory lock is held in short bursts by concurrent
+# writers — same-process (two hydrates of one session 28 ms apart: the
+# terminal-event inject and the memory reminder's persist, 2026-10-22) or
+# cross-process (a dev daemon on the same workspace). The lock itself is
+# non-blocking with zero retries, so callers absorb contention here: brief
+# exponential backoff (~1.55 s in all), then the final attempt's error.
+LOCK_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+async def retry_session_lock(fn, *, delays: "tuple[float, ...] | None" = None):
+    """Run ``fn``, retrying while the session file's lock is contended.
+
+    ``fn`` may return a plain value (sync call sites run each attempt on the
+    event loop) or an awaitable (``asyncio.to_thread`` call sites); the
+    backoff sleeps yield so the lock holder can finish. ``delays`` defaults
+    to the module's ``LOCK_RETRY_DELAYS`` read at call time (tests shorten
+    it). The final attempt's ``FileLockError`` propagates after one warning
+    that names the contended path, so the log reader never has to
+    reconstruct it from a traceback.
+    """
+    import asyncio
+    import inspect
+
+    async def _attempt():
+        result = fn()
+        return await result if inspect.isawaitable(result) else result
+
+    schedule = LOCK_RETRY_DELAYS if delays is None else delays
+    for delay in schedule:
+        try:
+            return await _attempt()
+        except FileLockError:
+            await asyncio.sleep(delay)
+    try:
+        return await _attempt()
+    except FileLockError as exc:
+        logger.warning(
+            "session file lock still held after %d retries (%.2fs): %s",
+            len(schedule), sum(schedule), exc)
+        raise
+
+
+def retry_session_lock_sync(fn, *, delays: "tuple[float, ...] | None" = None):
+    """Blocking twin of ``retry_session_lock`` for call sites that cannot
+    await (``time.sleep`` between attempts). Only for paths that already run
+    off the event loop or whose contention is rare enough that a bounded
+    pause beats dropping the write."""
+    import time
+
+    schedule = LOCK_RETRY_DELAYS if delays is None else delays
+    for delay in schedule:
+        try:
+            return fn()
+        except FileLockError:
+            time.sleep(delay)
+    try:
+        return fn()
+    except FileLockError as exc:
+        logger.warning(
+            "session file lock still held after %d retries (%.2fs): %s",
+            len(schedule), sum(schedule), exc)
+        raise

@@ -728,6 +728,8 @@ export interface SubAgentLifecycleEvent {
   type:
     | 'sub_agent.started'
     | 'sub_agent.completed'
+    // Spec 129: a turn the worker started on its own ended.
+    | 'sub_agent.continued'
     | 'sub_agent.error'
     | 'sub_agent.failed'
     | 'sub_agent.stopped'

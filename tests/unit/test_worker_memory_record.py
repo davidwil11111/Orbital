@@ -346,3 +346,165 @@ async def test_the_reminder_task_is_strongly_referenced_until_it_finishes(tmp_pa
     gate.set()
     await _settle()
     assert mgr._background_tasks == set()
+
+
+# ---------------------------------------------------------------------------
+# Spec 129 §5D: the reminder fires on quiescence, once per run
+# ---------------------------------------------------------------------------
+
+from agent_os.daemon_v2.background_work import BackgroundWorkRegistry  # noqa: E402
+
+
+def _registry(mgr, live: list[str]):
+    registry = MagicMock(spec=BackgroundWorkRegistry)
+    registry.live_commands = MagicMock(return_value=list(live))
+    mgr._process_manager.background_work = registry
+    return registry
+
+
+def _continued_meta(handle=HANDLE, reply="v2 is out", **extra):
+    display = f"[Sub-agent] {handle} continued. Summary: {reply}. Transcript: t.jsonl."
+    return {"event": "sub_agent_terminal", "kind": "continued", "handle": handle,
+            "display_content": display, "reply": reply, "suppress_wake": True,
+            "cause": "success", **extra}
+
+
+@pytest.mark.asyncio
+async def test_completed_terminal_with_a_live_background_shell_sends_no_reminder(tmp_path):
+    """The worker ended its turn to wait for a shell: the run is not over.
+    Asking now would get its answer from the shell's self-wake turn."""
+    mgr, sub = _manager(tmp_path, transport_cls=SDKTransport)
+    _plant_session(mgr, tmp_path)
+    registry = _registry(mgr, ["sleep 25; echo done"])
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: waiting.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+    registry.live_commands.assert_called_with(PROJECT, SID, HANDLE)
+
+
+@pytest.mark.asyncio
+async def test_continued_terminal_with_an_empty_registry_sends_one_reminder_spanning_the_run(tmp_path):
+    """The shell exited, the worker ran its own turn and went quiet: now ask,
+    and list every file the run touched since the last record row — the
+    dispatched turn's edits AND the self turn's — not just the last turn's."""
+    mgr, sub = _manager(tmp_path, transport_cls=SDKTransport)
+    session = _plant_session(mgr, tmp_path)
+    _registry(mgr, [])
+    transcript_path = sub._transcripts[(PROJECT, SID, HANDLE)].filepath
+
+    def tool(name, path, dispatch_id, ts):
+        return {"source": HANDLE, "content": f"[Tool: {name}]", "timestamp": ts,
+                "chunk_type": "tool_activity",
+                "metadata": {"tool_call_id": f"t-{ts}", "tool_name": name,
+                             "arguments": {"file_path": path}},
+                **({"dispatch_id": dispatch_id} if dispatch_id else {})}
+
+    def boundary(dispatch_id, ts):
+        return {"source": HANDLE, "content": "", "timestamp": ts, "chunk_type": "turn_complete",
+                **({"dispatch_id": dispatch_id} if dispatch_id else {})}
+
+    rows = [
+        # An earlier run, already recorded (its reminder turn is dR).
+        tool("Edit", "old/a.py", "d0", "2026-10-22T10:00:00+00:00"), boundary("d0", "2026-10-22T10:00:01+00:00"),
+        tool("Edit", "orbital/PROJECT_STATE.md", "dR", "2026-10-22T10:00:02+00:00"), boundary("dR", "2026-10-22T10:00:03+00:00"),
+        # This run: the dispatched turn starts a shell and ends...
+        tool("Edit", "src/b.py", "d1", "2026-10-22T10:01:00+00:00"), boundary("d1", "2026-10-22T10:01:01+00:00"),
+        # ...then the worker's own turn when the shell exits (no dispatch id).
+        tool("Write", "src/c.py", None, "2026-10-22T10:02:00+00:00"),
+        {"source": HANDLE, "content": "v2 is out", "timestamp": "2026-10-22T10:02:01+00:00",
+         "chunk_type": "response"},
+        boundary(None, "2026-10-22T10:02:02+00:00"),
+    ]
+    with open(transcript_path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    # The management session: the earlier run's reminder marker (tagged,
+    # carrying its dispatch id) is the record row the files list starts after.
+    session.append({"role": "system", "source": "daemon",
+                    "content": '[Sub-agent] Message sent to codex: "[Orbital memory] …"',
+                    "_kind": MEMORY_RECORD_KIND,
+                    "_meta": {"dispatch_id": "dR", "handle": HANDLE, "transcript_path": transcript_path,
+                              "suppress_wake": True}})
+    session.append({"role": "system", "source": "daemon",
+                    "content": "[Sub-agent] codex completed. Summary: nothing to record.",
+                    "_kind": MEMORY_RECORD_KIND, "_meta": _completed_meta(reply="nothing to record")})
+    session.append({"role": "system", "source": "daemon",
+                    "content": '[Sub-agent] Message sent to codex: "run it"',
+                    "_meta": {"dispatch_id": "d1", "handle": HANDLE, "transcript_path": transcript_path,
+                              "suppress_wake": True}})
+
+    # The dispatched turn's completion arrived while the shell was live → no ask.
+    _registry(mgr, ["sleep 25"])
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: waiting.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+
+    # The self turn ends with nothing live underneath → exactly one ask.
+    _registry(mgr, [])
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex continued. Summary: v2 is out.",
+                                    session_id=SID, meta=_continued_meta())
+    await _settle()
+    sub.send.assert_awaited_once()
+    text = sub.send.call_args.args[2]
+    assert "Files this turn changed: src/b.py, src/c.py\n" in text
+    assert "old/a.py" not in text
+
+
+@pytest.mark.asyncio
+async def test_continued_terminal_with_a_queued_prompt_waits_for_the_next_terminal(tmp_path):
+    """A user prompt is queued behind the turn that just ended: the reminder
+    would ask about the wrong turn. The next terminal re-evaluates."""
+    mgr, sub = _manager(tmp_path, transport_cls=SDKTransport)
+    _plant_session(mgr, tmp_path)
+    _registry(mgr, [])
+    sub._prompt_queues = {(PROJECT, SID, HANDLE): ["a queued user prompt"]}
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex continued. Summary: v2 is out.",
+                                    session_id=SID, meta=_continued_meta())
+    await _settle()
+    sub.send.assert_not_awaited()
+
+    sub._prompt_queues = {}
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: done.",
+                                    session_id=SID, meta=_completed_meta())
+    await _settle()
+    sub.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_continued_terminal_with_cause_error_sends_no_reminder(tmp_path):
+    mgr, sub = _manager(tmp_path, transport_cls=SDKTransport)
+    _plant_session(mgr, tmp_path)
+    _registry(mgr, [])
+    await mgr.inject_system_message(PROJECT, "[Sub-agent] codex continued. Summary: (no output).",
+                                    session_id=SID, meta=_continued_meta(cause="error"))
+    await _settle()
+    sub.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reminder_lock_exhaustion_is_dropped_with_a_warning_naming_the_session(tmp_path, caplog, monkeypatch):
+    """§7.2: on retry exhaustion the reminder is dropped (no re-queue); the
+    warning names the path so the log reader does not need a traceback."""
+    import logging
+    from agent_os.utils import file_lock
+    from agent_os.utils.file_lock import FileLockError
+    mgr, sub = _manager(tmp_path, transport_cls=SDKTransport)
+    _plant_session(mgr, tmp_path)
+    _registry(mgr, [])
+    monkeypatch.setattr(file_lock, "LOCK_RETRY_DELAYS", (0.001, 0.002))
+    locked_path = os.path.join(str(tmp_path), "orbital", "sessions", f"{SID}.jsonl")
+
+    async def contended(*a, **k):
+        raise FileLockError(f"Session file is locked by another process: {locked_path}")
+
+    mgr.persist_mention_message = contended
+    with caplog.at_level(logging.WARNING, logger="agent_os.daemon_v2.agent_manager"):
+        await mgr.inject_system_message(PROJECT, "[Sub-agent] codex completed. Summary: done.",
+                                        session_id=SID, meta=_completed_meta())
+        await _settle()
+    sub.send.assert_not_awaited()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("memory reminder" in w and locked_path in w and SID in w for w in warnings), warnings
+    assert not mgr._worker_memory_records

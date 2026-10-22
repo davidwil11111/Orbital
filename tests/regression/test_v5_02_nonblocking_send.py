@@ -172,15 +172,14 @@ class TestNonBlockingSend:
         transport = SDKTransport()
         transport._client = MagicMock()
         transport._client.query = AsyncMock()
-        transport._needs_flush = False
 
-        # Mock receive_response to be slow (async generator)
+        # Mock receive_messages to be slow (async generator)
         async def slow_receive():
             await asyncio.sleep(5)
             return
             yield  # Make it an async generator
 
-        transport._client.receive_response = slow_receive
+        transport._client.receive_messages = slow_receive
 
         start = time.monotonic()
         await transport.dispatch("hello")
@@ -188,6 +187,8 @@ class TestNonBlockingSend:
 
         assert elapsed < 1.0, f"dispatch() took {elapsed:.1f}s — should be non-blocking"
         transport._client.query.assert_awaited_once_with("hello")
+        transport._reader_task.cancel()
+        await asyncio.gather(transport._reader_task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_sdk_dispatch_raises_when_client_not_initialized(self):
@@ -207,8 +208,10 @@ class TestNonBlockingSend:
             await transport.dispatch("hello")
 
     @pytest.mark.asyncio
-    async def test_sdk_dispatch_flushes_stale_messages(self):
-        """SDKTransport.dispatch() flushes stale messages before querying."""
+    async def test_sdk_dispatch_starts_the_persistent_reader_once(self):
+        """Spec 129: there is no stale-message flush any more — one reader
+        lives for the client's life, so nothing is ever left unread between
+        dispatches. dispatch() only makes sure it is running."""
         try:
             from agent_os.agent.transports.sdk_transport import SDKTransport, HAS_SDK
         except ImportError:
@@ -220,27 +223,21 @@ class TestNonBlockingSend:
         transport = SDKTransport()
         transport._client = MagicMock()
         transport._client.query = AsyncMock()
-        transport._needs_flush = True
 
-        flush_called = False
-        original_flush = transport._flush_stale_messages
-
-        async def mock_flush():
-            nonlocal flush_called
-            flush_called = True
-            transport._needs_flush = False
-
-        transport._flush_stale_messages = mock_flush
-
-        # Mock receive_response as async generator
-        async def empty_receive():
+        async def open_stream():
+            await asyncio.sleep(5)
             return
             yield
 
-        transport._client.receive_response = empty_receive
+        transport._client.receive_messages = open_stream
 
         await transport.dispatch("hello")
-        assert flush_called, "_flush_stale_messages should have been called"
+        reader = transport._reader_task
+        assert reader is not None and not reader.done()
+        assert transport.dispatch_pending is True
+        assert not hasattr(transport, "_flush_stale_messages")
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_background_send_error_is_logged(self, tmp_path):

@@ -15,6 +15,11 @@
     "content": "[Sub-agent] claude-code completed. Summary: All tests passing. Transcript: /tmp/fixture-transcript.jsonl."
   },
   {
+    "shape": "continued",
+    "action": "continued",
+    "content": "[Sub-agent] claude-code continued. Summary: The render finished; v2 is out. Transcript: /tmp/fixture-transcript.jsonl."
+  },
+  {
     "shape": "failed",
     "action": "failed",
     "content": "[Sub-agent] claude-code failed: adapter crashed. The dispatched task did not complete."

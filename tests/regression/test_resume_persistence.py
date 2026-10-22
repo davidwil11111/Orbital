@@ -131,11 +131,11 @@ class TestTransportThreadIdentity:
             yield assistant
             yield result
 
-        mock_client.receive_response = lambda: receive()
+        mock_client.receive_messages = lambda: receive()
         transport._client = mock_client
         transport._alive = True
         await transport.dispatch("go")
-        await asyncio.gather(transport._bg_task, return_exceptions=True)
+        await asyncio.gather(transport._reader_task, return_exceptions=True)
 
         events = []
         while True:

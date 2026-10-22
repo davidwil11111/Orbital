@@ -105,6 +105,9 @@ PRODUCER_SHAPES = {
     "lifecycle_observer.on_message_routed": {"sent"},
     "lifecycle_observer.on_interaction_required": {"interaction_required"},
     "lifecycle_observer.on_completed": {"completed"},
+    # Spec 129: a self-initiated worker turn ended (a background command it
+    # was waiting on finished and the CLI ran a turn of its own).
+    "lifecycle_observer.on_continued": {"continued"},
     "lifecycle_observer.on_error": {"stopped_with_error"},
     "lifecycle_observer.on_failed": {"failed"},
     "lifecycle_observer.on_user_stopped": {
@@ -459,6 +462,9 @@ async def test_every_fixture_shape_matches_its_producer_exactly():
         PROJECT_ID, HANDLE,
         commands=["npm run dev", "python server.py"],
         session_id=SESSION_ID)
+    await observer.on_continued(
+        PROJECT_ID, HANDLE, "The render finished; v2 is out", TRANSCRIPT_PATH,
+        session_id=SESSION_ID, cause="success")
 
     produced = {
         "started": agent_manager.injections[0],
@@ -471,6 +477,7 @@ async def test_every_fixture_shape_matches_its_producer_exactly():
         "stopped_by_user_with_background": agent_manager.injections[7],
         "turn_interrupted": agent_manager.injections[8],
         "background_work_lost": agent_manager.injections[9],
+        "continued": agent_manager.injections[10],
     }
 
     # Every producer call above landed one marker, no more, no less.
