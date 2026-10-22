@@ -228,6 +228,18 @@ function isNotDetectedEntry(entry: SubAgentEntry): boolean {
   return entry.installed !== true && (entry.install?.platforms?.length ?? 0) === 0;
 }
 
+/** Spec 127 D3: an Orbital-installed agent that is not installed and whose
+ *  Orbital install is not on offer — this host is outside its platform list,
+ *  or the last run failed — gets the locate card *under* its card, never in
+ *  place of it: the card keeps Install / Retry, the failure text and the
+ *  credential form; the row is the way to a launcher the user installed by
+ *  hand. A successful install, or one still on offer, shows the card alone. */
+function showsLocateFallback(entry: SubAgentEntry): boolean {
+  if (entry.installed === true) return false;
+  if ((entry.install?.platforms?.length ?? 0) === 0) return false;
+  return entry.install?.supported === false || entry.install?.state === 'failed';
+}
+
 /** The credentials this card can take a value for: manifest-declared secrets
  *  the agent's own CLI does not ingest. Falls back to the required-and-missing
  *  keys on daemons that don't declare credentials — enough to offer the field
@@ -419,6 +431,16 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
                   />
                 )
                 : <SubAgentCard entry={entry} onChanged={load} />}
+              {showsLocateFallback(entry) && (
+                <NotDetectedRow
+                  slug={entry.slug}
+                  name={entry.name}
+                  overridePath={entry.override_path}
+                  overrideMissing={entry.override_missing}
+                  onChanged={load}
+                  fallbackHint={t('subAgentCard.locate.orbitalInstallFallback', { name: entry.name })}
+                />
+              )}
               {cliMissing[entry.slug] && (
                 <p
                   data-testid={`sub-agent-update-missing-${entry.slug}`}
@@ -556,6 +578,10 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
       if (event.slug !== entry.slug) return;
       setInstalling(false);
       setInstallError(event.error);
+      // Spec 127 D3: the daemon's job registry now says `failed`; refetch
+      // so the list can hang the locate card under this card. The live
+      // error text above outranks the entry's generic "failed earlier".
+      void onChanged();
     };
     ws.on('sub_agent_install_progress', onProgress);
     ws.on('sub_agent_install_done', onDone);

@@ -16,12 +16,29 @@ runtime:
 
 setup:
   orbital_install:
-    platforms: [macos, linux]         # Windows: untested npm .bin shim story — see Deferred
+    # Windows: gate lifted by spec 127 (2026-10-22). The composition is
+    # OS-neutral (shutil staging, `npm ci` with no-window flags, PATHEXT-aware
+    # node/npm lookup) and the lockfile resolves the sandbox to
+    # @deepseek-ai/dsh-sandbox-windows-acl there. Must be verified on the
+    # CI-built Orbital-Setup .exe (spec 127 V1–V3: install, dispatch,
+    # sandbox); record the passing CI run id here. Until that line exists,
+    # treat Windows as unverified — not as gated by design.
+    platforms: [macos, linux, windows]
   auto_detect:
     macos:
       - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo"
     linux:
       - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo"
+    windows:
+      # npm's `.cmd` shim is the launcher CreateProcess can run. The
+      # extensionless file beside it is a POSIX sh script and the `.ps1`
+      # needs a PowerShell host; neither is a spawn target.
+      - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo.cmd"
+  # No check_command: dsh-acp-demo is an ACP stdio server whose only option
+  # is --config/-c (spec 127 V0: --version/--help both exit 1 with
+  # ERR_PARSE_ARGS_UNKNOWN_OPTION). The locate card's Test therefore checks
+  # existence + executability only (SetupEngine.test_override), and the
+  # status sweep reports no cli_version for this agent.
   credentials:
     - key: "DEEPSEEK_API_KEY"
       label: "DeepSeek API Key"

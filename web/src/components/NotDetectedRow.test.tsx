@@ -70,6 +70,35 @@ describe('NotDetectedRow (the locate card)', () => {
     expect(answerBox().placeholder).toBe('Paste the answer here');
   });
 
+  it('a fallback hint replaces the paste-into-the-agent line (spec 127 D3)', () => {
+    render(
+      <NotDetectedRow
+        slug="codex"
+        name="Codex"
+        fallbackHint="Or point Orbital at a Codex you installed yourself."
+      />,
+    );
+    expect(row()).toHaveTextContent('Or point Orbital at a Codex you installed yourself.');
+    expect(row()).not.toHaveTextContent('Copy this into Codex and paste its answer below.');
+    // The prompt is still on offer: the copy button stays.
+    expect(screen.getByTestId('sub-agent-locate-copy-codex')).toBeInTheDocument();
+  });
+
+  it('a passing Test with no version output says so instead of a blank (spec 127 D2)', async () => {
+    routeApi({
+      test: () => ({ ok: true, binary: '/opt/dsh/node_modules/.bin/dsh-acp-demo', path_prepend: [],
+        env_names: [], version_output: '' }),
+    });
+    render(<NotDetectedRow slug="codex" name="Codex" />);
+    fireEvent.change(answerBox(), { target: { value: '/opt/dsh/node_modules/.bin/dsh-acp-demo' } });
+    fireEvent.click(testBtn());
+    await waitFor(() => expect(screen.getByTestId('sub-agent-locate-result-codex')).toBeInTheDocument());
+    expect(screen.getByTestId('sub-agent-locate-result-codex')).toHaveTextContent(
+      'Found Codex at /opt/dsh/node_modules/.bin/dsh-acp-demo (no version check for this agent)',
+    );
+    expect(saveBtn().disabled).toBe(false);
+  });
+
   it('Copy fetches the prompt once, writes it to the clipboard, and says Copied', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });

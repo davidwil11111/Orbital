@@ -15,6 +15,10 @@ interface Props {
   overrideMissing?: boolean;
   /** Refetch the list; after Save the row becomes the installed card. */
   onChanged?: () => void | Promise<void>;
+  /** Spec 127 D3: shown under an Orbital-installed agent's card as the
+   *  fallback. Replaces the "copy this into {name}" line, which would
+   *  imply the agent itself can answer — an ACP server like dsh cannot. */
+  fallbackHint?: string;
 }
 
 interface LocateTestResult {
@@ -40,7 +44,7 @@ interface LocateTestResult {
  *  `overrideMissing`: the file the user chose earlier is gone (the agent
  *  updated itself, say). Same row, first line names the missing file. */
 export default function NotDetectedRow({
-  slug, name, overridePath, overrideMissing, onChanged,
+  slug, name, overridePath, overrideMissing, onChanged, fallbackHint,
 }: Props) {
   const t = useT();
   const [answer, setAnswer] = useState('');
@@ -151,7 +155,7 @@ export default function NotDetectedRow({
 
       <div className="flex items-center gap-2 flex-wrap mt-1.5">
         <p className="text-xs text-secondary">
-          {t('subAgentCard.locate.hint', { name })}
+          {fallbackHint ?? t('subAgentCard.locate.hint', { name })}
         </p>
         <button
           type="button"
@@ -208,11 +212,18 @@ export default function NotDetectedRow({
             className={`text-xs break-all ${result.ok ? 'text-success' : 'text-error'}`}
           >
             {result.ok
-              ? t('subAgentCard.locate.found', {
-                  name,
-                  version: versionOf(result.version_output),
-                  path: result.binary ?? '',
-                })
+              ? (result.version_output
+                  ? t('subAgentCard.locate.found', {
+                      name,
+                      version: versionOf(result.version_output),
+                      path: result.binary ?? '',
+                    })
+                  // Spec 127 D2: an agent with no check command passes on
+                  // existence alone; say that rather than print a blank.
+                  : t('subAgentCard.locate.foundNoVersion', {
+                      name,
+                      path: result.binary ?? '',
+                    }))
               : (result.error ?? '')}
           </span>
         )}

@@ -43,6 +43,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_os.agents import installer as installer_mod
+from agent_os.agents import setup_engine as setup_engine_mod
 from agent_os.agents.installer import (
     InstallInProgress,
     InstallUnsupported,
@@ -420,12 +421,26 @@ class TestGates:
 
     def test_platform_gate_rejects_unsupported_host(self, engine, ws,
                                                     dsh_manifest, monkeypatch):
-        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        # Spec 127 lifted dsh's Windows gate, so every real OS value is now
+        # in its list; a made-up host keeps the gate logic itself under test.
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "freebsd")
         inst = SubAgentInstaller(setup_engine=engine, ws_manager=ws)
         with pytest.raises(InstallUnsupported) as exc:
             inst.start("dsh", dsh_manifest)
-        assert "windows" in str(exc.value)
+        assert "freebsd" in str(exc.value)
         assert inst.get_state("dsh") is None
+
+    def test_windows_is_a_supported_host(self, engine, ws, dsh_manifest,
+                                         monkeypatch):
+        """Spec 127 D1: Orbital installs dsh on Windows too. ``supports``
+        says yes and the echoed platform list carries all three OS values."""
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        inst = SubAgentInstaller(setup_engine=engine, ws_manager=ws)
+        assert inst.supports(dsh_manifest) is True
+        entry = inst.entry_for(dsh_manifest, installed=False)
+        assert entry["supported"] is True
+        assert entry["platforms"] == ["macos", "linux", "windows"]
+        assert entry["state"] == "not_installed"
 
     def test_agent_without_orbital_install_is_rejected(self, installer):
         claude = ManifestLoader.load(
@@ -588,19 +603,30 @@ class TestStatusEntry:
         agent Orbital never installs (no button, no explanation) and one it
         installs elsewhere but not here (the "not yet supported on this
         platform" line). The echoed platform list separates them."""
-        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        # A made-up host: dsh lists every real OS since spec 127.
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "freebsd")
 
         entries = client.get("/api/v2/settings/sub-agents").json()
         dsh = next(e for e in entries if e["slug"] == "dsh")
         claude = next(e for e in entries if e["slug"] == "claude-code")
 
         assert dsh["install"]["supported"] is False
-        assert dsh["install"]["platforms"] == ["macos", "linux"]
+        assert dsh["install"]["platforms"] == ["macos", "linux", "windows"]
         assert claude["install"]["supported"] is False
         assert claude["install"]["platforms"] == []
 
     def test_supported_host_echoes_the_same_platform_list(self, client):
-        assert dsh_entry(client)["install"]["platforms"] == ["macos", "linux"]
+        assert dsh_entry(client)["install"]["platforms"] == [
+            "macos", "linux", "windows"]
+
+    def test_windows_host_reports_dsh_as_installable(self, client,
+                                                     monkeypatch):
+        """Spec 127 D1: the Windows card gets the Install button, not the
+        "not yet supported on this platform" line."""
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        entry = dsh_entry(client)
+        assert entry["install"]["supported"] is True
+        assert entry["install"]["platforms"] == ["macos", "linux", "windows"]
 
 
 class TestDeclaredCredentials:
@@ -673,18 +699,35 @@ class TestInstallRoute:
         assert resp.status_code == 400
 
     def test_unsupported_platform_400(self, client, monkeypatch):
-        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        # A made-up host: dsh lists every real OS since spec 127.
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "freebsd")
         resp = client.post("/api/v2/settings/sub-agents/dsh/install")
         assert resp.status_code == 400
-        assert "windows" in resp.json()["detail"]
+        assert "freebsd" in resp.json()["detail"]
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="dsh declares no Windows auto_detect path by design (install "
-               "is platform-gated off Windows), so resolve_binary can never "
-               "report the planted binary and the 'installed' state is "
-               "unreachable here",
-    )
+    def test_windows_host_gets_202(self, client, monkeypatch):
+        """Spec 127 D1: the install route no longer 400s on Windows."""
+        monkeypatch.setattr(installer_mod, "detect_os", lambda: "windows")
+        exec_fake = FakeExec()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_fake)
+        patch_which(monkeypatch)
+
+        resp = client.post("/api/v2/settings/sub-agents/dsh/install")
+        assert resp.status_code == 202
+        assert resp.json()["state"] == "installing"
+
+        # Let the faked job settle so it never outlives this test.
+        import agent_os.api.routes.settings as settings_routes
+        deadline = time.time() + 30
+        state = None
+        while time.time() < deadline:
+            state = settings_routes._installer.get_state("dsh")
+            if state is not None and state["state"] != "installing":
+                break
+            time.sleep(0.02)
+        assert state is not None and state["state"] == "installed"
+        assert exec_fake.npm_calls, "npm ci must have been started"
+
     def test_install_lifecycle_is_refresh_safe(self, client, tmp_path,
                                                monkeypatch):
         """202 immediately; a page refresh mid-install reads ``installing``
@@ -696,7 +739,10 @@ class TestInstallRoute:
         def plant_binary():
             bin_dir = os.path.join(target, "node_modules", ".bin")
             os.makedirs(bin_dir, exist_ok=True)
-            with open(os.path.join(bin_dir, "dsh-acp-demo"), "w") as f:
+            # Spec 127: on Windows the manifest's auto_detect entry names
+            # npm's ``.cmd`` shim; elsewhere the ``#!/usr/bin/env node`` one.
+            name = "dsh-acp-demo.cmd" if sys.platform == "win32" else "dsh-acp-demo"
+            with open(os.path.join(bin_dir, name), "w") as f:
                 f.write("#!/bin/sh\n")
 
         exec_fake = FakeExec(gate=gate, on_npm_wait=plant_binary)
@@ -742,3 +788,54 @@ class TestInstallRoute:
         assert entry["install"]["state"] == "installed"
         assert entry["installed"] is True
         assert os.path.isfile(os.path.join(target, ".install-complete"))
+
+
+
+# ---------------------------------------------------------------------------
+# 5. Spec 127: Windows detection of the Orbital-installed tree
+# ---------------------------------------------------------------------------
+
+class TestWindowsDetection:
+    """On Windows the auto_detect entry names npm's ``.cmd`` shim — the only
+    launcher CreateProcess can run. The extensionless file npm drops beside
+    it is a POSIX sh script and must never be the one reported."""
+
+    def _plant(self, engine, name):
+        bin_dir = os.path.join(engine.data_dir, "agents", "dsh",
+                               "node_modules", ".bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        path = os.path.join(bin_dir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        return path
+
+    def test_manifest_names_the_cmd_shim_for_windows(self, dsh_manifest):
+        assert dsh_manifest.setup.orbital_install.platforms == [
+            "macos", "linux", "windows"]
+        windows = dsh_manifest.setup.auto_detect.get("windows")
+        assert windows == [
+            "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo.cmd"]
+        for other in ("macos", "linux"):
+            assert dsh_manifest.setup.auto_detect[other] == [
+                "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo"]
+
+    def test_resolves_the_cmd_shim_and_extends_the_daemon_path(
+            self, engine, dsh_manifest, monkeypatch):
+        monkeypatch.setattr(setup_engine_mod, "detect_os", lambda: "windows")
+        monkeypatch.setattr(setup_engine_mod.shutil, "which", lambda *_a, **_k: None)
+        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+        posix = self._plant(engine, "dsh-acp-demo")
+        shim = self._plant(engine, "dsh-acp-demo.cmd")
+
+        resolved = engine.resolve_binary(dsh_manifest)
+
+        assert resolved == os.path.normpath(shim)
+        assert resolved != posix
+        assert os.path.dirname(shim) in os.environ["PATH"].split(os.pathsep)
+
+    def test_posix_file_alone_is_not_detected_on_windows(
+            self, engine, dsh_manifest, monkeypatch):
+        monkeypatch.setattr(setup_engine_mod, "detect_os", lambda: "windows")
+        monkeypatch.setattr(setup_engine_mod.shutil, "which", lambda *_a, **_k: None)
+        self._plant(engine, "dsh-acp-demo")
+        assert engine.resolve_binary(dsh_manifest) is None

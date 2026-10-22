@@ -434,11 +434,15 @@ class TestDshManifest:
         assert claude.setup.orbital_install.platforms == []
 
     def test_declares_the_platforms_orbital_can_install_it_on(self):
-        """Windows is deliberately absent — the npm .bin shim story is
-        untested there, and the auto_detect entries match this gate."""
+        """Spec 127 lifted the Windows gate: every OS Orbital installs on
+        has an auto_detect entry, and Windows names npm's ``.cmd`` shim
+        (the only launcher CreateProcess can run)."""
         dsh = _load_dsh()
-        assert dsh.setup.orbital_install.platforms == ["macos", "linux"]
-        assert sorted(dsh.setup.auto_detect) == ["linux", "macos"]
+        assert dsh.setup.orbital_install.platforms == ["macos", "linux", "windows"]
+        assert sorted(dsh.setup.auto_detect) == ["linux", "macos", "windows"]
+        assert sorted(dsh.setup.auto_detect) == sorted(
+            dsh.setup.orbital_install.platforms)
+        assert dsh.setup.auto_detect["windows"][0].endswith("dsh-acp-demo.cmd")
 
     def test_does_not_claim_orbital_governs_its_egress(self):
         """Transport-backed sub-agents spawn outside the project sandbox, so a

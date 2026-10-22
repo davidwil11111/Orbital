@@ -903,11 +903,97 @@ describe('SubAgentSettings — Orbital-managed install', () => {
 
     render(<SubAgentSettings />);
 
-    await waitFor(() => expect(screen.getByText('DeepSeek Harness')).toBeInTheDocument());
-    expect(screen.getByTestId('sub-agent-install-unsupported-dsh')).toHaveTextContent(
+    // Spec 127 D3 hangs the locate card under this card, so the name is on
+    // the page twice; wait on the card's own line.
+    await waitFor(() => expect(screen.getByTestId('sub-agent-install-unsupported-dsh')).toHaveTextContent(
       'Not yet supported on this platform.',
-    );
+    ));
     expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument();
+  });
+
+  // Spec 127 D3: an Orbital-installed agent that is not installed and cannot
+  // be (this host, or a failed run) keeps its card AND gets the locate card
+  // beneath it, so a hand-installed launcher can still be wired up.
+  it('adds the locate card under an unsupported-platform card (spec 127 D3)', async () => {
+    mockList([
+      makeDshEntry({
+        install: { supported: false, state: 'not_installed', platforms: ['macos', 'linux'] },
+      }),
+    ]);
+
+    render(<SubAgentSettings />);
+
+    // The card stays: its explanation line is still there.
+    await waitFor(() => expect(screen.getByTestId('sub-agent-install-unsupported-dsh')).toBeInTheDocument());
+    const row = screen.getByTestId('sub-agent-not-detected-dsh');
+    expect(row).toHaveTextContent(
+      'Or point Orbital at a DeepSeek Harness you installed yourself: paste the launcher path (or the YAML an agent returns for it) below.',
+    );
+    expect(row).not.toHaveTextContent('Copy this into DeepSeek Harness');
+    expect(within(row).getByTestId('sub-agent-locate-answer-dsh')).toBeInTheDocument();
+  });
+
+  it('adds the locate card under a card whose Orbital install failed (spec 127 D3)', async () => {
+    mockList([
+      makeDshEntry({
+        install: { supported: true, state: 'failed', job_id: 'job-1', platforms: ['macos', 'linux'] },
+      }),
+    ]);
+
+    render(<SubAgentSettings />);
+
+    await waitFor(() => expect(screen.getByTestId('sub-agent-install-error-dsh')).toBeInTheDocument());
+    // Retry stays on the card; the row is the fallback, not a replacement.
+    expect(screen.getByRole('button', { name: 'Retry install' })).toBeInTheDocument();
+    expect(screen.getByTestId('sub-agent-not-detected-dsh')).toBeInTheDocument();
+  });
+
+  it('shows no locate card while an Orbital install is still on offer (spec 127 D3)', async () => {
+    mockList([makeDshEntry()]);
+
+    render(<SubAgentSettings />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Install' })).toBeInTheDocument());
+    expect(screen.queryByTestId('sub-agent-not-detected-dsh')).not.toBeInTheDocument();
+  });
+
+  it('shows no locate card for an installed Orbital-managed agent (spec 127 D3)', async () => {
+    mockList([
+      makeDshEntry({
+        installed: true,
+        binary_path: '/data/agents/dsh/node_modules/.bin/dsh-acp-demo',
+        install: { supported: true, state: 'installed', platforms: ['macos', 'linux'] },
+      }),
+    ]);
+
+    render(<SubAgentSettings />);
+
+    await waitFor(() => expect(screen.getByText('DeepSeek Harness')).toBeInTheDocument());
+    expect(screen.queryByTestId('sub-agent-not-detected-dsh')).not.toBeInTheDocument();
+  });
+
+  it('refetches after a failed install so the locate card appears (spec 127 D3)', async () => {
+    mockList(
+      [makeDshEntry()],
+      [makeDshEntry({
+        install: { supported: true, state: 'failed', job_id: 'job-1', platforms: ['macos', 'linux'] },
+      })],
+    );
+
+    render(<SubAgentSettings />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Install' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('sub-agent-install-spinner-dsh')).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('sub-agent-not-detected-dsh')).not.toBeInTheDocument();
+
+    emit('sub_agent_install_failed', { slug: 'dsh', job_id: 'job-1', error: 'npm ci failed with exit code 1' });
+
+    await waitFor(() => expect(screen.getByTestId('sub-agent-not-detected-dsh')).toBeInTheDocument());
+    // The live error text is kept over the generic "failed earlier" line.
+    expect(screen.getByTestId('sub-agent-install-error-dsh')).toHaveTextContent(
+      'npm ci failed with exit code 1',
+    );
   });
 
   it('POSTs the install route and enters the installing state', async () => {

@@ -471,6 +471,15 @@ class SetupEngine:
         if not os.path.isfile(binary):
             return {"ok": False, "error": f"No file at {binary}."}
         check = manifest.setup.check_command or ""
+        if not check:
+            # Spec 127 D2: an agent with no check command (dsh is an ACP
+            # stdio server that takes only ``--config``) cannot be asked
+            # for a version — running it bare would block on stdin until
+            # the timeout. Existence plus executability is the whole test;
+            # the card says so with an empty ``version_output``.
+            if not os.access(binary, os.X_OK):
+                return {"ok": False, "error": f"{binary} is not executable."}
+            return {"ok": True, "version_output": ""}
         command = manifest.runtime.command or ""
         rest = ""
         if check and command and (check == command or check.startswith(command + " ")):
