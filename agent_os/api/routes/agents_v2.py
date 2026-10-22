@@ -2244,7 +2244,10 @@ async def patch_session(project_id: str, session_id: str, req: SessionPatchReque
 
     Returns ``{"status", "session_id"}`` plus whichever fields were set. 400 if
     the body sets nothing, or if ``name`` is present but empty. 404 if no
-    session with this id (F1 or F2/uuid) exists for the project.
+    session with this id (F1 or F2/uuid) exists for the project — but a
+    validated ``pinned_target`` has already been remembered as the project's
+    sticky pin by then (spec 131 B), so a pick on a not-yet-materialized
+    session still decides what the next new session starts on.
     """
     if _project_store is not None and _project_store.get_project(project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -2279,6 +2282,22 @@ async def patch_session(project_id: str, session_id: str, req: SessionPatchReque
     patch_kwargs: dict = {"name": name, "pinned": req.pinned}
     if target_set:
         patch_kwargs["pinned_target"] = req.pinned_target
+        # The project's sticky pin follows the user's last choice (keyless
+        # onboarding contract §2), including an explicit null (= Orbital).
+        # Written BEFORE the session write (spec 131 B): "+ new session"
+        # mints an id with no file behind it, and the composer PATCHes that
+        # id the moment the user picks a target. The session patch below
+        # then 404s (correct — the first send materializes it and re-persists
+        # the pin), but the pick itself must still land on the project, or
+        # an Orbital pick on a fresh session never clears a worker default.
+        # The project is known from the URL and the slug has passed
+        # validation above; on the loop, as set_default_pinned_target wants.
+        try:
+            _agent_manager.set_default_pinned_target(
+                project_id, req.pinned_target)
+        except Exception:
+            logger.warning("could not remember the default pin for %s",
+                           project_id, exc_info=True)
     try:
         # Same lock-contention discipline as the inject route: the disk-path
         # patch write-locks the session JSONL and can lose the race against a
@@ -2300,15 +2319,6 @@ async def patch_session(project_id: str, session_id: str, req: SessionPatchReque
         result["pinned"] = bool(req.pinned)
     if target_set:
         result["pinned_target"] = req.pinned_target
-        # The project's sticky pin follows the user's last choice (keyless
-        # onboarding contract §2), including an explicit null (= Orbital).
-        # Written here on the loop, after the session write succeeded.
-        try:
-            _agent_manager.set_default_pinned_target(
-                project_id, req.pinned_target)
-        except Exception:
-            logger.warning("could not remember the default pin for %s",
-                           project_id, exc_info=True)
         # Pin time (spec 074 §3.6): hash-guarded AGENTS.md refresh — codex's
         # only context channel is reading that file from the workspace root.
         # Guarded inside reseed_project_agent_md; a user-edited file is never

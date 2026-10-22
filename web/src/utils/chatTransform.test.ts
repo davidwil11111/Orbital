@@ -1519,6 +1519,68 @@ describe('mergeRecoveredAssistantMessage — REST recovery resolves identity lik
   });
 });
 
+describe('mergeRecoveredAssistantMessage — tagged rows never become a bubble (spec 131 A)', () => {
+  // Spec 131 A: the end-of-run memory record turn (spec 112 A6) appends rows
+  // tagged `_kind: "memory_record"` AFTER the real reply. The live path is
+  // silent for them by design, so the idle catch-up's /chat?limit=1 lands on
+  // the record turn's closing text — which deepseek-v4.1-flash writes as a
+  // restatement of the reply. Any tagged row must be ignored here: the
+  // persisted transform already owns rendering for tagged rows (it keeps the
+  // edits as a collapsed capsule and drops the text).
+  function agentItem(content: string, source = 'management', timestamp = TS) {
+    return { type: 'agent_message' as const, content, source, timestamp };
+  }
+
+  it('returns the list unchanged for a memory_record text row that differs from the reply', () => {
+    const prev = [agentItem('the real reply')];
+    const out = mergeRecoveredAssistantMessage(
+      prev,
+      asst({ content: 'the real reply, memory updated', _kind: 'memory_record', timestamp: TS3 }),
+    );
+    expect(out).toBe(prev);
+  });
+
+  it('does not extend the last bubble with a memory_record row that merely restates it', () => {
+    // The truncation-repair branch would otherwise "complete" the reply with
+    // the record turn's longer restatement.
+    const prev = [agentItem('the real reply')];
+    const out = mergeRecoveredAssistantMessage(
+      prev,
+      asst({ content: 'the real reply — and memory updated.', _kind: 'memory_record', timestamp: TS3 }),
+    );
+    expect(out).toBe(prev);
+    expect(out[0].type === 'agent_message' && out[0].content).toBe('the real reply');
+  });
+
+  it('ignores a memory_record row even when the list is empty', () => {
+    const prev: ReturnType<typeof agentItem>[] = [];
+    const out = mergeRecoveredAssistantMessage(
+      prev,
+      asst({ content: 'nothing to record', _kind: 'memory_record' }),
+    );
+    expect(out).toBe(prev);
+  });
+
+  it('ignores a memory_tidy row too — any kind, not just memory_record', () => {
+    const prev = [agentItem('the real reply')];
+    const out = mergeRecoveredAssistantMessage(
+      prev,
+      asst({ content: 'tidied 3 files', _kind: 'memory_tidy', timestamp: TS3 }),
+    );
+    expect(out).toBe(prev);
+  });
+
+  it('still recovers an untagged row (the gate is kind-aware, not a blanket drop)', () => {
+    const prev = [agentItem('older turn')];
+    const out = mergeRecoveredAssistantMessage(
+      prev,
+      asst({ content: 'recovered reply', timestamp: TS3 }),
+    );
+    expect(out).toHaveLength(2);
+    expect(out[1].type === 'agent_message' && out[1].content).toBe('recovered reply');
+  });
+});
+
 // ── P3-G: budget-trip timeline row ──────────────────────────────────────────
 // The agent loop appends a structured system row on a budget trip:
 //   {role:'system', source:'budget', event:'budget_blocked', payload:{...}}

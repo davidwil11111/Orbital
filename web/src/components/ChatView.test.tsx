@@ -61,6 +61,9 @@ let pendingApprovalResponder: (path: string) => unknown = () => ({ pending: fals
 // Keyless onboarding: GET /projects/{pid}/sessions (useSessions) answers this
 // list, and PUT /projects/{pid} (the no-session sticky pin) is logged.
 let sessionsListResponse: unknown[] = [];
+// Spec 131 A: the idle catch-up (fetchLatestMessage) GETs the tail of
+// /chat through `api` (not apiWithTotal). Tests set this to hand it a row.
+let chatLatestResponse: unknown[] = [];
 const projectPutCalls: Array<{ path: string; body: unknown }> = [];
 
 vi.mock('../config', () => ({
@@ -93,7 +96,11 @@ vi.mock('../config', () => ({
     if (path.includes('/pending-approval')) {
       return pendingApprovalResponder(path);
     }
-    // /chat?limit=1 (REST fallback) and anything else → empty list.
+    // /chat?limit=N (the idle catch-up / REST fallback).
+    if (!opts?.method && /\/chat\?limit=\d+/.test(path)) {
+      return chatLatestResponse;
+    }
+    // Anything else → empty list.
     return [];
   }),
   apiWithTotal: vi.fn(async (path: string, opts?: { signal?: AbortSignal }) => {
@@ -330,6 +337,7 @@ beforeEach(() => {
   runStatusTerminalEvent = null;
   pendingApprovalResponder = () => ({ pending: false });
   sessionsListResponse = [];
+  chatLatestResponse = [];
   projectPutCalls.length = 0;
   chatInitialResponse = { data: [], total: 0 };
   chatOlderResponse = { data: [], total: 0 };
@@ -4682,5 +4690,115 @@ describe('Session import: opening an imported row', () => {
     await act(async () => { release(); });
     await flushEffects();
     expect(container.querySelector('[data-testid="chat-importing"]')).toBeNull();
+  });
+});
+
+// Spec 131 A: the end-of-run memory record turn (spec 112 A6) appends rows
+// tagged `_kind: "memory_record"` behind the real reply, silently (the
+// backend streams nothing for them). When the run goes idle, the catch-up
+// fetch lands on that closing text and used to insert it as a second reply
+// that only a reload made disappear. Items after the catch-up must equal
+// items before it whenever the recovered row is tagged.
+describe('ChatView: the idle catch-up ignores memory record rows (spec 131 A)', () => {
+  const USER = {
+    role: 'user',
+    content: 'what is it',
+    source: 'user',
+    timestamp: '2026-10-22T08:30:00.000Z',
+    session_id: 's1',
+  };
+  const REPLY = {
+    role: 'assistant',
+    content: 'THE-REAL-REPLY',
+    source: 'management',
+    timestamp: '2026-10-22T08:31:48.000Z',
+    session_id: 's1',
+  };
+  const RECORD_TEXT = 'THE-REAL-REPLY restated, memory updated';
+
+  // One agent avatar per agent bubble (the copy button renders nothing in
+  // jsdom, where the clipboard API is unavailable).
+  function bubbles() {
+    return container.querySelectorAll('[data-testid="message-avatar"][data-variant="agent"]').length;
+  }
+
+  // Drive a full turn on the viewed session: idle → running (latches the
+  // catch-up) → idle (fires it), then wait out the REST fallback delay.
+  async function settleTurn() {
+    runStatusHolder = 's1';
+    chatInitialResponse = { data: [USER, REPLY], total: 2 };
+    await renderChat({ agentStatus: 'idle', sessionId: 's1' });
+    await flushEffects();
+    await renderChat({ agentStatus: 'running', sessionId: 's1' });
+    await flushEffects();
+    await renderChat({ agentStatus: 'idle', sessionId: 's1' });
+    await flushEffects();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 700));
+    });
+  }
+
+  it('control: an untagged assistant row the view lacks is recovered as a bubble', async () => {
+    chatLatestResponse = [{ ...REPLY, content: 'A-RECOVERED-CLOSING-TEXT', timestamp: '2026-10-22T08:32:10.000Z' }];
+    await settleTurn();
+    expect(container.textContent ?? '').toContain('A-RECOVERED-CLOSING-TEXT');
+    expect(bubbles()).toBe(2);
+  });
+
+  it('a memory_record closing text is not inserted as a second reply', async () => {
+    chatLatestResponse = [{ ...REPLY, content: RECORD_TEXT, _kind: 'memory_record', timestamp: '2026-10-22T08:32:10.000Z' }];
+    await settleTurn();
+    expect(container.textContent ?? '').toContain('THE-REAL-REPLY');
+    expect(container.textContent ?? '').not.toContain(RECORD_TEXT);
+    expect(bubbles()).toBe(1);
+  });
+
+  it('a memory_record row with reasoning_content spawns no stray thinking capsule', async () => {
+    chatLatestResponse = [{
+      ...REPLY,
+      content: RECORD_TEXT,
+      reasoning_content: 'pondering what to record',
+      _kind: 'memory_record',
+      timestamp: '2026-10-22T08:32:10.000Z',
+    }];
+    await settleTurn();
+    expect(container.textContent ?? '').not.toContain('thinking');
+    expect(bubbles()).toBe(1);
+  });
+
+  it('control: an untagged row with reasoning_content still yields a thinking capsule', async () => {
+    chatLatestResponse = [{
+      ...REPLY,
+      content: 'A-RECOVERED-CLOSING-TEXT',
+      reasoning_content: 'pondering the answer',
+      timestamp: '2026-10-22T08:32:10.000Z',
+    }];
+    await settleTurn();
+    expect(container.textContent ?? '').toContain('thinking');
+  });
+
+  it('recovers the real reply from behind the record turn when the window holds both', async () => {
+    // The optional belt from spec 131 A4: the catch-up asks for a few rows
+    // and takes the last UNTAGGED one, so a stream lost mid-turn is still
+    // repaired even though the record turn has already appended behind it.
+    chatInitialResponse = { data: [USER], total: 1 };
+    chatLatestResponse = [
+      { ...REPLY, content: 'A-RECOVERED-CLOSING-TEXT' },
+      { role: 'system', content: '[MEMORY] This run is ending', source: 'daemon', _kind: 'memory_record', timestamp: '2026-10-22T08:31:49.000Z', session_id: 's1' },
+      { ...REPLY, content: RECORD_TEXT, _kind: 'memory_record', timestamp: '2026-10-22T08:32:10.000Z' },
+    ];
+    runStatusHolder = 's1';
+    await renderChat({ agentStatus: 'idle', sessionId: 's1' });
+    await flushEffects();
+    await renderChat({ agentStatus: 'running', sessionId: 's1' });
+    await flushEffects();
+    await renderChat({ agentStatus: 'idle', sessionId: 's1' });
+    await flushEffects();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 700));
+    });
+    expect(container.textContent ?? '').toContain('A-RECOVERED-CLOSING-TEXT');
+    expect(container.textContent ?? '').not.toContain(RECORD_TEXT);
+    expect(bubbles()).toBe(1);
   });
 });
