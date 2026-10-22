@@ -339,6 +339,17 @@ class Session:
         # as ``name``. Governance settings are deliberately NOT here; they
         # resolve live at dispatch.
         self.sub_agent_threads: dict[str, dict] = {}
+        # Spec 128: every ``sub_agent_thread`` row this session ever wrote,
+        # per handle, in order — the resume map above keeps only the last.
+        # A reset or an import starts a new thread; the earlier threads'
+        # native logs stay known so a dispatch can point the next agent at
+        # them. Metadata only, never conversation.
+        self.sub_agent_thread_history: dict[str, list[dict]] = {}
+
+    @property
+    def filepath(self) -> str:
+        """The canonical session JSONL path (read-only)."""
+        return self._filepath
 
     # ------------------------------------------------------------------
     # Construction
@@ -457,6 +468,8 @@ class Session:
                                 session.sub_agent_threads[msg["handle"]] = (
                                     dict(msg["thread"])
                                 )
+                                session.sub_agent_thread_history.setdefault(
+                                    msg["handle"], []).append(dict(msg["thread"]))
                         continue
                     session._messages.append(msg)
 
@@ -776,6 +789,7 @@ class Session:
             # JSONL path from thread/start|resume — pre-checked before resume.
             record["rollout_path"] = rollout_path
         self.sub_agent_threads[handle] = record
+        self.sub_agent_thread_history.setdefault(handle, []).append(dict(record))
         self.append_meta("sub_agent_thread", handle=handle, thread=record)
 
     def get_sub_agent_thread(self, handle: str) -> dict | None:

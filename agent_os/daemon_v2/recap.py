@@ -35,7 +35,9 @@ end):
 
 from __future__ import annotations
 
+import json
 import re
+from typing import Callable
 
 # Total budget for one block. Measured on a full day's session: ~19k chars
 # of visible messages, so this only ever bites on a pathological paste.
@@ -152,3 +154,140 @@ def build_recap(messages: list[dict], handle: str, *, fresh: bool) -> str:
         return ""
     lines.reverse()
     return _HEADER + "\n\n".join(lines) + _FOOTER
+
+
+# ---------------------------------------------------------------------------
+# Spec 128: where the earlier details live (paths only, read on demand)
+# ---------------------------------------------------------------------------
+#
+# The recap above is conversational text; tool calls, results and lifecycle
+# rows are filtered out of it on purpose. The agent taking over after a pin
+# switch therefore gets, alongside the recap, the file paths of the prior
+# agents' ORIGINAL session logs — Claude Code's own
+# ``~/.claude/projects/<slug>/<id>.jsonl``, Codex's rollout JSONL — plus the
+# canonical Orbital chat log. Only when a native log cannot be resolved is
+# the Orbital worker transcript offered instead, labelled as the partial
+# capture it is. Nothing is read or injected here: the recipient opens a
+# file when it needs earlier details. The block is kept apart from
+# ``_visible_line`` and the recap budget so neither filtering nor eviction
+# can drop it.
+
+SOURCE_LOGS_HEADER = (
+    "Previous session logs — read only when you need earlier details:\n")
+
+_UNAVAILABLE = "unavailable"
+
+
+def _dispatch_marker_paths(messages: list[dict]) -> dict[str, list[str]]:
+    """``handle -> [exact transcript paths]`` from this chat's own dispatch
+    markers, first-seen order, deduplicated. The memory record / tidy turns
+    are bookkeeping (spec 112 A6) and never a source."""
+    paths: dict[str, list[str]] = {}
+    for row in messages:
+        if row.get("_kind") in ("memory_record", "memory_tidy"):
+            continue
+        meta = row.get("_meta")
+        if (
+            row.get("role") != "system"
+            or not isinstance(meta, dict)
+            or not meta.get("dispatch_id")
+            or not meta.get("handle")
+        ):
+            continue
+        path = meta.get("transcript_path")
+        if not isinstance(path, str) or not path or path == "unknown":
+            continue
+        known = paths.setdefault(meta["handle"], [])
+        if path not in known:
+            known.append(path)
+    return paths
+
+
+def source_log_entries(
+    messages: list[dict],
+    handle: str,
+    *,
+    fresh: bool,
+    thread_history: dict[str, list[dict]],
+    chat_log_path: str | None,
+    native_path_for: Callable[[str, dict], str | None],
+) -> list[tuple[str, str | None]]:
+    """``(label, path)`` entries for the dispatch to ``handle``; ``path`` is
+    None for a known source that could not be resolved (rendered as
+    "unavailable" — never a fabricated path).
+
+    ``thread_history`` is every persisted resume record per handle, in
+    order, for THIS chat (``Session.sub_agent_thread_history``), so a reset
+    does not lose the earlier threads' logs. ``native_path_for`` resolves
+    one record to its native log file (metadata only — it must not read
+    transcript bodies).
+
+    A resumed worker's latest record IS the thread it is resuming, so that
+    one — and its own transcript — are left out; its older records are
+    prior logs like any other agent's. A fresh spawn gets everything,
+    including its own lost threads.
+    """
+    entries: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+
+    def add(label: str, path: str | None) -> None:
+        if path is not None:
+            if path in seen:
+                return
+            seen.add(path)
+        entries.append((label, path))
+
+    marker_paths = _dispatch_marker_paths(messages)
+    handles: list[str] = []
+    for h in list(thread_history) + list(marker_paths):
+        if h not in handles:
+            handles.append(h)
+
+    for other in handles:
+        records = list(thread_history.get(other) or [])
+        own_live = other == handle and not fresh
+        if own_live:
+            # The latest record is the thread being resumed — every record
+            # carrying that session id (a completion rewrites it each turn)
+            # is skipped. The earlier (lost) threads stay; the worker is
+            # never offered its own current log or transcript.
+            live = records[-1].get("session_id") if records else None
+            records = [r for r in records
+                       if isinstance(r, dict) and r.get("session_id") != live]
+            if not records:
+                continue
+        resolved = False
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            path = native_path_for(other, record)
+            if isinstance(path, str) and path:
+                add(f"Original agent session log ({other})", path)
+                resolved = True
+        if resolved or own_live:
+            continue
+        fallback = marker_paths.get(other) or []
+        if fallback:
+            for path in fallback:
+                add(f"Orbital worker transcript ({other}, partial capture)", path)
+        elif records:
+            add(f"Original agent session log ({other})", None)
+
+    if chat_log_path:
+        add("Orbital chat log", chat_log_path)
+    return entries
+
+
+def format_source_logs(entries: list[tuple[str, str | None]]) -> str:
+    """Render the path block, or "" when there is nothing to point at.
+
+    Paths are JSON-encoded so a quote or newline in a filename cannot break
+    the block; they are never truncated."""
+    if not entries:
+        return ""
+    lines = [SOURCE_LOGS_HEADER]
+    for label, path in entries:
+        value = (json.dumps(path, ensure_ascii=False)
+                 if path else _UNAVAILABLE)
+        lines.append(f"- {label}: {value}")
+    return "\n".join(lines) + "\n\n"

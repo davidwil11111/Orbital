@@ -964,21 +964,32 @@ class CodexTransport(AgentTransport):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def resume_source_exists(record: dict) -> bool:
-        """Pre-check the rollout file before resuming. Codex pruning policy
-        is unmeasured (R4 open) — never trust the resume call to fail
-        loudly; a fresh start must never look like a resume."""
+    def resume_source_path(record: dict) -> str | None:
+        """The rollout JSONL a thread record resolves to, or None.
+
+        The saved ``rollout_path`` when it is still there; else the exact
+        thread id looked up in the sessions store (``$CODEX_HOME`` or
+        ``~/.codex``). Metadata only — the file is never opened. Shared by
+        the resume pre-check and the spec 128 dispatch path block."""
         path = record.get("rollout_path")
         if path and os.path.isfile(path):
-            return True
+            return path
         thread_id = record.get("session_id")
         if not thread_id:
-            return False
+            return None
         home = os.environ.get("CODEX_HOME") or os.path.join(
             os.path.expanduser("~"), ".codex")
         pattern = os.path.join(home, "sessions", "*", "*", "*",
                                f"rollout-*-{thread_id}.jsonl")
-        return bool(_glob.glob(pattern))
+        matches = sorted(_glob.glob(pattern))
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def resume_source_exists(record: dict) -> bool:
+        """Pre-check the rollout file before resuming. Codex pruning policy
+        is unmeasured (R4 open) — never trust the resume call to fail
+        loudly; a fresh start must never look like a resume."""
+        return CodexTransport.resume_source_path(record) is not None
 
 
 # ----------------------------------------------------------------------

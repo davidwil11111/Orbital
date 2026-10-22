@@ -1364,7 +1364,8 @@ class SubAgentManager:
         # actually goes out (drain time for a queued one), so the block and
         # the marker written below agree on the watermark, and every entry
         # path — pinned, @mention, manager dispatch — gets the same block.
-        preamble = await self._build_recap(adapter, project_id, session_id, handle)
+        preamble = await self._build_recap(
+            adapter, project_id, session_id, handle, message=prompt.message)
         try:
             await self._dispatch_async(
                 adapter, project_id, handle, preamble + prompt.message,
@@ -1385,7 +1386,7 @@ class SubAgentManager:
             )
 
     async def _build_recap(self, adapter, project_id: str, session_id: str,
-                           handle: str) -> str:
+                           handle: str, *, message: str | None = None) -> str:
         """The "Conversation so far" block for this dispatch, or "".
 
         A FRESH spawn's first dispatch gets the whole session (its thread is
@@ -1421,7 +1422,94 @@ class SubAgentManager:
             adapter._recap_primed = True
         except Exception:
             pass
+        # Spec 128: after the recap, the paths of the earlier agents'
+        # original session logs (read on demand). Resolved off the loop —
+        # it stats the native stores — and fault-isolated from the recap.
+        try:
+            block += await asyncio.to_thread(
+                self._source_logs_block, project_id, session, messages,
+                handle, bool(fresh), message)
+        except Exception:
+            logger.warning(
+                "source-log path block failed for %s/%s — dispatching "
+                "without", project_id, handle, exc_info=True,
+            )
         return block
+
+    def _source_logs_block(self, project_id: str, session, messages: list[dict],
+                           handle: str, fresh: bool,
+                           message: str | None = None) -> str:
+        """The spec 128 path block for one dispatch, or "".
+
+        Sources are THIS chat's persisted thread records (every record, so
+        a reset keeps the earlier threads' logs) and its dispatch markers'
+        exact transcript paths; the canonical chat log closes the list. A
+        session object without that metadata (legacy fakes) yields "".
+
+        The memory record turn (spec 112 A6) is bookkeeping, not a
+        handover: its dispatched text is the persisted ``_kind``-tagged
+        user row, and it gets no block.
+        """
+        from agent_os.daemon_v2.recap import format_source_logs, source_log_entries
+
+        if session is None:
+            return ""
+        if message is not None:
+            for row in reversed(messages):
+                if row.get("role") == "user" and row.get("target") == handle \
+                        and row.get("content") == message:
+                    if row.get("_kind") in ("memory_record", "memory_tidy"):
+                        return ""
+                    break
+        chat_log_path = getattr(session, "filepath", None)
+        if not isinstance(chat_log_path, str) or not chat_log_path:
+            chat_log_path = None
+        history = getattr(session, "sub_agent_thread_history", None)
+        if not isinstance(history, dict):
+            threads = getattr(session, "sub_agent_threads", None)
+            history = ({h: [r] for h, r in threads.items() if r}
+                       if isinstance(threads, dict) else {})
+        entries = source_log_entries(
+            messages, handle, fresh=fresh, thread_history=history,
+            chat_log_path=chat_log_path,
+            native_path_for=lambda h, record: self._native_log_path(
+                project_id, h, record, chat_log_path=chat_log_path),
+        )
+        return format_source_logs(entries)
+
+    def _native_log_path(self, project_id: str, handle: str, record: dict,
+                         *, chat_log_path: str | None = None) -> str | None:
+        """Resolve one persisted thread record to its native session log.
+
+        The same per-transport lookups ``_determine_resume`` trusts: a Codex
+        record by rollout path / exact thread id, a claude-code record by
+        the workspace slug under the configured store. ACP and Pi ids are
+        provider-owned and not files. Metadata only; never reads the log.
+        """
+        if not isinstance(record, dict):
+            return None
+        manifest = self._registry.get(handle) if self._registry else None
+        hint = getattr(getattr(manifest, "runtime", None), "transport", None)
+        if hint == "codex-appserver" or record.get("rollout_path"):
+            from agent_os.agent.transports.codex_transport import CodexTransport
+            return CodexTransport.resume_source_path(record)
+        if hint in ("acp-sdk", "pi-rpc"):
+            return None
+        session_id = record.get("session_id")
+        if not session_id:
+            return None
+        workspace = ""
+        if self._project_store is not None:
+            project = self._project_store.get_project(project_id)
+            workspace = (project or {}).get("workspace", "") or ""
+        if not workspace and chat_log_path:
+            # ``<workspace>/orbital/sessions/<id>.jsonl``
+            workspace = os.path.dirname(os.path.dirname(
+                os.path.dirname(chat_log_path)))
+        if not workspace:
+            return None
+        from agent_os.agent.transports.sdk_transport import SDKTransport
+        return SDKTransport.resume_source_path(workspace, session_id)
 
     async def _mark_queued_prompts_dropped(
         self, dropped, project_id: str, handle: str, *, session_id: str,
