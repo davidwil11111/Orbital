@@ -250,6 +250,44 @@ class TestTestOverride:
         r = engine.test_override(SLUG, str(tmp_path / "gone"), path_prepend=[])
         assert r["ok"] is False and "gone" in r["error"]
 
+    def test_no_check_command_passes_an_executable_without_spawning(
+            self, tmp_path, store, monkeypatch):
+        """Spec 127 D2: an agent with no ``check_command`` (dsh is an ACP
+        stdio server that takes only ``--config``) is tested by existence
+        and executability alone — never by running it, which would hang on
+        stdin until the timeout."""
+        binary = _fake_cli(tmp_path)
+        reg = AgentRegistry()
+        reg.register(_manifest(check_command=None))
+        engine = SetupEngine(reg, sub_agent_config_store=store)
+
+        def _never(*_a, **_k):
+            raise AssertionError("test_override must not spawn without a check command")
+        monkeypatch.setattr("agent_os.agents.setup_engine.subprocess.run", _never)
+
+        r = engine.test_override(SLUG, binary, path_prepend=[])
+        assert r == {"ok": True, "version_output": ""}
+
+    def test_no_check_command_still_needs_the_file(self, tmp_path, store):
+        reg = AgentRegistry()
+        reg.register(_manifest(check_command=None))
+        engine = SetupEngine(reg, sub_agent_config_store=store)
+        r = engine.test_override(SLUG, str(tmp_path / "gone"), path_prepend=[])
+        assert r["ok"] is False and "gone" in r["error"]
+
+    @pytest.mark.skipif(sys.platform == "win32",
+                        reason="Windows has no execute bit")
+    def test_no_check_command_refuses_a_non_executable_file(
+            self, tmp_path, store):
+        path = tmp_path / "codex"
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o644)
+        reg = AgentRegistry()
+        reg.register(_manifest(check_command=None))
+        engine = SetupEngine(reg, sub_agent_config_store=store)
+        r = engine.test_override(SLUG, str(path), path_prepend=[])
+        assert r["ok"] is False and "not executable" in r["error"]
+
     @_runs_fake_cli
     def test_space_in_path_survives(self, tmp_path, store):
         d = tmp_path / "Application Support"
