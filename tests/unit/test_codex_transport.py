@@ -50,6 +50,32 @@ class TestPolicyMapping:
         assert _POLICY_BY_AUTONOMY[Autonomy.CHECK_IN] == ("on-request", "workspace-write")
         assert _POLICY_BY_AUTONOMY[Autonomy.SUPERVISED] == ("on-request", "workspace-write")
 
+    def test_posix_hands_off_stays_never(self):
+        from agent_os.agent.transports.codex_transport import policy_for_autonomy
+        for os_name in ("macos", "linux"):
+            assert policy_for_autonomy(Autonomy.HANDS_OFF, os_name) == ("never", "workspace-write")
+
+    def test_windows_hands_off_asks_and_orbital_answers(self):
+        # Without a Codex sandbox, `never` rejects every command on Windows
+        # ("blocked by policy"); `on-request` lets Codex ask and the
+        # hands-off auto-accept (TestApprovals) answers without surfacing.
+        from agent_os.agent.transports.codex_transport import policy_for_autonomy
+        assert policy_for_autonomy(Autonomy.HANDS_OFF, "windows") == ("on-request", "workspace-write")
+        assert policy_for_autonomy(Autonomy.CHECK_IN, "windows") == ("on-request", "workspace-write")
+        assert policy_for_autonomy(Autonomy.SUPERVISED, "windows") == ("on-request", "workspace-write")
+        for policy, _ in (policy_for_autonomy(a, "windows") for a in Autonomy):
+            assert policy != "untrusted"
+
+    @pytest.mark.asyncio
+    async def test_thread_start_on_windows_sends_on_request(self, monkeypatch):
+        import agent_os.agent.transports.codex_transport as mod
+        monkeypatch.setattr(mod, "detect_os", lambda: "windows")
+        t, stdin = _wired(autonomy=Autonomy.HANDS_OFF)
+        method, params = t._thread_open_request("/tmp/ws")
+        assert method == "thread/start"
+        assert params["approvalPolicy"] == "on-request"
+        assert params["sandbox"] == "workspace-write"
+
 
 class TestCapability:
     def test_two_state_only(self):

@@ -38,6 +38,7 @@ from typing import AsyncIterator
 import psutil
 
 from agent_os.agent.prompt_builder import Autonomy
+from agent_os.daemon_v2.models import detect_os
 from agent_os.agent.transports.base import AgentTransport, TransportEvent
 from agent_os.agent.transports.jsonl_stream import (
     LineTooLongError,
@@ -82,6 +83,25 @@ _POLICY_BY_AUTONOMY: dict[Autonomy, tuple[str, str]] = {
     Autonomy.SUPERVISED: ("on-request", "workspace-write"),
 }
 _DEFAULT_POLICY = ("on-request", "workspace-write")
+
+
+def policy_for_autonomy(autonomy, os_name: str | None = None) -> tuple[str, str]:
+    """``(approvalPolicy, sandbox)`` for a thread under *autonomy*.
+
+    Windows hands-off is ``on-request``, not ``never``: Codex has no sandbox
+    there unless the user ran its elevated setup, and with ``never`` it then
+    REJECTS every command ("blocked by policy") instead of asking — the
+    keyless onboarding worker could not even list the folder (Windows
+    batch-1022 run, 2026-10-23). ``on-request`` makes Codex ask, and under
+    hands-off this transport answers "accept" itself without surfacing
+    anything (``should_auto_approve``), so the preset stays unattended. On a
+    machine whose Codex sandbox is set up, Codex runs sandboxed and never
+    asks, so this costs nothing there either.
+    """
+    policy = _POLICY_BY_AUTONOMY.get(autonomy, _DEFAULT_POLICY)
+    if autonomy is Autonomy.HANDS_OFF and (os_name or detect_os()) == "windows":
+        return ("on-request", policy[1])
+    return policy
 
 # Cold-start model resolution (TASK-codex-startup-model): the server default
 # (gpt-5.x-codex) 400s on ChatGPT-account auth, and OpenAI's guidance marks
@@ -629,8 +649,7 @@ class CodexTransport(AgentTransport):
         (model-is-config): passed when a current override exists, omitted
         otherwise so the provider serves the thread's last-used model.
         """
-        approval_policy, sandbox = _POLICY_BY_AUTONOMY.get(
-            self._autonomy, _DEFAULT_POLICY)
+        approval_policy, sandbox = policy_for_autonomy(self._autonomy)
         params: dict = {"cwd": workspace, "approvalPolicy": approval_policy,
                         "sandbox": sandbox}
         if self._model:
