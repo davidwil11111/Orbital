@@ -756,9 +756,14 @@ class TestConfigTemplateDispatchHook:
     @pytest.mark.asyncio
     async def test_missing_installed_template_fails_the_dispatch(self, tmp_path):
         """A config_template manifest with no installed template must not
-        silently spawn an unconfigured harness."""
+        silently spawn an unconfigured harness. The renderer first falls back
+        to the template bundled with the build (a launcher chosen on the
+        locate card has no staged copy; spec 127 V4) — covered by
+        test_composition_template_fallback.py — so this pins the case where
+        neither exists."""
         mgr, workspace = self._mgr(tmp_path, install_template=False)
-        with patch("agent_os.daemon_v2.sub_agent_manager.CLIAdapter") as MockAdapter:
+        with patch("agent_os.daemon_v2.sub_agent_manager.CLIAdapter") as MockAdapter, \
+                patch("agent_os.agents.installer.bundled_asset_path", return_value=None):
             adapter = MagicMock()
             adapter.start = AsyncMock()
             MockAdapter.return_value = adapter
