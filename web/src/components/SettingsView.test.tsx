@@ -36,7 +36,28 @@ vi.mock('./BudgetSection', () => ({
 }));
 vi.mock('./ProjectConnectorToggles', () => ({ default: () => null }));
 vi.mock('./NetworkAccessSection', () => ({ NetworkAccessSection: () => null }));
-vi.mock('./SubAgentCard', () => ({ default: () => null }));
+vi.mock('./SubAgentCard', () => ({
+  default: (p: { slug: string; ready: boolean }) => (
+    <div data-testid={`sub-agent-card-${p.slug}`} data-ready={String(p.ready)} />
+  ),
+}));
+
+// Daemon-global WS events. Keep the handlers so tests can emit at them.
+type WsHandler = (event: unknown) => void;
+const wsHandlers = new Map<string, Set<WsHandler>>();
+vi.mock('../hooks/useWebSocket', () => ({
+  useWebSocket: () => ({
+    on: (type: string, fn: WsHandler) => {
+      if (!wsHandlers.has(type)) wsHandlers.set(type, new Set());
+      wsHandlers.get(type)!.add(fn);
+    },
+    off: (type: string, fn: WsHandler) => {
+      wsHandlers.get(type)?.delete(fn);
+    },
+    connectionState: 'connected',
+    subscribe: vi.fn(),
+  }),
+}));
 
 const project: Project = {
   project_id: 'project-1',
@@ -126,6 +147,8 @@ describe('SettingsView sub-agent deployment instructions', () => {
 // Bug #36: GET /api/v2/settings/sub-agents took a measured 7.28 s on a cold
 // packaged daemon, and for all 7 s the section claimed the user had no
 // sub-agents installed. The empty state must not stand in for "still checking".
+// Spec 136 C.3: the section is built from the one sub-agent-memory reply,
+// which now carries `ready`; /settings/sub-agents is not asked at all.
 describe('SettingsView sub-agents loading state', () => {
   const INSTALL_HINT = "Install an agent's CLI on your machine to use it here.";
   const CHECKING = 'Checking installed sub-agents…';
@@ -139,7 +162,7 @@ describe('SettingsView sub-agents loading state', () => {
     localStorage.clear();
     mockApi.mockReset();
     mockApi.mockImplementation((path: string) => {
-      if (path === '/api/v2/settings/sub-agents') {
+      if (path === '/api/v2/projects/project-1/sub-agent-memory') {
         return new Promise((resolve, reject) => {
           settleSubAgents = { resolve, reject };
         });
@@ -148,6 +171,11 @@ describe('SettingsView sub-agents loading state', () => {
       if (path === '/api/v2/projects/project-1') return Promise.resolve({ ...project });
       return Promise.resolve([]);
     });
+  });
+
+  const memoryEntry = (slug: string, name: string, ready?: boolean) => ({
+    agent_slug: slug, agent_name: name, exists: false, content: '',
+    last_modified: null, size_bytes: 0, ...(ready === undefined ? {} : { ready }),
   });
 
   it('shows a checking message instead of the install hint while the probe is in flight', async () => {
@@ -180,14 +208,47 @@ describe('SettingsView sub-agents loading state', () => {
     render(<SettingsView project={project} onSave={vi.fn()} onDelete={vi.fn()} />);
 
     await act(async () => {
-      settleSubAgents.resolve([
-        { slug: 'codex', name: 'Codex', installed: true, ready: true },
-      ]);
+      settleSubAgents.resolve([memoryEntry('codex', 'Codex', true)]);
     });
 
     await waitFor(() => expect(screen.queryByText(CHECKING)).toBeNull());
+    expect(screen.getByTestId('sub-agent-card-codex')).toBeInTheDocument();
     // Toggles save themselves now; there is no Save below to remind about.
     expect(screen.queryByText(/Remember to Save/)).toBeNull();
+  });
+
+  it('builds the cards from the memory reply alone, with its ready flag', async () => {
+    render(<SettingsView project={project} onSave={vi.fn()} onDelete={vi.fn()} />);
+    await act(async () => {
+      settleSubAgents.resolve([
+        memoryEntry('codex', 'Codex', false),
+        memoryEntry('cursor', 'Cursor'), // an older daemon sends no `ready`
+      ]);
+    });
+    await waitFor(() => expect(screen.getByTestId('sub-agent-card-codex')).toBeInTheDocument());
+    expect(screen.getByTestId('sub-agent-card-codex')).toHaveAttribute('data-ready', 'false');
+    expect(screen.getByTestId('sub-agent-card-cursor')).toHaveAttribute('data-ready', 'true');
+    const paths = mockApi.mock.calls.map((c) => c[0]);
+    expect(paths).not.toContain('/api/v2/settings/sub-agents');
+  });
+
+  it('refetches the list when the daemon says the sub-agents changed', async () => {
+    render(<SettingsView project={project} onSave={vi.fn()} onDelete={vi.fn()} />);
+    await act(async () => {
+      settleSubAgents.resolve([memoryEntry('codex', 'Codex', false)]);
+    });
+    await waitFor(() => expect(screen.getByTestId('sub-agent-card-codex')).toBeInTheDocument());
+
+    act(() => {
+      wsHandlers.get('sub_agents.updated')?.forEach((fn) => fn({ type: 'sub_agents.updated' }));
+    });
+    // The refetch must not drop the cards back to "checking…" meanwhile.
+    expect(screen.queryByText(CHECKING)).toBeNull();
+    await act(async () => {
+      settleSubAgents.resolve([memoryEntry('codex', 'Codex', true)]);
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('sub-agent-card-codex')).toHaveAttribute('data-ready', 'true'));
   });
 });
 

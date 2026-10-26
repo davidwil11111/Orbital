@@ -11,6 +11,7 @@ import type {
   ProjectUpdateRequest,
 } from '../types';
 import { api, BASE_URL, isRelayMode, ApiError } from '../config';
+import { useWebSocket } from '../hooks/useWebSocket';
 import CardList from './CardList';
 import MigrationNoteBanner from './MigrationNoteBanner';
 import FallbackModelsEditor from './FallbackModelsEditor';
@@ -172,12 +173,11 @@ export default function SettingsView({
   const [memoryEntries, setMemoryEntries] = useState<SubAgentMemoryEntry[]>([]);
   const [memoryError, setMemoryError] = useState('');
 
-  // Sub-agent enable/disable state. The list of installed sub-agents is
-  // global (one daemon-level binary check); the denylist is per-project.
-  const [installedSubAgents, setInstalledSubAgents] = useState<InstalledSubAgent[]>([]);
-  // The binary probe behind GET /settings/sub-agents runs multi-second on a cold
-  // daemon; without this flag the section's empty state doubles as its loading
-  // state and tells the user they have no sub-agents installed (bug #36).
+  // Sub-agent enable/disable state. The installed list comes from the
+  // memory listing (one entry per installed agent, with `ready` — spec 136
+  // C.3); the denylist is per-project.
+  // Until that first reply the section's empty state must not double as its
+  // loading state and tell the user they have no sub-agents (bug #36).
   const [loadingSubAgents, setLoadingSubAgents] = useState(!project.is_scratch);
   const [disabledSubAgents, setDisabledSubAgents] = useState<string[]>(
     project.disabled_sub_agents ?? [],
@@ -317,8 +317,12 @@ export default function SettingsView({
   // Load sub-agent MEMORY.md list. Re-runs whenever the project changes
   // (which includes when disabled_sub_agents has been edited and saved
   // via the parent — the parent re-fetches and passes a fresh project).
+  // Scratch projects don't delegate to sub-agents, so skip.
   const fetchMemories = useCallback(async () => {
-    if (project.is_scratch) return;
+    if (project.is_scratch) {
+      setLoadingSubAgents(false);
+      return;
+    }
     setMemoryError('');
     try {
       const data = await api<SubAgentMemoryEntry[]>(
@@ -327,6 +331,9 @@ export default function SettingsView({
       setMemoryEntries(data);
     } catch (e) {
       setMemoryError(e instanceof ApiError ? e.detail : t('settings.subAgentMemories.loadError'));
+    } finally {
+      // Both outcomes, or a failed read wedges the section in "checking…".
+      setLoadingSubAgents(false);
     }
   }, [pid, project.is_scratch]);
 
@@ -334,37 +341,20 @@ export default function SettingsView({
     fetchMemories();
   }, [fetchMemories]);
 
-  // Load the installed sub-agents (global, daemon-level binary check) so the
-  // user can enable/disable each for THIS project. Scratch projects don't
-  // delegate to sub-agents, so skip.
+  // Spec 136 A.2: the daemon serves its last sweep at once and announces a
+  // background sweep that changed something; catch up without the spinner.
+  const ws = useWebSocket();
   useEffect(() => {
-    if (project.is_scratch) {
-      setLoadingSubAgents(false);
-      return;
-    }
-    let cancelled = false;
-    setLoadingSubAgents(true);
-    api<Array<{ slug: string; name: string; installed: boolean; ready: boolean }>>(
-      '/api/v2/settings/sub-agents',
-    )
-      .then((data) => {
-        if (cancelled) return;
-        setInstalledSubAgents(
-          data
-            .filter((s) => s.installed && s.slug !== 'built-in')
-            .map((s) => ({ slug: s.slug, name: s.name, ready: s.ready })),
-        );
-      })
-      .catch(() => {
-        // Non-fatal — the section falls back to its empty state.
-      })
-      // Must clear on BOTH outcomes or a failed probe wedges the section in
-      // "checking…" forever.
-      .finally(() => {
-        if (!cancelled) setLoadingSubAgents(false);
-      });
-    return () => { cancelled = true; };
-  }, [project.is_scratch]);
+    const onUpdated = () => { void fetchMemories(); };
+    ws.on('sub_agents.updated', onUpdated);
+    return () => { ws.off('sub_agents.updated', onUpdated); };
+  }, [ws, fetchMemories]);
+
+  // One card per installed sub-agent, so the user can enable/disable each
+  // for THIS project. An older daemon sends no `ready`: treat as ready.
+  const installedSubAgents: InstalledSubAgent[] = memoryEntries.map((e) => ({
+    slug: e.agent_slug, name: e.agent_name, ready: e.ready ?? true,
+  }));
 
   const { saveNow, saveSoon } = autosave;
 

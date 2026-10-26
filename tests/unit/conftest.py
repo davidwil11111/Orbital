@@ -14,6 +14,8 @@ profile under ``$DSH_HOME`` and reads keys from its credentials file there, so
 every unit test gets an empty ``DSH_HOME`` instead of the developer's ``~/.dsh``.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 
@@ -24,3 +26,13 @@ def _isolate_native_session_homes(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("ORBITAL_CODEX_HOME", str(empty / "codex"))
     monkeypatch.setenv("DSH_HOME", str(empty / "dsh"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_sub_agent_warm_up():
+    """Spec 136: ``create_app()``'s lifespan starts a background sweep of
+    every agent CLI. Unit tests that enter it must not probe the developer's
+    real CLIs (or race a test's own ``subprocess.run`` patch);
+    ``test_settings_sub_agents_136.py`` calls the route-level hook directly."""
+    with patch("agent_os.api.app.start_sub_agent_status"):
+        yield

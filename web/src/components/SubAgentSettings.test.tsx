@@ -1606,3 +1606,36 @@ describe('SubAgentSettings — desktop app sources', () => {
     expect(screen.getByTestId('sub-agent-locate-change-dsh')).toHaveTextContent('更改位置');
   });
 });
+
+// Spec 136 A.2: Settings shows the last sweep at once; when the daemon's
+// background sweep (or a late model list) changes it, `sub_agents.updated`
+// arrives and the list refetches without dropping back to the spinner.
+describe('SubAgentSettings — background status updates (spec 136)', () => {
+  it('refetches on sub_agents.updated and keeps the cards up meanwhile', async () => {
+    let settle: (value: unknown) => void = () => {};
+    api.mockResolvedValueOnce([makeEntry({ credentials_configured: false })]);
+    render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(screen.getByText('Not logged in')).toBeInTheDocument();
+
+    api.mockImplementationOnce(() => new Promise((resolve) => { settle = resolve; }));
+    emit('sub_agents.updated', { reason: 'status' });
+    expect(api).toHaveBeenLastCalledWith('/api/v2/settings/sub-agents');
+    expect(screen.getByText('Claude Code')).toBeInTheDocument();
+    expect(screen.queryByText('Loading sub-agents...')).toBeNull();
+
+    await act(async () => {
+      settle([makeEntry({ credentials_configured: true, missing_credentials: [] })]);
+    });
+    await waitFor(() => expect(screen.getByText('Logged in')).toBeInTheDocument());
+  });
+
+  it('stops listening when unmounted', async () => {
+    api.mockResolvedValueOnce([makeEntry()]);
+    const { unmount } = render(<SubAgentSettings />);
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    expect(wsHandlers.get('sub_agents.updated')?.size ?? 0).toBe(1);
+    unmount();
+    expect(wsHandlers.get('sub_agents.updated')?.size ?? 0).toBe(0);
+  });
+});

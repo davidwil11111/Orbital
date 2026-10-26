@@ -321,6 +321,19 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
 
   useEffect(() => { void load(); }, [load]);
 
+  // Spec 136 A.2: the list is served from the daemon's last sweep, however
+  // old; a background sweep (or a late model list) that changes it says so
+  // over the WS. Refetch quietly — the cards stay up, no spinner.
+  useEffect(() => {
+    const onUpdated = () => {
+      api<SubAgentEntry[]>('/api/v2/settings/sub-agents')
+        .then(setEntries)
+        .catch(() => { /* the next update or Refresh tries again */ });
+    };
+    ws.on('sub_agents.updated', onUpdated);
+    return () => { ws.off('sub_agents.updated', onUpdated); };
+  }, [ws]);
+
   // 1018 bench item 5: an update that took the CLI with it. Held here, not in
   // the card, because the refetched "not installed" entry may render as the
   // not-detected row instead of a card. The daemon already dropped its cached

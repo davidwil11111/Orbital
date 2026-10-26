@@ -699,15 +699,22 @@ def _validate_pin_slug(slug: str | None) -> None:
     if slug is None:
         return
     reserved = {"orbital", "built-in"}
-    known: set[str] = set()
-    if _setup_engine is not None:
-        try:
-            known = {getattr(s, "slug", None)
-                     for s in _setup_engine.check_all(allow_stale=True)}
-        except Exception:
-            logger.warning("pin slug validation: setup check failed", exc_info=True)
+    # Spec 136 D.2: "registered" is the registry's answer — no probe. This
+    # runs on the event loop, and right after an invalidation the sweep
+    # behind ``check_all`` would have run there in full.
+    registry = getattr(_setup_engine, "_registry", None) if _setup_engine is not None else None
+    known = False
+    try:
+        if registry is not None:
+            known = registry.get(slug) is not None
+        elif _setup_engine is not None:
+            # An engine without a registry (test doubles): its listing.
+            known = slug in {getattr(s, "slug", None)
+                             for s in _setup_engine.check_all(allow_stale=True)}
+    except Exception:
+        logger.warning("pin slug validation: registry lookup failed", exc_info=True)
     if (not slug or slug.lstrip("@").lower() in reserved
-            or slug not in known):
+            or not known):
         raise HTTPException(
             status_code=400,
             detail=f"Unknown agent {slug!r} for default_pinned_target",
@@ -4370,7 +4377,9 @@ def _resolve_available_sub_agents(project: dict) -> list[dict]:
     disabled = set(project.get("disabled_sub_agents", []) or [])
     if _setup_engine is None:
         return []
-    statuses = _setup_engine.check_all()
+    # Spec 136 A.1: the last sweep, however old (one background sweep
+    # refreshes it). The project's denylist is applied here, never cached.
+    statuses = _setup_engine.check_all(allow_stale=True)
     out: list[dict] = []
     for s in statuses:
         if s.slug == "built-in":
@@ -4554,14 +4563,15 @@ def _installed_sub_agents() -> list[dict]:
     """
     if _setup_engine is None:
         return []
-    statuses = _setup_engine.check_all()
+    # Spec 136 A.1: served stale, refreshed in the background.
+    statuses = _setup_engine.check_all(allow_stale=True)
     out: list[dict] = []
     for s in statuses:
         if s.slug == "built-in":
             continue
         if not s.installed:
             continue
-        out.append({"slug": s.slug, "name": s.name})
+        out.append({"slug": s.slug, "name": s.name, "ready": status_ready(s)})
     return out
 
 
@@ -4587,6 +4597,9 @@ async def list_sub_agent_memory(project_id: str):
     for entry in available:
         slug = entry["slug"]
         name = entry["name"]
+        # Spec 136 C.3: Project Settings builds its sub-agent cards from this
+        # one reply (it no longer asks /settings/sub-agents too).
+        ready = entry.get("ready", True)
         path = _memory_md_path_for(workspace, slug)
         if os.path.isfile(path):
             try:
@@ -4596,6 +4609,7 @@ async def list_sub_agent_memory(project_id: str):
                 out.append({
                     "agent_slug": slug,
                     "agent_name": name,
+                    "ready": ready,
                     "exists": True,
                     "content": content,
                     "last_modified": stat.st_mtime,
@@ -4605,6 +4619,7 @@ async def list_sub_agent_memory(project_id: str):
                 out.append({
                     "agent_slug": slug,
                     "agent_name": name,
+                    "ready": ready,
                     "exists": False,
                     "content": "",
                     "last_modified": None,
@@ -4614,6 +4629,7 @@ async def list_sub_agent_memory(project_id: str):
             out.append({
                 "agent_slug": slug,
                 "agent_name": name,
+                "ready": ready,
                 "exists": False,
                 "content": "",
                 "last_modified": None,

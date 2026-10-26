@@ -5,13 +5,16 @@
 """Global settings endpoints."""
 
 import asyncio
-import functools
+import copy
+import hashlib
 import inspect
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from uuid import uuid4
 
@@ -260,6 +263,8 @@ async def create_card(req: CreateCardRequest):
     telemetry.emit("key_set", {"provider": req.provider})
     telemetry.latch("key_set")
     test = await _test_and_record(card.id, reuse_recent=True)
+    # Pi borrows a card key for its configured model's provider.
+    _refresh_agents_in_background(_model_provider_slugs())
     return {"card": _masked(card.id), "test": test}
 
 
@@ -288,6 +293,8 @@ async def update_card(card_id: str, req: UpdateCardRequest):
     except (RuntimeError, ValueError) as exc:
         raise _card_error("keychain_error", str(exc), 500)
     test = await _test_and_record(card_id, reuse_recent=True) if retest else None
+    if retest:
+        _refresh_agents_in_background(_model_provider_slugs())
     return {"card": _masked(card_id), "test": test}
 
 
@@ -333,6 +340,7 @@ async def delete_card(card_id: str):
         _settings_store.update(current)
 
     _settings_store.delete_card(card_id)
+    _refresh_agents_in_background(_model_provider_slugs())
     return {"id": card_id, "deleted": True, "reassigned_projects": reassigned}
 
 
@@ -821,9 +829,141 @@ async def _augment_claude_live_models(entries: list[dict]) -> list[dict]:
     return entries
 
 
-async def _augment_live_models(entries: list[dict]) -> list[dict]:
-    return await _augment_acp_live_models(await _augment_claude_live_models(
-        await _augment_codex_live_models(entries)))
+# Spec 136 C: how long a Settings read waits for the live model lists. A
+# cached list answers within a loop tick or two; a cold probe (a CLI start,
+# 0.3-3 s) keeps running after the reply and announces its list with
+# ``sub_agents.updated`` when it lands.
+LIVE_MODEL_WAIT_S = 0.15
+SUB_AGENTS_UPDATED = "sub_agents.updated"
+# The last late model answer announced per augmenter: a refetch that misses
+# the budget again with the same answer must not announce again (the page
+# refetches on the event — announcing every time would loop).
+_late_model_digests: dict[str, str] = {}
+_late_model_tasks: set[asyncio.Task] = set()
+
+
+def _model_schemas(entries: list[dict]) -> str:
+    payload = json.dumps([(e.get("slug"), e.get("param_schema")) for e in entries],
+                         sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _broadcast_sub_agents_updated(reason: str) -> None:
+    if _ws_manager is not None:
+        _ws_manager.broadcast_global({"type": SUB_AGENTS_UPDATED, "reason": reason})
+
+
+async def _augment_live_models(entries: list[dict], *,
+                               wait: float = LIVE_MODEL_WAIT_S) -> list[dict]:
+    """Every live model list at once (they used to run one after another),
+    each against its own copy of the entries. Those that answer within
+    ``wait`` are merged into this reply; the rest finish in the background
+    and announce themselves when their list changes what the page shows."""
+    augmenters = (("codex", _augment_codex_live_models),
+                  ("claude-code", _augment_claude_live_models),
+                  ("acp", _augment_acp_live_models))
+    original = copy.deepcopy(entries)
+    jobs = []
+    for name, augment in augmenters:
+        mine = copy.deepcopy(original)
+        jobs.append((name, mine, _model_schemas(mine),
+                     asyncio.ensure_future(augment(mine))))
+    await asyncio.wait([task for *_rest, task in jobs], timeout=wait)
+    for name, mine, before, task in jobs:
+        if not task.done():
+            _finish_late(name, mine, before, task)
+            continue
+        if task.cancelled() or task.exception() is not None:
+            if not task.cancelled():
+                logger.warning("live model list failed (%s)", name,
+                               exc_info=task.exception())
+            continue
+        # Each augmenter changes its own agents' schemas only.
+        for entry, untouched, augmented in zip(entries, original, mine):
+            if augmented.get("param_schema") != untouched.get("param_schema"):
+                entry["param_schema"] = augmented.get("param_schema")
+        _late_model_digests[name] = _model_schemas(mine)
+    return entries
+
+
+def _finish_late(name: str, mine: list[dict], before: str, task: asyncio.Task) -> None:
+    _late_model_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _late_model_tasks.discard(t)
+        if t.cancelled() or t.exception() is not None:
+            return
+        after = _model_schemas(mine)
+        if after == before or _late_model_digests.get(name) == after:
+            return
+        _late_model_digests[name] = after
+        _broadcast_sub_agents_updated("models")
+
+    task.add_done_callback(_done)
+
+
+def start_sub_agent_status_updates(engine, ws_manager) -> None:
+    """Spec 136 A.2/A.3, at daemon start (on the event loop): a sweep that
+    changes the agents' status is announced to every client as
+    ``sub_agents.updated``, and the first sweep starts now, in the
+    background, so the first Settings open finds a result."""
+    loop = asyncio.get_running_loop()
+
+    def _on_change(_results) -> None:
+        # From the sweeping thread; broadcast_global is loop-only.
+        loop.call_soon_threadsafe(ws_manager.broadcast_global,
+                                  {"type": SUB_AGENTS_UPDATED, "reason": "status"})
+
+    set_listener = getattr(engine, "set_status_listener", None)
+    if callable(set_listener):
+        set_listener(_on_change)
+    warm = getattr(engine, "warm", None)
+    if callable(warm):
+        warm()
+
+
+def _refresh_agent_sync(slug: str):
+    """Spec 136 A.5: re-probe the one agent a change touched into the
+    cached sweep (an engine without it drops the sweep, as before)."""
+    refresh = getattr(_setup_engine, "refresh_agent", None)
+    if callable(refresh):
+        try:
+            return refresh(slug)
+        except Exception:  # noqa: BLE001 — fall back to dropping the sweep
+            logger.warning("re-probe of %s failed; dropping the sweep", slug,
+                           exc_info=True)
+    if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
+        _setup_engine.invalidate_cache()
+    return None
+
+
+async def _refresh_agent(slug: str) -> None:
+    await asyncio.to_thread(_refresh_agent_sync, slug)
+
+
+def _model_provider_slugs() -> list[str]:
+    """Agents whose credential follows the configured model's provider (Pi):
+    a saved card or model setting changes their state without a probe of
+    their own."""
+    registry = getattr(_setup_engine, "_registry", None)
+    if registry is None:
+        return []
+    return [m.slug for m in registry.list_all()
+            if any(c.type == "model_provider" for c in m.setup.credentials)]
+
+
+def _refresh_agents_in_background(slugs: list[str]) -> None:
+    """Re-probe ``slugs`` on a daemon thread; the result reaches open
+    Settings screens through ``sub_agents.updated``. For saves whose reply
+    must not wait on another agent's probe (cards, model settings)."""
+    if not slugs or not callable(getattr(_setup_engine, "refresh_agent", None)):
+        return
+
+    def _run() -> None:
+        for slug in slugs:
+            _refresh_agent_sync(slug)
+
+    threading.Thread(target=_run, name="sub-agent-reprobe", daemon=True).start()
 
 
 def _offers_live_acp_models(slug: str) -> bool:
@@ -903,12 +1043,23 @@ async def list_sub_agent_settings():
     """
     if _setup_engine is None:
         return []
-    statuses = await asyncio.to_thread(_setup_engine.check_all)
-    return await _augment_live_models([
-        _build_sub_agent_status_entry(s)
-        for s in statuses
-        if s.slug != "built-in"
-    ])
+    # Spec 136 A.1: the last sweep at once, however old; an expired one
+    # starts one background sweep whose changes arrive as
+    # ``sub_agents.updated``. Built in the same thread: the entries read the
+    # keychain for optional credentials.
+    entries = await asyncio.to_thread(_status_entries, True)
+    return await _augment_live_models(entries)
+
+
+def _status_entries(allow_stale: bool, handshake_wait: float | None = None) -> list[dict]:
+    check_all = _setup_engine.check_all
+    kwargs = {}
+    if allow_stale:
+        kwargs["allow_stale"] = True
+    if handshake_wait is not None and "handshake_wait" in inspect.signature(check_all).parameters:
+        kwargs["handshake_wait"] = handshake_wait
+    return [_build_sub_agent_status_entry(s)
+            for s in check_all(**kwargs) if s.slug != "built-in"]
 
 
 class SubAgentConfigRequest(BaseModel):
@@ -981,6 +1132,8 @@ async def put_sub_agent_config(slug: str, req: SubAgentConfigRequest):
                                               extra_allowed=extra_allowed)
     except SubAgentConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Pi's credential state follows its configured model's provider.
+    _refresh_agents_in_background([s for s in _model_provider_slugs() if s == slug])
     return {"slug": slug, "config": cleaned}
 
 
@@ -1032,11 +1185,13 @@ def _locate_test(slug: str, answer: str) -> dict:
 
 
 def _fresh_sub_agent_entry(slug: str) -> dict:
-    """The listing entry for ``slug`` after a detection change."""
+    """The listing entry for ``slug`` after a detection change — re-probed
+    into the cached sweep, so the list the card refetches agrees."""
     _setup_engine.invalidate_resolved_path(slug)
-    if hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
-    return _build_sub_agent_status_entry(_setup_engine.check_agent(slug))
+    status = _refresh_agent_sync(slug)
+    if status is None:
+        status = _setup_engine.check_agent(slug)
+    return _build_sub_agent_status_entry(status)
 
 
 @router.get("/settings/sub-agents/{slug}/locate-prompt")
@@ -1125,6 +1280,10 @@ async def refresh_sub_agent_status():
     # (a key or a network problem fixed since the last ask).
     if hasattr(_setup_engine, "forget_handshakes"):
         _setup_engine.forget_handshakes()
+    # Spec 136 B.3: version answers are cached by binary identity; a CLI
+    # rewritten in place with the same mtime and size is caught here.
+    if hasattr(_setup_engine, "forget_versions"):
+        _setup_engine.forget_versions()
     # User-triggered refresh wants CURRENT state — drop the codex model/list
     # cache too so a just-fixed install / new model generation shows up.
     from agent_os.agent.transports.codex_models import clear_codex_models_cache
@@ -1133,18 +1292,11 @@ async def refresh_sub_agent_status():
     clear_claude_models_cache()
     from agent_os.agents.acp_models import clear_acp_models_cache
     clear_acp_models_cache()
-    # The user asked for current state: wait for the handshakes (they run in
-    # parallel, so this costs the slowest one) instead of reporting them
-    # pending the way the routine sweep does.
-    check_all = _setup_engine.check_all
-    if "handshake_wait" in inspect.signature(check_all).parameters:
-        check_all = functools.partial(check_all, handshake_wait=HANDSHAKE_TIMEOUT_S)
-    statuses = await asyncio.to_thread(check_all)
-    return await _augment_live_models([
-        _build_sub_agent_status_entry(s)
-        for s in statuses
-        if s.slug != "built-in"
-    ])
+    # The user asked for current state: a fresh sweep, waiting for the
+    # handshakes (they run in parallel, so this costs the slowest one)
+    # instead of reporting them pending the way the routine sweep does.
+    entries = await asyncio.to_thread(_status_entries, False, HANDSHAKE_TIMEOUT_S)
+    return await _augment_live_models(entries)
 
 
 def _find_npm(binary: str | None) -> str | None:
@@ -1559,8 +1711,10 @@ async def _run_login_job(slug: str, job_id: str, command: str,
             _fail("nonzero_exit" if rc != 0 else "unverified", return_code=rc,
                   cli_missing=True)
             return
-    else:
-        _drop_cached_detection()
+    elif _setup_engine is not None:
+        # Spec 136 A.5: this agent's sign-in changed; re-probe it alone into
+        # the cached sweep before the terminal event makes the UI refetch.
+        await _refresh_agent(slug)
 
     if rc != 0:
         _fail("nonzero_exit", return_code=rc)
@@ -1755,11 +1909,11 @@ async def trigger_sub_agent_logout(slug: str):
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="logout timed out")
 
-    if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
     _forget_quota(slug)
     if result.returncode == 0:
         _clear_auth_failure(slug)
+    if _setup_engine is not None:
+        await _refresh_agent(slug)
 
     return {
         "slug": slug,
@@ -1860,8 +2014,7 @@ async def set_sub_agent_credential(slug: str, req: SubAgentCredentialRequest):
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    if hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
+    await _refresh_agent(slug)
     _forget_quota(slug)
 
     return {"slug": slug, "key": req.key, "set": True,
@@ -1875,8 +2028,7 @@ async def delete_sub_agent_credential(slug: str, key: str):
     _validate_credential_key(manifest, key)
     _sub_agent_credential_store().delete(key)
 
-    if hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
+    await _refresh_agent(slug)
     _forget_quota(slug)
 
     return {"slug": slug, "key": key, "set": False}
@@ -1942,8 +2094,8 @@ async def set_sub_agent_api_key(slug: str, req: SetSubAgentApiKeyRequest):
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
-        _setup_engine.invalidate_cache()
+    if _setup_engine is not None:
+        await _refresh_agent(slug)
     _forget_quota(slug)
 
     # The third way a key gets set, and the only one that emitted nothing.

@@ -8,6 +8,9 @@ Reads agent manifests from the registry, probes the system for installed
 binaries and satisfied dependencies, and reports what is available.
 """
 
+import concurrent.futures
+import copy
+import dataclasses
 import glob
 import hashlib
 import json
@@ -36,6 +39,11 @@ logger = logging.getLogger(__name__)
 # snappy for back-to-back requests; explicit invalidation clears it after any
 # action that could change the result (install, login, refresh).
 CHECK_ALL_CACHE_TTL_SECONDS = 60
+
+# Spec 136: the sweep runs every agent's probes at once on a pool of its own
+# (never asyncio's default executor, which the routes' ``to_thread`` work
+# shares), so a cold sweep costs the slowest agent instead of the sum.
+SWEEP_MAX_WORKERS = 8
 
 # The one placeholder in the manifest system, expanded in ``setup.auto_detect``
 # entries only. Agents Orbital installs itself land under the daemon's data dir,
@@ -108,18 +116,57 @@ def _expand_auto_detect_entry(expanded: str) -> list[str]:
     return sorted(glob.glob(expanded), key=_natural_key, reverse=True)
 
 
+_daemon_path_lock = threading.Lock()
+
+
 def _append_to_daemon_path(directory: str) -> None:
     """Append *directory* to ``os.environ["PATH"]`` once (spec 115 D3 rule).
 
     Appended, never prepended: the user's own PATH order stays authoritative
-    for anything it already resolves."""
+    for anything it already resolves. Locked: the parallel sweep resolves
+    several agents at once, and two read-modify-writes would lose one."""
     if not directory:
         return
-    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
-    if directory in entries:
-        return
-    entries.append(directory)
-    os.environ["PATH"] = os.pathsep.join(entries)
+    with _daemon_path_lock:
+        entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+        if directory in entries:
+            return
+        entries.append(directory)
+        os.environ["PATH"] = os.pathsep.join(entries)
+
+
+class _SweepMemo:
+    """Answers shared by every agent in one sweep (spec 136 B.2): ten
+    manifests ask ``node --version``, and it runs once. Single-flight per
+    key, so agents probed in parallel wait for the first ask."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._futures: dict[tuple, concurrent.futures.Future] = {}
+
+    def get(self, key: tuple, compute):
+        with self._lock:
+            future = self._futures.get(key)
+            owner = future is None
+            if owner:
+                future = concurrent.futures.Future()
+                self._futures[key] = future
+        if owner:
+            try:
+                future.set_result(compute())
+            except BaseException as exc:  # noqa: BLE001 — handed to every waiter
+                future.set_exception(exc)
+        return future.result()
+
+
+def _status_digest(results) -> str:
+    """A stable digest of a sweep, to tell a changed result from a repeat."""
+    def plain(obj):
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return dataclasses.asdict(obj)
+        return getattr(obj, "__dict__", str(obj))
+    payload = json.dumps([plain(r) for r in results], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def agent_store_path(store: dict, env: dict | None = None) -> str | None:
@@ -241,6 +288,26 @@ class SetupEngine:
         # finished, so its result is returned to its caller but not cached.
         self._cache_generation = 0
         self._refresh_thread: threading.Thread | None = None
+        self._sweep_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # Spec 136 B.3: ``--version`` output keyed by the binary's identity
+        # (realpath, mtime, size, app version, the check command and the
+        # locate card's PATH). A CLI's version only changes when its file
+        # does, so a sweep after the first skips these subprocesses. Kept for
+        # the daemon's lifetime; Refresh drops it (``forget_versions``).
+        self._version_cache: dict[tuple, str] = {}
+        # Spec 136 B.4: slugs whose binary was not found, with when that
+        # answer expires (the sweep TTL). Read by sweeps only, so a missing
+        # agent stops spawning its check command through a shell every sweep
+        # while a single-agent check (locate, install done) looks afresh.
+        self._resolved_misses: dict[str, float] = {}
+        # Spec 136 decision 2: the last answer each ``oauth_cli`` probe gave,
+        # kept when a later probe times out (Cursor's ``agent status`` hangs
+        # several times a day; a timeout used to read as signed out).
+        self._auth_verdicts: dict[tuple[str, str], bool] = {}
+        # Told when a sweep (or ``refresh_agent``) caches a result that
+        # differs from the last one; the app broadcasts it on the WS.
+        self._status_listener = None
+        self._published_digest: str | None = None
         # Spec 113: what the last ``oauth_cli`` auth probe for a slug came
         # back with — exit code, exception class, stderr category, duration —
         # so a dispatch refused for "not signed in" can carry structured
@@ -268,7 +335,7 @@ class SetupEngine:
             return False
         if slug not in self._auth_failures:
             self._auth_failures.add(slug)
-            self.invalidate_cache()
+            self._patch_auth_record(slug)
             logger.info("%s: dispatch failed with an authentication error; "
                         "marking its sign-in as expired", slug)
         return True
@@ -278,7 +345,33 @@ class SetupEngine:
         confirmed, or the user logged out."""
         if slug in self._auth_failures:
             self._auth_failures.discard(slug)
+            self._patch_auth_record(slug)
+
+    def _patch_auth_record(self, slug: str) -> None:
+        """Turn the cached entry's ``auth_expired`` to match the record.
+
+        The record changes nothing a probe reads, so the sweep is patched
+        instead of dropped (a dropped sweep re-probes every agent on the next
+        Settings read). A sweep in flight may already have read the old
+        record: then drop it, as before, so its result is not cached.
+        """
+        if self._probe_lock.locked():
             self.invalidate_cache()
+            return
+        cached = self._check_all_cache
+        if cached is None:
+            return
+        results = []
+        for status in cached[0]:
+            if getattr(status, "slug", None) == slug:
+                status = copy.copy(status)
+                status.auth_expired = bool(
+                    getattr(status, "installed", False)
+                    and getattr(status, "credentials_configured", False)
+                    and slug in self._auth_failures)
+            results.append(status)
+        self._check_all_cache = (results, cached[1])
+        self._publish(results)
 
     def auth_expired(self, slug: str) -> bool:
         return slug in self._auth_failures
@@ -344,10 +437,7 @@ class SetupEngine:
             cmd = self._substitute_binary(manifest.setup.check_command, manifest.runtime.command, binary)
             check_env = (self._override_env(override)
                          if manifest.slug in self._override_hits else None)
-            # Positional-only when there is nothing to add: test seams stub
-            # this method with a one-argument callable.
-            version = (self._run_check_command(cmd, env=check_env)
-                       if check_env is not None else self._run_check_command(cmd))
+            version = self._version_for(manifest.slug, binary, cmd, check_env)
 
         # Spec 116 D1/D4: the manifest's version floor, checked offline
         # against the version just read. No version → no floor (the agent
@@ -370,7 +460,9 @@ class SetupEngine:
         # for itself, and a later sign-in must read as signed in); one that
         # still says signed in cannot see the expiry, so it does not clear it.
         if manifest.slug in self._auth_failures and installed and not creds_ok:
-            self.clear_auth_failure(manifest.slug)
+            # Discarded, not ``clear_auth_failure``: this status is the one
+            # being built, so there is no cached entry to patch.
+            self._auth_failures.discard(manifest.slug)
         auth_expired = installed and creds_ok and manifest.slug in self._auth_failures
 
         # ACP agents: does the binary actually speak the protocol?
@@ -403,6 +495,41 @@ class SetupEngine:
             source=self.resolved_source(manifest.slug) if installed else None,
             handshake=handshake,
         )
+
+    def _version_for(self, slug: str, binary: str, cmd: str,
+                     check_env: dict[str, str] | None) -> str | None:
+        """The version check's output, cached by binary identity (B.3).
+
+        Keyed on the realpath's stat (npm, Homebrew and the claude installer
+        replace the file or repoint its symlink on update), the desktop app's
+        own version (its launcher script never changes), the command, and the
+        locate card's PATH. A failed check is not cached: it is asked again
+        next sweep.
+        """
+        key = None
+        try:
+            real = os.path.realpath(binary)
+            st = os.stat(real)
+            source = self._resolved_sources.get(slug) or {}
+            key = (slug, real, st.st_mtime_ns, st.st_size, source.get("app_version"),
+                   cmd, (check_env or {}).get("PATH"))
+        except OSError:
+            pass
+        if key is not None:
+            cached = self._version_cache.get(key)
+            if cached is not None:
+                return cached
+        # Positional-only when there is nothing to add: test seams stub
+        # this method with a one-argument callable.
+        version = (self._run_check_command(cmd, env=check_env)
+                   if check_env is not None else self._run_check_command(cmd))
+        if key is not None and version is not None:
+            self._version_cache[key] = version
+        return version
+
+    def forget_versions(self) -> None:
+        """Drop every cached version answer — the user's Refresh."""
+        self._version_cache.clear()
 
     # ------------------------------------------------------------------
     # ACP handshake (readiness verdict)
@@ -585,22 +712,101 @@ class SetupEngine:
             if cached is not None and time.monotonic() < cached[1]:
                 return cached[0]
             generation = self._cache_generation
-            results = []
-            self._start_handshakes()
-            # The sweep's handshake budget reaches check_agent through a
-            # thread-local, so the per-agent call keeps its plain signature.
-            self._sweep_local.handshake_wait = handshake_wait
+            started = time.monotonic()
+            self._sweep_local.in_sweep = True
             try:
-                for manifest in self._registry.list_all():
-                    results.append(self.check_agent(manifest.slug))
+                self._start_handshakes()
             finally:
-                self._sweep_local.handshake_wait = None
+                self._sweep_local.in_sweep = False
+            slugs = [m.slug for m in self._registry.list_all()]
+            memo = _SweepMemo()
+            timings: dict[str, float] = {}
+
+            def _one(slug: str) -> AgentSetupStatus:
+                # The sweep's handshake budget and memo reach check_agent
+                # through a thread-local, so the per-agent call keeps its
+                # plain signature (test seams stub it with one argument).
+                local = self._sweep_local
+                local.handshake_wait = handshake_wait
+                local.in_sweep = True
+                local.dep_memo = memo
+                t0 = time.monotonic()
+                try:
+                    return self.check_agent(slug)
+                finally:
+                    timings[slug] = time.monotonic() - t0
+                    local.handshake_wait = None
+                    local.in_sweep = False
+                    local.dep_memo = None
+
+            pool = self._sweep_executor()
+            # Results in registry order, whatever order the agents finish in.
+            results = [f.result() for f in [pool.submit(_one, s) for s in slugs]]
+            if timings:
+                slowest = max(timings, key=timings.get)
+                logger.info("check_all sweep: %d agents in %.2fs (slowest: %s %.2fs)",
+                            len(results), time.monotonic() - started,
+                            slowest, timings[slowest])
             if generation == self._cache_generation:
                 self._check_all_cache = (
                     results,
                     time.monotonic() + CHECK_ALL_CACHE_TTL_SECONDS,
                 )
+                self._publish(results)
             return results
+
+    def _sweep_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        if self._sweep_pool is None:
+            self._sweep_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=SWEEP_MAX_WORKERS, thread_name_prefix="check-all")
+        return self._sweep_pool
+
+    def refresh_agent(self, slug: str) -> AgentSetupStatus:
+        """Re-probe one agent and patch it into the cached sweep (spec 136 A.5).
+
+        For the single-agent changes — a login, logout, saved credential,
+        located binary, finished install — so the next read costs this
+        agent's probe instead of every agent's. The expiry is kept. Under the
+        probe lock, so a sweep in flight finishes first (its answer for this
+        agent may predate the change); not written when the cache was dropped
+        meanwhile. Waits for an ACP handshake verdict, like any single-agent
+        check.
+        """
+        with self._probe_lock:
+            generation = self._cache_generation
+            status = self.check_agent(slug)
+            cached = self._check_all_cache
+            if cached is not None and generation == self._cache_generation:
+                results = [status if getattr(r, "slug", None) == slug else r
+                           for r in cached[0]]
+                self._check_all_cache = (results, cached[1])
+                self._publish(results)
+            return status
+
+    def set_status_listener(self, listener) -> None:
+        """``listener(results)`` is called, from the sweeping thread, when a
+        cached result differs from the previous one. The first sweep is the
+        baseline: nothing was shown before it."""
+        self._status_listener = listener
+
+    def _publish(self, results) -> None:
+        try:
+            digest = _status_digest(results)
+        except Exception:  # noqa: BLE001 — never fail a sweep over its digest
+            logger.warning("sweep digest failed", exc_info=True)
+            return
+        previous, self._published_digest = self._published_digest, digest
+        if previous is None or previous == digest or self._status_listener is None:
+            return
+        try:
+            self._status_listener(results)
+        except Exception:  # noqa: BLE001 — a dead WS must not fail the sweep
+            logger.warning("sub-agent status listener failed", exc_info=True)
+
+    def warm(self) -> None:
+        """Start the first sweep in the background (daemon start), so the
+        first Settings open finds a result instead of running the sweep."""
+        self._refresh_in_background()
 
     def _refresh_in_background(self) -> None:
         """Start one daemon-thread sweep unless one is already running."""
@@ -643,6 +849,7 @@ class SetupEngine:
         """
         self._resolved_paths.pop(slug, None)
         self._resolved_sources.pop(slug, None)
+        self._resolved_misses.pop(slug, None)
         self._override_hits.discard(slug)
         self._override_missing.pop(slug, None)
 
@@ -788,6 +995,22 @@ class SetupEngine:
                         slug, cached)
             self.invalidate_resolved_path(slug)
 
+        # Spec 136 B.4: inside a sweep, a recent "not found" stands.
+        miss = self._resolved_misses.get(slug)
+        if (miss is not None and time.monotonic() < miss
+                and getattr(self._sweep_local, "in_sweep", False)):
+            return None
+        found = self._resolve_uncached(manifest)
+        if found is None:
+            self._resolved_misses[slug] = time.monotonic() + CHECK_ALL_CACHE_TTL_SECONDS
+        else:
+            self._resolved_misses.pop(slug, None)
+        return found
+
+    def _resolve_uncached(self, manifest: AgentManifest) -> str | None:
+        """``resolve_binary``'s strategies 0-5, without the caches."""
+        slug = manifest.slug
+
         # Strategy 0: the user chose the location.
         override = self._override_for(slug)
         if override is not None:
@@ -907,8 +1130,16 @@ class SetupEngine:
         Returns (all_met, missing_names).
         """
         missing: list[str] = []
+        # Spec 136 B.2: within one sweep, each distinct check runs once.
+        memo = getattr(self._sweep_local, "dep_memo", None)
         for dep in manifest.setup.dependencies:
-            if not self._check_single_dependency(dep.check_command, dep.min_version):
+            if memo is not None:
+                ok = memo.get(("dependency", dep.check_command, dep.min_version),
+                              lambda dep=dep: self._check_single_dependency(
+                                  dep.check_command, dep.min_version))
+            else:
+                ok = self._check_single_dependency(dep.check_command, dep.min_version)
+            if not ok:
                 missing.append(dep.name)
         return (len(missing) == 0, missing)
 
@@ -954,8 +1185,20 @@ class SetupEngine:
                 if not probe_cli_auth:
                     missing.append(cred.key)
                     continue
-                if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary,
-                                            slug=manifest.slug):
+                verdict = self._cli_auth_verdict(cred, manifest.runtime.command,
+                                                 resolved_binary, slug=manifest.slug)
+                remembered = (manifest.slug, cred.key)
+                if verdict is None:
+                    # Spec 136 decision 2: the probe timed out. Keep the last
+                    # answer; with none, the sign-in is unknown — never a
+                    # Login button for a CLI that simply did not answer.
+                    verdict = self._auth_verdicts.get(remembered)
+                    if verdict is None:
+                        state = state or "unknown"
+                        continue
+                else:
+                    self._auth_verdicts[remembered] = verdict
+                if not verdict:
                     missing.append(cred.key)
                 continue
             # The agent's own store wins over anything Orbital injects
@@ -1069,7 +1312,15 @@ class SetupEngine:
     def _check_cli_auth(self, cred, command: str | None = None,
                         resolved_binary: str | None = None, *,
                         slug: str | None = None) -> bool:
+        """Whether the CLI says it is signed in; a timeout reads as False."""
+        return self._cli_auth_verdict(cred, command, resolved_binary, slug=slug) is True
+
+    def _cli_auth_verdict(self, cred, command: str | None = None,
+                          resolved_binary: str | None = None, *,
+                          slug: str | None = None) -> bool | None:
         """Run a CLI command to check auth status (e.g. claude auth status --json).
+
+        None when the probe timed out: no answer, not a "signed out" one.
 
         Parses JSON output and checks check_field == check_value.
 
@@ -1142,8 +1393,9 @@ class SetupEngine:
                            stderr=stderr or f"{cred.check_field}={actual}",
                            why=f"{cred.check_field}={actual!r}, expected {cred.check_value!r}")
         except subprocess.TimeoutExpired as exc:
-            return _record(False, exit_code=None, exc=exc, stderr="",
-                           why="TimeoutExpired after 10s")
+            _record(False, exit_code=None, exc=exc, stderr="",
+                    why="TimeoutExpired after 10s")
+            return None
         except (FileNotFoundError, OSError, ValueError) as exc:
             return _record(False, exit_code=None, exc=exc, stderr=str(exc),
                            why=f"{type(exc).__name__}: {exc}")

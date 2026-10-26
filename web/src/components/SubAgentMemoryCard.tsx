@@ -17,6 +17,9 @@ export interface SubAgentMemoryEntry {
   content: string;
   last_modified: number | null;
   size_bytes: number;
+  /** Spec 136 C.3: dispatchable right now (installed, signed in, …), so
+   *  Project Settings needs no second request. Absent from older daemons. */
+  ready?: boolean;
 }
 
 interface Props {

@@ -156,6 +156,14 @@ def _configure_file_logging(data_dir: str) -> None:
     logger.info("Daemon file logging enabled at %s", log_path)
 
 
+def start_sub_agent_status(setup_engine, ws_manager) -> None:
+    """Spec 136 A.3: the first sub-agent sweep starts at daemon start, in
+    the background, and every later sweep that changes something is pushed
+    as ``sub_agents.updated``. A seam of its own so unit tests that enter the
+    app lifespan do not probe the developer's real CLIs."""
+    settings_routes.start_sub_agent_status_updates(setup_engine, ws_manager)
+
+
 def schedule_sandbox_grant_refresh(platform_provider, workspaces: list[str]):
     """Spec 109 D2: re-apply the Windows sandbox ACLs at daemon start, off the loop.
 
@@ -568,6 +576,13 @@ def create_app(data_dir: str | None = None) -> FastAPI:
         sub_agent_manager=sub_agent_manager,
     )
     app.include_router(settings_routes.router)
+
+    @app.on_event("startup")
+    async def _warm_sub_agent_status():
+        try:
+            start_sub_agent_status(setup_engine, ws_manager)
+        except Exception:
+            logger.warning("sub-agent status warm-up failed to start", exc_info=True)
 
     # 7b. File browsing routes
     files_v2.configure(project_store, agent_manager=agent_manager, ws_manager=ws_manager)

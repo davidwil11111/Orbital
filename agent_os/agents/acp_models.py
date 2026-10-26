@@ -36,6 +36,9 @@ SESSION_SETTLE_S = 1.5
 
 _cache: dict[tuple, tuple[float, dict | None]] = {}
 _lock = threading.Lock()
+# One probe per key at a time: Settings now asks in the background while the
+# page may ask again (spec 136 C.2), and each probe is an agent start.
+_inflight: dict[tuple, threading.Event] = {}
 
 
 def clear_acp_models_cache() -> None:
@@ -109,15 +112,26 @@ def live_options(engine, slug: str) -> dict | None:
     # list the previous configuration produced.
     fingerprint_of = getattr(engine, "spawn_fingerprint", None)
     key = (slug, fingerprint_of(slug, "") if callable(fingerprint_of) else None)
-    now = time.monotonic()
-    with _lock:
-        cached = _cache.get(key)
-        if cached is not None and now - cached[0] < CACHE_TTL_S:
-            return cached[1]
-    choices = _probe(engine, slug)
-    with _lock:
-        _cache[key] = (time.monotonic(), choices)
-    return choices
+    while True:
+        with _lock:
+            cached = _cache.get(key)
+            if cached is not None and time.monotonic() - cached[0] < CACHE_TTL_S:
+                return cached[1]
+            running = _inflight.get(key)
+            if running is None:
+                running = _inflight[key] = threading.Event()
+                break
+        # Another caller is probing this key: take its answer.
+        running.wait(timeout=60)
+    try:
+        choices = _probe(engine, slug)
+        with _lock:
+            _cache[key] = (time.monotonic(), choices)
+        return choices
+    finally:
+        with _lock:
+            _inflight.pop(key, None)
+        running.set()
 
 
 def _probe(engine, slug: str) -> dict | None:
