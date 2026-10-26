@@ -4,6 +4,7 @@
 
 """Test --setup-sandbox and --teardown-sandbox CLI flag handling."""
 
+import os
 import subprocess
 import sys
 
@@ -71,14 +72,19 @@ class TestTeardownSandboxFlag:
 class TestNormalLaunch:
     """Verify normal launch (no flags) doesn't accidentally run sandbox setup."""
 
-    def test_no_flag_does_not_run_setup(self):
+    def test_no_flag_does_not_run_setup(self, tmp_path):
         """Without --setup-sandbox, the entry point should NOT print sandbox messages.
 
         It will start the daemon (which we kill after a few seconds) — that's expected.
+        The daemon gets a scratch home: with the real one it wrote the desktop
+        data dir, reclaimed the machine-wide ``~/orbital/daemon.pid`` and
+        recorded an app_start telemetry event (batch 1026 Windows pass).
         """
+        env = {**os.environ, "APPDATA": str(tmp_path), "HOME": str(tmp_path),
+               "USERPROFILE": str(tmp_path), "AGENT_OS_TELEMETRY_DISABLED": "1"}
         proc = subprocess.Popen(
             [sys.executable, "-m", "agent_os.desktop.main"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
         )
         try:
             stdout, stderr = proc.communicate(timeout=5)
