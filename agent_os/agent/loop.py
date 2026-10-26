@@ -11,12 +11,16 @@ process response -> execute tools -> repeat.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import json
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import deque
 from uuid import uuid4
@@ -52,6 +56,38 @@ _diag_logger = logging.getLogger("agent.diag")
 # Per-session cache-hit aggregation (Part 4D). Shares the provider's cache
 # audit channel so per-call and per-session lines land together in daemon.log.
 _cache_logger = logging.getLogger("orbital.cache_audit")
+
+# Spec 134 A2: sync tools (shell above all) run on their own bounded pool, not
+# the event loop's default one. The default pool is ``min(32, cpu + 4)``
+# threads — 8 on a 4-core laptop — and every request handler that uses
+# ``asyncio.to_thread`` shares it; a few stuck shell calls used to fill it and
+# freeze the whole app. With the spec 134 runner no tool call outlives its
+# timeout, so this pool always drains.
+TOOL_POOL_SIZE = 16
+_tool_pool: ThreadPoolExecutor | None = None
+_tool_pool_lock = threading.Lock()
+
+
+def tool_executor() -> ThreadPoolExecutor:
+    """The process-wide pool sync tools run on (created on first use)."""
+    global _tool_pool
+    with _tool_pool_lock:
+        if _tool_pool is None:
+            _tool_pool = ThreadPoolExecutor(
+                max_workers=TOOL_POOL_SIZE, thread_name_prefix="orbital-tool")
+            from agent_os.utils import stall_watch
+
+            stall_watch.register_executor("tools", _tool_pool)
+        return _tool_pool
+
+
+async def run_sync_tool(func, /, *args):
+    """``asyncio.to_thread`` on the tool pool (context vars carried along)."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(
+        tool_executor(), functools.partial(ctx.run, func, *args))
+
 
 # Spec 013: minimum seconds between STARTED background memory passes.
 # Applies to every scheduler-routed trigger (agent_decided, over_budget,
@@ -1730,7 +1766,7 @@ class AgentLoop:
                                 tc["arguments"],
                             )
                         else:
-                            result: ToolResult = await asyncio.to_thread(
+                            result: ToolResult = await run_sync_tool(
                                 self._tool_registry.execute,
                                 tc["name"],
                                 tc["arguments"],
@@ -1920,7 +1956,7 @@ class AgentLoop:
                                 _signal_tc["name"], _signal_tc["arguments"],
                             )
                         else:
-                            _sig_result: ToolResult = await asyncio.to_thread(
+                            _sig_result: ToolResult = await run_sync_tool(
                                 self._tool_registry.execute,
                                 _signal_tc["name"], _signal_tc["arguments"],
                             )
@@ -2395,7 +2431,7 @@ class AgentLoop:
                             result = await self._tool_registry.execute_async(
                                 tc["name"], tc["arguments"])
                         else:
-                            result = await asyncio.to_thread(
+                            result = await run_sync_tool(
                                 self._tool_registry.execute,
                                 tc["name"], tc["arguments"])
                         content = dispatch_prefilter(

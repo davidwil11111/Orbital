@@ -26,6 +26,7 @@ import pytest
 
 from agent_os.agent.tools.base import ToolResult
 from agent_os.platform.types import CommandResult
+from tests.shell_doubles import fake_shell_run
 
 
 # ---------------------------------------------------------------------------
@@ -158,28 +159,21 @@ class TestShellToolFallback:
         """ShellTool falls back to subprocess.run() when provider is None."""
         tool = _make_shell_tool(platform_provider=None, os_type="windows")
 
-        with patch("agent_os.agent.tools.shell.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="subprocess_output\n", stderr=""
-            )
+        with fake_shell_run(stdout="subprocess_output\n") as mock_run:
             result = tool.execute(command="echo hello")
 
-            mock_run.assert_called_once()
+            assert len(mock_run.calls) == 1
             assert "subprocess_output" in result.content
 
     def test_execute_uses_subprocess_on_existing_behavior(self):
         """Legacy behavior: without provider, subprocess.run is called with correct shell."""
         tool = _make_shell_tool(platform_provider=None, os_type="linux")
 
-        with patch("agent_os.agent.tools.shell.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="linux output\n", stderr=""
-            )
+        with fake_shell_run(stdout="linux output\n") as mock_run:
             result = tool.execute(command="ls -la")
 
             # Should use bash for linux
-            call_args = mock_run.call_args
-            cmd = call_args[0][0] if call_args[0] else call_args[1].get("args")
+            cmd = mock_run.calls[0]["argv"]
             assert "bash" in cmd
 
 

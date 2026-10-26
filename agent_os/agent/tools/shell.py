@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable
 from uuid import uuid4
 
+from agent_os.platform.proc_runner import run_foreground
 from agent_os.utils.subprocess_flags import win_no_window_flags
 
 from .base import Tool, ToolResult
@@ -26,6 +27,16 @@ _MAX_LINES = 200
 _HEAD_LINES = 20
 _TAIL_LINES = 50
 _HARD_CAP = 50_000
+
+# Spec 134 A1 — appended to "timed out after N seconds". A timeout now ends the
+# whole process tree (it used to end only the shell and, on Windows, block on
+# the grandchildren for as long as they ran), so say so, and point long work
+# elsewhere than a foreground call.
+_TIMEOUT_HINT = (
+    " and was stopped, together with every process it started. If this is "
+    "long-running work (a server, a watcher, a long build or script), run it "
+    "in the background instead of waiting for it here."
+)
 
 # Patterns for detecting network-related commands
 _NETWORK_CMD_RE = re.compile(r'\b(curl|wget|npm|pip|git)\b')
@@ -94,6 +105,16 @@ _SANDBOX_WAIT_HINT = (
 # provider call made earlier in this process may have exported the allowlist
 # proxy into the daemon's own environment; the child must never inherit it.
 _PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+
+
+def _timeout_content(output: str) -> str:
+    """The tool result for a timed-out command: the hint, then what it printed."""
+    if len(output) > _HARD_CAP:
+        output = output[:_HARD_CAP] + "\n[OUTPUT TRUNCATED at 50,000 characters]"
+    content = f"Error: command timed out after {_TIMEOUT} seconds{_TIMEOUT_HINT}"
+    if output:
+        content += f"\nOutput before the timeout:\n{output}"
+    return content
 
 
 @dataclass(frozen=True)
@@ -644,11 +665,8 @@ class ShellTool(Tool):
             output = cmd_result.stdout
             if cmd_result.stderr:
                 output = output + cmd_result.stderr if output else cmd_result.stderr
-            output = self._truncate_output(output, self._workspace)
-            return ToolResult(
-                content=f"Error: command timed out after {_TIMEOUT} seconds\n{output}",
-                meta=meta,
-            )
+            output = _strip_marker(self._truncate_output(output, self._workspace))
+            return ToolResult(content=_timeout_content(output), meta=meta)
 
         output = cmd_result.stdout
         if cmd_result.stderr:
@@ -692,32 +710,27 @@ class ShellTool(Tool):
             if k.upper() not in _PROXY_ENV_VARS
         }
 
+        # Spec 134 A1: output to a file in the user's temp folder (as-user,
+        # same rule as the script above), own process group, tree kill on
+        # timeout only, bounded read-back. A truncated log is kept under the
+        # workspace's shell-output folder for the agent to ``read``.
+        from agent_os.agent.project_paths import ProjectPaths
+
         try:
-            proc = subprocess.run(
+            run = run_foreground(
                 cmd,
                 cwd=self._workspace,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=_TIMEOUT,
                 env=env,
-                creationflags=win_no_window_flags(),
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                content=f"Error: command timed out after {_TIMEOUT} seconds",
-                meta=meta,
+                log_dir=None,
+                keep_dir=ProjectPaths(self._workspace).shell_output_dir,
             )
         finally:
             self._remove_script(script)
 
-        output = proc.stdout or ""
-        if proc.stderr:
-            output = output + proc.stderr if output else proc.stderr
-        output = _strip_marker(output)
-
-        output = self._truncate_output(output, self._workspace)
+        output = _strip_marker(run.output.render(run.log_path))
+        if run.timed_out:
+            return ToolResult(content=_timeout_content(output), meta=meta)
 
         if len(output) > _HARD_CAP:
             output = output[:_HARD_CAP] + "\n[OUTPUT TRUNCATED at 50,000 characters]"
@@ -725,7 +738,7 @@ class ShellTool(Tool):
         # No ``[sandbox]`` hint here: outside the sandbox an EPERM is the OS
         # talking, and naming the sandbox would send the agent (and the user)
         # after a wall that is not there.
-        content = f"Exit code: {proc.returncode}\n{output}"
+        content = f"Exit code: {run.exit_code}\n{output}"
         return ToolResult(content=content, meta=meta)
 
     # Old name, kept for the dev-daemon path and existing callers.

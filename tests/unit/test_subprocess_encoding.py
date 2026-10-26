@@ -44,11 +44,6 @@ _ALLOWLIST: dict[str, tuple[int, str]] = {
         "policy question as shell.py. Windows worst case is stdout=None in "
         "the CommandResult, not an escaping exception.",
     ),
-    "agent_os/platform/macos/provider.py": (
-        1,
-        "macOS-only module (instantiated only when sys.platform == 'darwin'); "
-        "macOS locales are UTF-8, so locale decoding is the right default.",
-    ),
 }
 
 

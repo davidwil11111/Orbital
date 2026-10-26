@@ -13,7 +13,8 @@ and nothing else.
 What goes in (and nothing else): Orbital version, OS, the sub-agent status the
 settings page shows, the recent telemetry failure rows if the spool has them,
 the tail of ``daemon.log``, the desktop app's ``orbital-stderr.log``, the
-failure context the UI was opened from, and the install id the ping sender
+stall detector's ``hang.log`` (spec 134 A3), the failure context the UI was
+opened from, and the install id the ping sender
 uses. Never a workspace file, a session transcript, or a project path on
 purpose; the sanitiser catches the ones that leak through log lines.
 
@@ -39,10 +40,12 @@ from .spool import Spool
 logger = logging.getLogger(__name__)
 
 DAEMON_LOG_TAIL_BYTES = 200 * 1024
-# The server rejects bodies above 1 MB (413); keep the stderr log under a
-# cap so the two logs together can never reach it. The file is rewritten on
-# every launch, so it is normally a few KB.
-STDERR_LOG_MAX_BYTES = 600 * 1024
+# The server rejects bodies above 1 MB (413); the three log tails together
+# stay well under it. The stderr log is appended across launches (size-capped
+# by the desktop app, spec 134 A4), so its tail is what matters.
+STDERR_LOG_MAX_BYTES = 300 * 1024
+# Spec 134 A3: the stall detector's thread dumps. Newest at the end.
+HANG_LOG_TAIL_BYTES = 300 * 1024
 MAX_UPLOAD_BYTES = 1024 * 1024
 MAX_MESSAGE_CHARS = 4000
 RECENT_FAILURES_MAX = 20
@@ -123,6 +126,7 @@ class BundleSources:
     data_dir: Path | None
     daemon_log: Path | None
     stderr_log: Path | None
+    hang_log: Path | None = None
 
 
 def _daemon_log_from_root_logger() -> Path | None:
@@ -161,6 +165,9 @@ def default_sources(data_dir: Path | str | None) -> BundleSources:
         data_dir=base,
         daemon_log=daemon_log,
         stderr_log=desktop_log_dir() / "orbital-stderr.log",
+        # Spec 134 A3: written by agent_os/utils/stall_watch.py next to
+        # daemon.log.
+        hang_log=daemon_log.parent / "hang.log" if daemon_log is not None else None,
     )
 
 
@@ -289,5 +296,8 @@ def build_bundle(
 
     lines += ["", "== orbital-stderr.log =="]
     lines.append(_read_tail(sources.stderr_log, STDERR_LOG_MAX_BYTES, "orbital-stderr.log"))
+
+    lines += ["", f"== hang.log (last {HANG_LOG_TAIL_BYTES // 1024} KB) =="]
+    lines.append(_read_tail(sources.hang_log, HANG_LOG_TAIL_BYTES, "hang.log"))
 
     return sanitise("\n".join(lines)) + "\n"

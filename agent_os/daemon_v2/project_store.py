@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import threading
+import time
 from uuid import uuid4
 
 
@@ -86,6 +87,57 @@ DEFAULT_FLUSH_INTERVAL_SECONDS = 10.0
 DEFAULT_BUDGET_FLUSH_THRESHOLD_USD = 0.50
 
 
+class ProjectStoreCorrupt(RuntimeError):
+    """``projects.json`` is unreadable and no usable backup exists.
+
+    Raised instead of starting with an empty project list (spec 134 A5): an
+    empty list would look like every project was deleted, and the next save
+    would make that true. The desktop app shows the message in a window.
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        super().__init__(
+            f"{path} is unreadable ({reason}) and there is no usable backup "
+            f"({path}.bak). Orbital will not start with an empty project list. "
+            f"Move the file aside to start fresh, or restore it from a backup."
+        )
+
+
+def _read_projects_file(path: str) -> dict:
+    """Parse a projects file; ValueError/OSError when it is not a usable one."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    return data
+
+
+def _atomic_write_json(path: str, data) -> None:
+    """tmp + fsync + ``os.replace``: a reader sees the old file or the new one."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows: a scanner or indexer briefly holds the target.
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class ProjectStore:
     """CRUD for projects using JSON files on disk.
 
@@ -147,16 +199,52 @@ class ProjectStore:
         return False
 
     def _load(self) -> None:
-        if os.path.exists(self._projects_file):
-            with open(self._projects_file, "r", encoding="utf-8") as f:
-                self._projects = json.load(f)
-        else:
+        """Load ``projects.json``; restore it from ``.bak`` when corrupt.
+
+        Spec 134 A5: a good load refreshes the backup. A corrupt file is moved
+        aside (``projects.json.corrupt-<epoch>``) and the backup restored;
+        ``restored_from_backup`` records that for the caller. With no usable
+        backup, ``ProjectStoreCorrupt`` — never an empty list.
+        """
+        self.restored_from_backup = False
+        self.corrupt_copy: str | None = None
+        if not os.path.exists(self._projects_file):
             self._projects = {}
+            return
+        try:
+            self._projects = _read_projects_file(self._projects_file)
+        except (ValueError, OSError) as exc:
+            self._projects = self._restore_from_backup(exc)
+        try:
+            _atomic_write_json(self._backup_file, self._projects)
+        except OSError:
+            logger.warning("Could not write %s", self._backup_file, exc_info=True)
+
+    @property
+    def _backup_file(self) -> str:
+        return self._projects_file + ".bak"
+
+    def _restore_from_backup(self, exc: Exception) -> dict:
+        reason = f"{type(exc).__name__}: {exc}"
+        try:
+            data = _read_projects_file(self._backup_file)
+        except (ValueError, OSError):
+            logger.error("%s is unreadable (%s) and has no usable backup; "
+                         "refusing to start empty", self._projects_file, reason)
+            raise ProjectStoreCorrupt(self._projects_file, reason) from exc
+        aside = f"{self._projects_file}.corrupt-{int(time.time())}"
+        os.replace(self._projects_file, aside)
+        _atomic_write_json(self._projects_file, data)
+        logger.error("%s was unreadable (%s); moved it to %s and restored %d "
+                     "project(s) from %s", self._projects_file, reason, aside,
+                     len(data), self._backup_file)
+        self.restored_from_backup = True
+        self.corrupt_copy = aside
+        return data
 
     def _save(self) -> None:
         os.makedirs(self._data_dir, exist_ok=True)
-        with open(self._projects_file, "w", encoding="utf-8") as f:
-            json.dump(self._projects, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(self._projects_file, self._projects)
 
     def list_projects(self) -> list[dict]:
         return list(self._projects.values())

@@ -702,8 +702,9 @@ class TestAsyncToolExecution:
 
     @pytest.mark.asyncio
     async def test_tool_runs_in_thread(self, tmp_path):
-        """Tool execution should use asyncio.to_thread so sync tools don't
-        block the event loop."""
+        """Sync tools run in a worker thread so they don't block the event
+        loop — since spec 134 A2 on the dedicated tool pool, not the loop's
+        default one (``asyncio.to_thread``)."""
         session = Session.new("thread", str(tmp_path))
 
         tc = [{"id": "call_t", "type": "function",
@@ -723,7 +724,7 @@ class TestAsyncToolExecution:
                 return False
 
             def execute(self, name, arguments):
-                tool_thread_ids.append(threading.current_thread().ident)
+                tool_thread_ids.append(threading.current_thread())
                 return ToolResult(content="slow result")
 
             def tool_names(self):
@@ -740,10 +741,11 @@ class TestAsyncToolExecution:
 
         loop = AgentLoop(session, provider, registry, context_mgr)
 
-        with patch("agent_os.agent.loop.asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread:
-            persist_user_row(loop._session, "run slow tool")
-            await loop.run()
-            assert mock_to_thread.called
+        persist_user_row(loop._session, "run slow tool")
+        await loop.run()
+        assert len(tool_thread_ids) == 1
+        assert tool_thread_ids[0].ident != main_thread_id
+        assert tool_thread_ids[0].name.startswith("orbital-tool")
 
 
 # ===========================================================================
