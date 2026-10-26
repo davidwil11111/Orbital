@@ -246,3 +246,15 @@ def test_native_session_orbital_ran_as_a_worker_is_not_a_card(world):
     assert imported_session_id("codex", "019a-driven") not in ids
     assert ids == [imported_session_id("codex", "019a-users")]
     assert out["last_time"]["session_id"] == "orb_w"
+
+
+def test_orbital_run_native_threads_are_not_the_users(world, monkeypatch):
+    """Orbital's own kimi / minimax ACP runs carry no marker in the native
+    store; session_import's ``orbital_thread_ids`` names them (138-R)."""
+    import agent_os.onboarding.session_import as si
+    home, ws, _desk, scanner = world
+    codex_session(home, "019a-mine", ws, user="a thing I asked", at=iso(2), aborted=True)
+    codex_session(home, "019a-orb", ws, user="a worker task", at=iso(1), aborted=True)
+    monkeypatch.setattr(si, "orbital_thread_ids", lambda workspace: {"019a-orb"}, raising=False)
+    out = lo.left_off_for_project({"workspace": ws}, scanner)
+    assert [u["session_id"] for u in out["unfinished"]] == [imported_session_id("codex", "019a-mine")]

@@ -21,7 +21,7 @@ import threading
 from agent_os.onboarding.history import (
     HistoryScanner, LeftOffEntry, git_facts, is_noise, resets_at_if_future, select_left_off,
 )
-from agent_os.onboarding.history_types import CAUSE_NETWORK_AUTH, HistorySession
+from agent_os.onboarding.history_types import HistorySession
 from agent_os.onboarding.sources._common import TurnState, iter_json_lines, norm_ts
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ def _read_orbital(path: str) -> OrbitalSession | None:
                 elif row.get("source") == "management":
                     if content.startswith("LLM error") or "API key was rejected" in content:
                         probe.ended_at = ts or probe.ended_at
-                        turn.error(content, ts, fallback=CAUSE_NETWORK_AUTH)
+                        turn.error(content, ts)
                     elif content.startswith("[cancelled by user]"):
                         probe.ended_at = ts or probe.ended_at
                         turn.interrupted("cancelled")

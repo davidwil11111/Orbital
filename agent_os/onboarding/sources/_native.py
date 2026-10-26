@@ -271,7 +271,8 @@ def text_parts(content, kinds=("text",)) -> str:
 def history_home(home: str | None = None) -> str:
     """``home`` > ``$ORBITAL_HISTORY_HOME`` > ``~`` — the home whose agent
     stores are read (tests and smokes point it at a staged home)."""
-    return home or os.environ.get("ORBITAL_HISTORY_HOME") or os.path.expanduser("~")
+    from agent_os.onboarding import history_paths
+    return home or history_paths.history_home()
 
 
 def is_default_home(home: str) -> bool:

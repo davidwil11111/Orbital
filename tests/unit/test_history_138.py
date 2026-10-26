@@ -97,6 +97,15 @@ class TestClaudeReader:
                          isApiErrorMessage=True, error="authentication_failed")])
         assert s.stop.cause == CAUSE_NETWORK_AUTH
 
+    def test_unplaceable_api_error_still_counts_as_unfinished(self, tmp_path):
+        # Same choice as every reader (138-R): an error naming no cause is
+        # "interrupted", never a finished turn.
+        s = read_claude(tmp_path, [
+            cu("go"), ca("API Error: 529 overloaded", model="<synthetic>",
+                         isApiErrorMessage=True, error="unknown")])
+        assert s.stop.cause == CAUSE_INTERRUPTED
+        assert "overloaded" in s.stop.detail
+
     def test_tool_result_last_is_interrupted_mid_tool(self, tmp_path):
         s = read_claude(tmp_path, [
             cu("run the suite"), ca([tool_use("Bash", command="pytest")]), cu([tool_result()])])
@@ -217,6 +226,10 @@ class TestCodexReader:
             xev("error", message="400 Bad Request: the 'gpt-x' model is not supported"),
             xev("task_complete")])
         assert s.stop.cause == CAUSE_MODEL_UNAVAILABLE
+
+    def test_unplaceable_error_event_is_interrupted(self, tmp_path):
+        s = read_codex(tmp_path, [xmeta(), xu("go"), xev("error", message="stream disconnected")])
+        assert s.stop.cause == CAUSE_INTERRUPTED
 
     def test_usage_limit_error(self, tmp_path):
         s = read_codex(tmp_path, [xmeta(), xu("go"),

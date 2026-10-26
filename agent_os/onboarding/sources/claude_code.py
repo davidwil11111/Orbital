@@ -18,7 +18,7 @@ import os
 
 from agent_os.onboarding.history_paths import claude_dir
 from agent_os.onboarding.history_types import (
-    CAUSE_NETWORK_AUTH, CAUSE_USAGE_LIMIT, HistorySession,
+    CAUSE_INTERRUPTED, CAUSE_NETWORK_AUTH, CAUSE_USAGE_LIMIT, HistorySession,
 )
 from agent_os.onboarding.sources._common import (
     TurnState, add_skill, bump, iter_json_lines, norm_ts, note_mentions, touch,
@@ -153,7 +153,7 @@ def _read(path: str) -> HistorySession | None:
         if rec.get("isApiErrorMessage"):
             any_message = True
             touch(s, ts)
-            fallback = _ERROR_FIELD_CAUSES.get(rec.get("error"), CAUSE_NETWORK_AUTH)
+            fallback = _ERROR_FIELD_CAUSES.get(rec.get("error"), CAUSE_INTERRUPTED)
             turn.error(_assistant_text(content), ts, fallback=fallback)
             continue
         if msg.get("model") == "<synthetic>":
