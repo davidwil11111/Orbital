@@ -298,6 +298,14 @@ def _row(i, **fields):
       "_meta": {"event": "sub_agent_terminal", "kind": "error"}}, True),
     ({"role": "system", "source": "daemon", "content": "[Sub-agent] codex needs input",
       "_meta": {"event": "interaction_required"}}, True),
+    # Spec 134 Part B: a background job group's join answers the user; its
+    # check-in, start and stop notes do not.
+    ({"role": "system", "source": "daemon", "content": "[Background jobs grp_1] ...",
+      "_meta": {"event": "job_terminal", "kind": "job_join"}}, True),
+    ({"role": "system", "source": "daemon", "content": "[Background jobs grp_1] Check-in",
+      "_meta": {"event": "job_checkin"}}, False),
+    ({"role": "system", "source": "daemon", "content": "Background job job_1 was stopped",
+      "_meta": {"event": "job_note", "suppress_wake": True}}, False),
     # The dispatch ack / started rows carry no event: not a reply.
     ({"role": "system", "source": "daemon", "content": "[Sub-agent] Message sent to codex",
       "_meta": {"dispatch_id": "d1"}}, False),

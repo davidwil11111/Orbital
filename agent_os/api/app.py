@@ -441,6 +441,34 @@ def _assemble_app(app: FastAPI, data_dir: str | None) -> FastAPI:
     )
     sub_agent_manager._fanout_registry = fanout_registry
     lifecycle_observer.fanout_registry = fanout_registry
+    # 6a3. Background jobs (spec 134 Part B): fanout with process workers.
+    # ``shell(background=true)`` and the workspace launcher Codex/Pi run start
+    # jobs; the registry wakes the session when a group ends and checks in
+    # every 15 min. Started after boot cleanup of a crashed run's leftovers;
+    # every job tree ends at shutdown (jobs do not survive quitting).
+    from agent_os.daemon_v2.jobs import JobRegistry
+
+    job_registry = JobRegistry(
+        inject=agent_manager.inject_system_message,
+        broadcast=ws_manager.broadcast,
+        dispatch_worker=agent_manager.deliver_job_message_to_worker,
+        workspaces=lambda: [
+            (p.get("project_id", ""), p.get("workspace") or "")
+            for p in project_store.list_projects()
+        ],
+    )
+    agent_manager._job_registry = job_registry
+    sub_agent_manager._job_registry = job_registry
+    app.state.job_registry = job_registry
+
+    @app.on_event("startup")
+    async def _start_job_registry():
+        await job_registry.start()
+
+    @app.on_event("shutdown")
+    async def _stop_job_registry():
+        await job_registry.shutdown()
+
     # Worker-deps factory (Task 3): resolves provider/workspace/tool-registry
     # per fanout batch. Bound method, not called here — dispatch_fanout invokes
     # it once per dispatch as (project_id, session_id) -> WorkerDeps.

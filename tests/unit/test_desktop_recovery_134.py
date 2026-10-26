@@ -225,9 +225,13 @@ def test_failure_dialog_tail_reads_only_this_launch(tmp_path):
 
 
 def test_every_os_exit_in_main_releases_the_pid_file_first():
+    # Spec 134 Part B: main() leaves only through _exit_app (which also ends
+    # the background jobs); that one os._exit releases the PID file first.
     src = Path(main.__file__).read_text(encoding="utf-8")
-    lines = src[src.index("def main():"):].splitlines()
+    main_src = src[src.index("def main():"):]
+    assert "os._exit(0)" not in main_src
+    assert main_src.count("_exit_app(port)") == 2   # tray shutdown + macOS window close
+    lines = src[src.index("def _exit_app("):src.index("def _handle_window_close(")].splitlines()
     exits = [n for n, line in enumerate(lines) if line.strip() == "os._exit(0)"]
-    assert exits
-    for n in exits:
-        assert lines[n - 1].strip().startswith("release_pid_file()"), lines[n - 2:n + 1]
+    assert len(exits) == 1
+    assert "release_pid_file()" in lines[exits[0] - 1], lines[exits[0] - 2:exits[0] + 1]

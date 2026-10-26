@@ -31,8 +31,9 @@
 // tick for (see the `allTerminal` effect dependency below).
 
 import { useEffect, useState } from 'react';
+import { api } from '../config';
 import { useT } from '../i18n/useT';
-import type { FanoutTaskDescriptor, FanoutTaskStatus } from '../types';
+import type { FanoutTaskDescriptor, FanoutTaskStatus, JobRef } from '../types';
 import type { StringKey } from '../i18n/strings';
 
 /** True for every status except 'running' — the vocabulary has no other
@@ -85,6 +86,69 @@ const STATUS_LABEL_KEY: Record<FanoutTaskStatus, StringKey> = {
   interrupted: 'fanout.status.interrupted',
 };
 
+// Spec 134 Part B: background job rows reuse the fanout status vocabulary
+// (completed = exit 0, error = failed, interrupted = cancelled / stopped
+// because Orbital closed) but read as job states.
+const JOB_STATUS_LABEL_KEY: Record<FanoutTaskStatus, StringKey> = {
+  running: 'fanout.job.state.running',
+  completed: 'fanout.job.state.done',
+  error: 'fanout.job.state.failed',
+  stalled: 'fanout.job.state.failed',
+  interrupted: 'fanout.job.state.stopped',
+};
+
+type CancelState = 'idle' | 'pending' | 'failed';
+
+function JobRow({ task, job, status, elapsedMs }: {
+  task: FanoutTaskDescriptor;
+  job: JobRef;
+  status: FanoutTaskStatus;
+  elapsedMs: number;
+}) {
+  const t = useT();
+  const [cancel, setCancel] = useState<CancelState>('idle');
+  const onCancel = () => {
+    setCancel('pending');
+    api(`/api/v2/projects/${encodeURIComponent(job.project_id)}/jobs/${encodeURIComponent(job.job_id)}/cancel`,
+      { method: 'POST' })
+      // The row's status flips when the daemon's task update arrives.
+      .catch(() => setCancel('failed'));
+  };
+  const cancelKey: StringKey = cancel === 'pending'
+    ? 'fanout.job.cancelling'
+    : cancel === 'failed' ? 'fanout.job.cancelFailed' : 'fanout.job.cancel';
+  return (
+    <div data-testid={`fanout-row-${task.handle}`}
+         className="mb-1 flex items-center gap-2 w-full font-mono text-[11px] text-secondary">
+      <span className="flex-1 min-w-0 truncate text-primary font-medium" title={task.label}>
+        {job.agent ? <span className="text-secondary">{job.agent} · </span> : null}
+        {task.label}
+      </span>
+      <span
+        data-testid={`fanout-status-${task.handle}`}
+        data-status={status}
+        className={`shrink-0 rounded-full border px-2 py-0.5 text-2xs leading-4 ${STATUS_CLASS[status]}`}
+      >
+        {t(JOB_STATUS_LABEL_KEY[status])}
+      </span>
+      <span className="shrink-0 w-14 text-right text-[11px] font-mono text-secondary">
+        {formatElapsed(elapsedMs)}
+      </span>
+      {status === 'running' ? (
+        <button
+          type="button"
+          data-testid={`job-cancel-${task.handle}`}
+          onClick={onCancel}
+          disabled={cancel === 'pending'}
+          className="shrink-0 rounded border border-border px-1.5 py-0.5 text-2xs leading-4 text-secondary hover:text-primary hover:border-primary disabled:opacity-60 cursor-pointer disabled:cursor-default"
+        >
+          {t(cancelKey)}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function formatElapsed(ms: number): string {
   if (ms < 1000) return '<1s';
   const s = Math.round(ms / 1000);
@@ -118,6 +182,30 @@ export default function FanoutCard({
     return () => clearInterval(timer);
   }, [completedAtMs, allTerminal]);
   const batchDuration = formatElapsed(Math.max(0, (completedAtMs ?? now) - startedAtMs));
+  const isJobGroup = tasks.some((task) => task.job);
+  // Spec 134 Part B: a reloaded job card only knows what history rows said.
+  // A job that already ended while its group still runs has no such row, so
+  // rows not known to be finished take their state from the daemon once.
+  const [daemonJobs, setDaemonJobs] = useState<Record<string, { status: FanoutTaskStatus; endedAtMs?: number | null }>>({});
+  const jobProjectId = tasks.find((task) => task.job)?.job?.project_id;
+  const needsJobStates = isJobGroup && tasks.some(
+    (task) => task.job && !isTerminal(statuses[task.handle]?.status ?? 'running'));
+  useEffect(() => {
+    if (!needsJobStates || !jobProjectId) return;
+    let alive = true;
+    api<{ jobs?: Array<{ job_id: string; status: FanoutTaskStatus; ended_at_ms?: number | null }> }>(
+      `/api/v2/projects/${encodeURIComponent(jobProjectId)}/jobs`)
+      .then((body) => {
+        if (!alive) return;
+        const next: Record<string, { status: FanoutTaskStatus; endedAtMs?: number | null }> = {};
+        for (const j of body?.jobs ?? []) next[j.job_id] = { status: j.status, endedAtMs: j.ended_at_ms };
+        setDaemonJobs(next);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [needsJobStates, jobProjectId]);
 
   return (
     <div data-testid="fanout-card" data-fanout-id={fanoutId} className="ml-9 flex gap-[10px]">
@@ -125,7 +213,9 @@ export default function FanoutCard({
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 w-full font-mono text-[11px] text-secondary">
           <span className="truncate text-primary font-medium">
-            {t(tasks.length === 1 ? 'fanout.card.title.one' : 'fanout.card.title.other', { n: tasks.length })}
+            {isJobGroup
+              ? t(tasks.length === 1 ? 'fanout.jobs.title.one' : 'fanout.jobs.title.other', { n: tasks.length })
+              : t(tasks.length === 1 ? 'fanout.card.title.one' : 'fanout.card.title.other', { n: tasks.length })}
           </span>
           <span className="ml-auto shrink-0 text-[11px] font-mono text-secondary">{batchDuration}</span>
         </div>
@@ -136,6 +226,18 @@ export default function FanoutCard({
             // Per-row freeze (issue 1): this row's own completedAtMs wins;
             // else fall back to the batch join time; else keep ticking.
             const rowElapsed = Math.max(0, (entry?.completedAtMs ?? completedAtMs ?? now) - startedAtMs);
+            if (task.job) {
+              const fetched = daemonJobs[task.handle];
+              const jobStatus = entry && isTerminal(entry.status)
+                ? entry.status
+                : (fetched?.status ?? entry?.status ?? 'running');
+              // A job's own recorded end (from history) beats the batch time
+              // a history merge stamps on every row.
+              const jobEnd = task.job.ended_at_ms ?? fetched?.endedAtMs ?? entry?.completedAtMs
+                ?? completedAtMs ?? now;
+              return <JobRow key={task.handle} task={task} job={task.job} status={jobStatus}
+                             elapsedMs={Math.max(0, jobEnd - startedAtMs)} />;
+            }
             return (
               <div key={task.handle} className="mb-1 font-mono text-[11px] text-secondary">
                 <button

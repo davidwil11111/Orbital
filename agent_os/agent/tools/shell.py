@@ -35,8 +35,30 @@ _HARD_CAP = 50_000
 _TIMEOUT_HINT = (
     " and was stopped, together with every process it started. If this is "
     "long-running work (a server, a watcher, a long build or script), run it "
-    "in the background instead of waiting for it here."
+    "with `background: true` instead of waiting for it here: the call returns "
+    "at once and Orbital messages you when it ends."
 )
+
+# Spec 134 Part B — what the agent reads about background jobs.
+_DESCRIPTION = "Execute a shell command in the workspace."
+_BACKGROUND_DESCRIPTION = (
+    "Execute a shell command in the workspace. A foreground call is stopped "
+    f"after {_TIMEOUT} seconds. For anything that can take longer (a build, a "
+    "test suite, training, a download, a server, a long script) pass "
+    "`background: true`: the call returns at once with a job id and its output "
+    "file, your turn ends after this message's tool calls, and Orbital sends you "
+    "the exit code and the last output lines when it ends (and checks in every "
+    "15 minutes while it runs). Do not sleep or poll to wait for it."
+)
+_BACKGROUND_PARAM = {
+    "type": "boolean",
+    "description": (
+        "Run as a background job instead of waiting. Several background calls "
+        "in one message form one group: you are woken when all of them have "
+        "ended, or at once when one fails."
+    ),
+}
+_STARTED_RE = re.compile(r"Started background job (job_[0-9a-f]+)")
 
 # Patterns for detecting network-related commands
 _NETWORK_CMD_RE = re.compile(r'\b(curl|wget|npm|pip|git)\b')
@@ -450,7 +472,8 @@ class ShellTool(Tool):
     def __init__(self, workspace: str, os_type: str,
                  platform_provider=None, project_id: str | None = None,
                  safe_mode_cb: Callable[[], bool] | None = None,
-                 unsandboxed_cb: Callable[[], list[str]] | None = None):
+                 unsandboxed_cb: Callable[[], list[str]] | None = None,
+                 jobs=None, session_id: str | None = None):
         self._workspace = workspace
         self._os_type = os_type
         self._platform_provider = platform_provider
@@ -461,8 +484,12 @@ class ShellTool(Tool):
         # allow"). Both None → the legacy rule (provider when one is set up).
         self._safe_mode_cb = safe_mode_cb
         self._unsandboxed_cb = unsandboxed_cb
+        # Spec 134 Part B: the daemon's JobRegistry and this tool's session.
+        # Without them (fanout workers, tests) there is no ``background``.
+        self._jobs = jobs
+        self._session_id = session_id
         self.name = "shell"
-        self.description = "Execute a shell command in the workspace."
+        self.description = _BACKGROUND_DESCRIPTION if jobs is not None else _DESCRIPTION
         self.parameters = {
             "type": "object",
             "properties": {
@@ -470,6 +497,8 @@ class ShellTool(Tool):
             },
             "required": ["command"],
         }
+        if jobs is not None:
+            self.parameters["properties"]["background"] = dict(_BACKGROUND_PARAM)
 
     def _is_toolchain_path(self, path: str) -> bool:
         """True when the path is a tool reading its own installation.
@@ -744,6 +773,91 @@ class ShellTool(Tool):
     # Old name, kept for the dev-daemon path and existing callers.
     _execute_via_subprocess = _execute_unsandboxed
 
+    # --- Spec 134 Part B — background jobs --------------------------------
+
+    def _execute_background(self, command: str, meta: dict) -> ToolResult:
+        """Start *command* as a background job and return at once.
+
+        Open path (safe mode off, the default for new projects): Orbital spawns
+        it detached through the A1 runner (own process group; on Windows a
+        kill-on-close Job Object held for the app's lifetime). Sandboxed: the
+        workspace launcher (``orbital/bin/bg``) is run through the provider,
+        so the job inherits the sandbox and detaches inside it.
+        """
+        from agent_os.agent.loop import current_tool_batch
+
+        refusal = self._jobs.admission(self._project_id or "", self._workspace)
+        if refusal:
+            return ToolResult(content=refusal, meta=meta)
+        group = self._jobs.open_group(
+            self._project_id or "", self._session_id or "", self._workspace,
+            batch_key=current_tool_batch())
+        sandboxed = not self._runs_unsandboxed(command) and (
+            self._platform_provider is not None
+            and self._platform_provider.get_capabilities().setup_complete)
+        if sandboxed:
+            job, failure = self._start_via_launcher(command, group, meta)
+            if job is None:
+                return failure
+        else:
+            cmd, _script = self._build_cmd(command, as_user=True)
+            env = {
+                k: v for k, v in os.environ.items()
+                if k.upper() not in _PROXY_ENV_VARS
+            }
+            try:
+                job = self._jobs.spawn_job(group, command, cmd, env=env)
+            except OSError as e:
+                self._remove_script(_script)
+                return ToolResult(content=f"Error: the background job could not start: {e}",
+                                  meta=meta)
+            # PowerShell has read a ``-File`` script once it runs; the script
+            # (Windows only) goes with the job's other scratch.
+            if _script:
+                job.scratch.append(_script)
+        return ToolResult(content=self._jobs.start_text(job), meta={
+            **meta,
+            "yield_after_batch": True,
+            "background_job": {
+                "job_id": job.id, "group_id": job.group_id,
+                "project_id": job.project_id, "session_id": job.session_id,
+                "command": job.command, "pid": job.pid,
+                "started_at_ms": int(job.started_at * 1000),
+            },
+        })
+
+    def _start_via_launcher(self, command: str, group, meta: dict):
+        """Run the workspace launcher through the sandboxed provider path."""
+        from agent_os.agent.project_paths import ProjectPaths
+        from agent_os.daemon_v2.job_launcher import ensure_launcher
+
+        ensure_launcher(self._workspace)
+        bin_dir = ProjectPaths(self._workspace).bin_dir
+        assignments = {
+            "ORBITAL_SESSION_ID": group.session_id,
+            "ORBITAL_PROJECT_ID": group.project_id,
+            "ORBITAL_JOB_GROUP": group.id,
+        }
+        if self._os_type == "windows":
+            def ps(v: str) -> str:
+                return "'" + v.replace("'", "''") + "'"
+            launch = "; ".join(f"$env:{k}={ps(v)}" for k, v in assignments.items())
+            launch += f"; & {ps(os.path.join(bin_dir, 'bg.ps1'))} {ps(command)}"
+        else:
+            launch = " ".join(f"{k}={shlex.quote(v)}" for k, v in assignments.items())
+            launch += f" {shlex.quote(os.path.join(bin_dir, 'bg'))} {shlex.quote(command)}"
+        result = self._execute_via_provider(launch, meta)
+        match = _STARTED_RE.search(result.content if isinstance(result.content, str) else "")
+        job = None
+        if match:
+            job = self._jobs.adopt(ProjectPaths(self._workspace).job_dir(match.group(1)),
+                                   group=group, project_id=self._project_id)
+        if job is None:
+            return None, ToolResult(
+                content=f"Error: the background job could not start:\n{result.content}",
+                meta=result.meta)
+        return job, None
+
     @staticmethod
     def executable_of(command: str, _depth: int = 0) -> str:
         """The program "always allow" records for *command* (spec 117 D5).
@@ -824,7 +938,9 @@ class ShellTool(Tool):
             # Spec 117: the project's switch decides first; then the legacy
             # rule — provider path only when a real provider is set up (not
             # NullProvider).
-            if self._runs_unsandboxed(command):
+            if arguments.get("background") is True and self._jobs is not None:
+                result = self._execute_background(command, meta)
+            elif self._runs_unsandboxed(command):
                 result = self._execute_unsandboxed(command, meta)
             elif (self._platform_provider is not None
                     and self._platform_provider.get_capabilities().setup_complete):

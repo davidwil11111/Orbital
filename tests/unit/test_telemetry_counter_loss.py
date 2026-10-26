@@ -196,7 +196,12 @@ class TestDesktopExitFlush:
         point must be preceded by the flush call (the two exit paths are not
         unit-drivable — they tear down the interpreter)."""
         src = Path(desktop_src()).read_text(encoding="utf-8")
-        body = src[src.index("def main():"):]
+        # Spec 134 Part B: both exit paths of main() (tray shutdown, macOS
+        # window close) go through _exit_app, the one os._exit.
+        main_body = src[src.index("def main():"):]
+        assert "os._exit(0)" not in main_body
+        assert main_body.count("_exit_app(port)") == 2
+        body = src[src.index("def _exit_app("):src.index("def _handle_window_close(")]
         exits = [i for i in range(len(body)) if body.startswith("os._exit(0)", i)]
         assert exits, "no exit paths found"
         for i in exits:
