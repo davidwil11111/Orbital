@@ -23,8 +23,36 @@ from .spool import Spool
 
 SCHEMA_VERSION = 1
 
-# Milestone names carried in every ping (lifetime booleans, §5).
-MILESTONES = ("key_set", "first_project", "first_session", "first_turn")
+# Milestone names carried in every ping (lifetime booleans, §5). Spec 138
+# adds the onboarding-from-history funnel: the key step skipped, the first
+# batch import, the first left-off card opened, the first send in a session
+# imported from another agent's history.
+MILESTONES = ("key_set", "first_project", "first_session", "first_turn",
+              "key_skipped", "first_import", "first_leftoff_open", "first_imported_send")
+
+# Spec 138 onboarding enums. Anything outside them is dropped, never sent.
+WIZARD_STEPS = ("agents", "projects", "key", "accounts", "done")
+HISTORY_BUCKETS = ("0", "1-10", "11-100", "100+")
+LEFTOFF_KINDS = ("last_time", "unfinished")
+STOP_CAUSES = ("usage_limit", "model_unavailable", "network_auth", "interrupted", "no_reply")
+
+
+def history_bucket(n: int) -> str:
+    """``history_sessions_bucket`` for a session count."""
+    if n <= 0:
+        return "0"
+    if n <= 10:
+        return "1-10"
+    if n <= 100:
+        return "11-100"
+    return "100+"
+
+
+def _count(value: object) -> int:
+    """A non-negative int field from a spool row (anything else is 0)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, min(value, 1_000_000))
 
 # Sub-agent slugs allowed to leave the machine. A dispatch handle is chosen by
 # the model, so a hallucinated name reaches the spawn and fails — anything not
@@ -120,6 +148,17 @@ def build_ping(
         # ``diagnostics.sanitize_failure_row`` — so a user's problem can be
         # located from this payload alone.
         "recent_failures": [],
+        # Spec 138 — value-first onboarding from the user's agent history.
+        "wizard_step_reached": {step: 0 for step in WIZARD_STEPS},
+        "agents_detected": None,
+        "agents_located": 0,
+        "history_sessions_bucket": None,
+        "projects_imported": {"folder": 0, "group": 0},
+        "projects_unchecked": 0,
+        "leftoff_shown": 0,
+        "leftoff_opened": {kind: 0 for kind in LEFTOFF_KINDS},
+        "unfinished_opened_by_cause": {cause: 0 for cause in STOP_CAUSES},
+        "agent_switch_after_open": 0,
     }
     recent: list[dict] = []
     for row in spool.read_day(day):
@@ -175,6 +214,31 @@ def build_ping(
                 reason = _reason_bucket(row.get("reason"), SUBAGENT_FAILURE_REASONS)
                 _bump(counters["subagent_failed_by_reason"], reason)
                 _bump(by_agent["failed_by_reason"], reason)
+        elif event == "wizard_step_reached":
+            if row.get("step") in WIZARD_STEPS:
+                counters["wizard_step_reached"][row["step"]] += 1
+        elif event == "agents_detected":
+            # Latest report of the day: how many supported agents were found.
+            counters["agents_detected"] = _count(row.get("n"))
+        elif event == "agent_located":
+            counters["agents_located"] += 1
+        elif event == "history_sessions_bucket":
+            if row.get("bucket") in HISTORY_BUCKETS:
+                counters["history_sessions_bucket"] = row["bucket"]
+        elif event == "projects_imported":
+            counters["projects_imported"]["folder"] += _count(row.get("folder"))
+            counters["projects_imported"]["group"] += _count(row.get("group"))
+        elif event == "projects_unchecked":
+            counters["projects_unchecked"] += _count(row.get("n"))
+        elif event == "leftoff_shown":
+            counters["leftoff_shown"] += 1
+        elif event == "leftoff_opened":
+            if row.get("kind") in LEFTOFF_KINDS:
+                counters["leftoff_opened"][row["kind"]] += 1
+                if row["kind"] == "unfinished" and row.get("cause") in STOP_CAUSES:
+                    counters["unfinished_opened_by_cause"][row["cause"]] += 1
+        elif event == "agent_switch_after_open":
+            counters["agent_switch_after_open"] += 1
         if event in FAILURE_EVENTS:
             recent.append(sanitize_failure_row(row, agent_bucket=_subagent_bucket))
     # Bounded and newest-last: the spool is append-only in time order.

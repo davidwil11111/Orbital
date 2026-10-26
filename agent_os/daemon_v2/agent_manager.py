@@ -6087,6 +6087,10 @@ class AgentManager:
             workspace = project.get("workspace") or ""
             if not project_id or not workspace:
                 continue
+            if project.get("deferred_seed"):
+                # Spec 138: an imported project writes nothing (the queue
+                # file included) until first use starts its dispatcher.
+                continue
             try:
                 await self._ensure_dispatcher(project_id, workspace)
             except Exception:
