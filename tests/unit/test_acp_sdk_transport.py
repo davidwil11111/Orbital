@@ -117,6 +117,34 @@ async def test_missing_resume_session_falls_back_fresh_but_reports_reason(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_resume_refused_as_invalid_params_falls_back_fresh(tmp_path):
+    """Spec 138: a session imported into a group project ran in another
+    folder; MiniMax Code refuses session/resume for a different cwd with
+    Invalid params ("Requested cwd does not match the persisted session
+    workspace"). That is a refusal of THIS session, so the dispatch starts
+    fresh (the recap carries the conversation) instead of failing."""
+    transport = ACPSDKTransport(resume_record={"session_id": "elsewhere"})
+    transport._workspace = str(tmp_path)
+    transport._connection = AsyncMock()
+    transport._connection.initialize.return_value = InitializeResponse(
+        protocol_version=1,
+        agent_capabilities=AgentCapabilities(
+            load_session=True, session_capabilities=SessionCapabilities()
+        ),
+    )
+    transport._connection.load_session.side_effect = RequestError.invalid_params(
+        {"message": "Requested cwd does not match the persisted session workspace"}
+    )
+    transport._connection.new_session.return_value = NewSessionResponse(
+        session_id="fresh", config_options=[]
+    )
+    await transport._initialize_and_open_session()
+    assert transport.session_id == "fresh"
+    assert transport.resume_outcome == ("fresh", "resume_failed")
+    assert transport._resume_session_id is None
+
+
+@pytest.mark.asyncio
 async def test_generic_resume_error_fails_start_instead_of_claiming_fresh(tmp_path):
     transport = ACPSDKTransport(resume_record={"session_id": "existing"})
     transport._workspace = str(tmp_path)

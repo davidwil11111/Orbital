@@ -17,7 +17,12 @@ FAKE_PI_EXIT_AT_START     exit with this code before answering anything
 FAKE_PI_EXIT_WITHOUT_SESSION  exit 2 when started without ``--session``
 FAKE_PI_KNOWN_SESSIONS    comma list of session ids ``--session`` can open
 FAKE_PI_RESUME_MODE       "mismatch": open a new id instead of exiting 1
-FAKE_PI_NEW_SESSION_ID    id of a freshly created session
+FAKE_PI_NEW_SESSION_ID    id of a freshly created (or forked) session
+FAKE_PI_REFUSE_PATHS      exit 1 for ``--session <file>`` / ``--fork <file>``
+
+``--session <file>`` (an argument with a path separator or ending .jsonl)
+opens that file: its header id is the session, the file is the sessionFile.
+``--fork <file>`` copies it into a new session in ``--session-dir``.
 FAKE_PI_SCENARIO          JSONL replayed for every prompt
 
 Scenario directives (lines that are not protocol records):
@@ -78,12 +83,24 @@ def _read_stdin(commands: "queue.Queue") -> None:
     commands.put(None)
 
 
-def _state(session_id: str, session_dir: str | None) -> dict:
+def _state(session_id: str, session_dir: str | None, session_file: str | None = None) -> dict:
     with open(os.path.join(HERE, "get_state_response.json"), encoding="utf-8") as f:
         data = json.load(f)["data"]
     data["sessionId"] = session_id
-    data["sessionFile"] = os.path.join(session_dir or HERE, f"{session_id}.jsonl")
+    data["sessionFile"] = session_file or os.path.join(session_dir or HERE, f"{session_id}.jsonl")
     return data
+
+
+def _is_path(arg: str) -> bool:
+    return "/" in arg or "\\" in arg or arg.endswith(".jsonl")
+
+
+def _header_id(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.loads(f.readline()).get("id")
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _scenario() -> list:
@@ -148,6 +165,7 @@ def main() -> int:
         append_text = (open(append, encoding="utf-8").read()
                        if os.path.isfile(append) else append)
     requested = _arg(argv, "--session")
+    fork = _arg(argv, "--fork")
     record({"event": "spawn", "argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
             "env": {k: os.environ.get(k) for k in env_keys},
             "append_prompt": append_text})
@@ -160,7 +178,17 @@ def main() -> int:
         return 2
 
     session_id = os.environ.get("FAKE_PI_NEW_SESSION_ID", "fresh-session-1")
-    if requested is not None:
+    session_file = None
+    if (requested is not None and _is_path(requested)) or fork is not None:
+        path = fork if fork is not None else requested
+        header_id = _header_id(path)
+        if header_id is None or os.environ.get("FAKE_PI_REFUSE_PATHS"):
+            sys.stderr.write(f"Error: cannot open session file {path}\n")
+            sys.stderr.flush()
+            return 1
+        if fork is None:
+            session_id, session_file = header_id, path
+    elif requested is not None:
         known = [s for s in os.environ.get("FAKE_PI_KNOWN_SESSIONS", "").split(",") if s]
         if requested in known:
             session_id = requested
@@ -179,7 +207,7 @@ def main() -> int:
         ctype = cmd.get("type")
         if ctype == "get_state":
             emit({"id": cmd.get("id"), "type": "response", "command": "get_state",
-                  "success": True, "data": _state(session_id, session_dir)})
+                  "success": True, "data": _state(session_id, session_dir, session_file)})
         elif ctype == "prompt":
             _run_prompt(cmd, commands)
         elif ctype == "abort":

@@ -453,6 +453,101 @@ class TestResume:
                      if f.startswith(PROMPT_FILE_PREFIX)]
         assert leftovers == []
 
+    # ---- spec 138: a session imported from the user's own pi store ----------
+
+    @staticmethod
+    def _native_file(tmp_path, cwd, sid="S-native"):
+        """A pi session file in pi's own store (outside Orbital's session dir)."""
+        d = tmp_path / "home" / ".pi" / "agent" / "sessions" / "--x--"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"2026-10-20T10-00-00-000Z_{sid}.jsonl"
+        path.write_text(json.dumps({"type": "session", "version": 3, "id": sid,
+                                    "timestamp": "2026-10-20T10:00:00.000Z",
+                                    "cwd": str(cwd)}) + "\n")
+        return str(path)
+
+    async def test_native_session_of_this_folder_is_reopened_by_its_file(self, tmp_path):
+        native = self._native_file(tmp_path, tmp_path / "ws")
+        t = await _started(tmp_path, resume={"session_id": "S-native", "rollout_path": native})
+        try:
+            [spawn] = _spawns(tmp_path)
+            argv = spawn["argv"]
+            assert argv[argv.index("--session") + 1] == native
+            assert "--fork" not in argv
+            assert t.resume_outcome == ("resumed", None)
+            assert t.session_id == "S-native"
+            [started] = [e for e in _drain(t) if e.event_type == "thread_started"]
+            assert started.data["rollout_path"] == native  # the next spawn reopens it again
+        finally:
+            await t.stop()
+
+    async def test_session_file_key_is_read_too(self, tmp_path):
+        native = self._native_file(tmp_path, tmp_path / "ws")
+        t = await _started(tmp_path, resume={"session_id": "S-native", "session_file": native})
+        try:
+            [spawn] = _spawns(tmp_path)
+            assert spawn["argv"][spawn["argv"].index("--session") + 1] == native
+            assert t.resume_outcome == ("resumed", None)
+        finally:
+            await t.stop()
+
+    async def test_native_session_from_another_folder_is_forked_into_the_workspace(
+            self, tmp_path):
+        """pi runs an opened session in the cwd its header records; a group
+        project's session ran elsewhere, so it is forked into the workspace
+        (Orbital's session dir) instead — history kept, new id."""
+        other = tmp_path / "Desktop"
+        other.mkdir()
+        native = self._native_file(tmp_path, other)
+        t = await _started(tmp_path, resume={"session_id": "S-native", "rollout_path": native},
+                           env={"FAKE_PI_NEW_SESSION_ID": "S-forked"})
+        try:
+            [spawn] = _spawns(tmp_path)
+            argv = spawn["argv"]
+            assert argv[argv.index("--fork") + 1] == native
+            assert "--session" not in argv
+            assert t.resume_outcome == ("resumed", None)
+            assert t.session_id == "S-forked"
+            assert os.path.dirname(t._session_file) == str(tmp_path / "pi-sessions")
+        finally:
+            await t.stop()
+
+    async def test_unopenable_native_file_restarts_fresh(self, tmp_path):
+        native = self._native_file(tmp_path, tmp_path / "ws")
+        t = await _started(tmp_path, resume={"session_id": "S-native", "rollout_path": native},
+                           env={"FAKE_PI_REFUSE_PATHS": "1"})
+        try:
+            first, second = _spawns(tmp_path)
+            assert "--session" in first["argv"] and "--session" not in second["argv"]
+            assert t.resume_outcome == ("fresh", "resume_failed")
+            assert t.session_id == "fresh-session-1"
+        finally:
+            await t.stop()
+
+    async def test_orbitals_own_session_file_still_resumes_by_id(self, tmp_path):
+        own = tmp_path / "pi-sessions" / "S-known.jsonl"
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text(json.dumps({"type": "session", "id": "S-known",
+                                   "cwd": str(tmp_path / "ws")}) + "\n")
+        t = await _started(tmp_path, resume={"session_id": "S-known", "rollout_path": str(own)},
+                           env={"FAKE_PI_KNOWN_SESSIONS": "S-known"})
+        try:
+            [spawn] = _spawns(tmp_path)
+            assert spawn["argv"][spawn["argv"].index("--session") + 1] == "S-known"
+            assert t.resume_outcome == ("resumed", None)
+        finally:
+            await t.stop()
+
+    async def test_vanished_native_file_falls_back_to_the_id(self, tmp_path):
+        t = await _started(tmp_path, resume={"session_id": "S-gone",
+                                             "rollout_path": str(tmp_path / "nope.jsonl")})
+        try:
+            first, second = _spawns(tmp_path)
+            assert first["argv"][first["argv"].index("--session") + 1] == "S-gone"
+            assert t.resume_outcome == ("fresh", "resume_failed")
+        finally:
+            await t.stop()
+
     async def test_startup_failure_is_loud_and_redacted(self, tmp_path):
         with pytest.raises(RuntimeError) as excinfo:
             await _started(tmp_path, env={
