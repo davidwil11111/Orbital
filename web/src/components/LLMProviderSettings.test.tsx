@@ -19,8 +19,8 @@
  *    selected via the dropdown;
  *  - the no-China-endpoint caption and the "Get your API key" console link
  *    render for the right providers and are hidden for Custom;
- *  - the wizard-only preset-card picker renders chips in the fixed order and
- *    selects exactly like the dropdown.
+ *  - the wizard-only picker is a searchable combobox (spec 138) that selects
+ *    exactly like the dropdown.
  *
  * The api client (web/src/config.ts `api`) is mocked — no network.
  */
@@ -352,26 +352,25 @@ describe('LLMProviderSettings — no-China-endpoint caption + "Get your API key"
 
 // ---- Wizard-only preset cards ----
 
-describe('LLMProviderSettings — preset cards (providerPicker="cards", wizard-only)', () => {
-  it('renders provider chips in the fixed order instead of a <select>, and selects on click', async () => {
+describe('LLMProviderSettings — searchable picker (providerPicker="cards", wizard-only)', () => {
+  it('renders a searchable combobox instead of a <select>, filters as you type, and selects like the dropdown', async () => {
     mockApi({ settings: { provider: '' } });
     render(<LLMProviderSettings mode="global" hideSaveButton providerPicker="cards" />);
-    // Wait for INIT, not just for the chips. The picker is gated on both
-    // loads, so the chips and the data arrive in one commit — but the default
-    // selection is applied by a passive effect that runs just AFTER that
-    // commit. waitFor resolves on the DOM mutation, so a click fired right
-    // away queued setProvider('openai') ahead of the effect's
-    // setProvider(default), which then won. Test-only: no person can click in
-    // that gap. It flaked on a slow CI runner (DeepSeek selected in the dump).
-    await waitFor(() =>
-      expect(screen.getByText('DeepSeek').className).toContain('bg-accent'),
-    );
+    // Wait for INIT, not just for the picker: the default selection is applied
+    // by a passive effect that runs just AFTER the commit that renders it (see
+    // the CI flake note in git history for the chip-row version of this test).
+    const input = await waitFor(() => {
+      const el = screen.getByTestId('provider-combobox') as HTMLInputElement;
+      expect(el.value).toBe('DeepSeek');
+      return el;
+    });
+    expect(document.querySelector('select')).toBeNull();
 
-    expect(screen.queryByRole('combobox')).toBeNull();
-
-    expect(screen.getByText('OpenAI').className).not.toContain('bg-accent');
-    fireEvent.click(screen.getByText('OpenAI'));
-    await waitFor(() => expect(screen.getByText('OpenAI').className).toContain('bg-accent'));
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: 'openai' } });
+    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(['OpenAI', 'Custom / Self-Hosted']);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(input.value).toBe('OpenAI'));
   });
 
   it('defaults to the dropdown picker when the prop is omitted', async () => {
@@ -399,11 +398,16 @@ describe('LLMProviderSettings — no duplicate Custom entry', () => {
     expect(screen.getAllByText('Custom / Self-Hosted')).toHaveLength(1);
   });
 
-  it('renders exactly one Custom chip in cards mode', async () => {
+  it('offers exactly one Custom option in the wizard\'s searchable picker', async () => {
     mockApi({ settings: { provider: '' } });
     render(<LLMProviderSettings mode="global" hideSaveButton providerPicker="cards" />);
-    await waitFor(() => expect(screen.getByText('DeepSeek')).toBeTruthy());
-    expect(screen.getAllByText('Custom / Self-Hosted')).toHaveLength(1);
+    const input = await waitFor(() => {
+      const el = screen.getByTestId('provider-combobox') as HTMLInputElement;
+      expect(el.value).toBe('DeepSeek');
+      return el;
+    });
+    fireEvent.focus(input);
+    expect(screen.getAllByRole('option').filter((o) => o.textContent === 'Custom / Self-Hosted')).toHaveLength(1);
   });
 
   it('a saved provider="custom" resolves to the sentinel Custom, shows Advanced, and keeps the saved base_url', async () => {

@@ -18,6 +18,7 @@ import { useLocale } from '../i18n/LocaleContext';
 import type { Locale } from '../i18n/locales';
 import watchaLogo from '../assets/watcha-logo.png';
 import Select from './Select';
+import ProviderCombobox from './ProviderCombobox';
 
 interface LLMSettingsResponse {
   /** Spec-less keyless mode (2026-10-21): the wizard's "Skip for now" choice. */
@@ -50,8 +51,9 @@ interface LLMProviderSettingsProps {
   hideSaveButton?: boolean;
   /** Ref to expose save function to parent */
   saveRef?: React.MutableRefObject<(() => Promise<boolean>) | null>;
-  /** Provider picker style. 'cards' is wizard-only (Spec 17); everywhere else
-   * keeps the compact dropdown. Default 'dropdown'. */
+  /** Provider picker style. 'cards' is wizard-only (Spec 17): since spec 138
+   * a searchable combobox (ProviderCombobox), no longer a chip row; everywhere
+   * else keeps the compact dropdown. Default 'dropdown'. */
   providerPicker?: 'dropdown' | 'cards';
 }
 
@@ -894,33 +896,13 @@ export default function LLMProviderSettings({
       <div>
         <label className="block text-sm font-medium text-primary mb-1.5">{t('llm.field.provider')}</label>
         {providerPicker === 'cards' ? (
-          <div className="flex flex-wrap gap-2">
-            {orderedProviderKeys.map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => handleProviderChange(key)}
-                className={`text-sm px-3 py-1.5 rounded-full border transition-all duration-150 ${
-                  provider === key
-                    ? 'bg-accent text-white border-accent'
-                    : 'bg-sidebar text-secondary border-border hover:text-primary hover:border-secondary/40'
-                }`}
-              >
-                {providers[key].display_name}
-              </button>
-            ))}
-            <button
-              type="button"
-              onClick={() => handleProviderChange(CUSTOM_PROVIDER_KEY)}
-              className={`text-sm px-3 py-1.5 rounded-full border transition-all duration-150 ${
-                provider === CUSTOM_PROVIDER_KEY
-                  ? 'bg-accent text-white border-accent'
-                  : 'bg-sidebar text-secondary border-border hover:text-primary hover:border-secondary/40'
-              }`}
-            >
-              {t('llm.provider.custom')}
-            </button>
-          </div>
+          <ProviderCombobox
+            label={t('llm.field.provider')}
+            options={orderedProviderKeys.map((key) => ({ key, label: providers[key].display_name }))}
+            custom={{ key: CUSTOM_PROVIDER_KEY, label: t('llm.provider.custom') }}
+            value={provider}
+            onChange={handleProviderChange}
+          />
         ) : (
           <Select
             value={provider}
