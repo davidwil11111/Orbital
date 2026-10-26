@@ -56,6 +56,13 @@ class _ParamSchema:
     # Most CLI parameters deliberately have no Orbital default and continue
     # to inherit the provider's own default.
     default: str | None = None
+    # Delivered as this environment variable instead of argv (dsh reads its
+    # sandbox + approval mode from DSH_PERMISSION_MODE).
+    env_var: str | None = None
+    # Delivered as this ACP session config option (session/set_config_option
+    # after session/new or resume) — the agent's own knob, applied only when
+    # the agent advertises the option and the value.
+    acp_config_option: str | None = None
 
 
 # Authoritative tier-5 stable parameters for each sub-agent. Anything not on
@@ -211,25 +218,37 @@ SCHEMA: dict[str, dict[str, _ParamSchema]] = {
         ),
     },
     "dsh": {
-        # Both params reach dsh through the per-spawn composition file
-        # (agent_os/agents/composition.py), never argv — dsh takes its whole
-        # runtime configuration from the Cordis plugin list. They live here so
-        # the model and permission mode are ordinary Settings dropdowns like
-        # every other sub-agent's. Changes take effect on the next spawn.
+        # None of these is argv. The model is ``provider/model`` and goes into
+        # the per-spawn patch's ``acp`` row (agent_os/agents/composition.py);
+        # the dropdown is dsh's own live list (the providers the user set up
+        # in DSH Desktop, mirrored into the patch), which widens this static
+        # fallback at save time. Unset follows the default model picked in
+        # the app. A change rebuilds an idle worker on its next dispatch.
         "model": _ParamSchema(
             name="model",
-            allowed=("deepseek-v4-flash", "deepseek-v4-pro"),
+            allowed=(
+                "deepseek-official/deepseek-flash",
+                "deepseek-official/deepseek-v4-pro",
+            ),
             flag_template=None,
-            default="deepseek-v4-flash",
         ),
-        # Maps to the composition's dsh-sandbox-policy mode, which is dsh's own
-        # enforcement layer — Orbital's project sandbox does not govern
-        # transport-backed sub-agents.
+        # dsh's own reasoning control (ACP config option ``reasoning_effort``,
+        # offered for reasoning models). Unset = dsh's default.
+        "effort": _ParamSchema(
+            name="effort",
+            allowed=("off", "low", "high", "max"),
+            flag_template=None,
+            acp_config_option="reasoning_effort",
+        ),
+        # dsh's own enforcement layer (its sandbox policy, and its approval
+        # policy: "never" ask only under danger-full-access) — Orbital's
+        # project sandbox does not govern transport-backed sub-agents.
         "permission-mode": _ParamSchema(
             name="permission-mode",
-            allowed=("workspace-write", "danger-full-access"),
+            allowed=("read-only", "workspace-write", "danger-full-access"),
             flag_template=None,
             default="workspace-write",
+            env_var="DSH_PERMISSION_MODE",
         ),
     },
     "pi": {
@@ -376,8 +395,8 @@ class SubAgentConfigStore:
     @staticmethod
     def manifest_launches_via_shim(manifest) -> bool:
         """True when every Windows launcher the manifest knows is a
-        ``.cmd``/``.bat``/``.ps1`` shim — dsh's npm-installed
-        ``dsh-acp-demo.cmd`` is the only spawn target it has. For such an
+        ``.cmd``/``.bat``/``.ps1`` shim — dsh's ``dsh.cmd`` (npm's, or the
+        one inside DSH Desktop) is the only spawn target it has. For such an
         agent a pasted shim is the same file Orbital itself runs, and "paste
         the real executable instead" names a file that does not exist, so
         the shim refusal below would reject the only path that works (spec
@@ -390,6 +409,12 @@ class SubAgentConfigStore:
                        if isinstance(e, str) and e.strip()]
         except AttributeError:
             return False
+        # The launcher inside a desktop app (DSH Desktop's dsh.cmd) counts:
+        # it is the file discovery itself would hand the spawn.
+        for app in getattr(manifest.setup, "desktop_apps", None) or []:
+            spec = getattr(app, "platforms", {}).get("windows")
+            if spec is not None and getattr(spec, "executable", ""):
+                entries.append(spec.executable)
         return bool(entries) and all(
             e.lower().endswith(_WINDOWS_SHIMS) for e in entries
         )
@@ -555,6 +580,26 @@ class SubAgentConfigStore:
                 continue
             argv.extend(schema.flag_template.format(value=value).split())
         return argv
+
+    def build_extra_env(self, slug: str) -> dict[str, str]:
+        """Environment variables for the params whose schema names one."""
+        slug_schema = SCHEMA.get(slug, {})
+        env: dict[str, str] = {}
+        for key, value in resolve_params(slug, self).items():
+            schema = slug_schema.get(key)
+            if schema is not None and schema.env_var and value:
+                env[schema.env_var] = str(value)
+        return env
+
+    def build_acp_config_options(self, slug: str) -> dict[str, str]:
+        """ACP session config options for the params whose schema names one."""
+        slug_schema = SCHEMA.get(slug, {})
+        options: dict[str, str] = {}
+        for key, value in resolve_params(slug, self).items():
+            schema = slug_schema.get(key)
+            if schema is not None and schema.acp_config_option and value:
+                options[schema.acp_config_option] = str(value)
+        return options
 
     def schema_for(self, slug: str) -> dict[str, dict[str, object]]:
         """Return the parameter schema for ``slug`` in JSON-friendly shape.

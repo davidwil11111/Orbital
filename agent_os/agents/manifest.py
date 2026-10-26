@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 import yaml
 
+from agent_os.agents.desktop_apps import parse_desktop_apps
+
 
 class ManifestError(Exception):
     """Raised when a manifest file is invalid or cannot be loaded."""
@@ -43,6 +45,14 @@ class ManifestRuntime:
     # appends ``--config <rendered>`` to the spawn args. Empty = argv-only
     # configuration, which is every other agent today.
     config_template: str = ""
+    # The flag the rendered file is handed to the CLI with: dsh 0.2 takes a
+    # patch overlay on its shipped ``acp`` profile (``--patch <file>``).
+    config_flag: str = "--config"
+    # Rows copied verbatim from the user's own setup of this agent into the
+    # rendered file (dsh: provider definitions from DSH Desktop's profile, so
+    # what works in the app works here). {home_env, home_default, file, rows,
+    # default_model_row, default_provider} — see agents/composition.py.
+    config_mirror: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -75,6 +85,13 @@ class ManifestCredential:
     # non-ready answer is reported as unknown).
     provider_keys: list[dict] = field(default_factory=list)
     check_missing_value: str = ""
+    # The agent keeps this key in a store of its own that WINS over the env
+    # Orbital injects (DSH Desktop's ``$DSH_HOME/.credentials.yaml``): a key
+    # there means the credential is configured, and an Orbital-held one would
+    # be ignored. {file, home_env?, key, label}: ``file`` is ``~``-expanded,
+    # its directory replaced by ``$home_env`` when that is set; ``key`` is a
+    # dotted path into the YAML document; ``label`` names the owner for the UI.
+    agent_store: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -112,6 +129,9 @@ class ManifestSetup:
     # half-removed — 1018 bench item 5). The same string names the manual
     # recovery command. None = always use ``update_command``.
     npm_package: str | None = None        # "@anthropic-ai/claude-code"
+    # Vendor desktop apps that bundle this agent's CLI, found by identity
+    # (bundle id / uninstall registry) — see agents/desktop_apps.py.
+    desktop_apps: list = field(default_factory=list)
 
 
 @dataclass
@@ -254,6 +274,8 @@ class ManifestLoader:
             approval_patterns=runtime_data.get("approval_patterns", []),
             activity_patterns=runtime_data.get("activity_patterns", []),
             config_template=runtime_data.get("config_template", ""),
+            config_flag=runtime_data.get("config_flag", "--config"),
+            config_mirror=dict(runtime_data.get("config_mirror") or {}),
         )
 
         # Setup
@@ -281,6 +303,7 @@ class ManifestLoader:
                 setup_label=cred.get("setup_label", ""),
                 provider_keys=cred.get("provider_keys", []),
                 check_missing_value=cred.get("check_missing_value", ""),
+                agent_store=dict(cred.get("agent_store") or {}),
             ))
         setup = ManifestSetup(
             dependencies=dependencies,
@@ -296,6 +319,7 @@ class ManifestLoader:
             update_command=setup_data.get("update_command"),
             update_label=setup_data.get("update_label"),
             npm_package=setup_data.get("npm_package"),
+            desktop_apps=parse_desktop_apps(setup_data.get("desktop_apps")),
         )
 
         # Capabilities

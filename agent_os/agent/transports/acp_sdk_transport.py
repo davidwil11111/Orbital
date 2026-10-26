@@ -175,6 +175,11 @@ class ACPSDKTransport(AgentTransport):
         self._agent_capabilities: Any = None
         self._available_auth_methods: list[dict[str, Any]] = []
         self._session_config_options: dict[str, dict[str, Any]] = {}
+        # Desired options the agent did not offer when the session opened.
+        # dsh registers user-configured provider routes asynchronously after
+        # boot, so a resumed session can briefly list only its recorded
+        # model; these are retried before each prompt, a few times at most.
+        self._pending_config: dict[str, int] = {}
 
         self._connection: Any = None
         self._stdio_context: Any = None
@@ -409,6 +414,7 @@ class ACPSDKTransport(AgentTransport):
             if option is None or option.current_value == value:
                 continue
             if not _config_value_is_advertised(option, value):
+                self._pending_config.setdefault(config_id, 0)
                 # Cursor accepts friendly CLI aliases (for example
                 # ``cursor-grok-4.5-low``) then reports a canonical session
                 # value (for example ``grok-4.5[effort=high,fast=true]``).
@@ -453,8 +459,38 @@ class ACPSDKTransport(AgentTransport):
         await self._prompt_task
         return "".join(self._turn_text_parts) or "(no response)"
 
+    _PENDING_CONFIG_ATTEMPTS = 3
+
+    async def _retry_pending_configuration(self) -> None:
+        """Apply desired options the agent did not offer at session start.
+
+        Bounded: an agent that never offers the value (Cursor's model
+        aliases, which it canonicalises) costs at most a few rejected
+        requests, never one per prompt forever.
+        """
+        for config_id in list(self._pending_config):
+            value = self._desired_config.get(config_id)
+            current = (self._session_config_options.get(config_id) or {}).get("currentValue")
+            attempts = self._pending_config[config_id]
+            if value is None or current == value or attempts >= self._PENDING_CONFIG_ATTEMPTS:
+                self._pending_config.pop(config_id, None)
+                continue
+            self._pending_config[config_id] = attempts + 1
+            try:
+                result = await self._connection.set_config_option(
+                    config_id=config_id, session_id=self._session_id, value=value
+                )
+            except Exception as exc:  # noqa: BLE001 — the prompt goes ahead either way
+                logger.debug("ACPSDKTransport: pending %s=%r still not accepted: %s",
+                             config_id, value, exc)
+                continue
+            self._remember_session_configuration(result)
+            self._pending_config.pop(config_id, None)
+
     async def _run_prompt(self, message: str) -> None:
         try:
+            if self._pending_config:
+                await self._retry_pending_configuration()
             response = await self._connection.prompt(
                 session_id=self._session_id, prompt=[text_block(message)]
             )

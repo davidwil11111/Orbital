@@ -89,6 +89,19 @@ setup:
       type: secret
       required: false
       env_var: "OPENAI_API_KEY"
+  # The ChatGPT desktop app (bundle id com.openai.codex) ships a codex CLI
+  # that speaks the same `app-server` protocol. After the standalone CLI:
+  # the desktop copy runs ahead of the version the transport is pinned to
+  # (0.163-alpha vs 0.157.1 on 2026-10-26), so it is the fallback, not the
+  # default. OpenAI has moved this path before — found by bundle id, and
+  # re-resolved if it moves again.
+  desktop_apps:
+    - label: "ChatGPT"
+      order: after_cli
+      macos:
+        bundle_ids: ["com.openai.codex"]
+        app_names: ["ChatGPT.app", "Codex.app"]
+        executable: "Contents/Resources/codex-cli/bin/codex"
   auto_detect:
     windows:
       - "%APPDATA%\\npm\\codex.cmd"

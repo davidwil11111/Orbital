@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.skills import SkillLoader
+from agent_os.agents.setup_types import status_ready
 from agent_os.daemon_v2.agent_md_seeder import (
     AGENT_MD_FILENAME,
     is_seeded_agent_md,
@@ -3371,8 +3372,7 @@ async def available_agents():
             "version": s.version,
             # Spec 116 D4: an installed CLI older than the manifest floor is
             # not ready; the picker reads ``update_needed`` to say "update".
-            "ready": (s.installed and s.dependencies_met and s.credentials_configured
-                      and not getattr(s, "update_needed", False)),
+            "ready": status_ready(s),
             "update_needed": bool(getattr(s, "update_needed", False)),
             "min_version": getattr(s, "min_version", None),
             "dependencies_met": s.dependencies_met,
@@ -3411,8 +3411,7 @@ async def agent_status(slug: str):
         "installed": s.installed,
         "binary_path": s.binary_path,
         "version": s.version,
-        "ready": (s.installed and s.dependencies_met and s.credentials_configured
-                  and not getattr(s, "update_needed", False)),
+        "ready": status_ready(s),
         "update_needed": bool(getattr(s, "update_needed", False)),
         "min_version": getattr(s, "min_version", None),
         "dependencies_met": s.dependencies_met,

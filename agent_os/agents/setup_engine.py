@@ -9,6 +9,8 @@ binaries and satisfied dependencies, and reports what is available.
 """
 
 import glob
+import hashlib
+import json
 import logging
 import os
 import re
@@ -120,6 +122,67 @@ def _append_to_daemon_path(directory: str) -> None:
     os.environ["PATH"] = os.pathsep.join(entries)
 
 
+def agent_store_path(store: dict, env: dict | None = None) -> str | None:
+    """The file an agent keeps its own credentials in, per the manifest's
+    ``agent_store`` — ``$<home_env>/<basename>`` when that variable is set,
+    else ``file`` with ``~`` expanded."""
+    raw = (store or {}).get("file")
+    if not raw:
+        return None
+    env = os.environ if env is None else env
+    home_env = store.get("home_env")
+    if home_env and env.get(home_env):
+        return os.path.join(env[home_env], os.path.basename(raw))
+    return os.path.expanduser(raw)
+
+
+def agent_store_has(store: dict, env: dict | None = None) -> bool:
+    """Whether the agent's own credential store holds a non-empty value at
+    ``store["key"]`` (a dotted path into its YAML document).
+
+    Presence only: the value is never returned or logged. Unreadable,
+    malformed or absent → False, and the Orbital-held key / env decide.
+    """
+    path = agent_store_path(store, env)
+    key = (store or {}).get("key")
+    if not path or not key or not os.path.isfile(path):
+        return False
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            node = yaml.safe_load(f)
+    except Exception:  # noqa: BLE001 — never surface a parse error with secrets in it
+        logger.warning("agent credential store unreadable: %s", path)
+        return False
+    for part in key.split("."):
+        if not isinstance(node, dict):
+            return False
+        node = node.get(part)
+    return isinstance(node, str) and bool(node.strip())
+
+
+def spawn_fingerprint(config_dict: dict, params: dict | None) -> str:
+    """A digest of everything a spawn is launched with.
+
+    Binary, argv, the env Orbital injects (credentials, locate-card PATH) and
+    the agent's Settings params — including UI-only ones such as dsh's model,
+    which never reach argv. A live worker whose recorded digest differs from
+    the current one was spawned with settings that have since changed (a key
+    saved 2026-10-26 never reached the running dsh process). Only the digest
+    is kept, so no secret is held beside the adapter.
+    """
+    payload = json.dumps({
+        "command": config_dict.get("command"),
+        "args": list(config_dict.get("args") or []),
+        "env": dict(sorted((config_dict.get("env") or {}).items())),
+        "params": dict(sorted((params or {}).items())),
+        # What a rendered file copies from the user's own setup (dsh's
+        # providers in DSH Desktop): editing them there rebuilds the worker.
+        "composition_inputs": config_dict.get("composition_inputs"),
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class SetupEngine:
     """Probes the system for agent readiness based on manifest metadata."""
 
@@ -149,6 +212,23 @@ class SetupEngine:
         # bug hid behind exactly that fallback).
         self._override_hits: set[str] = set()
         self._override_missing: dict[str, str] = {}
+        # Where each resolved binary came from: {"kind": "override" |
+        # "desktop_app" | "path" | "auto_detect" | "check_command", plus
+        # "label"/"app_path"/"app_version" for a desktop app}. The card says
+        # which copy Orbital drives.
+        self._resolved_sources: dict[str, dict] = {}
+        # ACP handshake verdicts keyed by the binary's identity (path, mtime,
+        # size, app version): re-run only when the binary changes, so a
+        # 60 s status sweep never re-spawns every agent.
+        self._handshakes: dict[tuple, dict] = {}
+        # In-flight handshakes, one per identity. A sweep starts every ACP
+        # agent's handshake up front so they overlap with the other agents'
+        # version and auth probes instead of adding ~1-3 s each in series
+        # (spec 136: the sweep is already the slow part of Settings).
+        self._handshake_futures: dict[tuple, "concurrent.futures.Future"] = {}
+        self._handshake_lock = threading.Lock()
+        self._sweep_local = threading.local()
+        self._handshake_pool: "concurrent.futures.ThreadPoolExecutor | None" = None
         # In-memory cache of the last check_all() result. Tuple of
         # (results, expires_at_monotonic). None when empty or invalidated.
         self._check_all_cache: tuple[list[AgentSetupStatus], float] | None = None
@@ -221,8 +301,15 @@ class SetupEngine:
     # Public API
     # ------------------------------------------------------------------
 
-    def check_agent(self, slug: str) -> AgentSetupStatus:
-        """Full read-only status check for one agent."""
+    def check_agent(self, slug: str, *,
+                    handshake_wait: float | None = None) -> AgentSetupStatus:
+        """Full read-only status check for one agent.
+
+        ``handshake_wait``: how long to wait for an ACP agent's handshake
+        verdict when none is cached — None waits for it (a single-agent
+        check, the user's Refresh); the routine sweep passes 0 and reports a
+        pending handshake as "unknown" rather than stall Settings.
+        """
         manifest = self._registry.get(slug)
         if manifest is None:
             raise ValueError(f"Unknown agent: {slug}")
@@ -286,6 +373,12 @@ class SetupEngine:
             self.clear_auth_failure(manifest.slug)
         auth_expired = installed and creds_ok and manifest.slug in self._auth_failures
 
+        # ACP agents: does the binary actually speak the protocol?
+        if handshake_wait is None:
+            handshake_wait = getattr(self._sweep_local, "handshake_wait", None)
+        handshake = (self._handshake_for(manifest, binary, wait=handshake_wait)
+                     if installed else None)
+
         # Build setup actions
         actions = self._build_actions(manifest, installed, missing_deps, missing_creds,
                                       update_needed=update_needed)
@@ -307,7 +400,128 @@ class SetupEngine:
             auth_expired=auth_expired,
             override_path=override_path,
             override_missing=override_missing,
+            source=self.resolved_source(manifest.slug) if installed else None,
+            handshake=handshake,
         )
+
+    # ------------------------------------------------------------------
+    # ACP handshake (readiness verdict)
+    # ------------------------------------------------------------------
+
+    def _handshake_for(self, manifest: AgentManifest, binary: str, *,
+                       wait: float | None = None) -> dict | None:
+        """The ``initialize`` verdict for an ACP agent, cached per binary
+        identity. None for agents on other transports."""
+        if getattr(manifest.runtime, "transport", "") != "acp-sdk":
+            return None
+        import concurrent.futures
+
+        future = self._handshake_future(manifest, binary)
+        try:
+            return dict(future.result(timeout=wait))
+        except concurrent.futures.TimeoutError:
+            # Still running: unknown never blocks, and a "failed" verdict
+            # expires the sweep cache when it lands (_run_handshake_inner).
+            return {"state": "unknown", "detail": None, "pending": True,
+                    "agent_name": None, "agent_version": None}
+        except Exception:  # noqa: BLE001 — a crashed probe is "unknown", never "failed"
+            logger.warning("handshake probe crashed for %s", manifest.slug, exc_info=True)
+            return {"state": "unknown", "detail": None,
+                    "agent_name": None, "agent_version": None}
+
+    def _start_handshakes(self) -> None:
+        """Start the handshake of every installed ACP agent whose verdict is
+        not cached, so the sweep only waits for the slowest of them."""
+        for manifest in self._registry.list_all():
+            runtime = getattr(manifest, "runtime", None)
+            if getattr(runtime, "transport", "") != "acp-sdk":
+                continue
+            try:
+                binary = self.resolve_binary(manifest)
+            except Exception:  # noqa: BLE001 — the per-agent check reports it
+                continue
+            if binary is not None:
+                self._handshake_future(manifest, binary)
+
+    def _handshake_future(self, manifest: AgentManifest, binary: str):
+        """The (single-flight) handshake for this binary identity, already
+        resolved when the verdict is cached."""
+        import concurrent.futures
+
+        identity = self._binary_identity(manifest.slug, binary)
+        with self._handshake_lock:
+            cached = self._handshakes.get(identity)
+            if cached is not None:
+                done: concurrent.futures.Future = concurrent.futures.Future()
+                done.set_result(dict(cached))
+                return done
+            future = self._handshake_futures.get(identity)
+            if future is None:
+                if self._handshake_pool is None:
+                    self._handshake_pool = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=6, thread_name_prefix="acp-handshake")
+                future = self._handshake_pool.submit(
+                    self._run_handshake, manifest, binary, identity)
+                self._handshake_futures[identity] = future
+            return future
+
+    def _run_handshake(self, manifest: AgentManifest, binary: str,
+                       identity: tuple) -> dict:
+        from agent_os.agents.handshake import acp_handshake
+
+        try:
+            return self._run_handshake_inner(manifest, binary, identity, acp_handshake)
+        finally:
+            with self._handshake_lock:
+                self._handshake_futures.pop(identity, None)
+
+    def _run_handshake_inner(self, manifest: AgentManifest, binary: str,
+                             identity: tuple, acp_handshake) -> dict:
+        env = None
+        try:
+            # The spawn's own env (credentials, locate-card PATH), so the
+            # verdict is about the process a dispatch would start.
+            env = self.get_adapter_config(manifest.slug, "").get("env")
+        except ValueError:
+            pass
+        result = acp_handshake([binary] + list(manifest.runtime.args or []),
+                               env=env, cwd=self._data_dir if os.path.isdir(
+                                   self._data_dir) else None)
+        if result["state"] == "failed":
+            logger.warning("ACP handshake failed for %s (%s): %s",
+                           manifest.slug, binary, result.get("detail"))
+        if result["state"] != "unknown":
+            # A timeout is retried on the next sweep; a verdict is kept
+            # until the binary changes.
+            with self._handshake_lock:
+                self._handshakes[identity] = dict(result)
+        if result["state"] == "failed":
+            # A sweep may already have reported this agent "unknown" while
+            # the handshake ran; let the next caller see the verdict.
+            cached = self._check_all_cache
+            if cached is not None:
+                self._check_all_cache = (cached[0], 0.0)
+        return result
+
+    def _binary_identity(self, slug: str, binary: str) -> tuple:
+        try:
+            st = os.stat(binary)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = (None, None)
+        source = self._resolved_sources.get(slug) or {}
+        manifest = self._registry.get(slug)
+        args = tuple(getattr(getattr(manifest, "runtime", None), "args", None) or ())
+        # A desktop launcher script never changes when the app updates in
+        # place; the app's own version does. The slug and launch args are
+        # part of it: one binary driven two ways is two verdicts.
+        return (binary, *stamp, source.get("app_version"), slug, args)
+
+    def forget_handshakes(self) -> None:
+        """Drop every cached handshake verdict so the next sweep asks again —
+        the user's Refresh, which promises current state."""
+        with self._handshake_lock:
+            self._handshakes.clear()
 
     @classmethod
     def _below_floor(cls, installed: bool, version: str | None,
@@ -341,7 +555,8 @@ class SetupEngine:
         probe = self._last_auth_probe.get(slug)
         return dict(probe) if probe is not None else None
 
-    def check_all(self, allow_stale: bool = False) -> list[AgentSetupStatus]:
+    def check_all(self, allow_stale: bool = False, *,
+                  handshake_wait: float = 0.0) -> list[AgentSetupStatus]:
         """Status check for all registered agents.
 
         Cached for ``CHECK_ALL_CACHE_TTL_SECONDS``. Use ``invalidate_cache()``
@@ -360,9 +575,9 @@ class SetupEngine:
             if allow_stale:
                 self._refresh_in_background()
                 return results
-        return self._probe_all()
+        return self._probe_all(handshake_wait=handshake_wait)
 
-    def _probe_all(self) -> list[AgentSetupStatus]:
+    def _probe_all(self, *, handshake_wait: float = 0.0) -> list[AgentSetupStatus]:
         """Run the sweep once, however many callers ask at the same time."""
         with self._probe_lock:
             # Another caller may have finished a sweep while we waited.
@@ -371,8 +586,15 @@ class SetupEngine:
                 return cached[0]
             generation = self._cache_generation
             results = []
-            for manifest in self._registry.list_all():
-                results.append(self.check_agent(manifest.slug))
+            self._start_handshakes()
+            # The sweep's handshake budget reaches check_agent through a
+            # thread-local, so the per-agent call keeps its plain signature.
+            self._sweep_local.handshake_wait = handshake_wait
+            try:
+                for manifest in self._registry.list_all():
+                    results.append(self.check_agent(manifest.slug))
+            finally:
+                self._sweep_local.handshake_wait = None
             if generation == self._cache_generation:
                 self._check_all_cache = (
                     results,
@@ -420,6 +642,7 @@ class SetupEngine:
         changes what is on disk for ``slug``.
         """
         self._resolved_paths.pop(slug, None)
+        self._resolved_sources.pop(slug, None)
         self._override_hits.discard(slug)
         self._override_missing.pop(slug, None)
 
@@ -470,6 +693,24 @@ class SetupEngine:
             return {"ok": False, "error": f"Unknown agent: {slug}"}
         if not os.path.isfile(binary):
             return {"ok": False, "error": f"No file at {binary}."}
+        result = self._test_override_version(manifest, binary, path_prepend)
+        if not result.get("ok") or getattr(manifest.runtime, "transport", "") != "acp-sdk":
+            return result
+        # An ACP agent must also answer the handshake: a binary that prints a
+        # version but takes another launch contract (dsh 0.1 vs 0.2) would
+        # otherwise be saved and fail every dispatch.
+        from agent_os.agents.handshake import acp_handshake
+        env = {"PATH": self._prepend_path(list(path_prepend or []))}
+        handshake = acp_handshake([binary] + list(manifest.runtime.args or []), env=env)
+        if handshake["state"] == "failed":
+            return {"ok": False, "error": (
+                f"{os.path.basename(binary)} started but did not answer Orbital's "
+                f"handshake: {handshake.get('detail') or 'no details'}")}
+        return result
+
+    def _test_override_version(self, manifest: AgentManifest, binary: str,
+                               path_prepend: list[str] | None) -> dict:
+        """The version half of the locate card's Test."""
         check = manifest.setup.check_command or ""
         if not check:
             # Spec 127 D2: an agent with no check command (dsh is an ACP
@@ -521,46 +762,67 @@ class SetupEngine:
 
         Strategy:
         0. The user-chosen location (the locate card). Its file gone → None,
-           reported as ``override_missing``; never a fallback to 1–3.
-        1. shutil.which(command) — works if PATH is correct
-        2. Expand and probe auto_detect paths for current OS
-        3. Try check_command via subprocess
+           reported as ``override_missing``; never a fallback to the rest.
+        1. A vendor desktop app declared ``order: before_cli`` (the vendor's
+           primary distribution — DSH Desktop).
+        2. shutil.which(command) — works if PATH is correct
+        3. Expand and probe auto_detect paths for current OS
+        4. A desktop app declared ``order: after_cli`` (a standalone CLI the
+           user installed wins over the copy inside ChatGPT.app).
+        5. Try check_command via subprocess
 
-        Returns absolute path or None. Caches result.
+        Returns absolute path or None. The answer is pinned until its file
+        disappears — an app update that moves its CLI, a self-updating CLI
+        that relocates (the claude-code stale-path bug) — and then resolved
+        afresh instead of being reported "installed" until a restart.
         """
-        # Check cache first
-        if manifest.slug in self._resolved_paths:
-            return self._resolved_paths[manifest.slug]
+        slug = manifest.slug
+        cached = self._resolved_paths.get(slug)
+        if cached is not None:
+            # Only a pin this resolver made (it always records a source) is
+            # re-checked; a path seeded into the cache directly is the
+            # caller's assertion and is taken as given.
+            if slug not in self._resolved_sources or os.path.isfile(cached):
+                return cached
+            logger.info("resolved binary for %s is gone (%s) — resolving again",
+                        slug, cached)
+            self.invalidate_resolved_path(slug)
 
         # Strategy 0: the user chose the location.
-        override = self._override_for(manifest.slug)
+        override = self._override_for(slug)
         if override is not None:
             chosen = override["binary"]
             if os.path.isfile(chosen):
-                self._override_missing.pop(manifest.slug, None)
-                self._override_hits.add(manifest.slug)
-                self._resolved_paths[manifest.slug] = chosen
-                # D3 rule, same reason as strategy 2: the dependency checks
+                self._override_missing.pop(slug, None)
+                self._override_hits.add(slug)
+                self._pin(slug, chosen, {"kind": "override"})
+                # D3 rule, same reason as strategy 3: the dependency checks
                 # (``node --version``) run on the daemon PATH.
                 for directory in override.get("path_prepend") or []:
                     _append_to_daemon_path(directory)
                 return chosen
-            self._override_missing[manifest.slug] = chosen
-            self._override_hits.discard(manifest.slug)
+            self._override_missing[slug] = chosen
+            self._override_hits.discard(slug)
             return None
+
+        current_os = detect_os()
+
+        # Strategy 1: the vendor's desktop app, when it is the primary route.
+        hit = self._desktop_app_binary(manifest, current_os, "before_cli")
+        if hit is not None:
+            return hit
 
         command = manifest.runtime.command
         if not command:
             return None
 
-        # Strategy 1: shutil.which
+        # Strategy 2: shutil.which
         path = shutil.which(command)
         if path:
-            self._resolved_paths[manifest.slug] = path
+            self._pin(slug, path, {"kind": "path"})
             return path
 
-        # Strategy 2: auto_detect paths for current OS
-        current_os = detect_os()
+        # Strategy 3: auto_detect paths for current OS
         auto_paths = manifest.setup.auto_detect.get(current_os, [])
         for raw_path in auto_paths:
             # ${ORBITAL_DATA_DIR} is resolved before expandvars: it is not an
@@ -578,7 +840,7 @@ class SetupEngine:
             for candidate in _expand_auto_detect_entry(expanded):
                 if not os.path.isfile(candidate):
                     continue
-                self._resolved_paths[manifest.slug] = candidate
+                self._pin(slug, candidate, {"kind": "auto_detect"})
                 # Spec 115 D3 rule: a binary found here is one shutil.which
                 # could not see, so its directory is not on PATH. An npm
                 # entry point is a `#!/usr/bin/env node` shim and the
@@ -588,7 +850,12 @@ class SetupEngine:
                 _append_to_daemon_path(os.path.dirname(candidate))
                 return candidate
 
-        # Strategy 3: try check_command via subprocess
+        # Strategy 4: the CLI inside a desktop app, behind a standalone CLI.
+        hit = self._desktop_app_binary(manifest, current_os, "after_cli")
+        if hit is not None:
+            return hit
+
+        # Strategy 5: try check_command via subprocess
         if manifest.setup.check_command:
             result = self._run_check_command(manifest.setup.check_command)
             if result is not None:
@@ -596,10 +863,43 @@ class SetupEngine:
                 # Use shutil.which one more time or fall back to bare command
                 path = shutil.which(command)
                 if path:
-                    self._resolved_paths[manifest.slug] = path
+                    self._pin(slug, path, {"kind": "check_command"})
                     return path
 
         return None
+
+    def _pin(self, slug: str, path: str, source: dict) -> None:
+        self._resolved_paths[slug] = path
+        self._resolved_sources[slug] = source
+
+    def _desktop_app_binary(self, manifest: AgentManifest, current_os: str,
+                            order: str) -> str | None:
+        """The CLI inside the first installed desktop app of this ``order``.
+
+        Not appended to the daemon PATH: these launchers are self-contained
+        (DSH's runs the app's own Electron as node; ChatGPT's execs a signed
+        binary beside it), and putting an app's private bin dir on PATH
+        would shadow the user's own tools.
+        """
+        from agent_os.agents.desktop_apps import find_desktop_app
+
+        for app in manifest.setup.desktop_apps:
+            if app.order != order:
+                continue
+            hit = find_desktop_app(app, current_os)
+            if hit is None:
+                continue
+            self._pin(manifest.slug, hit.executable, {
+                "kind": "desktop_app", "label": hit.label,
+                "app_path": hit.app_path, "app_version": hit.version,
+            })
+            return hit.executable
+        return None
+
+    def resolved_source(self, slug: str) -> dict | None:
+        """Where the pinned binary for ``slug`` came from, or None."""
+        source = self._resolved_sources.get(slug)
+        return dict(source) if source else None
 
     def check_dependencies(self, manifest: AgentManifest) -> tuple[bool, list[str]]:
         """Run each dependency check_command via subprocess.
@@ -657,6 +957,10 @@ class SetupEngine:
                 if not self._check_cli_auth(cred, manifest.runtime.command, resolved_binary,
                                             slug=manifest.slug):
                     missing.append(cred.key)
+                continue
+            # The agent's own store wins over anything Orbital injects
+            # (DSH Desktop's credentials file) — a key there is configured.
+            if cred.agent_store and agent_store_has(cred.agent_store):
                 continue
             # Check credential store
             if self._credential_store is not None:
@@ -854,7 +1158,11 @@ class SetupEngine:
         if not resolved or not command:
             return cmd
         if cmd == command or cmd.startswith(command + " "):
-            return resolved + cmd[len(command):]
+            # The command runs through a shell: a launcher inside an app
+            # bundle ("/Applications/DeepSeek Harness.app/…", Claude's
+            # "Application Support") would split at its first space.
+            quoted = f'"{resolved}"' if " " in resolved else resolved
+            return quoted + cmd[len(command):]
         return cmd
 
     def get_resolved_path(self, slug: str) -> str | None:
@@ -877,9 +1185,9 @@ class SetupEngine:
         if manifest is None:
             raise ValueError(f"Unknown agent: {slug}")
 
-        binary = self._resolved_paths.get(slug)
-        if binary is None:
-            binary = self.resolve_binary(manifest)
+        # Through resolve_binary, never the raw cache: a pinned path whose
+        # file has gone must re-resolve, not spawn into ENOENT.
+        binary = self.resolve_binary(manifest)
         if binary is None:
             raise ValueError(f"Agent '{slug}' not installed or binary not found")
 
@@ -914,6 +1222,18 @@ class SetupEngine:
                 if value and name not in env:
                     env[name] = value
 
+        # Params delivered by environment (dsh's DSH_PERMISSION_MODE). Never
+        # over a credential the manifest injects.
+        if self._sub_agent_config_store is not None:
+            build_env = getattr(self._sub_agent_config_store, "build_extra_env", None)
+            if callable(build_env):
+                try:
+                    for name, value in (build_env(slug) or {}).items():
+                        env.setdefault(name, value)
+                except Exception:
+                    logger.warning("Failed to build sub-agent env for %s",
+                                   slug, exc_info=True)
+
         # Merge daemon-level sub-agent config (model/effort/etc.) into argv.
         # Persisted overrides win when no manifest arg conflicts; we simply
         # append, leaving the CLI to take the last-wins value if duplicated.
@@ -929,9 +1249,41 @@ class SetupEngine:
                     slug, exc_info=True,
                 )
 
+        # ACP session options (dsh's reasoning_effort) and what the rendered
+        # file would copy from the user's own setup of the agent: neither is
+        # argv or env, but both decide what a spawn runs with.
+        acp_config_options: dict[str, str] = {}
+        if self._sub_agent_config_store is not None:
+            build_options = getattr(self._sub_agent_config_store,
+                                    "build_acp_config_options", None)
+            if callable(build_options):
+                try:
+                    acp_config_options = dict(build_options(slug) or {})
+                except Exception:
+                    logger.warning("Failed to build ACP config options for %s",
+                                   slug, exc_info=True)
+        composition_inputs = None
+        mirror_spec = getattr(manifest.runtime, "config_mirror", None)
+        if mirror_spec:
+            from agent_os.agents.composition import (
+                acp_model_value, effective_model, read_mirror,
+            )
+            from agent_os.daemon_v2.sub_agent_config_store import resolve_params
+            composition_inputs = read_mirror(mirror_spec)[2]
+            # The patch sets the model a NEW session boots with; a resumed one
+            # keeps the model recorded in it (dsh's own rule). Switching it
+            # in-session through dsh's ACP ``model`` option makes every spawn
+            # run the model Settings shows — applied only if dsh offers it.
+            pair = effective_model(manifest, resolve_params(
+                slug, self._sub_agent_config_store))
+            if pair is not None:
+                acp_config_options.setdefault("model", acp_model_value(pair))
+
         return {
             "command": binary,
             "args": list(manifest.runtime.args) + extra_args,
+            "acp_config_options": acp_config_options,
+            "composition_inputs": composition_inputs,
             "workspace": project_workspace,
             "approval_patterns": [
                 p.get("regex", "") for p in manifest.runtime.approval_patterns
@@ -940,6 +1292,27 @@ class SetupEngine:
             "network_domains": list(manifest.permissions.network_domains),
             "interactive": manifest.runtime.interactive,
         }
+
+    def fingerprint_config(self, slug: str, config_dict: dict) -> str:
+        """``spawn_fingerprint`` of a config built by ``get_adapter_config``."""
+        params: dict = {}
+        if self._sub_agent_config_store is not None:
+            try:
+                params = dict(self._sub_agent_config_store.get(slug) or {})
+            except Exception:
+                logger.warning("Failed to read sub-agent params for %s",
+                               slug, exc_info=True)
+        return spawn_fingerprint(config_dict, params)
+
+    def spawn_fingerprint(self, slug: str, project_workspace: str) -> str | None:
+        """What a spawn of ``slug`` would be launched with right now, or None
+        when no config can be built (binary gone, unknown agent)."""
+        try:
+            config_dict = self.get_adapter_config(
+                slug=slug, project_workspace=project_workspace)
+        except ValueError:
+            return None
+        return self.fingerprint_config(slug, config_dict)
 
     # ------------------------------------------------------------------
     # Internal helpers

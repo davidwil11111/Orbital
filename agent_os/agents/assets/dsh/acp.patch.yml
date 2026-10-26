@@ -1,0 +1,26 @@
+# Orbital's per-spawn overlay on DeepSeek Harness's shipped `acp` profile,
+# handed to `dsh --profile acp --patch <rendered copy>`.
+#
+# A patch row REPLACES that row's whole `config` (verified with
+# `dsh --profile acp --patch … --dump-config`, 0.2.1-rc.3): every row here
+# restates all the keys it needs — dropping `provider` from `acp` would leave
+# dsh with no model route. Orbital's renderer (agents/composition.py) fills
+# in the persona, the model, and an absolute session root per project; these
+# values are the defaults that keep the file bootable on its own.
+
+# The sub-agent prompt Orbital renders per dispatch. ACP carries no system
+# prompt, so this row is its only route into dsh.
+- id: system-prompt
+  config:
+    personaPrefix: You are a coding agent powered by the {{model}} model.
+
+- id: acp
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-flash
+
+# Orbital's sessions live with the project, not in DSH Desktop's own
+# session list (~/.dsh/sessions). `session/resume` reads them back from here.
+- id: session-persistence-jsonl
+  config:
+    root: ./.sessions

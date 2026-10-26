@@ -176,6 +176,11 @@ class TestManifestLoader:
                 for os_name in ("windows", "macos", "linux"):
                     if platforms and os_name not in platforms:
                         continue
+                    # A desktop app that ships the CLI is a discovery
+                    # route of its own; otherwise auto_detect must say
+                    # where the CLI lands on this OS.
+                    if any(os_name in app.platforms for app in m.setup.desktop_apps):
+                        continue
                     assert os_name in m.setup.auto_detect, (
                         f"CLI manifest '{m.slug}' missing auto_detect.{os_name}"
                     )

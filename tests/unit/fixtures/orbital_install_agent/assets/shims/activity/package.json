@@ -1,0 +1,6 @@
+{
+  "name": "@orbital-fixture/activity-shim",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.js"
+}

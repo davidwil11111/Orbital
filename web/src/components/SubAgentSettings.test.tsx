@@ -1447,3 +1447,162 @@ describe('SubAgentSettings — Codex sign-in', () => {
     expect(screen.queryByRole('button', { name: 'Set API Key' })).not.toBeInTheDocument();
   });
 });
+
+describe('SubAgentSettings — desktop app sources', () => {
+  beforeEach(() => {
+    api.mockReset();
+    wsHandlers.clear();
+  });
+
+  const DSH_URL = 'https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg';
+
+  function mockEntries(entries: Entry[]) {
+    api.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/settings') return { llm: { provider: 'opencode', api_key_set: true } };
+      if (path === LIST_PATH) return entries;
+      throw new Error(`unexpected api call: ${path}`);
+    });
+  }
+
+  /** dsh as the daemon reports it now: found inside DSH Desktop, ACP. */
+  function desktopDsh(overrides: Record<string, unknown> = {}): Entry {
+    return makeDshEntry({
+      installed: true,
+      binary_path: '/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh',
+      version: '0.2.1-rc.3',
+      ready: true,
+      credentials_configured: true,
+      missing_credentials: [],
+      install: { supported: false, state: 'installed', platforms: [] },
+      emits_tool_activity: true,
+      ...overrides,
+      // Fields the shared Entry type predates.
+      ...({
+        source: { kind: 'desktop_app', label: 'DeepSeek Harness',
+                  app_path: '/Applications/DeepSeek Harness.app', app_version: '0.2.1-rc.3' },
+        handshake: { state: 'ok', detail: null },
+        desktop_app: { label: 'DeepSeek Harness', download_url: DSH_URL },
+        ...overrides,
+      } as Partial<Entry>),
+    });
+  }
+
+  it('a not-detected desktop-app agent leads with the vendor download link', async () => {
+    mockEntries([makeDshEntry({
+      install: { supported: false, state: 'not_installed', platforms: [] },
+      ...({ desktop_app: { label: 'DeepSeek Harness', download_url: DSH_URL } } as Partial<Entry>),
+    })]);
+    render(<SubAgentSettings />);
+    const row = await screen.findByTestId('sub-agent-not-detected-dsh');
+    const link = within(row).getByRole('link', { name: 'Install DeepSeek Harness' });
+    expect(link).toHaveAttribute('href', DSH_URL);
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(row).toHaveTextContent('Orbital finds it on its own once it is installed. Then click Refresh.');
+    // The path fallback is still there, worded for an app.
+    expect(row).toHaveTextContent('Installed somewhere else? Paste the path to DeepSeek Harness');
+    expect(within(row).getByTestId('sub-agent-locate-answer-dsh')).toBeInTheDocument();
+  });
+
+  it('names the desktop app a detected agent comes from', async () => {
+    mockEntries([desktopDsh()]);
+    render(<SubAgentSettings />);
+    const chip = await screen.findByTestId('sub-agent-source-dsh');
+    expect(chip).toHaveTextContent('From the DeepSeek Harness app');
+    expect(chip).toHaveAttribute('title', '/Applications/DeepSeek Harness.app · 0.2.1-rc.3');
+    expect(screen.queryByTestId('sub-agent-handshake-failed-dsh')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('sub-agent-silent-note-dsh')).not.toBeInTheDocument();
+  });
+
+  it('a key the desktop app holds is named, not offered as a field', async () => {
+    mockEntries([desktopDsh({
+      credentials: [
+        { key: 'DEEPSEEK_API_KEY', label: 'DeepSeek API Key', type: 'secret', required: true,
+          configured: true, has_setup_command: false, stored_by: 'DeepSeek Harness' },
+        { key: 'DEEPSEEK_BASE_URL', label: 'DeepSeek API Base URL', type: 'secret', required: false,
+          configured: false, has_setup_command: false, stored_by: null },
+      ],
+    })]);
+    render(<SubAgentSettings />);
+    const owned = await screen.findByTestId('sub-agent-cred-stored-by-DEEPSEEK_API_KEY');
+    expect(owned).toHaveTextContent('Saved in DeepSeek Harness');
+    expect(owned).toHaveTextContent('DeepSeek Harness uses its own copy of this key, so change it there.');
+    expect(screen.queryByTestId('sub-agent-cred-input-DEEPSEEK_API_KEY')).not.toBeInTheDocument();
+    // A key nobody else holds keeps Orbital's field.
+    expect(screen.getByTestId('sub-agent-cred-input-DEEPSEEK_BASE_URL')).toBeInTheDocument();
+  });
+
+  it('a failed handshake says so in the agent\'s words and opens the locate row', async () => {
+    mockEntries([desktopDsh({
+      ready: false,
+      handshake: { state: 'failed', detail: 'error: --profile <name> is required' },
+    })]);
+    render(<SubAgentSettings />);
+    const note = await screen.findByTestId('sub-agent-handshake-failed-dsh');
+    expect(note).toHaveTextContent('DeepSeek Harness was found, but it did not answer Orbital, so it cannot be used yet.');
+    expect(note).toHaveTextContent('error: --profile <name> is required');
+    const row = screen.getByTestId('sub-agent-not-detected-dsh');
+    expect(row).toHaveTextContent('Point Orbital at a different copy of DeepSeek Harness');
+  });
+
+  it('Change location opens the locate row under a working card and closes it again', async () => {
+    mockEntries([desktopDsh()]);
+    render(<SubAgentSettings />);
+    const change = await screen.findByTestId('sub-agent-locate-change-dsh');
+    expect(screen.queryByTestId('sub-agent-not-detected-dsh')).not.toBeInTheDocument();
+    fireEvent.click(change);
+    expect(screen.getByTestId('sub-agent-not-detected-dsh')).toHaveTextContent(
+      'Point Orbital at a different copy of DeepSeek Harness');
+    fireEvent.click(change);
+    expect(screen.queryByTestId('sub-agent-not-detected-dsh')).not.toBeInTheDocument();
+  });
+
+  it('dsh on its own providers: no key pill, a providers note, dsh-labelled models', async () => {
+    mockEntries([desktopDsh({
+      credentials: [
+        { key: 'DEEPSEEK_API_KEY', label: 'DeepSeek API Key', type: 'secret', required: false,
+          configured: false, has_setup_command: false, stored_by: null },
+        { key: 'DEEPSEEK_BASE_URL', label: 'DeepSeek API Base URL', type: 'secret', required: false,
+          configured: false, has_setup_command: false, stored_by: null },
+      ],
+      config: { model: 'opencode-go/deepseek-v4-pro' },
+      param_schema: {
+        model: {
+          allowed: ['opencode-go/deepseek-v4-flash', 'opencode-go/deepseek-v4-pro'],
+          default: null,
+          labels: {
+            'opencode-go/deepseek-v4-flash': 'OpenCode Go · DeepSeek V4 Flash',
+            'opencode-go/deepseek-v4-pro': 'OpenCode Go · DeepSeek V4 Pro',
+          },
+        },
+        effort: { allowed: ['off', 'high', 'max'], default: null,
+                  labels: { off: 'Off', high: 'High', max: 'Max' } },
+      },
+    })]);
+    render(<SubAgentSettings />);
+    expect(await screen.findByTestId('sub-agent-host-note-dsh')).toHaveTextContent(
+      'Providers, keys and sign-ins are set up in DeepSeek Harness');
+    // Whether dsh can serve a task is dsh's call: no "API key needed" pill.
+    expect(screen.queryByText('API key needed')).not.toBeInTheDocument();
+    expect(screen.queryByText('API key saved')).not.toBeInTheDocument();
+    const [model] = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    expect(model.value).toBe('opencode-go/deepseek-v4-pro');
+    expect(within(model).getByRole('option', { name: 'OpenCode Go · DeepSeek V4 Flash' })).toBeInTheDocument();
+    // dsh offers no "low" for this route, so neither does the card.
+    expect(screen.queryByRole('option', { name: 'low' })).not.toBeInTheDocument();
+  });
+
+  it('renders the desktop-app strings in Simplified Chinese', async () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    mockEntries([desktopDsh({
+      credentials: [
+        { key: 'DEEPSEEK_API_KEY', label: 'DeepSeek API Key', type: 'secret', required: true,
+          configured: true, has_setup_command: false, stored_by: 'DeepSeek Harness' },
+      ],
+    })]);
+    render(<LocaleProvider><SubAgentSettings /></LocaleProvider>);
+    expect(await screen.findByTestId('sub-agent-source-dsh')).toHaveTextContent('来自 DeepSeek Harness 应用');
+    expect(screen.getByTestId('sub-agent-cred-stored-by-DEEPSEEK_API_KEY')).toHaveTextContent(
+      '已保存在 DeepSeek Harness 中');
+    expect(screen.getByTestId('sub-agent-locate-change-dsh')).toHaveTextContent('更改位置');
+  });
+});

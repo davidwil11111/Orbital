@@ -55,6 +55,31 @@ interface CredentialSpec {
   /** True when the agent's own CLI ingests this credential (`codex login`),
    *  which is a different mechanism from a key Orbital holds. */
   has_setup_command?: boolean;
+  /** The agent's own app holds this key (DSH Desktop) and uses it over
+   *  anything Orbital injects: the card names the owner instead of offering
+   *  a field whose value would be ignored. */
+  stored_by?: string | null;
+}
+
+/** Which copy of the agent Orbital drives. `desktop_app`: the CLI inside a
+ *  vendor app (DeepSeek Harness, ChatGPT); `override`: the user's pick. */
+interface SourceInfo {
+  kind: 'desktop_app' | 'override' | 'path' | 'auto_detect' | 'check_command';
+  label?: string | null;
+  app_path?: string | null;
+  app_version?: string | null;
+}
+
+/** ACP agents: did the binary answer `initialize`? Only `failed` blocks. */
+interface HandshakeInfo {
+  state: 'ok' | 'failed' | 'unknown';
+  detail?: string | null;
+}
+
+/** The vendor app that ships this agent, and where to download it. */
+interface DesktopAppInfo {
+  label: string;
+  download_url?: string | null;
 }
 
 interface SubAgentEntry {
@@ -101,6 +126,9 @@ interface SubAgentEntry {
    *  dispatchable, but only the CLI can confirm it. Absent for agents whose
    *  credential is a login or a key Orbital holds. */
   credential_state?: CredentialState | null;
+  source?: SourceInfo | null;
+  handshake?: HandshakeInfo | null;
+  desktop_app?: DesktopAppInfo | null;
 }
 
 type CredentialState = 'configured' | 'missing' | 'unknown';
@@ -114,6 +142,7 @@ const CREDENTIAL_STATE_KEY: Record<CredentialState, StringKey> = {
 /** Per-agent note under the card header, for agents whose runtime differs
  *  from the sandboxed default in a way the user has to know about. */
 const HOST_NOTE_KEY: Record<string, StringKey> = {
+  dsh: 'subAgentCard.dsh.providersNote',
   pi: 'subAgentCard.pi.hostNote',
   'minimax-code': 'subAgentCard.minimaxCode.signInNote',
 };
@@ -235,7 +264,8 @@ function isNotDetectedEntry(entry: SubAgentEntry): boolean {
  *  credential form; the row is the way to a launcher the user installed by
  *  hand. A successful install, or one still on offer, shows the card alone. */
 function showsLocateFallback(entry: SubAgentEntry): boolean {
-  if (entry.installed === true) return false;
+  // Found, but it did not answer the handshake: the way out is another copy.
+  if (entry.installed === true) return entry.handshake?.state === 'failed';
   if ((entry.install?.platforms?.length ?? 0) === 0) return false;
   return entry.install?.supported === false || entry.install?.state === 'failed';
 }
@@ -272,6 +302,8 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
   const [refreshing, setRefreshing] = useState(false);
   const ws = useWebSocket();
   const [cliMissing, setCliMissing] = useState<Record<string, CliMissing>>({});
+  // "Change location" on a detected card opens the locate row under it.
+  const [locating, setLocating] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -428,17 +460,32 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
                     overridePath={entry.override_path}
                     overrideMissing={entry.override_missing}
                     onChanged={load}
+                    desktopApp={entry.desktop_app}
+                    fallbackHint={entry.desktop_app
+                      ? t('subAgentCard.desktop.locateHint', { app: entry.desktop_app.label })
+                      : undefined}
                   />
                 )
-                : <SubAgentCard entry={entry} onChanged={load} />}
-              {showsLocateFallback(entry) && (
+                : (
+                  <SubAgentCard
+                    entry={entry}
+                    onChanged={load}
+                    onChangeLocation={() => setLocating(m => ({ ...m, [entry.slug]: !m[entry.slug] }))}
+                  />
+                )}
+              {!isNotDetectedEntry(entry) && (showsLocateFallback(entry) || locating[entry.slug]) && (
                 <NotDetectedRow
                   slug={entry.slug}
                   name={entry.name}
                   overridePath={entry.override_path}
                   overrideMissing={entry.override_missing}
-                  onChanged={load}
-                  fallbackHint={t('subAgentCard.locate.orbitalInstallFallback', { name: entry.name })}
+                  onChanged={async () => {
+                    setLocating(m => ({ ...m, [entry.slug]: false }));
+                    await load();
+                  }}
+                  fallbackHint={entry.installed
+                    ? t('subAgentCard.locate.changeHint', { name: entry.name })
+                    : t('subAgentCard.locate.orbitalInstallFallback', { name: entry.name })}
                 />
               )}
               {cliMissing[entry.slug] && (
@@ -483,9 +530,11 @@ export default function SubAgentSettings({ standalone = false, onBack }: Props) 
 interface CardProps {
   entry: SubAgentEntry;
   onChanged: () => void | Promise<void>;
+  /** Open the locate row under this card: point Orbital at another copy. */
+  onChangeLocation?: () => void;
 }
 
-function SubAgentCard({ entry, onChanged }: CardProps) {
+function SubAgentCard({ entry, onChanged, onChangeLocation }: CardProps) {
   const t = useT();
   const ws = useWebSocket();
   // Local copy of the config so the form is editable before save.
@@ -544,6 +593,11 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
   // and keeps its own branch.
   const usesManagedCredentials =
     !supportsLogin && !isApiKeyFlow && credentialFields.length > 0;
+  // Every key optional (dsh: it runs on whatever provider the user set up
+  // in its own app): no "key needed / saved" pill — whether a task can be
+  // served is the agent's call, and the host note says where to set it up.
+  const keyOptional = usesManagedCredentials
+    && credentialFields.every(f => f.required === false);
   // Set only for agents whose credential follows the configured model's
   // provider; Orbital owns no login for those, so neither Login nor Logout.
   const credentialState = entry.credential_state ?? null;
@@ -829,7 +883,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
                 label={t(CREDENTIAL_STATE_KEY[credentialState], { name: entry.name })}
                 variant={credentialState === 'configured' ? 'success' : 'warning'}
               />
-            ) : (
+            ) : keyOptional ? null : (
               <StatusPill
                 label={usesManagedCredentials
                   ? (entry.credentials_configured ? t('subAgentCard.keySaved') : t('subAgentCard.keyNeeded'))
@@ -841,6 +895,25 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
             )}
             {entry.version && (
               <span className="text-secondary/80 font-mono">v{entry.version}</span>
+            )}
+            {entry.installed && entry.source?.kind === 'desktop_app' && entry.source.label && (
+              <span
+                data-testid={`sub-agent-source-${entry.slug}`}
+                title={[entry.source.app_path, entry.source.app_version].filter(Boolean).join(' · ')}
+                className="px-2 py-0.5 rounded-full border text-[11px] bg-sidebar text-secondary border-border"
+              >
+                {t('subAgentCard.source.desktop', { app: entry.source.label })}
+              </span>
+            )}
+            {entry.installed && !entry.override_path && onChangeLocation && (
+              <button
+                type="button"
+                onClick={onChangeLocation}
+                data-testid={`sub-agent-locate-change-${entry.slug}`}
+                className="text-secondary hover:text-primary transition-all duration-150"
+              >
+                {t('subAgentCard.locate.change')}
+              </button>
             )}
             {entry.override_path && (
               <>
@@ -882,6 +955,23 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
         >
           {t('subAgentCard.silentUntilDone')}
         </p>
+      )}
+
+      {entry.installed && entry.handshake?.state === 'failed' && (
+        <div
+          data-testid={`sub-agent-handshake-failed-${entry.slug}`}
+          className="flex flex-col gap-1 mt-2"
+        >
+          <p className="text-xs text-warning">
+            {t('subAgentCard.handshakeFailed', { name: entry.name })}
+          </p>
+          {entry.handshake.detail && (
+            // The agent's own words — dynamic, never translated.
+            <pre className="text-[11px] font-mono text-secondary/80 whitespace-pre-wrap break-words">
+              {entry.handshake.detail}
+            </pre>
+          )}
+        </div>
       )}
 
       {!entry.installed && entry.missing_dependencies.length > 0 && (
@@ -1323,6 +1413,16 @@ function ManagedCredentials({ slug, fields, onChanged }: ManagedCredentialsProps
               </span>
             </label>
 
+            {field.stored_by ? (
+              <div data-testid={`sub-agent-cred-stored-by-${field.key}`} className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <StatusPill label={t('subAgentCard.cred.storedBy', { owner: field.stored_by })} variant="success" />
+                </div>
+                <p className="text-xs text-secondary">
+                  {t('subAgentCard.cred.storedByNote', { owner: field.stored_by })}
+                </p>
+              </div>
+            ) : (<>
             {field.configured && (
               <div className="flex items-center gap-2">
                 <StatusPill label={t('subAgentCard.cred.stored')} variant="success" />
@@ -1381,6 +1481,7 @@ function ManagedCredentials({ slug, fields, onChanged }: ManagedCredentialsProps
                 {errors[field.key]}
               </p>
             )}
+            </>)}
           </div>
         );
       })}

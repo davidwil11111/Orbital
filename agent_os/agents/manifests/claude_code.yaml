@@ -94,6 +94,11 @@ setup:
       - "$HOME/.local/share/fnm/node-versions/*/installation/bin/claude"
       - "$HOME/Library/Application Support/fnm/node-versions/*/installation/bin/claude"
       - "/opt/homebrew/opt/node@*/bin/claude"
+      # The Claude desktop app downloads its own Claude Code into versioned
+      # dirs (<version>/<hash>/claude.app), keeping the previous one beside
+      # it; `*` picks the newest. Last, so a CLI the user installed wins. A
+      # pinned copy the app later prunes is re-resolved (SetupEngine heal).
+      - "$HOME/Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude"
     linux:
       - "/usr/local/bin/claude"
       - "$HOME/.local/bin/claude"

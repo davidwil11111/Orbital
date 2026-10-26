@@ -52,3 +52,29 @@ class AgentSetupStatus:
     # which file is gone, and detection never quietly falls back to PATH.
     override_path: str | None = None
     override_missing: bool = False
+    # Where the binary came from (SetupEngine.resolved_source): the card
+    # names a desktop app ("DeepSeek Harness 0.2.1-rc.3") or the user's pick.
+    source: dict | None = None
+    # ACP agents: the ``initialize`` handshake verdict (agents/handshake.py)
+    # — {"state": "ok"|"failed"|"unknown", "detail"}. Only "failed" makes
+    # the agent not ready; None for agents that are not ACP.
+    handshake: dict | None = None
+
+
+def handshake_failed(status) -> bool:
+    """The agent was found but did not answer the ACP handshake."""
+    handshake = getattr(status, "handshake", None)
+    return isinstance(handshake, dict) and handshake.get("state") == "failed"
+
+
+def status_ready(status) -> bool:
+    """Dispatchable: installed, dependencies met, credentials configured,
+    not below its version floor, and not failing its handshake. The one
+    definition every readiness surface shares."""
+    return bool(
+        getattr(status, "installed", False)
+        and getattr(status, "dependencies_met", True)
+        and getattr(status, "credentials_configured", True)
+        and not getattr(status, "update_needed", False)
+        and not handshake_failed(status)
+    )

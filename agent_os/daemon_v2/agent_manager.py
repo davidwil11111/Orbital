@@ -35,6 +35,7 @@ from agent_os.agent.tools.registry import ToolRegistry
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agent.workspace_files import WorkspaceFileManager, run_session_end_routine
 from agent_os.agents.setup_engine import StaleOkView
+from agent_os.agents.setup_types import handshake_failed
 from agent_os.config.provider_registry import ProviderRegistry
 from agent_os.daemon_v2.default_skills_installer import install_default_skills
 from agent_os.daemon_v2.autonomy import (
@@ -2096,6 +2097,8 @@ class AgentManager:
                 if getattr(status, "credentials_configured", True) is False:
                     continue
                 if getattr(status, "update_needed", False) is True:
+                    continue
+                if handshake_failed(status):
                     continue
                 out.append(slug)
         except Exception:

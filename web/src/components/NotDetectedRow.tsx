@@ -19,6 +19,9 @@ interface Props {
    *  fallback. Replaces the "copy this into {name}" line, which would
    *  imply the agent itself can answer — an ACP server like dsh cannot. */
   fallbackHint?: string;
+  /** The vendor app that ships this agent (DSH Desktop): the row leads with
+   *  its download link, because installing the app is all it takes. */
+  desktopApp?: { label: string; download_url?: string | null } | null;
 }
 
 interface LocateTestResult {
@@ -44,7 +47,7 @@ interface LocateTestResult {
  *  `overrideMissing`: the file the user chose earlier is gone (the agent
  *  updated itself, say). Same row, first line names the missing file. */
 export default function NotDetectedRow({
-  slug, name, overridePath, overrideMissing, onChanged, fallbackHint,
+  slug, name, overridePath, overrideMissing, onChanged, fallbackHint, desktopApp,
 }: Props) {
   const t = useT();
   const [answer, setAnswer] = useState('');
@@ -151,6 +154,23 @@ export default function NotDetectedRow({
         >
           {t('subAgentCard.locate.gone', { path: overridePath })}
         </p>
+      )}
+
+      {desktopApp?.download_url && (
+        <div
+          data-testid={`sub-agent-desktop-install-${slug}`}
+          className="flex items-center gap-2 flex-wrap mt-2"
+        >
+          <a
+            href={desktopApp.download_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs bg-accent text-white rounded px-3 py-1.5 hover:bg-accent/90 transition-all duration-150"
+          >
+            {t('subAgentCard.desktop.install', { app: desktopApp.label })}
+          </a>
+          <span className="text-xs text-secondary">{t('subAgentCard.desktop.installHint')}</span>
+        </div>
       )}
 
       <div className="flex items-center gap-2 flex-wrap mt-1.5">

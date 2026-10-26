@@ -1,0 +1,58 @@
+# Test-only agent for tests/unit/test_orbital_installer.py. Never shipped:
+# it lives outside agent_os/agents/manifests/ and is registered by the tests
+# themselves. It exercises every manifest field SubAgentInstaller and the
+# GET /settings/sub-agents install entry read, so the generic installer keeps
+# coverage without any shipped agent having to be Orbital-installed.
+manifest_version: "1"
+name: "NPM Composed Fixture"
+slug: "npm-composed"
+description: "Fixture agent installed by Orbital as a pinned npm composition"
+author: "orbital-tests"
+version: "1.0.0"
+
+runtime:
+  adapter: cli
+  command: "npm-composed-acp"        # never on PATH; resolved via auto_detect below
+  transport: acp-sdk
+  mode: pipe
+  interactive: false
+  args: []
+  config_template: "agent.template.yml"
+
+setup:
+  orbital_install:
+    platforms: [macos, linux, windows]
+  auto_detect:
+    macos:
+      - "${ORBITAL_DATA_DIR}/agents/npm-composed/node_modules/.bin/npm-composed-acp"
+    linux:
+      - "${ORBITAL_DATA_DIR}/agents/npm-composed/node_modules/.bin/npm-composed-acp"
+    windows:
+      # npm's `.cmd` shim is the launcher CreateProcess can run; the
+      # extensionless file beside it is a POSIX sh script.
+      - "${ORBITAL_DATA_DIR}/agents/npm-composed/node_modules/.bin/npm-composed-acp.cmd"
+  credentials:
+    - key: "NPM_COMPOSED_API_KEY"
+      label: "NPM Composed API Key"
+      type: secret
+      required: true
+      env_var: "NPM_COMPOSED_API_KEY"
+    - key: "NPM_COMPOSED_BASE_URL"
+      label: "NPM Composed API Base URL (optional)"
+      type: secret
+      required: false
+      env_var: "NPM_COMPOSED_BASE_URL"
+
+capabilities:
+  skills: [code_generation]
+  input_types: [text]
+  output_types: [text]
+  routing_hint: "Test fixture; never routed to"
+  needs_shell: true
+  needs_network: true
+  emits_tool_activity: false
+
+permissions:
+  shell: true
+  workspace_access: read_write
+  autonomy_recommended: hands_off

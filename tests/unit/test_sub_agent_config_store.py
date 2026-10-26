@@ -31,7 +31,7 @@ def store(tmp_path):
 class TestFlaglessParams:
     def test_build_extra_args_skips_none_flag_template(self, store):
         """A UI-only param must contribute nothing to argv."""
-        store.set("dsh", {"model": "deepseek-v4-pro"})
+        store.set("dsh", {"model": "deepseek-official/deepseek-v4-pro"})
         assert store.build_extra_args("dsh") == []
 
     def test_build_extra_args_skips_defaults_with_none_flag_template(self, store):
@@ -62,44 +62,45 @@ class TestFlaglessParams:
 
     def test_flagless_params_are_surfaced_to_the_ui(self, store):
         schema = store.schema_for("dsh")
+        # The static fallback; the route widens it with dsh's live list.
         assert schema["model"]["allowed"] == [
-            "deepseek-v4-flash", "deepseek-v4-pro",
+            "deepseek-official/deepseek-flash", "deepseek-official/deepseek-v4-pro",
         ]
-        assert schema["model"]["default"] == "deepseek-v4-flash"
+        # Unset follows the default model picked in DSH Desktop.
+        assert schema["model"]["default"] is None
         assert schema["permission-mode"]["allowed"] == [
-            "workspace-write", "danger-full-access",
+            "read-only", "workspace-write", "danger-full-access",
         ]
         assert schema["permission-mode"]["default"] == "workspace-write"
 
     def test_flagless_params_round_trip_through_the_store(self, store):
-        store.set("dsh", {"model": "deepseek-v4-pro",
+        store.set("dsh", {"model": "deepseek-official/deepseek-v4-pro",
                           "permission-mode": "danger-full-access"})
         assert store.get("dsh") == {
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-official/deepseek-v4-pro",
             "permission-mode": "danger-full-access",
         }
+
+    def test_a_live_model_is_accepted_through_extra_allowed(self, store):
+        store.set("dsh", {"model": "opencode-go/deepseek-v4-pro"},
+                  extra_allowed={"model": ["opencode-go/deepseek-v4-pro"]})
+        assert store.get("dsh")["model"] == "opencode-go/deepseek-v4-pro"
 
 
 class TestResolveParams:
     def test_defaults_apply_when_nothing_persisted(self, store):
-        assert resolve_params("dsh", store) == {
-            "model": "deepseek-v4-flash",
-            "permission-mode": "workspace-write",
-        }
+        assert resolve_params("dsh", store) == {"permission-mode": "workspace-write"}
 
     def test_persisted_overrides_beat_defaults(self, store):
-        store.set("dsh", {"model": "deepseek-v4-pro"})
+        store.set("dsh", {"model": "deepseek-official/deepseek-v4-pro"})
         assert resolve_params("dsh", store) == {
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-official/deepseek-v4-pro",
             "permission-mode": "workspace-write",
         }
 
     def test_works_without_a_store(self):
         """Dispatch must still get the SCHEMA defaults when no store is wired."""
-        assert resolve_params("dsh") == {
-            "model": "deepseek-v4-flash",
-            "permission-mode": "workspace-write",
-        }
+        assert resolve_params("dsh") == {"permission-mode": "workspace-write"}
 
     def test_unknown_slug_is_empty(self, store):
         assert resolve_params("nope", store) == {}
@@ -112,15 +113,27 @@ class TestDshSchema:
 
     def test_model_allowlist(self):
         assert SCHEMA["dsh"]["model"].allowed == (
-            "deepseek-v4-flash", "deepseek-v4-pro",
+            "deepseek-official/deepseek-flash", "deepseek-official/deepseek-v4-pro",
         )
-        assert SCHEMA["dsh"]["model"].default == "deepseek-v4-flash"
+        assert SCHEMA["dsh"]["model"].default is None
 
-    def test_permission_mode_allowlist(self):
-        assert SCHEMA["dsh"]["permission-mode"].allowed == (
-            "workspace-write", "danger-full-access",
-        )
-        assert SCHEMA["dsh"]["permission-mode"].default == "workspace-write"
+    def test_permission_mode_is_dsh_env_with_all_three_modes(self):
+        schema = SCHEMA["dsh"]["permission-mode"]
+        assert schema.allowed == ("read-only", "workspace-write", "danger-full-access")
+        assert schema.default == "workspace-write"
+        assert schema.env_var == "DSH_PERMISSION_MODE"
+
+    def test_effort_is_dshs_reasoning_option(self, tmp_path):
+        from agent_os.daemon_v2.sub_agent_config_store import SubAgentConfigStore
+        schema = SCHEMA["dsh"]["effort"]
+        assert schema.allowed == ("off", "low", "high", "max")
+        assert schema.default is None
+        assert schema.acp_config_option == "reasoning_effort"
+        store = SubAgentConfigStore(str(tmp_path / "cfg.json"))
+        assert store.build_acp_config_options("dsh") == {}
+        store.set("dsh", {"effort": "max"})
+        assert store.build_acp_config_options("dsh") == {"reasoning_effort": "max"}
+        assert store.build_extra_args("dsh") == []
 
 
 class TestCodeBuddySchema:

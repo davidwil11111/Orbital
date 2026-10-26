@@ -1,52 +1,112 @@
 manifest_version: "1"
 name: "DeepSeek Harness"
 slug: "dsh"
-description: "DeepSeek's agent harness, driven over ACP from an Orbital-managed install"
+description: "DeepSeek's agent harness, driven over ACP through the DeepSeek Harness desktop app"
 author: "deepseek-ai"
-version: "1.0.0"
+version: "2.0.0"
 
 runtime:
   adapter: cli
-  command: "dsh-acp-demo"            # never on PATH; resolved via auto_detect below
+  # DeepSeek ships the harness as a desktop app (0.2.x, Oct 2026) with the
+  # `dsh` CLI inside it. Its shipped `acp` profile is an ACP stdio server;
+  # Orbital's per-spawn patch (assets/dsh/acp.patch.yml) adds the persona,
+  # model, and per-project session store. The 0.1 `dsh-acp-demo --config`
+  # composition Orbital used to install is gone upstream.
+  command: "dsh"
   transport: acp-sdk
   mode: pipe
   interactive: false
-  args: []                            # --config <per-spawn file> appended by the Task 4 renderer
-  config_template: "cordis.template.yml"
+  args: ["--profile", "acp"]
+  config_template: "acp.patch.yml"
+  config_flag: "--patch"
+  # dsh keeps provider definitions per profile: what the user sets up on DSH
+  # Desktop's Models page lands in the `desktop` profile, which the `acp`
+  # profile never reads (keys and sign-ins are shared, the routes are not).
+  # These rows are copied into every spawn's patch unchanged, so a provider
+  # that works in the app works here and one that does not, does not —
+  # Orbital never writes dsh's files. `agent-default-model` is the model the
+  # user picked in the app, used when Orbital's own model setting is unset.
+  config_mirror:
+    home_env: "DSH_HOME"
+    home_default: "~/.dsh"
+    file: "profiles/desktop/cordis.patch.yml"
+    rows: ["llm-deepseek", "llm-deepseek-account", "llm-pi-ai"]
+    default_model_row: "agent-default-model"
+    default_provider: "deepseek-official"
 
 setup:
-  orbital_install:
-    # Windows: gate lifted by spec 127 (2026-10-22). The composition is
-    # OS-neutral (shutil staging, `npm ci` with no-window flags, PATHEXT-aware
-    # node/npm lookup) and the lockfile resolves the sandbox to
-    # @deepseek-ai/dsh-sandbox-windows-acl there. Must be verified on the
-    # CI-built Orbital-Setup .exe (spec 127 V1–V3: install, dispatch,
-    # sandbox); record the passing CI run id here. Until that line exists,
-    # treat Windows as unverified — not as gated by design.
-    platforms: [macos, linux, windows]
+  # The desktop app is the vendor's distribution, so it is looked for first.
+  # A `dsh` on PATH (Desktop's opt-in "Manage dsh Command…", or an npm
+  # install of @deepseek-ai/dsh on Node 24.9+) is the same CLI and works too.
+  desktop_apps:
+    - label: "DeepSeek Harness"
+      order: before_cli
+      macos:
+        bundle_ids: ["com.deepseek.dsh"]
+        app_names: ["DeepSeek Harness.app"]
+        # A shell launcher that runs the app's own Electron as node
+        # (ELECTRON_RUN_AS_NODE): no system node, nothing on PATH.
+        executable: "Contents/Resources/runtime/cli/bin/dsh"
+      windows:
+        # Per-user NSIS install; InstallLocation in the uninstall registry.
+        # Layout from upstream apps/desktop (cli/dsh.cmd) — verify on the
+        # CI-built Orbital-Setup .exe before calling Windows supported.
+        display_names: ["DeepSeek Harness"]
+        install_dirs: ["%LOCALAPPDATA%\\Programs\\DeepSeek Harness"]
+        executable: "resources\\runtime\\cli\\bin\\dsh.cmd"
+      download_urls:
+        macos-arm64: "https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg"
+        macos-x86_64: "https://download.deepseek.com/desktop/dsh-latest-macos-x64.dmg"
+        windows: "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+  # The standalone CLI (`npm install -g @deepseek-ai/dsh`, Node 24.9+) and
+  # the /usr/local/bin/dsh link DSH Desktop's "Manage dsh Command…" creates.
+  # `which` finds these when the daemon's PATH is complete; the list is the
+  # second line of defence.
   auto_detect:
-    macos:
-      - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo"
-    linux:
-      - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo"
     windows:
-      # npm's `.cmd` shim is the launcher CreateProcess can run. The
-      # extensionless file beside it is a POSIX sh script and the `.ps1`
-      # needs a PowerShell host; neither is a spawn target.
-      - "${ORBITAL_DATA_DIR}/agents/dsh/node_modules/.bin/dsh-acp-demo.cmd"
-  # No check_command: dsh-acp-demo is an ACP stdio server whose only option
-  # is --config/-c (spec 127 V0: --version/--help both exit 1 with
-  # ERR_PARSE_ARGS_UNKNOWN_OPTION). The locate card's Test therefore checks
-  # existence + executability only (SetupEngine.test_override), and the
-  # status sweep reports no cli_version for this agent.
+      - "%APPDATA%\\npm\\dsh.cmd"
+    macos:
+      - "/usr/local/bin/dsh"
+      - "/opt/homebrew/bin/dsh"
+      - "$HOME/.npm-global/bin/dsh"
+      - "$HOME/.nvm/versions/node/*/bin/dsh"
+      - "$HOME/.volta/bin/dsh"
+      - "$HOME/Library/pnpm/dsh"
+      - "$HOME/.local/bin/dsh"
+    linux:
+      - "/usr/local/bin/dsh"
+      - "$HOME/.npm-global/bin/dsh"
+      - "$HOME/.nvm/versions/node/*/bin/dsh"
+      - "$HOME/.volta/bin/dsh"
+      - "$HOME/.local/share/pnpm/dsh"
+      - "$HOME/.local/bin/dsh"
+  # Commander prints the version and exits before anything boots or reads
+  # stdin (2.6 s through the desktop launcher).
+  check_command: "dsh -V"
+  # 0.2.1 is the first line with the `acp` profile, --patch, and
+  # session/resume; anything older is the retired 0.1 composition.
+  min_version: "0.2.1-rc.1"
   credentials:
     - key: "DEEPSEEK_API_KEY"
       label: "DeepSeek API Key"
       type: secret
-      required: true
-      env_var: "DEEPSEEK_API_KEY"     # REQUIRED — a credential without env_var is silently dropped (setup_engine.py:297)
+      # Not required: dsh can run on any provider the user set up in DSH
+      # Desktop (DeepSeek account sign-in, OpenAI, a gateway…), so whether a
+      # dispatch can be served is dsh's call, in its own words — Orbital does
+      # not gate on a DeepSeek key.
+      required: false
+      env_var: "DEEPSEEK_API_KEY"     # a credential without env_var is silently dropped
+      # DSH Desktop's Models page saves the key here, and dsh resolves this
+      # file BEFORE the environment: with a key in it, the one Orbital
+      # injects is ignored. Orbital's field is the fallback for a machine
+      # where the desktop app never got one.
+      agent_store:
+        file: "~/.dsh/.credentials.yaml"
+        home_env: "DSH_HOME"
+        key: "refs.DEEPSEEK_API_KEY"
+        label: "DeepSeek Harness"
     - key: "DEEPSEEK_BASE_URL"
-      label: "DeepSeek API Base URL (optional; region-locked endpoints)"
+      label: "DeepSeek API Base URL"
       type: secret
       required: false
       env_var: "DEEPSEEK_BASE_URL"
@@ -58,7 +118,9 @@ capabilities:
   routing_hint: "Use for coding tasks on DeepSeek models via the DeepSeek Harness"
   needs_shell: true
   needs_network: true
-  emits_tool_activity: false          # drives the Task 5 silent-until-done copy
+  # dsh 0.2's ACP bridge emits tool_call / tool_call_update itself; the
+  # activity shim Orbital injected into the 0.1 composition is retired.
+  emits_tool_activity: true
 
 permissions:
   # NOTE: network_domains deliberately omitted. It would be documentation-only:

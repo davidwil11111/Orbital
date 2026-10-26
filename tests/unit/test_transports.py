@@ -376,11 +376,10 @@ DSH_MANIFEST = os.path.join(
     _REPO_ROOT, "agent_os", "agents", "manifests", "dsh.yaml"
 )
 
-# Where the manifest's auto_detect entry lands once ${ORBITAL_DATA_DIR} is
-# expanded. Mirrors the installer's target layout.
-DSH_BINARY_RELPATH = os.path.join(
-    "agents", "dsh", "node_modules", ".bin", "dsh-acp-demo"
-)
+# What the DeepSeek Harness desktop app looks like to the resolver: the CLI
+# launcher inside the bundle (agents/desktop_apps.py finds it by bundle id).
+DSH_APP = "/Applications/DeepSeek Harness.app"
+DSH_DESKTOP_EXE = DSH_APP + "/Contents/Resources/runtime/cli/bin/dsh"
 
 
 def _load_dsh():
@@ -393,18 +392,28 @@ def _engine(manifest, data_dir):
     return SetupEngine(registry, data_dir=str(data_dir))
 
 
-def _plant_binary(data_dir):
-    path = os.path.join(str(data_dir), DSH_BINARY_RELPATH)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("#!/usr/bin/env node\n")
-    os.chmod(path, 0o755)
-    return path
+def _desktop_hit(found=True):
+    """Patch the desktop-app lookup: the DSH Desktop bundle is installed
+    (``found``) or not, independent of the host."""
+    from agent_os.agents.desktop_apps import DesktopAppHit
+
+    def _find(app, os_name, **_kw):
+        if not found or app.label != "DeepSeek Harness":
+            return None
+        return DesktopAppHit(label=app.label, app_path=DSH_APP,
+                             executable=DSH_DESKTOP_EXE, version="0.2.1-rc.3")
+    return patch("agent_os.agents.desktop_apps.find_desktop_app", _find)
+
+
+def _exists_only(*paths):
+    real = os.path.isfile
+    return patch("agent_os.agents.setup_engine.os.path.isfile",
+                 lambda p: p in paths or real(p))
 
 
 class TestDshManifest:
-    """The manifest is the contract between the installer, the renderer, and
-    the transport — every claim in it is load-bearing somewhere."""
+    """The manifest is the contract between discovery, the renderer, and the
+    transport — every claim in it is load-bearing somewhere."""
 
     def test_resolves_to_acp_sdk_transport(self):
         from agent_os.daemon_v2.sub_agent_manager import SubAgentManager
@@ -413,36 +422,57 @@ class TestDshManifest:
         t = mgr._resolve_transport(_load_dsh(), {})
         assert isinstance(t, ACPSDKTransport)
 
-    def test_runtime_args_are_empty(self):
-        """--config is appended per spawn by the composition renderer. A static
-        config path here would resurrect the shared-file race."""
-        assert _load_dsh().runtime.args == []
+    def test_boots_the_shipped_acp_profile_and_patches_it_per_spawn(self):
+        """``--profile acp`` is the 0.2 launch contract (the 0.1
+        ``dsh-acp-demo --config`` one answers "--profile <name> is
+        required"). The patch path is appended per spawn — a static path
+        here would resurrect the shared-file race."""
+        runtime = _load_dsh().runtime
+        assert runtime.command == "dsh"
+        assert runtime.args == ["--profile", "acp"]
+        assert runtime.config_template == "acp.patch.yml"
+        assert runtime.config_flag == "--patch"
 
-    def test_declares_a_config_template(self):
-        assert _load_dsh().runtime.config_template == "cordis.template.yml"
+    def test_the_patch_template_ships_with_the_build(self):
+        from agent_os.agents.installer import bundled_asset_path
+        assert bundled_asset_path("dsh", "acp.patch.yml") is not None
 
-    def test_declares_that_it_emits_no_tool_activity(self):
-        assert _load_dsh().capabilities.emits_tool_activity is False
+    def test_emits_tool_activity_itself(self):
+        """dsh 0.2's ACP bridge sends tool_call/tool_call_update; the 0.1
+        activity shim is retired."""
+        assert _load_dsh().capabilities.emits_tool_activity is True
 
     def test_other_manifests_default_to_emitting_tool_activity(self):
         claude = ManifestLoader.load(os.path.join(
             _REPO_ROOT, "agent_os", "agents", "manifests", "claude_code.yaml"))
         assert claude.capabilities.emits_tool_activity is True
         assert claude.runtime.config_template == ""
-        # No platform gate: the user brings their own binary, so the
-        # all-three-OSes auto_detect invariant still applies to it in full.
+        assert claude.runtime.config_flag == "--config"
         assert claude.setup.orbital_install.platforms == []
 
-    def test_declares_the_platforms_orbital_can_install_it_on(self):
-        """Spec 127 lifted the Windows gate: every OS Orbital installs on
-        has an auto_detect entry, and Windows names npm's ``.cmd`` shim
-        (the only launcher CreateProcess can run)."""
+    def test_the_desktop_app_is_the_distribution(self):
         dsh = _load_dsh()
-        assert dsh.setup.orbital_install.platforms == ["macos", "linux", "windows"]
-        assert sorted(dsh.setup.auto_detect) == ["linux", "macos", "windows"]
-        assert sorted(dsh.setup.auto_detect) == sorted(
-            dsh.setup.orbital_install.platforms)
-        assert dsh.setup.auto_detect["windows"][0].endswith("dsh-acp-demo.cmd")
+        assert dsh.setup.orbital_install.platforms == []
+        [app] = dsh.setup.desktop_apps
+        assert app.order == "before_cli"
+        assert app.platforms["macos"].bundle_ids == ["com.deepseek.dsh"]
+        assert app.platforms["macos"].executable == (
+            "Contents/Resources/runtime/cli/bin/dsh")
+        assert app.platforms["windows"].executable.endswith("dsh.cmd")
+        assert set(app.download_urls) == {"macos-arm64", "macos-x86_64", "windows"}
+        assert all(u.startswith("https://download.deepseek.com/")
+                   for u in app.download_urls.values())
+
+    def test_version_floor_is_the_acp_profile_line(self):
+        dsh = _load_dsh()
+        assert dsh.setup.check_command == "dsh -V"
+        assert dsh.setup.min_version == "0.2.1-rc.1"
+
+    def test_the_key_the_desktop_app_saved_is_recognised(self):
+        [key] = [c for c in _load_dsh().setup.credentials if c.key == "DEEPSEEK_API_KEY"]
+        assert key.agent_store == {
+            "file": "~/.dsh/.credentials.yaml", "home_env": "DSH_HOME",
+            "key": "refs.DEEPSEEK_API_KEY", "label": "DeepSeek Harness"}
 
     def test_does_not_claim_orbital_governs_its_egress(self):
         """Transport-backed sub-agents spawn outside the project sandbox, so a
@@ -450,53 +480,47 @@ class TestDshManifest:
         assert _load_dsh().permissions.network_domains == []
 
 
-@pytest.mark.skipif(
-    detect_os() == "windows",
-    reason="dsh v1 declares macOS/Linux auto_detect only (npm .bin shim "
-           "story is untested on Windows)",
-)
 class TestDshBinaryResolution:
-    def test_auto_detect_expands_orbital_data_dir(self, tmp_path):
+    def test_the_desktop_app_wins_over_a_cli_on_path(self, tmp_path):
         manifest = _load_dsh()
-        planted = _plant_binary(tmp_path)
         engine = _engine(manifest, tmp_path)
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
-            assert engine.resolve_binary(manifest) == planted
+        with _desktop_hit(), _exists_only(DSH_DESKTOP_EXE), \
+                patch("agent_os.agents.setup_engine.shutil.which",
+                      return_value="/usr/local/bin/dsh"):
+            assert engine.resolve_binary(manifest) == DSH_DESKTOP_EXE
+        assert engine.resolved_source("dsh") == {
+            "kind": "desktop_app", "label": "DeepSeek Harness",
+            "app_path": DSH_APP, "app_version": "0.2.1-rc.3"}
+
+    def test_a_cli_on_path_is_used_without_the_desktop_app(self, tmp_path):
+        manifest = _load_dsh()
+        engine = _engine(manifest, tmp_path)
+        with _desktop_hit(found=False), _exists_only("/usr/local/bin/dsh"), \
+                patch("agent_os.agents.setup_engine.shutil.which",
+                      return_value="/usr/local/bin/dsh"):
+            assert engine.resolve_binary(manifest) == "/usr/local/bin/dsh"
+        assert engine.resolved_source("dsh") == {"kind": "path"}
 
     def test_resolved_path_becomes_the_spawn_command(self, tmp_path):
         manifest = _load_dsh()
-        planted = _plant_binary(tmp_path)
         engine = _engine(manifest, tmp_path)
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
+        with _desktop_hit(), _exists_only(DSH_DESKTOP_EXE):
             config = engine.get_adapter_config("dsh", "/tmp/workspace")
-        assert config["command"] == planted
-        assert config["args"] == []
-
-    def test_data_dir_is_absolutised(self, tmp_path, monkeypatch):
-        """A relative data dir (the dev daemon default) must still resolve."""
-        manifest = _load_dsh()
-        _plant_binary(tmp_path)
-        monkeypatch.chdir(tmp_path)
-        engine = _engine(manifest, ".")
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
-            resolved = engine.resolve_binary(manifest)
-        assert resolved is not None
-        assert os.path.isabs(resolved)
+        assert config["command"] == DSH_DESKTOP_EXE
+        assert config["args"] == ["--profile", "acp"]
 
     def test_credentials_produce_a_deepseek_api_key_env_entry(
         self, tmp_path, monkeypatch
     ):
         manifest = _load_dsh()
-        _plant_binary(tmp_path)
         engine = _engine(manifest, tmp_path)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env")
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
+        with _desktop_hit(), _exists_only(DSH_DESKTOP_EXE):
             config = engine.get_adapter_config("dsh", "/tmp/workspace")
         assert config["env"]["DEEPSEEK_API_KEY"] == "sk-from-env"
 
     def test_credential_store_supplies_the_key(self, tmp_path):
         manifest = _load_dsh()
-        _plant_binary(tmp_path)
         registry = AgentRegistry()
         registry.register(manifest)
         store = MagicMock()
@@ -506,21 +530,42 @@ class TestDshBinaryResolution:
         engine = SetupEngine(
             registry, credential_store=store, data_dir=str(tmp_path),
         )
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
+        with _desktop_hit(), _exists_only(DSH_DESKTOP_EXE):
             config = engine.get_adapter_config("dsh", "/tmp/workspace")
         assert config["env"]["DEEPSEEK_API_KEY"] == "sk-from-store"
+
+    def test_permission_mode_reaches_dsh_as_its_env_var(self, tmp_path):
+        from agent_os.daemon_v2.sub_agent_config_store import SubAgentConfigStore
+        manifest = _load_dsh()
+        registry = AgentRegistry()
+        registry.register(manifest)
+        store = SubAgentConfigStore(str(tmp_path / "cfg.json"))
+        engine = SetupEngine(registry, sub_agent_config_store=store,
+                             data_dir=str(tmp_path))
+        with _desktop_hit(), _exists_only(DSH_DESKTOP_EXE):
+            default = engine.get_adapter_config("dsh", "/tmp/ws")
+            store.set("dsh", {"permission-mode": "danger-full-access"})
+            chosen = engine.get_adapter_config("dsh", "/tmp/ws")
+        assert default["env"]["DSH_PERMISSION_MODE"] == "workspace-write"
+        assert chosen["env"]["DSH_PERMISSION_MODE"] == "danger-full-access"
+        # Never argv: dsh's acp profile takes no such flag.
+        assert chosen["args"] == ["--profile", "acp"]
 
     def test_missing_binary_reports_not_installed(self, tmp_path):
         manifest = _load_dsh()
         engine = _engine(manifest, tmp_path)
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
+        with _desktop_hit(found=False), \
+                patch("agent_os.agents.setup_engine.shutil.which", return_value=None), \
+                patch("agent_os.agents.setup_engine.os.path.isfile", return_value=False):
             assert engine.resolve_binary(manifest) is None
             assert engine.check_agent("dsh").installed is False
 
     def test_missing_binary_raises_at_dispatch(self, tmp_path):
         manifest = _load_dsh()
         engine = _engine(manifest, tmp_path)
-        with patch("agent_os.agents.setup_engine.shutil.which", return_value=None):
+        with _desktop_hit(found=False), \
+                patch("agent_os.agents.setup_engine.shutil.which", return_value=None), \
+                patch("agent_os.agents.setup_engine.os.path.isfile", return_value=False):
             with pytest.raises(ValueError, match="not installed"):
                 engine.get_adapter_config("dsh", "/tmp/workspace")
 
@@ -576,9 +621,9 @@ class TestOrbitalDataDirToken:
 
 
 class TestConfigTemplateDispatchHook:
-    """A manifest declaring ``runtime.config_template`` gets a composition
-    rendered per spawn and appended as ``--config``. Manifest-driven, not
-    slug-hardcoded."""
+    """A manifest declaring ``runtime.config_template`` gets a file rendered
+    per spawn and appended with its ``runtime.config_flag`` (dsh:
+    ``--patch``). Manifest-driven, not slug-hardcoded."""
 
     def _mgr(self, tmp_path, persisted=None, *, install_template=True):
         import shutil as _shutil
@@ -592,8 +637,8 @@ class TestConfigTemplateDispatchHook:
             template_dir.mkdir(parents=True)
             _shutil.copy(
                 os.path.join(_REPO_ROOT, "agent_os", "agents", "assets", "dsh",
-                             "cordis.template.yml"),
-                str(template_dir / "cordis.template.yml"),
+                             "acp.patch.yml"),
+                str(template_dir / "acp.patch.yml"),
             )
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -636,8 +681,9 @@ class TestConfigTemplateDispatchHook:
     @staticmethod
     def _config_arg(adapter):
         args = adapter.start.await_args.args[0].args
-        assert "--config" in args, args
-        return args[args.index("--config") + 1]
+        assert "--patch" in args, args
+        assert "--config" not in args, args
+        return args[args.index("--patch") + 1]
 
     @pytest.mark.asyncio
     async def test_appends_config_pointing_at_a_rendered_file(self, tmp_path):
@@ -667,7 +713,7 @@ class TestConfigTemplateDispatchHook:
             workspace=str(workspace), namespace=None, agent_slug="dsh",
             enabled_sub_agents=["dsh"],
         )
-        assert blocks["acp-agent"]["config"]["persona"] == expected
+        assert blocks["system-prompt"]["config"]["personaPrefix"] == expected
 
     @pytest.mark.asyncio
     async def test_no_memory_md_stub_is_created(self, tmp_path):
@@ -681,16 +727,21 @@ class TestConfigTemplateDispatchHook:
         assert not os.path.exists(memory)
 
     @pytest.mark.asyncio
-    async def test_model_and_mode_come_from_the_config_store(self, tmp_path):
+    async def test_model_comes_from_the_config_store(self, tmp_path):
         import yaml as _yaml
         mgr, workspace = self._mgr(tmp_path, persisted={
-            "model": "deepseek-v4-pro", "permission-mode": "danger-full-access",
+            "model": "deepseek-official/deepseek-v4-pro",
+            "permission-mode": "danger-full-access",
         })
         adapter = await self._spawn(mgr)
         with open(self._config_arg(adapter), encoding="utf-8") as f:
             blocks = {b["id"]: b for b in _yaml.safe_load(f)}
-        assert blocks["acp-agent"]["config"]["model"] == "deepseek-v4-pro"
-        assert blocks["sandbox-policy"]["config"]["mode"] == "danger-full-access"
+        assert blocks["acp"]["config"] == {
+            "provider": "deepseek-official", "model": "deepseek-v4-pro"}
+        # The permission mode is DSH_PERMISSION_MODE (spawn env), never a
+        # patch row: replacing sandbox-policy's config would drop its
+        # workspaceRoot expression.
+        assert "sandbox-policy" not in blocks
 
     @pytest.mark.asyncio
     async def test_schema_defaults_apply_with_nothing_persisted(self, tmp_path):
@@ -699,8 +750,7 @@ class TestConfigTemplateDispatchHook:
         adapter = await self._spawn(mgr)
         with open(self._config_arg(adapter), encoding="utf-8") as f:
             blocks = {b["id"]: b for b in _yaml.safe_load(f)}
-        assert blocks["acp-agent"]["config"]["model"] == "deepseek-v4-flash"
-        assert blocks["sandbox-policy"]["config"]["mode"] == "workspace-write"
+        assert blocks["acp"]["config"]["model"] == "deepseek-v4-flash"
 
     @pytest.mark.asyncio
     async def test_persistence_root_is_scoped_to_project_and_handle(self, tmp_path):
@@ -710,7 +760,7 @@ class TestConfigTemplateDispatchHook:
         adapter = await self._spawn(mgr)
         with open(self._config_arg(adapter), encoding="utf-8") as f:
             blocks = {b["id"]: b for b in _yaml.safe_load(f)}
-        assert blocks["acp-agent"]["config"]["persistenceRoot"] == os.path.join(
+        assert blocks["session-persistence-jsonl"]["config"]["root"] == os.path.join(
             ProjectPaths(str(workspace)).sub_agent_dir("dsh"), "dsh-sessions")
 
     @pytest.mark.asyncio
@@ -773,7 +823,7 @@ class TestConfigTemplateDispatchHook:
 
     @pytest.mark.asyncio
     async def test_manifest_without_config_template_is_untouched(self, tmp_path):
-        """Every other agent's argv must not grow a --config."""
+        """Every other agent's argv must not grow a --config / --patch."""
         from agent_os.agents.manifest import AgentManifest, ManifestRuntime
         mgr, workspace = self._mgr(tmp_path)
         mgr._registry.get.return_value = AgentManifest(

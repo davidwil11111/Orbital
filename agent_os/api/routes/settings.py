@@ -5,6 +5,8 @@
 """Global settings endpoints."""
 
 import asyncio
+import functools
+import inspect
 import logging
 import os
 import re
@@ -24,6 +26,9 @@ from agent_os.telemetry.diagnostics import (
     error_class_of,
     install_kind_of,
 )
+from agent_os.agents.handshake import HANDSHAKE_TIMEOUT_S
+from agent_os.agents.setup_engine import agent_store_has
+from agent_os.agents.setup_types import status_ready
 from agent_os.agents.installer import (
     InstallInProgress,
     InstallUnsupported,
@@ -628,6 +633,25 @@ def _install_entry(manifest, *, installed: bool) -> dict:
     return _installer.entry_for(manifest, installed=installed)
 
 
+def _desktop_app_entry(manifest) -> dict | None:
+    """``{"label", "download_url"}`` for the first desktop app the manifest
+    declares for this OS, or None."""
+    if manifest is None:
+        return None
+    import platform
+
+    from agent_os.agents.desktop_apps import download_url_for
+    from agent_os.daemon_v2.models import detect_os
+
+    current_os = detect_os()
+    for app in manifest.setup.desktop_apps:
+        if current_os in app.platforms:
+            return {"label": app.label,
+                    "download_url": download_url_for(app, current_os,
+                                                     platform.machine())}
+    return None
+
+
 def _credential_configured(cred, missing: list[str]) -> bool:
     """Whether one declared credential currently resolves to a value.
 
@@ -641,6 +665,8 @@ def _credential_configured(cred, missing: list[str]) -> bool:
     """
     if cred.required:
         return cred.key not in missing
+    if getattr(cred, "agent_store", None) and agent_store_has(cred.agent_store):
+        return True
     if cred.type == "oauth_cli":
         # Never spawn a CLI to answer a status read; only the required
         # oauth credentials are worth that cost, and check_all pays it.
@@ -670,6 +696,12 @@ def _declared_credentials(manifest, missing: list[str]) -> list[dict]:
             # CLI login rather than a form Orbital renders.
             "has_setup_command": bool(c.setup_command),
             "configured": _credential_configured(c, missing),
+            # The agent's own app holds this key (DSH Desktop): the card
+            # names it instead of offering a field whose value the agent
+            # would ignore. None when Orbital's copy or the env is in charge.
+            "stored_by": (c.agent_store.get("label") or manifest.name)
+            if getattr(c, "agent_store", None) and agent_store_has(c.agent_store)
+            else None,
         }
         for c in manifest.setup.credentials
     ]
@@ -696,8 +728,8 @@ def _build_sub_agent_status_entry(s) -> dict:
         "installed": s.installed,
         "binary_path": s.binary_path,
         "version": s.version,
-        "ready": (s.installed and s.dependencies_met and s.credentials_configured
-                  and not update_needed),
+        # Spec 116 D4 floor and the ACP handshake verdict both count here.
+        "ready": status_ready(s),
         "update_needed": update_needed,
         "min_version": getattr(s, "min_version", None),
         # A dispatch failed with an authentication error while the probe
@@ -721,6 +753,17 @@ def _build_sub_agent_status_entry(s) -> dict:
         "credentials": _declared_credentials(manifest, s.missing_credentials),
         "supports_login": _supports_login(s.slug),
         "install": _install_entry(manifest, installed=s.installed),
+        # Which copy Orbital drives — {"kind": "desktop_app", "label",
+        # "app_path", "app_version"} for the CLI inside a vendor app,
+        # "override" for the user's pick, "path"/"auto_detect" otherwise.
+        "source": getattr(s, "source", None),
+        # ACP agents: {"state": ok|failed|unknown, "detail"} — "failed" is a
+        # found-but-cannot-be-driven agent, and the detail is its own words.
+        "handshake": getattr(s, "handshake", None),
+        # The vendor desktop app that ships this agent, with the download
+        # link for this OS/arch — what "Install" points at when Orbital
+        # cannot install the agent itself.
+        "desktop_app": _desktop_app_entry(manifest),
         # False means the agent's turns are silent until the final answer, so
         # the UI can say that instead of showing activity it cannot back up.
         "emits_tool_activity": (
@@ -779,8 +822,55 @@ async def _augment_claude_live_models(entries: list[dict]) -> list[dict]:
 
 
 async def _augment_live_models(entries: list[dict]) -> list[dict]:
-    return await _augment_claude_live_models(
-        await _augment_codex_live_models(entries))
+    return await _augment_acp_live_models(await _augment_claude_live_models(
+        await _augment_codex_live_models(entries)))
+
+
+def _offers_live_acp_models(slug: str) -> bool:
+    """An ACP agent configured through a rendered file (dsh): its model
+    setting is ``provider/model`` and its own ``session/new`` lists them."""
+    manifest = _registry_manifest(slug)
+    return bool(manifest is not None
+                and getattr(manifest.runtime, "transport", "") == "acp-sdk"
+                and manifest.runtime.config_template)
+
+
+async def _acp_live_options(slug: str) -> dict | None:
+    """Indirection over the cached live probe (monkeypatch seam for route
+    tests): ``{"models": [{"value": "provider/model", "label"}],
+    "efforts": [{"value", "label"}]}`` or None."""
+    from agent_os.agents.acp_models import live_options
+    if _setup_engine is None:
+        return None
+    return await asyncio.to_thread(live_options, _setup_engine, slug)
+
+
+async def _augment_acp_live_models(entries: list[dict]) -> list[dict]:
+    """dsh's model dropdown is dsh's own list: the providers that work in
+    the user's setup (DSH Desktop's, mirrored into the spawn), grouped by
+    provider. Probe failure, or an agent not installed, keeps the static
+    fallback. A saved value the list no longer offers stays visible."""
+    for entry in entries:
+        if not entry.get("installed") or not _offers_live_acp_models(entry.get("slug", "")):
+            continue
+        schema = entry.get("param_schema") or {}
+        live = await _acp_live_options(entry["slug"])
+        if not live:
+            continue
+        # Model: every provider/model dsh can serve. Effort: what dsh offers
+        # for the model it runs — "low" is not shown for a route that has
+        # none. A saved value no longer offered stays visible either way.
+        for param, choices in (("model", live.get("models")), ("effort", live.get("efforts"))):
+            param_schema = schema.get(param)
+            if param_schema is None or not choices:
+                continue
+            allowed = [c["value"] for c in choices]
+            saved = (entry.get("config") or {}).get(param)
+            if saved and saved not in allowed:
+                allowed.append(saved)
+            param_schema["allowed"] = allowed
+            param_schema["labels"] = {c["value"]: c["label"] for c in choices}
+    return entries
 
 
 async def _augment_codex_live_models(entries: list[dict]) -> list[dict]:
@@ -879,6 +969,13 @@ async def put_sub_agent_config(slug: str, req: SubAgentConfigRequest):
         live_claude = await _claude_live_models()
         if live_claude:
             extra_allowed = {"model": [m["value"] for m in live_claude]}
+    # dsh: its own live list (providers set up in DSH Desktop) widens the
+    # static DeepSeek fallback, the same way.
+    acp_model = (params.get("model") or "").strip() if _offers_live_acp_models(slug) else ""
+    if acp_model:
+        live_acp = await _acp_live_options(slug)
+        if live_acp and live_acp.get("models"):
+            extra_allowed = {"model": [c["value"] for c in live_acp["models"]]}
     try:
         cleaned = _sub_agent_config_store.set(slug, params,
                                               extra_allowed=extra_allowed)
@@ -901,6 +998,19 @@ def _locate_manifest(slug: str):
     return manifest
 
 
+def _app_launcher(slug: str, path: str) -> str | None:
+    """The agent CLI inside a picked desktop app (``/Applications/DeepSeek
+    Harness.app`` → its ``runtime/cli/bin/dsh``), per the manifest's
+    ``desktop_apps`` layout; None for anything else."""
+    from agent_os.agents.desktop_apps import launcher_inside
+    from agent_os.daemon_v2.models import detect_os
+
+    manifest = _registry_manifest(slug)
+    if manifest is None or not manifest.setup.desktop_apps:
+        return None
+    return launcher_inside(manifest.setup.desktop_apps, detect_os(), path)
+
+
 def _locate_test(slug: str, answer: str) -> dict:
     """Parse the pasted answer and run the agent's version check with it.
     Every failure is ``{"ok": False, "error": <text for the card>}``."""
@@ -909,10 +1019,11 @@ def _locate_test(slug: str, answer: str) -> dict:
         parsed = parse_locate_answer(answer)
     except LocateAnswerError as exc:
         return {"ok": False, "error": str(exc)}
+    binary = _app_launcher(slug, parsed.command) or parsed.command
     result = _setup_engine.test_override(
-        slug, parsed.command, path_prepend=list(parsed.path_prepend))
+        slug, binary, path_prepend=list(parsed.path_prepend))
     result.update({
-        "binary": parsed.command,
+        "binary": binary,
         "target": parsed.target,
         "path_prepend": list(parsed.path_prepend),
         "env_names": list(parsed.env_names),
@@ -1010,13 +1121,25 @@ async def refresh_sub_agent_status():
     if registry is not None and hasattr(_setup_engine, "invalidate_resolved_path"):
         for manifest in registry.list_all():
             _setup_engine.invalidate_resolved_path(manifest.slug)
+    # A verdict is kept until the binary changes; Refresh asks again anyway
+    # (a key or a network problem fixed since the last ask).
+    if hasattr(_setup_engine, "forget_handshakes"):
+        _setup_engine.forget_handshakes()
     # User-triggered refresh wants CURRENT state — drop the codex model/list
     # cache too so a just-fixed install / new model generation shows up.
     from agent_os.agent.transports.codex_models import clear_codex_models_cache
     from agent_os.agent.transports.claude_models import clear_claude_models_cache
     clear_codex_models_cache()
     clear_claude_models_cache()
-    statuses = await asyncio.to_thread(_setup_engine.check_all)
+    from agent_os.agents.acp_models import clear_acp_models_cache
+    clear_acp_models_cache()
+    # The user asked for current state: wait for the handshakes (they run in
+    # parallel, so this costs the slowest one) instead of reporting them
+    # pending the way the routine sweep does.
+    check_all = _setup_engine.check_all
+    if "handshake_wait" in inspect.signature(check_all).parameters:
+        check_all = functools.partial(check_all, handshake_wait=HANDSHAKE_TIMEOUT_S)
+    statuses = await asyncio.to_thread(check_all)
     return await _augment_live_models([
         _build_sub_agent_status_entry(s)
         for s in statuses

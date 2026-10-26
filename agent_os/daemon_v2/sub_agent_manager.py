@@ -26,6 +26,7 @@ from agent_os.agent.adapters.cli_adapter import CLIAdapter
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agents.setup_engine import StaleOkView
+from agent_os.agents.setup_types import handshake_failed
 from agent_os.daemon_v2.sub_agent_visibility import resolve_visible_sub_agent_slugs
 from agent_os.daemon_v2.models import (
     SessionKey,
@@ -376,8 +377,7 @@ class SubAgentManager:
         ``persona=None`` (the prompt render failed upstream) leaves the
         template's own persona in place rather than blanking it.
         """
-        from agent_os.agents.composition import gc_stale, render_composition
-        from agent_os.daemon_v2.sub_agent_config_store import resolve_params
+        from agent_os.agents.composition import gc_stale, render_spawn_file
 
         if not workspace:
             raise ValueError(
@@ -390,36 +390,17 @@ class SubAgentManager:
                 "setup engine has no data dir; cannot locate the installed "
                 f"composition template for '{handle}'"
             )
-        template_path = os.path.join(
-            data_dir, "agents", manifest.slug, manifest.runtime.config_template,
-        )
-        if not os.path.isfile(template_path):
-            # The launcher was chosen on the locate card (a hand-installed
-            # tree; spec 127 V4): the Orbital install dir never got the
-            # template staged, but the build ships it with the manifest.
-            from agent_os.agents.installer import bundled_asset_path
-            bundled = bundled_asset_path(
-                manifest.slug, manifest.runtime.config_template)
-            if bundled is not None:
-                template_path = bundled
-
         out_dir = ProjectPaths(workspace).sub_agent_dir(handle)
         # Opportunistic: renders whose adapter never reached the stop path
         # (daemon crash, unkillable slot) would otherwise accumulate here.
         gc_stale(out_dir)
-
-        params = resolve_params(
-            manifest.slug,
-            getattr(self._setup_engine, "sub_agent_config_store", None),
-        )
-        return render_composition(
-            template_path,
-            model=params.get("model"),
-            sandbox_mode=params.get("permission-mode"),
+        return render_spawn_file(
+            manifest,
+            data_dir=data_dir,
+            config_store=getattr(self._setup_engine, "sub_agent_config_store", None),
             persona=persona,
-            persistence_root=os.path.join(
-                out_dir, f"{manifest.slug}-sessions"),
             out_dir=out_dir,
+            persistence_root=os.path.join(out_dir, f"{manifest.slug}-sessions"),
         )
 
     def _resolve_transport(self, manifest, config_dict, autonomy=None, system_prompt: str | None = None,
@@ -489,8 +470,13 @@ class SubAgentManager:
             from agent_os.agent.transports.acp_sdk_transport import ACPSDKTransport
             # Permission policy and model are current config args consumed by
             # the transport at start(); only the provider session id belongs
-            # to resume identity.
-            return ACPSDKTransport(resume_record=resume_record)
+            # to resume identity. Session config options the user set (dsh's
+            # reasoning_effort) are applied after session/new or resume, and
+            # only when the agent advertises them.
+            return ACPSDKTransport(
+                resume_record=resume_record,
+                config_options=(config_dict or {}).get("acp_config_options") or None,
+            )
         elif transport_type == "codex-appserver":
             from agent_os.agent.transports.codex_transport import CodexTransport
             # Resume identity: threadId from the pre-checked record; the
@@ -855,6 +841,17 @@ class SubAgentManager:
                                      status=status, started=started)
             return (f"Error: {manifest.name} v{version} is older than {floor}; "
                     f"open Settings → Sub-agents and click Update")
+        if handshake_failed(status):
+            # Found, but it does not speak the protocol Orbital drives it
+            # with (a changed launch contract, a broken wrapper). Its own
+            # words beat "adapter start failed" deep inside the transport.
+            detail = (getattr(status, "handshake", None) or {}).get("detail")
+            self._note_start_failure(project_id, handle, "spawn",
+                                     status=status, started=started,
+                                     text=f"handshake failed: {detail}")
+            return (f"Error: {manifest.name} was found but did not answer "
+                    f"Orbital's handshake ({detail or 'no answer'}); open "
+                    f"Settings → Sub-agents to choose another location")
         if getattr(status, "credentials_configured", True) is False:
             missing = list(getattr(status, "missing_credentials", None) or [])
             by_key = {c.key: c for c in manifest.setup.credentials}
@@ -931,6 +928,9 @@ class SubAgentManager:
         except ValueError as e:
             self._note_start_failure(project_id, handle, "spawn", exc=e, started=started)
             return f"Error: {e}"
+        # Taken before anything below appends to argv (the rendered
+        # composition's per-spawn path would make every spawn look changed).
+        spawn_fp = self._fingerprint_of(handle, config_dict)
 
         # Spec 116 D5 then spec 113 A6: refuse what the CLI cannot serve
         # before any process is spawned or network rule written.
@@ -1116,7 +1116,9 @@ class SubAgentManager:
                     project_id, handle,
                 )
                 return f"Error: composition rendering failed: {e}"
-            config.args = list(config.args or []) + ["--config", rendered_config]
+            config.args = list(config.args or []) + [
+                getattr(manifest.runtime, "config_flag", None) or "--config",
+                rendered_config]
 
         adapter = CLIAdapter(
             handle=handle,
@@ -1132,6 +1134,9 @@ class SubAgentManager:
         # Travels with the adapter so the stop path can delete it; a rendered
         # composition outlives nothing but its own spawn.
         adapter._rendered_config_path = rendered_config
+        # What this process was launched with — send() rebuilds it once the
+        # user's settings have moved on (see _spawn_config_stale).
+        adapter._spawn_fingerprint = spawn_fp
 
         lock = self._get_lock(project_id, session_id=session_id)
         async with lock:
@@ -1192,6 +1197,44 @@ class SubAgentManager:
             f"Started {manifest.name} "
             f"({self._format_resume_clause(resume_status, resume_reason)})"
         )
+
+    def _fingerprint_of(self, handle: str, config_dict: dict) -> str | None:
+        """The spawn fingerprint of ``config_dict``, or None when the setup
+        engine can't produce one (test doubles, older engines)."""
+        fingerprint = getattr(self._setup_engine, "fingerprint_config", None)
+        if fingerprint is None:
+            return None
+        try:
+            value = fingerprint(handle, config_dict)
+        except Exception:
+            logger.warning("spawn fingerprint failed for %s", handle, exc_info=True)
+            return None
+        return value if isinstance(value, str) else None
+
+    async def _spawn_config_stale(self, project_id: str, handle: str,
+                                  adapter) -> bool:
+        """True when ``adapter`` was spawned with settings that have since
+        changed — a credential saved, the model or location switched.
+
+        Unknown is never stale: no recorded fingerprint (a path that records
+        none) or no current one (the binary vanished, the config can't be
+        built) keeps the live process, which is the best thing there is.
+        """
+        recorded = getattr(adapter, "_spawn_fingerprint", None)
+        current_of = getattr(self._setup_engine, "spawn_fingerprint", None)
+        if not isinstance(recorded, str) or current_of is None:
+            return False
+        project = (self._project_store.get_project(project_id)
+                   if self._project_store else None) or {}
+        workspace = project.get("workspace", "") if isinstance(project, dict) else ""
+        try:
+            # Off the loop: building the config reads the keychain.
+            current = await asyncio.to_thread(current_of, handle, workspace)
+        except Exception:
+            logger.warning("current spawn fingerprint failed for %s/%s",
+                           project_id, handle, exc_info=True)
+            return False
+        return isinstance(current, str) and current != recorded
 
     async def send(self, project_id: str, handle: str, message: str,
                    *, session_id: str | None = None, depth: int = 0,
@@ -1268,6 +1311,22 @@ class SubAgentManager:
                     "send: %s/%s transport is dead — rebuilding it with "
                     "resume before dispatch", project_id, handle)
                 await self.stop(project_id, handle, session_id=session_id)
+                existing = None
+
+        # An idle worker spawned with settings that have since changed (a key
+        # saved, the model switched) would keep using the old ones for the
+        # rest of its life. Rebuild it the same way, resuming the thread. A
+        # worker mid-turn is left alone: the prompt queues below, and the
+        # turn-close drain rebuilds it first (_on_prompt_turn_closed).
+        if (existing is not None
+                and getattr(existing, "_broken", False) is not True
+                and prompt_key not in self._prompt_active
+                and await self._spawn_config_stale(project_id, handle, existing)):
+            logger.info(
+                "send: %s/%s was spawned with settings that have since "
+                "changed — rebuilding it with resume before dispatch",
+                project_id, handle)
+            await self.stop(project_id, handle, session_id=session_id)
 
         # Spawn-on-demand pre-step, OUTSIDE the dispatch lock: start() takes
         # the same per-session lifecycle lock internally (non-reentrant), so
@@ -1669,8 +1728,12 @@ class SubAgentManager:
                 )
                 return
             is_alive = getattr(adapter, "is_alive", None)
-            if callable(is_alive) and is_alive() is False:
-                # The turn that just closed killed the transport (spec 098).
+            transport_dead = callable(is_alive) and is_alive() is False
+            # The turn that just closed killed the transport (spec 098), or
+            # the user's settings moved on while it ran (a key saved
+            # mid-turn): the queued prompts must reach a rebuilt process.
+            if transport_dead or await self._spawn_config_stale(
+                    project_id, handle, adapter):
                 # Rebuilding takes stop()/start(), which need this lock and
                 # cancel the consumer task we are running in, so hand off.
                 task = asyncio.create_task(
@@ -1712,9 +1775,10 @@ class SubAgentManager:
 
     async def _rebuild_and_drain(self, project_id: str, handle: str,
                                  session_id: str) -> None:
-        """Re-send a dead handle's queued prompts, in order, through send().
+        """Re-send a dead or outdated handle's queued prompts, in order,
+        through send().
 
-        send() stops the dead adapter and re-spawns it resuming the persisted
+        send() stops the adapter and re-spawns it resuming the persisted
         thread; the first prompt dispatches and the rest queue behind it as
         they did before. If the rebuild fails, every prompt not yet handed
         over gets a timeline row instead of vanishing.
@@ -1722,8 +1786,8 @@ class SubAgentManager:
         key = (project_id, session_id, handle)
         async with self._get_lock(project_id, session_id=session_id):
             pending = self._prompt_queues.pop(key, None)
-        logger.info("queued prompts for %s/%s wait on a dead transport — "
-                    "rebuilding it with resume", project_id, handle)
+        logger.info("queued prompts for %s/%s wait on a dead or outdated "
+                    "transport — rebuilding it with resume", project_id, handle)
         while pending:
             prompt = pending.popleft()
             try:

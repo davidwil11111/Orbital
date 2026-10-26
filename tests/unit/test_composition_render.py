@@ -2,12 +2,15 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Per-spawn composition rendering (Task 4).
+"""Per-spawn patch rendering for dsh's ``acp`` profile.
 
 The renderer is the ONLY route Orbital config takes into a harness that
-configures itself through a composition file. It must never string-template:
-a persona is arbitrary agent-authored prose and would otherwise be a YAML
-injection vector.
+configures itself through a file. It must never string-template: a persona is
+arbitrary agent-authored prose and would otherwise be a YAML injection vector.
+
+A dsh patch row REPLACES the row's whole ``config`` (verified against
+0.2.1-rc.3 with ``--dump-config``), so the renderer only ever sets values
+inside rows the template already restates in full.
 """
 
 import os
@@ -26,35 +29,32 @@ from agent_os.agents.composition import (
 
 SHIPPED_TEMPLATE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "agent_os", "agents", "assets", "dsh", "cordis.template.yml",
+    "agent_os", "agents", "assets", "dsh", "acp.patch.yml",
 )
 
 
 @pytest.fixture
 def template(tmp_path):
-    """A minimal stand-in with the same shape as the shipped template."""
-    path = tmp_path / "cordis.template.yml"
+    """A stand-in with the shipped template's rows plus one the renderer
+    knows nothing about."""
+    path = tmp_path / "acp.patch.yml"
     path.write_text(
-        "- id: sandbox-policy\n"
-        "  name: '@deepseek-ai/dsh-sandbox-policy'\n"
+        "- id: system-prompt\n"
         "  config:\n"
-        "    mode: workspace-write\n"
+        "    personaPrefix: You are a coding agent.\n"
         "\n"
-        "- id: bash\n"
-        "  name: '@deepseek-ai/dsh-bash-sandbox'\n"
-        "  config:\n"
-        "    timeoutMs: 60000\n"
-        "\n"
-        "- id: acp-agent\n"
-        "  name: '@deepseek-ai/dsh-acp-demo'\n"
+        "- id: acp\n"
         "  config:\n"
         "    provider: deepseek-official\n"
         "    model: deepseek-v4-flash\n"
-        "    persistenceRoot: './.sessions'\n"
-        "    workspaceContext:\n"
-        "      maxBytes: 65536\n"
-        "    persona: |\n"
-        "      You are a coding assistant.\n",
+        "\n"
+        "- id: session-persistence-jsonl\n"
+        "  config:\n"
+        "    root: ./.sessions\n"
+        "\n"
+        "- id: tool-bash\n"
+        "  config:\n"
+        "    timeoutMs: 60000\n",
         encoding="utf-8",
     )
     return str(path)
@@ -63,7 +63,6 @@ def template(tmp_path):
 def _render(template, tmp_path, **overrides):
     kwargs = {
         "model": "deepseek-v4-pro",
-        "sandbox_mode": "danger-full-access",
         "persona": "You are a sub-agent.",
         "persistence_root": str(tmp_path / "out" / "dsh-sessions"),
         "out_dir": str(tmp_path / "out"),
@@ -78,32 +77,35 @@ def _blocks(path):
 
 
 class TestRenderComposition:
-    def test_sets_model_sandbox_mode_persona_and_persistence_root(
-        self, template, tmp_path
-    ):
-        out = _render(template, tmp_path)
-        blocks = _blocks(out)
-        assert blocks["sandbox-policy"]["config"]["mode"] == "danger-full-access"
-        assert blocks["acp-agent"]["config"]["model"] == "deepseek-v4-pro"
-        assert blocks["acp-agent"]["config"]["persona"] == "You are a sub-agent."
-        assert blocks["acp-agent"]["config"]["persistenceRoot"] == str(
-            tmp_path / "out" / "dsh-sessions"
-        )
+    def test_sets_persona_model_and_session_root(self, template, tmp_path):
+        blocks = _blocks(_render(template, tmp_path))
+        assert blocks["system-prompt"]["config"]["personaPrefix"] == "You are a sub-agent."
+        assert blocks["acp"]["config"]["model"] == "deepseek-v4-pro"
+        assert blocks["session-persistence-jsonl"]["config"]["root"] == str(
+            tmp_path / "out" / "dsh-sessions")
 
-    def test_persistence_root_is_absolutised(self, template, tmp_path):
-        """The template ships a cwd-relative './.sessions' — overwriting it
-        with an absolute path is what keeps sessions inside the project."""
+    def test_acp_row_keeps_its_provider(self, template, tmp_path):
+        """The row replaces dsh's own: without ``provider`` the profile has
+        no model route at all."""
+        cfg = _blocks(_render(template, tmp_path))["acp"]["config"]
+        assert cfg == {"provider": "deepseek-official", "model": "deepseek-v4-pro"}
+
+    def test_session_root_is_absolutised(self, template, tmp_path):
+        """A cwd-relative root would scatter session stores, and resume needs
+        the same directory every spawn."""
         out = _render(template, tmp_path, persistence_root="rel/dsh-sessions")
-        root = _blocks(out)["acp-agent"]["config"]["persistenceRoot"]
+        root = _blocks(out)["session-persistence-jsonl"]["config"]["root"]
         assert os.path.isabs(root)
         assert root.endswith(os.path.join("rel", "dsh-sessions"))
 
-    def test_untouched_blocks_survive_verbatim(self, template, tmp_path):
-        out = _render(template, tmp_path)
-        blocks = _blocks(out)
-        assert blocks["bash"]["config"]["timeoutMs"] == 60000
-        assert blocks["acp-agent"]["config"]["provider"] == "deepseek-official"
-        assert blocks["acp-agent"]["config"]["workspaceContext"]["maxBytes"] == 65536
+    def test_none_leaves_the_template_defaults(self, template, tmp_path):
+        blocks = _blocks(_render(template, tmp_path, model=None, persona=None))
+        assert blocks["acp"]["config"]["model"] == "deepseek-v4-flash"
+        assert blocks["system-prompt"]["config"]["personaPrefix"] == "You are a coding agent."
+
+    def test_untouched_rows_survive_verbatim(self, template, tmp_path):
+        assert _blocks(_render(template, tmp_path))["tool-bash"]["config"] == {
+            "timeoutMs": 60000}
 
     def test_returns_an_existing_absolute_path(self, template, tmp_path):
         out = _render(template, tmp_path)
@@ -130,8 +132,8 @@ class TestRenderComposition:
         a = _render(template, tmp_path, persona="alpha")
         b = _render(template, tmp_path, persona="beta")
         assert a != b
-        assert _blocks(a)["acp-agent"]["config"]["persona"] == "alpha"
-        assert _blocks(b)["acp-agent"]["config"]["persona"] == "beta"
+        assert _blocks(a)["system-prompt"]["config"]["personaPrefix"] == "alpha"
+        assert _blocks(b)["system-prompt"]["config"]["personaPrefix"] == "beta"
 
     def test_template_file_is_not_modified(self, template, tmp_path):
         before = open(template, encoding="utf-8").read()
@@ -157,22 +159,22 @@ class TestPersonaSafety:
         self, template, tmp_path
     ):
         out = _render(template, tmp_path, persona=self.HOSTILE)
-        assert _blocks(out)["acp-agent"]["config"]["persona"] == self.HOSTILE
+        assert _blocks(out)["system-prompt"]["config"]["personaPrefix"] == self.HOSTILE
 
     def test_persona_cannot_inject_a_sibling_key(self, template, tmp_path):
-        attack = "hi\nmodel: attacker-model\npersistenceRoot: /etc\n"
-        out = _render(template, tmp_path, persona=attack)
-        cfg = _blocks(out)["acp-agent"]["config"]
-        assert cfg["persona"] == attack
-        assert cfg["model"] == "deepseek-v4-pro"
-        assert cfg["persistenceRoot"] != "/etc"
+        attack = "hi\nmodel: attacker-model\nroot: /etc\n"
+        blocks = _blocks(_render(template, tmp_path, persona=attack))
+        assert blocks["system-prompt"]["config"] == {"personaPrefix": attack}
+        assert blocks["acp"]["config"]["model"] == "deepseek-v4-pro"
+        assert blocks["session-persistence-jsonl"]["config"]["root"] != "/etc"
 
-    def test_persona_cannot_inject_a_new_plugin_block(self, template, tmp_path):
+    def test_persona_cannot_inject_a_new_row(self, template, tmp_path):
         attack = "hi\n- id: evil\n  name: '@evil/plugin'\n"
         out = _render(template, tmp_path, persona=attack)
         with open(out, "r", encoding="utf-8") as f:
             loaded = yaml.safe_load(f)
-        assert {b["id"] for b in loaded} == {"sandbox-policy", "bash", "acp-agent"}
+        assert {b["id"] for b in loaded} == {
+            "system-prompt", "acp", "session-persistence-jsonl", "tool-bash"}
 
 
 class TestShippedTemplate:
@@ -180,25 +182,28 @@ class TestShippedTemplate:
         out = render_composition(
             SHIPPED_TEMPLATE,
             model="deepseek-v4-flash",
-            sandbox_mode="workspace-write",
             persona="Orbital sub-agent prompt.",
             persistence_root=str(tmp_path / "dsh-sessions"),
             out_dir=str(tmp_path),
         )
         blocks = _blocks(out)
-        assert blocks["acp-agent"]["config"]["model"] == "deepseek-v4-flash"
-        assert blocks["sandbox-policy"]["config"]["mode"] == "workspace-write"
-        assert blocks["acp-agent"]["config"]["persona"] == (
-            "Orbital sub-agent prompt."
-        )
-        assert os.path.isabs(blocks["acp-agent"]["config"]["persistenceRoot"])
-        # Every shipped plugin must survive the round-trip — including blocks
-        # the renderer knows nothing about, like Task 7's activity shim.
-        # Compared against the template rather than a hardcoded count, so
-        # adding a plugin does not fail a test that is about preservation.
+        assert blocks["system-prompt"]["config"]["personaPrefix"] == (
+            "Orbital sub-agent prompt.")
+        assert blocks["acp"]["config"] == {
+            "provider": "deepseek-official", "model": "deepseek-v4-flash"}
+        assert os.path.isabs(blocks["session-persistence-jsonl"]["config"]["root"])
+
+    def test_shipped_rows_each_restate_a_whole_config(self):
+        """Patch rows replace dsh's row config: a row with no ``config`` (or a
+        sandbox-policy row, whose ``workspaceRoot`` is a JS expression Orbital
+        cannot restate) would silently strip dsh's own settings."""
         with open(SHIPPED_TEMPLATE, "r", encoding="utf-8") as f:
-            shipped = yaml.safe_load(f)
-        assert set(blocks) == {b["id"] for b in shipped}
+            rows = yaml.safe_load(f)
+        assert [r["id"] for r in rows] == [
+            "system-prompt", "acp", "session-persistence-jsonl"]
+        assert all(isinstance(r.get("config"), dict) and r["config"] for r in rows)
+        assert all("name" not in r for r in rows), (
+            "a `name` would insert a new plugin rather than patch dsh's row")
 
 
 class TestRenderErrors:
@@ -212,19 +217,12 @@ class TestRenderErrors:
         with pytest.raises(CompositionError):
             _render(str(bad), tmp_path)
 
-    def test_block_without_config_gets_one(self, tmp_path):
+    def test_row_without_config_gets_one(self, tmp_path):
         bare = tmp_path / "bare.yml"
-        bare.write_text(
-            "- id: sandbox-policy\n"
-            "  name: '@deepseek-ai/dsh-sandbox-policy'\n"
-            "- id: acp-agent\n"
-            "  name: '@deepseek-ai/dsh-acp-demo'\n",
-            encoding="utf-8",
-        )
-        out = _render(str(bare), tmp_path)
-        blocks = _blocks(out)
-        assert blocks["sandbox-policy"]["config"]["mode"] == "danger-full-access"
-        assert blocks["acp-agent"]["config"]["model"] == "deepseek-v4-pro"
+        bare.write_text("- id: acp\n- id: system-prompt\n", encoding="utf-8")
+        blocks = _blocks(_render(str(bare), tmp_path))
+        assert blocks["acp"]["config"]["model"] == "deepseek-v4-pro"
+        assert blocks["system-prompt"]["config"]["personaPrefix"] == "You are a sub-agent."
 
 
 class TestGarbageCollection:

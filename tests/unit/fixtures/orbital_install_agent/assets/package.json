@@ -1,0 +1,11 @@
+{
+  "name": "orbital-npm-composed-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Test-only composition for tests/unit/test_orbital_installer.py. npm never runs against it.",
+  "dependencies": {
+    "@orbital-fixture/npm-composed-acp": "9.9.9-fixture.1",
+    "@orbital-fixture/npm-composed-tools": "9.9.9-fixture.1",
+    "@orbital-fixture/activity-shim": "file:./shims/activity"
+  }
+}
