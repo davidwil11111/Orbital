@@ -575,12 +575,10 @@ chat.onlyNAllowed,Only {n} attachments allowed per message.,message_error,ChatVi
 chat.fileTooLarge,File exceeds 10 MB limit,message_error,ChatView.tsx,Attachment too large,文件超过 10 MB 上限,
 chat.cancelTimeout,Cancel took longer than expected — try again if needed.,message_error,ChatView.tsx,Notice when cancel takes too long,取消耗时超出预期——如有需要请重试。,
 chat.cancelFailed,Cancel request failed — try again if needed.,message_error,ChatView.tsx,Notice when cancel POST fails,取消请求失败——如有需要请重试。,
-chat.slash.new,/new,menu,ChatView.tsx,Slash command name to start a fresh session,/new,Keep the command literal.
-chat.slash.new.desc,Start a fresh session,menu,ChatView.tsx,Description of the /new slash command,开始新会话,
 chat.notify.newSession.title,New session started,message_success,ChatView.tsx,agent_notify card after starting a new session,新会话已开始,
 chat.notify.newSession.body,Workspace memory preserved. The agent remembers your project.,description,ChatView.tsx,Body of the new-session notify card,项目记忆已保留。,
 chat.notify.noSession.title,No active session,message_error,ChatView.tsx,Notify card when /new has no active session,没有活跃会话,
-chat.notify.noSession.body,"Start the agent first, then use /new to reset the session.",description,ChatView.tsx,Body when /new can't reset,请先启动Agent，然后使用 /new 重置会话。,Keep /new.
+chat.notify.noSession.body,"Start the agent first, then start a new session.",description,ChatView.tsx,Body when a new session can't start,请先启动Agent，然后再新建会话。,
 chat.toolRow.noResult,no result content,empty_state,ChatView.tsx,Shown when a tool call has empty result,无内容,
 chat.capsule.thinking,thinking,status,ChatView.tsx,Capsule summary head when only reasoning,思考中…,
 chat.capsule.agentStep,agent step,status,ChatView.tsx,Capsule summary head fallback,Agent步骤,

@@ -10,6 +10,7 @@ persisted to a JSONL file. Provides sliding window over recent messages.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -34,6 +35,8 @@ _NAME_MAX_LEN = 50
 # Machine prefixes stamped into first user messages, which must never become
 # the display name. Shapes mirror their producers — keep in sync:
 #   - <attached_files> block: agent_os/api/routes/_attachment_formatter.py
+#   - <use_skill> block (spec 132, after the attach block):
+#     agent_os/api/routes/_skill_formatter.py
 #   - queue wrapper: agent_os/queue/dispatcher.py (bracket header + the
 #     HEADER_CONTRACT paragraph; the START/END markers below are that
 #     contract's first and last sentences)
@@ -41,6 +44,7 @@ _NAME_MAX_LEN = 50
 # The trigger prefix ("[Triggered by …") is deliberately NOT stripped — the
 # frontend extracts the trigger's own name from it.
 _ATTACHED_BLOCK_RE = re.compile(r"^<attached_files>\n([\s\S]*?)\n</attached_files>\n\n?")
+_SKILL_BLOCK_RE = re.compile(r'^<use_skill name="([^"\n]*)"[^>\n]*>\n[\s\S]*?\n</use_skill>\n\n?')
 _QUEUE_BRACKET_RE = re.compile(r"^\[QUEUE ITEM \|[^\]\n]*\]\n")
 _QUEUE_CONTRACT_START = "You are working on a queue item."
 _QUEUE_CONTRACT_END = "Do not end with plain text.\n"
@@ -52,9 +56,9 @@ def _strip_machine_prefixes(text: str) -> tuple[str, str | None]:
     """Strip leading machine blocks from a first user message.
 
     Returns ``(remainder, attachment_fallback)`` where the fallback is the
-    first attached file's basename (upload timestamp stripped) — used as the
-    name when nothing human-typed remains. Dispatcher order for queue items
-    with staged files is attach block first, then the queue wrapper.
+    first attached file's basename (upload timestamp stripped), else the
+    picked skill's name — used as the name when nothing human-typed remains.
+    Order: attach block, then the skill block, then the queue wrapper.
     """
     fallback = None
     m = _ATTACHED_BLOCK_RE.match(text)
@@ -72,6 +76,11 @@ def _strip_machine_prefixes(text: str) -> tuple[str, str | None]:
                 fallback = base
             break
         text = text[m.end():]
+    sk = _SKILL_BLOCK_RE.match(text)
+    if sk:
+        if fallback is None:
+            fallback = html.unescape(sk.group(1)).strip() or None
+        text = text[sk.end():]
     b = _QUEUE_BRACKET_RE.match(text)
     if b:
         text = text[b.end():]
@@ -96,7 +105,8 @@ def is_machine_derived_name(name) -> bool:
     """
     if not isinstance(name, str):
         return False
-    return name.startswith("<attached_files>") or name.startswith("[QUEUE ITEM")
+    return (name.startswith("<attached_files>") or name.startswith("[QUEUE ITEM")
+            or name.startswith("<use_skill "))
 
 
 # Spec 078 §5.4: the composer appends a quotes block under this heading when

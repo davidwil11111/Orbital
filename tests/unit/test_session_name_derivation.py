@@ -139,3 +139,39 @@ def test_derive_name_drops_the_annotation_quotes_block():
         "[1] AGENTS.md\n    > AGENTS.md — read this first\n    note: explain"
     )
     assert _derive_name(content) == "what is this about"
+
+
+# ------------------------------------------------- spec 132: <use_skill> block
+
+SKILL_BLOCK = (
+    '<use_skill name="task-planning" path="/w/orbital/skills/task-planning/SKILL.md">\n'
+    "The user chose this skill for this message. Read the file at `path` before "
+    "acting and follow it.\n"
+    "</use_skill>\n\n"
+)
+
+
+def test_skill_block_is_stripped_from_the_name():
+    assert _derive_name(SKILL_BLOCK + "plan my week") == "plan my week"
+
+
+def test_skill_block_after_attachments_is_stripped():
+    assert _derive_name(ATTACH_BLOCK + SKILL_BLOCK + "plan it") == "plan it"
+
+
+def test_skill_only_message_falls_back_to_the_skill_name():
+    assert _derive_name(SKILL_BLOCK) == "task-planning"
+
+
+def test_inline_skill_block_body_never_becomes_the_name():
+    inline = (
+        '<use_skill name="g" path="/h/.claude/skills/g/SKILL.md" inline="true">\n'
+        "The user chose this skill for this message. Its SKILL.md is below.\n"
+        "<skill_content>\n# G\nStep one.\n</skill_content>\n"
+        "</use_skill>\n\n"
+    )
+    assert _derive_name(inline + "go") == "go"
+
+
+def test_skill_block_name_is_machine_derived():
+    assert is_machine_derived_name('<use_skill name="task-planning" path="/w/…')

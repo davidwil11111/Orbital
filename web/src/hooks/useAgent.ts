@@ -155,6 +155,9 @@ export function useAgent() {
       attachments?: Array<{ path: string; mime: string; size: number }>,
       sessionId?: string,
       pinned?: boolean,
+      // Spec 132: the skill picked in the `/` menu; the backend re-resolves
+      // `path` against the project's skill catalog and adds the block.
+      skill?: { key: string; path: string },
     ) => {
       return api<InjectResult>(
         `/api/v2/agents/${encodeURIComponent(projectId)}/inject`,
@@ -167,6 +170,7 @@ export function useAgent() {
             ...(attachments && attachments.length > 0 && { attachments }),
             ...(sessionId !== undefined && { session_id: sessionId }),
             ...(pinned && { pinned: true }),
+            ...(skill && { skill }),
           }),
         },
       );

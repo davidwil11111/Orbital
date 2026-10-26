@@ -73,6 +73,45 @@ describe('ChatMessage — user_message with <attached_files> block', () => {
   });
 });
 
+describe('ChatMessage — user_message with a <use_skill> block (spec 132)', () => {
+  const SKILL =
+    '<use_skill name="task-planning" path="/w/orbital/skills/task-planning/SKILL.md">\n' +
+    'The user chose this skill for this message. Read the file at `path` before acting and follow it.\n' +
+    '</use_skill>\n\n';
+
+  it('renders a skill chip and only the typed text', () => {
+    const { container } = render(<ChatMessage message={userMsg(SKILL + 'plan my week')} />);
+    const chip = container.querySelector('[data-testid="message-skill-chip"]');
+    expect(chip?.textContent).toBe('task-planning');
+    expect(chip?.getAttribute('title')).toBe('/w/orbital/skills/task-planning/SKILL.md');
+    expect(screen.getByText('plan my week')).toBeInTheDocument();
+    expect(container.textContent ?? '').not.toContain('use_skill');
+    expect(container.textContent ?? '').not.toContain('Read the file');
+  });
+
+  it('shows the skill chip next to attachment chips (skill block after attachments)', () => {
+    const content =
+      '<attached_files>\n- uploads/x.txt (text/plain, 11 B)\n</attached_files>\n\n' + SKILL + 'go';
+    const { container } = render(<ChatMessage message={userMsg(content)} />);
+    expect(container.querySelectorAll('[data-testid="attachment-chip"]').length).toBe(1);
+    expect(container.querySelector('[data-testid="message-skill-chip"]')).not.toBeNull();
+    expect(screen.getByText('go')).toBeInTheDocument();
+  });
+
+  it('copy carries the typed text, not the skill markup', async () => {
+    const writes: string[] = [];
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: async (text: string) => { writes.push(text); } },
+      configurable: true,
+      writable: true,
+    });
+    render(<ChatMessage message={userMsg(SKILL + 'plan it')} />);
+    fireEvent.click(screen.getByTestId('user-message-copy'));
+    await Promise.resolve();
+    expect(writes).toEqual(['plan it']);
+  });
+});
+
 describe('ChatMessage — flat avatar-log layout (Design §5)', () => {
   it('user message is right-anchored with NO avatar, a sender·time label, and a width-capped tint block', () => {
     const { container } = render(<ChatMessage message={userMsg('hello world')} />);

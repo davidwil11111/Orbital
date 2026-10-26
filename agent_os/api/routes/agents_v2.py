@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.skills import SkillLoader
+from agent_os.agent.skill_catalog import SkillCatalog
 from agent_os.agents.setup_types import status_ready
 from agent_os.daemon_v2.agent_md_seeder import (
     AGENT_MD_FILENAME,
@@ -48,6 +49,7 @@ from agent_os.api.routes._attachment_formatter import (
     validate_attachments,
     format_prefix,
 )
+from agent_os.api.routes._skill_formatter import format_skill_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +269,18 @@ class InjectAttachment(BaseModel):
         return v
 
 
+class InjectSkill(BaseModel):
+    """The skill picked in the composer's ``/`` menu (spec 132).
+
+    ``path`` is the SKILL.md path the catalog returned; the route re-resolves
+    it against ``SkillCatalog`` and refuses anything else. ``key`` is the
+    catalog key, informational only — the catalog entry names the block.
+    """
+
+    key: str = Field(default="", max_length=512)
+    path: str = Field(max_length=4096)
+
+
 class InjectRequest(BaseModel):
     content: str
     target: str | None = None
@@ -279,6 +293,10 @@ class InjectRequest(BaseModel):
     # never gets a 422.
     pinned: bool = False
     attachments: list[InjectAttachment] | None = None
+    # Spec 132: one skill per message, sent as a ``<use_skill>`` block after
+    # the attachments block. An old SPA never sends it; an old daemon ignores
+    # it (pydantic default).
+    skill: InjectSkill | None = None
     # F1 (user-facing chat thread id) — select which chat session within
     # the project to deliver the message to. Omitting it means "use
     # ``DEFAULT_SESSION_ID``", i.e. single-loop back-compat. See
@@ -1674,6 +1692,36 @@ async def _materialize_if_imported(project_id: str, session_id: str | None) -> N
                        project_id, session_id, exc_info=True)
 
 
+def _skill_inline_body(project_id: str, project: dict, session_id: str | None,
+                       skill_path: str) -> str | None:
+    """The SKILL.md body when a safe-mode manager cannot read ``skill_path``.
+
+    Spec 132 §2: in safe mode the manager's read tools see only the workspace,
+    the granted folders and (scratch) the in-scope projects. A skill outside
+    all of them is inlined; anything readable stays a pointer. Workers always
+    get the pointer, so this is only called for the manager.
+    """
+    from agent_os.agent.tools._path_utils import resolve_safe_read
+    from agent_os.daemon_v2.models import safe_mode_enabled
+    if not safe_mode_enabled(project):
+        return None
+    roots = [project.get("workspace") or ""]
+    compute = getattr(_agent_manager, "_compute_scope_roots", None)
+    if compute is not None:
+        try:
+            roots = compute(project_id, session_id, include_portals=True)[0]
+        except Exception:
+            logger.warning("skill inline: scope roots failed for %s", project_id,
+                           exc_info=True)
+    if resolve_safe_read(roots, skill_path) is not None:
+        return None
+    try:
+        with open(skill_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 @router.post("/agents/{project_id}/inject")
 async def inject_message(project_id: str, req: InjectRequest):
     # Verify project exists before attempting inject
@@ -1706,13 +1754,31 @@ async def inject_message(project_id: str, req: InjectRequest):
             validate_attachments(workspace, req.attachments)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid attachment: {e}")
-        effective_content = format_prefix(req.attachments) + req.content
+        attach_prefix = format_prefix(req.attachments)
         attachment_dicts: list[dict] | None = [
             a.model_dump() for a in req.attachments
         ]
     else:
-        effective_content = req.content
+        attach_prefix = ""
         attachment_dicts = None
+
+    # Spec 132: the picked skill, re-resolved against the catalog (a path the
+    # catalog did not return is a 400 and nothing is written). Its block sits
+    # after the attachments block, so that block stays at the very start.
+    skill_prefix = ""
+    if req.skill is not None:
+        workspace = project.get("workspace", "")
+        entry = await asyncio.to_thread(SkillCatalog(workspace).resolve, req.skill.path)
+        if entry is None:
+            raise HTTPException(status_code=400,
+                                detail="Invalid skill: not in this project's skill catalog")
+        to_manager = not (req.target and _sub_agent_manager is not None)
+        inline_body = (await asyncio.to_thread(
+            _skill_inline_body, project_id, project, req.session_id, entry["path"])
+            if to_manager else None)
+        skill_prefix = format_skill_prefix(entry["name"], entry["path"],
+                                           inline_body=inline_body)
+    effective_content = attach_prefix + skill_prefix + req.content
 
     if req.target and _sub_agent_manager is not None:
         # Route to sub-agent (Path B: a direct send — the composer pin).
@@ -4113,6 +4179,20 @@ async def list_skills(project_id: str):
     workspace = project.get("workspace", "")
     loader = SkillLoader(workspace)
     return loader.scan()
+
+
+@router.get("/projects/{project_id}/skill-catalog")
+async def get_skill_catalog(project_id: str):
+    """Every skill this project can use, for the composer's ``/`` picker.
+
+    Spec 132: the project's ``orbital/skills`` plus workspace-native and
+    user-global CLI skills, deduped (``SkillCatalog``). Read-only on purpose:
+    ``/skills`` above stays project-only because Settings deletes through it.
+    """
+    project = _project_store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await asyncio.to_thread(SkillCatalog(project.get("workspace", "")).scan)
 
 
 @router.delete("/projects/{project_id}/skills/{skill_name}")

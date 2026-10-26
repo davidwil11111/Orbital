@@ -31,6 +31,7 @@ import { parseProviderError, providerErrorKey } from '../utils/providerError';
 import { consumeOnboardingKickoff } from '../utils/onboardingKickoff';
 import { markFreshSession, consumeFreshSession } from '../utils/freshSession';
 import AttachmentChip from './AttachmentChip';
+import SkillChip from './SkillChip';
 import { useAttachments } from '../hooks/useAttachments';
 import { useAnnotations } from '../hooks/useAnnotations';
 import {
@@ -42,6 +43,14 @@ import {
 import { uploadFile } from '../lib/attachment-upload';
 import { BASE_URL, isRelayMode } from '../config';
 import { buildAttachmentsBlock, parseAttachmentsBlock } from '../lib/attachment-parsing';
+import { buildSkillBlock, parseSkillBlock, skillAwarePreview } from '../lib/skill-parsing';
+import {
+  cachedSkillCatalog,
+  loadSkillCatalog,
+  matchSkills,
+  slashQuery,
+  type SkillCatalogEntry,
+} from '../lib/skill-catalog';
 import ComposerDisabledPrompt from './ComposerDisabledPrompt';
 import PinTargetSelect, { resolveSendTarget } from './PinTargetSelect';
 import { useSessions } from '../hooks/useSessions';
@@ -656,9 +665,16 @@ const chatHistoryCache = new Map<string, ChatHistoryCacheEntry>();
 export function __clearChatHistoryCacheForTests() {
   chatHistoryCache.clear();
 }
-const SLASH_COMMANDS = [
-  { name: '/new', description: 'Start a fresh session' },
-];
+
+/**
+ * True when a queued message's wire content carries an attachments or a
+ * skill block: recall can't rebuild those chips, so it stays off (§12 R4;
+ * spec 132 treats the skill block like an attachment block).
+ */
+function hasMachineBlocks(content: string): boolean {
+  const { strippedContent, attachments } = parseAttachmentsBlock(content);
+  return attachments.length > 0 || parseSkillBlock(strippedContent).skill !== null;
+}
 
 /** The composer grows with its text up to this height, then scrolls. */
 const COMPOSER_MAX_HEIGHT_PX = 160;
@@ -950,9 +966,36 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   const viewedIsUnimportedImport =
     viewedEntry?.origin === 'imported' && viewedEntry.imported?.materialized === false;
   const [showThinking, setShowThinking] = useState(false);
-  const [showCommandDropdown, setShowCommandDropdown] = useState(false);
-  const [commandFilter, setCommandFilter] = useState('');
-  const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
+  // Spec 132: the `/` skill picker. Open/closed is derived from the composer
+  // text (`slashQuery`), the loaded catalog and the Esc flag, never stored, so
+  // it can't disagree with what is typed. `slashDismissed` is the sticky Esc:
+  // it holds until the composer stops starting with `/`.
+  // The catalog lives in the per-project module cache (skill-catalog.ts);
+  // this counter re-renders when a fetch lands.
+  const [, setSkillCatalogVersion] = useState(0);
+  const skillCatalog = cachedSkillCatalog(projectId);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
+  // One skill per message, scoped to the session it was picked in (a chip
+  // must not follow the user into another conversation).
+  const [pickedSkillState, setPickedSkillState] = useState<
+    { sessionId: string | undefined; skill: SkillCatalogEntry } | null
+  >(null);
+  const pickedSkill =
+    pickedSkillState && pickedSkillState.sessionId === sessionId ? pickedSkillState.skill : null;
+  // Keep the highlighted row visible inside the menu. Only the menu's own
+  // scrollTop moves: scrollIntoView would also scroll the page (WebKit).
+  const skillMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const menu = skillMenuRef.current;
+    const row = menu?.children[selectedSkillIndex] as HTMLElement | undefined;
+    if (!menu || !row) return;
+    if (row.offsetTop < menu.scrollTop) menu.scrollTop = row.offsetTop;
+    else if (row.offsetTop + row.offsetHeight > menu.scrollTop + menu.clientHeight) {
+      menu.scrollTop = row.offsetTop + row.offsetHeight - menu.clientHeight;
+    }
+  }, [selectedSkillIndex]);
+
   const [injectError, setInjectError] = useState<string | null>(null);
   // Track J Phase 1: intermediate "slot held" notice. Set when /inject
   // returns 202 with `slot_held` because the caller's session_id didn't
@@ -964,6 +1007,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         pendingTarget?: string;
         pendingNonce: string;
         pendingAttachments?: Array<{ path: string; mime: string; size: number }>;
+        pendingSkill?: SkillCatalogEntry;
       }
     | null
   >(null);
@@ -1591,8 +1635,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             // the raw typed text. Detect an attachments-block prefix: if present
             // we can't reconstruct the chips, so flag hasAttachments and let
             // recall no-op (§12 R4); otherwise the content IS the raw text.
-            const hasAttachments =
-              parseAttachmentsBlock(p.content).attachments.length > 0;
+            const hasAttachments = hasMachineBlocks(p.content);
             rebuilt.push([
               p.nonce,
               {
@@ -2636,8 +2679,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       // pending_enqueued is always cross-session (it carries a holder). We only
       // have the wire `content` from another tab — detect an attachments-block
       // prefix to gate recall (§12 R4); otherwise content IS the raw text.
-      const hasAttachments =
-        parseAttachmentsBlock(e.content).attachments.length > 0;
+      const hasAttachments = hasMachineBlocks(e.content);
       setPendingInputs((prev) => {
         const next = new Map(prev);
         next.set(e.nonce, {
@@ -2978,21 +3020,44 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     setInputText(value);
     adjustTextareaHeight({ reset: mayShrink });
 
-    // Check for /command trigger (only when input starts with /)
-    if (value.startsWith('/')) {
-      setShowCommandDropdown(true);
-      setCommandFilter(value.slice(1).toLowerCase());
-      setSelectedCommandIndex(0);
+    // Spec 132 `/` skill picker. The sticky Esc lasts until the composer no
+    // longer starts with `/`; the first `/` (and, at most every 30 s, a later
+    // one) loads the project's catalog.
+    if (!value.startsWith('/')) {
+      if (slashDismissed) setSlashDismissed(false);
       return;
     }
-    setShowCommandDropdown(false);
-    setCommandFilter('');
+    setSelectedSkillIndex(0);
+    if (slashQuery(value) !== null && !slashDismissed) {
+      // Answers from the cache while it is fresh; re-render only on new data.
+      const before = skillCatalog;
+      void loadSkillCatalog(projectId).then((list) => {
+        if (list !== before) setSkillCatalogVersion((v) => v + 1);
+      });
+    }
   }
 
-  const filteredCommands = SLASH_COMMANDS.filter(c =>
-    c.name.toLowerCase().startsWith('/' + commandFilter)
-  );
+  // The `/` menu: open only while the composer is in picker position, the
+  // catalog has loaded, and Esc has not dismissed it. No matches means fully
+  // closed — the keydown guard below does not run, so Enter sends and Tab
+  // behaves normally (`/Users/me/a.txt hi` used to be unsendable with Enter).
+  const currentSlashQuery = slashDismissed ? null : slashQuery(inputText);
+  const filteredSkills =
+    currentSlashQuery !== null && skillCatalog ? matchSkills(skillCatalog, currentSlashQuery) : [];
+  const skillMenuOpen = filteredSkills.length > 0;
+  // A bare `/` with nothing installed shows a hint instead (not interactive).
+  const skillMenuEmptyHint =
+    currentSlashQuery === '' && skillCatalog !== null && skillCatalog.length === 0;
 
+  /** Pick a skill: the `/query` text goes, the chip replaces any earlier pick. */
+  function pickSkill(entry: SkillCatalogEntry) {
+    setPickedSkillState({ sessionId, skill: entry });
+    setInputText('');
+    setSelectedSkillIndex(0);
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+  }
+
+  // Reused by the context strip's "new session" offer.
   async function executeNewSession() {
     setInputText('');
     // Echo the command so user sees it was received
@@ -3004,7 +3069,6 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         timestamp: new Date().toISOString(),
       }];
     });
-    setShowCommandDropdown(false);
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     try {
       const result = await newSession(projectId, sessionId);
@@ -3024,17 +3088,6 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     } catch (err) {
       console.error('[ChatView] /new failed:', err);
     }
-  }
-
-  function selectCommand(name: string) {
-    setShowCommandDropdown(false);
-    setCommandFilter('');
-    if (name === '/new') {
-      executeNewSession();
-      return;
-    }
-    setInputText(name);
-    setTimeout(() => handleSend(), 0);
   }
 
   function handleDragEnter(e: React.DragEvent<HTMLDivElement>) {
@@ -3062,11 +3115,12 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // Send is enabled when there is text OR a done chip, AND no chip is uploading.
   // A staged annotation is sendable on its own: the quote block + the note
   // carry the whole question ("this one, not the ad") without typed text.
+  // A picked skill is sendable on its own too ("run this skill").
   const canSend =
     !anyUploading &&
     !allError &&
-    (hasText || anyDone || annotations.length > 0) &&
-    !(attachments.length > 0 && !hasText && !anyDone);
+    (hasText || anyDone || annotations.length > 0 || pickedSkill !== null) &&
+    !(attachments.length > 0 && !hasText && !anyDone && pickedSkill === null);
   const disabledReason = anyUploading
     ? t('chat.disabled.waitingUploads')
     : allError && !hasText
@@ -3108,14 +3162,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     const text = inputText.trim();
     const doneAttachments = attachments.filter((a) => a.status === 'done');
     const pendingAnnotations = annotations;
-    if (!text && doneAttachments.length === 0 && pendingAnnotations.length === 0) return;
+    const skill = pickedSkill;
+    if (!text && doneAttachments.length === 0 && pendingAnnotations.length === 0 && !skill) return;
     if (anyUploading) return;
-
-    // Slash command: /new
-    if (text === '/new') {
-      executeNewSession();
-      return;
-    }
 
     // Spec 091: the sticky "Talking to" pin is the only direct-to-worker send;
     // otherwise the management agent. Text goes out verbatim — a leading
@@ -3151,9 +3200,17 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
 
     // Build the same prefix the backend will emit, so the optimistic local
     // user_message has the identical wire content as the WS echo will.
-    const wireContent = buildAttachmentsBlock(attachmentsPayload) + content;
+    // The skill block follows the attachments block, as on the backend. (A
+    // safe-mode manager gets the body inlined server-side; the echo then
+    // differs from this bubble, which the nonce dedup tolerates.)
+    const skillPayload = skill ? { key: skill.key, path: skill.path } : undefined;
+    const wireContent =
+      buildAttachmentsBlock(attachmentsPayload) +
+      buildSkillBlock(skill ? { name: skill.name, path: skill.path } : null) +
+      content;
 
     setInputText('');
+    if (skill) setPickedSkillState(null);
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
@@ -3215,6 +3272,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         attachmentsPayload.length > 0 ? attachmentsPayload : undefined,
         sessionId,
         resolved.pinned,
+        skillPayload,
       );
       // A pinned send materialized the session on the backend — if the pin
       // PATCH had failed earlier (brand-new session, 404 before the first
@@ -3252,7 +3310,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               holder,
               content: wireContent,
               rawText: text,
-              hasAttachments: attachmentsPayload.length > 0,
+              hasAttachments: attachmentsPayload.length > 0 || skill !== null,
               timestamp: optimisticTimestamp,
             });
             return next;
@@ -3282,7 +3340,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             holder: '',
             content: wireContent,
             rawText: text,
-            hasAttachments: attachmentsPayload.length > 0,
+            hasAttachments: attachmentsPayload.length > 0 || skill !== null,
             timestamp: optimisticTimestamp,
           });
           return next;
@@ -3326,6 +3384,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
           return prev;
         });
         setInputText(text);
+        if (skill) setPickedSkillState({ sessionId, skill });
         setSlotHeldNotice({
           holdingSessionId: result.holding_session_id,
           pendingContent: content,
@@ -3333,6 +3392,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
           pendingNonce: nonce,
           pendingAttachments:
             attachmentsPayload.length > 0 ? attachmentsPayload : undefined,
+          pendingSkill: skill ?? undefined,
         });
         return;
       }
@@ -3385,28 +3445,26 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     // While an IME (e.g. Pinyin) is composing, Enter/Arrow/Tab belong to the
     // candidate window — don't submit or hijack them for our dropdowns.
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-    if (showCommandDropdown) {
+    if (skillMenuOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSelectedCommandIndex(i => Math.min(i + 1, filteredCommands.length - 1));
+        setSelectedSkillIndex(i => Math.min(i + 1, filteredSkills.length - 1));
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setSelectedCommandIndex(i => Math.max(i - 1, 0));
+        setSelectedSkillIndex(i => Math.max(i - 1, 0));
         return;
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
-        if (filteredCommands.length > 0) {
-          selectCommand(filteredCommands[selectedCommandIndex].name);
-        }
+        pickSkill(filteredSkills[Math.min(selectedSkillIndex, filteredSkills.length - 1)]);
         return;
       }
-      if (e.key === 'Escape') {
-        setShowCommandDropdown(false);
-        return;
-      }
+    }
+    if ((skillMenuOpen || skillMenuEmptyHint) && e.key === 'Escape') {
+      setSlashDismissed(true);
+      return;
     }
     // Pending-input queue (spec 006 v3 §11c + §12). ↑ in an EMPTY composer (no
     // command dropdown open — the guard above already handled ↑ and
@@ -3685,7 +3743,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                   case 'started':
                     return t('chat.subActivity.started');
                   case 'sent':
-                    return t('chat.subActivity.sent', { preview: item.preview ?? '' });
+                    return t('chat.subActivity.sent', { preview: skillAwarePreview(item.preview ?? '') });
                   case 'completed':
                     return item.summary
                       ? t('chat.subActivity.completed', { summary: item.summary })
@@ -4140,7 +4198,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               // at (single active-loop slot model).
               setSlotHeldNotice(null);
               setInputText('');
-              const wireContent = pending.pendingContent;
+              setPickedSkillState(null);
+              const pendingSkill = pending.pendingSkill;
+              const wireContent =
+                buildSkillBlock(pendingSkill ? { name: pendingSkill.name, path: pendingSkill.path } : null) +
+                pending.pendingContent;
               setItems((prev) => [
                 ...prev,
                 {
@@ -4157,6 +4219,8 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                 pending.pendingNonce,
                 pending.pendingAttachments,
                 sessionId,
+                undefined,
+                pendingSkill ? { key: pendingSkill.key, path: pendingSkill.path } : undefined,
               );
             }}
           />
@@ -4210,35 +4274,70 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         {/* Context meter. Sits above the composer rather than in the project
             header because it is per-SESSION, and the header is per-project —
             it would report the wrong session while browsing the session list.
-            Reuses executeNewSession verbatim: the offer is the same /new flow
-            the slash command runs, not a parallel path. */}
+            Its offer runs executeNewSession (the flow the removed /new slash
+            command used to run). */}
         <ContextStrip usage={contextUsage} onNewSession={executeNewSession} />
         <div className="relative flex flex-col gap-2 bg-elevated border border-border rounded-lg shadow-[0_1px_2px_rgba(0,0,0,0.04)] px-3 py-2 transition-[border-color,box-shadow] duration-150 focus-within:border-accent focus-within:shadow-[0_0_0_3px_color-mix(in_oklab,var(--color-accent)18%,transparent)] motion-reduce:transition-none">
-          {showCommandDropdown && filteredCommands.length > 0 && (
-            <div className="absolute bottom-full left-0 mb-1 w-64 bg-zinc-800 border border-zinc-700 rounded-lg shadow-lg overflow-hidden z-50">
-              {filteredCommands.map((cmd, i) => (
+          {/* Spec 132: the `/` skill menu. Skills only, one flat list (no
+              origin badge); at most 8 rows visible, then it scrolls. */}
+          {skillMenuOpen && (
+            <div
+              role="listbox"
+              aria-label={t('chat.skill.menuAria')}
+              data-testid="skill-menu"
+              ref={skillMenuRef}
+              className="absolute bottom-full left-0 mb-1 w-[min(28rem,calc(100vw-2rem))] max-h-80 max-md:max-h-[352px] overflow-y-auto bg-elevated border border-border rounded-[10px] shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)] z-50 py-1"
+            >
+              {filteredSkills.map((skill, i) => (
                 <button
-                  key={cmd.name}
-                  className={`w-full text-left px-3 py-2 text-sm hover:bg-zinc-700 max-md:min-h-[44px] ${
-                    i === selectedCommandIndex ? 'bg-zinc-700' : ''
+                  key={skill.path}
+                  type="button"
+                  role="option"
+                  aria-selected={i === selectedSkillIndex}
+                  data-testid="skill-option"
+                  data-skill-name={skill.name}
+                  title={skill.description || skill.name}
+                  className={`w-full flex items-center px-3 h-10 max-md:h-11 text-left text-[13px] min-w-0 hover:bg-card-hover/50 ${
+                    i === selectedSkillIndex ? 'bg-card-hover' : ''
                   }`}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    selectCommand(cmd.name);
+                    pickSkill(skill);
                   }}
                 >
-                  <span className="font-medium text-zinc-200">{cmd.name === '/new' ? t('chat.slash.new') : cmd.name}</span>
-                  <span className="ml-2 text-zinc-500">{cmd.name === '/new' ? t('chat.slash.new.desc') : cmd.description}</span>
+                  {/* Row centred vertically; name and description share a baseline. */}
+                  <span className="flex items-baseline gap-2 min-w-0 w-full">
+                    <span className="shrink-0 max-w-[45%] truncate font-medium text-primary">{skill.name}</span>
+                    {skill.description && (
+                      <span className="min-w-0 flex-1 truncate text-xs text-muted">{skill.description}</span>
+                    )}
+                  </span>
                 </button>
               ))}
             </div>
           )}
+          {skillMenuEmptyHint && (
+            <div
+              data-testid="skill-menu-empty"
+              className="absolute bottom-full left-0 mb-1 w-[min(28rem,calc(100vw-2rem))] bg-elevated border border-border rounded-[10px] shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)] z-50 px-3 py-2 text-xs text-secondary"
+            >
+              {t('chat.skill.empty')}
+            </div>
+          )}
           {annotationStrip}
-          {attachments.length > 0 && (
+          {(attachments.length > 0 || pickedSkill) && (
             <div
               className="flex flex-wrap gap-2 max-h-[100px] overflow-y-auto"
               data-testid="chip-strip"
             >
+              {pickedSkill && (
+                <SkillChip
+                  name={pickedSkill.name}
+                  title={pickedSkill.description || pickedSkill.name}
+                  onRemove={() => setPickedSkillState(null)}
+                  data-testid="composer-skill-chip"
+                />
+              )}
               {attachments.map((a) => (
                 <AttachmentChip
                   key={a.id}
