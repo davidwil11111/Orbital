@@ -129,3 +129,19 @@ def test_startup_dispatchers_skip_deferred_projects(store, tmp_path):
     started = [c.args[0] for c in fake._ensure_dispatcher.await_args_list]
     assert started == [pid2]
     assert pid not in started
+
+
+def test_queue_of_an_unseeded_project_reads_idle(api, store, tmp_path):
+    """A deferred project has no dispatcher yet, so nothing is running. The
+    queue must read idle — "running" locks the chat composer behind
+    "Pause queue to start chatting" on every freshly imported project."""
+    from agent_os.queue.store import QueueStore
+    client, manager = api
+    pid, ws = _deferred(store, tmp_path)
+    manager.get_queue_store = MagicMock(
+        side_effect=lambda p, workspace: QueueStore(os.path.join(workspace, "orbital", "queue.json")))
+    r = client.get(f"/api/v2/projects/{pid}/queue")
+    assert r.status_code == 200
+    assert r.json()["state"] == "idle"
+    assert r.json()["items"] == []
+    assert not (ws / "orbital").exists()

@@ -2579,6 +2579,13 @@ async def _ensure_dispatcher_for(project_id: str):
 
 @router.get("/projects/{project_id}/queue")
 async def get_queue(project_id: str) -> dict:
+    project = _project_store.get_project(project_id) if _project_store else None
+    if isinstance(project, dict) and project.get(DEFERRED_SEED_FIELD):
+        # Spec 138: an imported project has no queue until first use. Loading
+        # the store would write orbital/queue.json into the user's folder, and
+        # its default "running" would lock the composer behind "Pause queue".
+        from agent_os.queue.models import QueueRunState, QueueState
+        return QueueState(state=QueueRunState.IDLE).model_dump(mode="json")
     store = _resolve_queue_store(project_id)
     return store.snapshot()
 
