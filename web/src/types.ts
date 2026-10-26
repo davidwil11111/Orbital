@@ -1025,6 +1025,15 @@ export interface LoginFailedEvent {
   kind?: 'login' | 'update';
 }
 
+// Spec 136: a background sub-agent sweep (reason "status") or a late live
+// model list (reason "models") changed what Settings shows. Daemon-global;
+// open Settings screens refetch. Settings reads serve the previous sweep at
+// once, so this is how they catch up.
+export interface SubAgentsUpdatedEvent {
+  type: 'sub_agents.updated';
+  reason?: 'status' | 'models';
+}
+
 export interface TriggerCreatedEvent {
   type: 'trigger.created';
   project_id: string;
@@ -1221,6 +1230,7 @@ export type WebSocketEvent =
   | LoginProgressEvent
   | LoginCompleteEvent
   | LoginFailedEvent
+  | SubAgentsUpdatedEvent
   | QuotaUpdatedEvent
   | UpdateAvailableEvent;
 

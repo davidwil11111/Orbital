@@ -338,28 +338,56 @@ class TestCredentialRouteStorage:
         assert resp.status_code == 200
         assert "short" not in resp.text
 
-    def test_post_invalidates_the_setup_cache(self, client):
+    @staticmethod
+    def _seed_and_count(engine):
+        """A cached sweep holding the route agent, and a counted per-agent
+        probe (spec 136 A.5: one agent is re-probed, the sweep is kept)."""
+        from agent_os.agents.setup_types import AgentSetupStatus
+
+        def status(configured):
+            return AgentSetupStatus(
+                slug=ROUTE_SLUG, name=ROUTE_SLUG, installed=True, binary_path=None,
+                version=None, dependencies_met=True, missing_dependencies=[],
+                credentials_configured=configured,
+                missing_credentials=[] if configured else [ROUTE_KEY])
+
+        expires = time.monotonic() + 300
+        engine._check_all_cache = ([status(False)], expires)
+        probes = []
+
+        def check_agent(slug):
+            probes.append(slug)
+            return status(SubAgentCredentialStore().get(ROUTE_KEY) is not None)
+
+        engine.check_agent = check_agent
+        return probes, expires
+
+    def test_post_reprobes_the_agent_into_the_setup_cache(self, client):
         import agent_os.api.routes.settings as settings_routes
 
         engine = settings_routes._setup_engine
-        engine._check_all_cache = ([], time.monotonic() + 300)
+        probes, expires = self._seed_and_count(engine)
 
         assert _post(client, key=ROUTE_KEY, value="sk-invalidate-0001").status_code == 200
-        assert engine._check_all_cache is None
+        assert probes == [ROUTE_SLUG]
+        results, expires_after = engine._check_all_cache
+        assert expires_after == expires
+        assert results[0].credentials_configured is True
 
-    def test_delete_removes_and_invalidates(self, client):
+    def test_delete_removes_and_reprobes(self, client):
         import agent_os.api.routes.settings as settings_routes
 
         _post(client, key=ROUTE_KEY, value="sk-delete-me-0001")
         engine = settings_routes._setup_engine
-        engine._check_all_cache = ([], time.monotonic() + 300)
+        probes, _expires = self._seed_and_count(engine)
 
         resp = client.delete(
             f"/api/v2/settings/sub-agents/{ROUTE_SLUG}/credential/{ROUTE_KEY}")
         assert resp.status_code == 200
         assert resp.json()["set"] is False
         assert SubAgentCredentialStore().get(ROUTE_KEY) is None
-        assert engine._check_all_cache is None
+        assert probes == [ROUTE_SLUG]
+        assert engine._check_all_cache[0][0].credentials_configured is False
 
     def test_delete_validates_slug_and_key(self, client):
         assert client.delete(

@@ -86,6 +86,8 @@ class SubAgentInstaller:
         self._ws_manager = ws_manager
         self._jobs: dict[str, dict] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        # Slugs re-probed into the cached sweep at the end of their job.
+        self._refreshed: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,7 +192,24 @@ class SubAgentInstaller:
             logger.exception("install job failed for %s", slug)
             self._finish_failed(slug, job_id, f"{type(exc).__name__}: {exc}")
             return
+        await self._refresh_detection(slug)
         self._finish_done(slug, job_id, version)
+
+    async def _refresh_detection(self, slug: str) -> None:
+        """Spec 136 A.5: re-probe the agent just installed into the cached
+        sweep before ``done`` goes out, so the list the card refetches has
+        it — one agent's probe, not every agent's."""
+        engine = self._setup_engine
+        refresh = getattr(engine, "refresh_agent", None) if engine is not None else None
+        if not callable(refresh):
+            return
+        if hasattr(engine, "invalidate_resolved_path"):
+            engine.invalidate_resolved_path(slug)
+        try:
+            await asyncio.to_thread(refresh, slug)
+            self._refreshed.add(slug)
+        except Exception:  # noqa: BLE001 — _finish_done falls back to dropping the sweep
+            logger.warning("post-install re-probe failed for %s", slug, exc_info=True)
 
     async def _preflight(self, manifest) -> tuple[str, str]:
         """Resolve node + npm and enforce the Node floor.
@@ -378,7 +397,9 @@ class SubAgentInstaller:
         # The binary the auto_detect probe is about to find did not exist when
         # this agent was last checked, and both caches outlive that fact — the
         # resolved-path one for the daemon's whole lifetime.
-        if engine is not None:
+        if engine is not None and slug in self._refreshed:
+            self._refreshed.discard(slug)
+        elif engine is not None:
             if hasattr(engine, "invalidate_cache"):
                 engine.invalidate_cache()
             if hasattr(engine, "invalidate_resolved_path"):

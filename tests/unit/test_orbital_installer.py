@@ -558,19 +558,39 @@ class TestInstallJob:
         assert "reinstall Orbital" in failed[0]["error"]
         assert exec_fake.npm_calls == []
 
-    async def test_success_invalidates_setup_engine_caches(
+    async def test_success_reprobes_the_installed_agent_into_the_cache(
             self, installer, engine, agent_manifest, monkeypatch):
         """The resolved-path cache lives for the daemon's lifetime; without an
-        explicit drop, a just-installed agent keeps reporting itself absent."""
-        engine._check_all_cache = ([], time.monotonic() + 999)
-        engine._resolved_paths[SLUG] = f"/stale/path/{COMMAND}"
+        explicit drop, a just-installed agent keeps reporting itself absent.
+        Spec 136 A.5: the path is dropped and this one agent is re-probed into
+        the cached sweep (same expiry) instead of every agent on next read."""
+        from agent_os.agents.setup_types import AgentSetupStatus
 
+        def absent(installed=False):
+            return AgentSetupStatus(
+                slug=SLUG, name=SLUG, installed=installed, binary_path=None,
+                version=None, dependencies_met=True, missing_dependencies=[],
+                credentials_configured=True, missing_credentials=[])
+
+        expires = time.monotonic() + 999
+        engine._check_all_cache = ([absent()], expires)
+        stale = f"/stale/path/{COMMAND}"
+        engine._resolved_paths[SLUG] = stale
+        probes = []
+
+        def check_agent(slug):
+            probes.append((slug, engine._resolved_paths.get(slug)))
+            return absent(installed=True)
+
+        engine.check_agent = check_agent
         exec_fake = FakeExec()
         patch_which(monkeypatch)
         await run_install(installer, agent_manifest, exec_fake, monkeypatch)
 
-        assert engine._check_all_cache is None
-        assert SLUG not in engine._resolved_paths
+        assert probes == [(SLUG, None)]  # the stale path was gone before the probe
+        results, expires_after = engine._check_all_cache
+        assert expires_after == expires
+        assert [r.installed for r in results] == [True]
 
 
 # ---------------------------------------------------------------------------

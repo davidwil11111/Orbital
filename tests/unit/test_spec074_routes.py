@@ -26,7 +26,8 @@ from agent_os.agent.session import Session
 def _fake_check_all_factory(installed_slugs: list[str]):
     from agent_os.agents.setup_types import AgentSetupStatus
 
-    def _fake() -> list[AgentSetupStatus]:
+    # Spec 136: the readers call ``check_all(allow_stale=True)``.
+    def _fake(*_args, **_kwargs) -> list[AgentSetupStatus]:
         statuses = [AgentSetupStatus(
             slug="built-in", name="Built-in",
             installed=True, binary_path=None, version=None,

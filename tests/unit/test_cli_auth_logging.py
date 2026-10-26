@@ -98,7 +98,10 @@ def test_timeout_logs_the_exception_class(caplog):
                side_effect=subprocess.TimeoutExpired(cmd="x", timeout=10)), \
             caplog.at_level(logging.WARNING, logger=LOGGER):
         ok, _ = engine.check_credentials(manifest)
-    assert ok is False
+    # Spec 136 decision 2: a timeout is "no answer", not "signed out" — with
+    # no earlier verdict to keep it is unknown, which is not missing. It is
+    # still logged and recorded like every other failed probe.
+    assert ok is True
     warnings = _warnings(caplog)
     assert len(warnings) == 1
     assert "TimeoutExpired" in warnings[0].getMessage()

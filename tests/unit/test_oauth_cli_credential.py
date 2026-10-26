@@ -169,8 +169,11 @@ class TestCheckCredentialsOAuthCLI:
                     side_effect=subprocess.TimeoutExpired("test-cmd", 10)):
             ok, missing = engine.check_credentials(manifest)
 
-        assert ok is False
-        assert "test_auth" in missing
+        # Spec 136 decision 2: a probe that never answered is not a "signed
+        # out" verdict. With no earlier answer to keep, the sign-in is
+        # unknown, which does not count as missing (no Login button).
+        assert ok is True
+        assert missing == []
 
     def test_check_credentials_oauth_cli_invalid_json(self):
         registry = AgentRegistry()
