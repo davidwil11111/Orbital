@@ -6,7 +6,8 @@
 
 ``list_sessions`` lists a project folder's native Claude Code / Codex sessions
 (``agent_os.onboarding.session_import``). Point the importer at empty homes for
-every unit test so none reads the developer's real ``~/.claude`` / ``~/.codex``;
+every unit test so none reads the developer's real ``~/.claude`` / ``~/.codex``
+(or ``~/.pi`` / ``~/.kimi-code`` / ``~/.minimax``, spec 138);
 tests that exercise the importer set these to their own fixture dirs.
 
 Same for DeepSeek Harness: its spawn copies provider rows out of DSH Desktop's
@@ -25,6 +26,8 @@ def _isolate_native_session_homes(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(empty / "claude"))
     monkeypatch.setenv("ORBITAL_CODEX_HOME", str(empty / "codex"))
     monkeypatch.setenv("DSH_HOME", str(empty / "dsh"))
+    # Spec 138: pi / Kimi Code / MiniMax Code stores are read under this home.
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", str(empty / "history-home"))
     yield
 
 

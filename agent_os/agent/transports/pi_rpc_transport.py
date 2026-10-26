@@ -162,6 +162,9 @@ class PiRPCTransport(AgentTransport):
         # Same attribute name as the SDK/Codex transports: the manager's
         # honesty downgrade compares it with the persisted record.
         self._resume_session_id: str | None = record.get("session_id")
+        # The session file the record names (spec 138: a session imported
+        # from pi's own store is reopened by its file, not its id).
+        self._resume_file: str | None = record.get("session_file") or record.get("rollout_path")
         self._resume_outcome: tuple[str, str | None] = ("fresh", None)
         self._system_prompt = system_prompt
         self._session_dir = session_dir
@@ -528,18 +531,31 @@ class PiRPCTransport(AgentTransport):
         A stored id only proves Orbital once saw it. ``--session`` makes pi
         exit when the id is unknown (``--session-id`` would silently create
         it), and get_state must echo the same id before this reports
-        "resumed". Any failure restarts fresh exactly once.
+        "resumed". A session imported from pi's own store (spec 138) is
+        reopened by its file — or forked, when it ran in another folder.
+        Any failure restarts fresh exactly once.
         """
         requested = self._resume_session_id
         if not requested:
             state = await self._spawn(argv, env)
             self._resume_outcome = ("fresh", None)
             return state
+        native = self._native_resume_file()
         try:
-            state = await self._spawn(argv + ["--session", requested], env)
-            if state.get("sessionId") != requested:
-                raise _StartupError(
-                    f"pi opened session {state.get('sessionId')!r}, not {requested!r}")
+            if native is not None and not self._ran_in_workspace(native):
+                # pi runs an opened session in the cwd its header records; a
+                # session from another folder (a group project) is forked into
+                # the workspace instead — same history, a new id in Orbital's
+                # session dir, the user's file untouched.
+                state = await self._spawn(argv + ["--fork", native], env)
+                if not state.get("sessionId"):
+                    raise _StartupError("pi fork returned no session id")
+            else:
+                state = await self._spawn(
+                    argv + ["--session", native or requested], env)
+                if state.get("sessionId") != requested:
+                    raise _StartupError(
+                        f"pi opened session {state.get('sessionId')!r}, not {requested!r}")
         except _StartupError as exc:
             logger.warning("PiRPCTransport: session %s could not be resumed; "
                            "starting fresh: %s", requested, exc)
@@ -550,6 +566,30 @@ class PiRPCTransport(AgentTransport):
             return state
         self._resume_outcome = ("resumed", None)
         return state
+
+    def _native_resume_file(self) -> str | None:
+        """The recorded session file when it lives in pi's own store (outside
+        Orbital's session dir) — an imported session. Orbital's own sessions
+        keep resuming by id, unchanged."""
+        path = self._resume_file
+        if not path or not os.path.isfile(path):
+            return None
+        if self._session_dir:
+            own = os.path.realpath(self._session_dir) + os.sep
+            if os.path.realpath(path).startswith(own):
+                return None
+        return path
+
+    def _ran_in_workspace(self, path: str) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                header = json.loads(fh.readline() or "null")
+            cwd = header.get("cwd") if isinstance(header, dict) else None
+            return (isinstance(cwd, str) and bool(cwd)
+                    and os.path.normcase(os.path.realpath(cwd))
+                    == os.path.normcase(os.path.realpath(self._workspace)))
+        except (OSError, ValueError):
+            return False
 
     async def _spawn(self, argv: list[str], env: dict) -> dict:
         self._stderr_tail.clear()

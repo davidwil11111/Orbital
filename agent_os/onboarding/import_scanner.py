@@ -29,6 +29,11 @@ Hard guarantees (see backlog #34):
 * **Ranked.** Agent-project candidates rank above Obsidian vaults (a vault is
   often a personal knowledge base, not a project). Within a tier, most-recently-
   active first.
+* **Folder rules (spec 138 pass 1).** A session folder inside a git repo
+  folds onto the repo's main root (worktrees included); ``~``, ``~/Desktop``,
+  ``~/Documents``, ``~/Downloads``, ``/`` and temp roots are never offered. A
+  folder that is not a git repo, has no ``AGENTS.md`` / ``CLAUDE.md`` and
+  holds fewer than 3 sessions is ``minor`` (offered unchecked).
 """
 
 from __future__ import annotations
@@ -41,6 +46,8 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from agent_os.onboarding.history_paths import HistoryEnv, codex_dir as _codex_dir, history_home
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,11 @@ class ImportCandidate:
     # Not part of the public {source,name,path,session_count,last_activity}
     # payload, but handy for debugging/telemetry.
     sources: list[str] = field(default_factory=list)
+    # Spec 138: sessions per agent, and the pass-1 folder facts.
+    by_agent: dict[str, int] = field(default_factory=dict)
+    is_git: bool = False
+    has_agent_md: bool = False
+    minor: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -91,6 +103,10 @@ class ImportCandidate:
             "session_count": self.session_count,
             "last_activity": self.last_activity,
             "already_imported": self.already_imported,
+            "kind": "folder",
+            "minor": self.minor,
+            "is_git": self.is_git,
+            "by_agent": dict(self.by_agent),
         }
 
 
@@ -106,6 +122,7 @@ def scan_importable_projects(
     codex_dir: str | None = None,
     obsidian_config_path: str | None = None,
     existing_workspaces: Iterable[str] = (),
+    env: HistoryEnv | None = None,
 ) -> list[ImportCandidate]:
     """Scan all v1 sources and return ranked, deduped, path-verified candidates.
 
@@ -119,13 +136,17 @@ def scan_importable_projects(
     ``already_imported=True`` rather than dropped, so the wizard can show it
     honestly. Matching uses the same realpath/normcase key as ``_dedupe``, so a
     symlinked import still matches its real folder.
+
+    ``home`` defaults to ``$ORBITAL_HISTORY_HOME`` or ``~``; ``env`` (the
+    container / temp folders of pass 1) defaults to the one for that home.
     """
-    home = home or os.path.expanduser("~")
+    home = str(home) if home else history_home()
+    env = env or HistoryEnv.for_home(home)
 
     if claude_projects_dir is None:
         claude_projects_dir = os.path.join(home, ".claude", "projects")
     if codex_dir is None:
-        codex_dir = os.path.join(home, ".codex")
+        codex_dir = _codex_dir(home)
     if obsidian_config_path is None:
         obsidian_config_path = _default_obsidian_config_path(home)
 
@@ -135,7 +156,10 @@ def scan_importable_projects(
     raw.extend(_safe(_scan_obsidian, obsidian_config_path))
 
     verified = [c for c in raw if _path_is_live(c.path)]
-    deduped = _dedupe(verified)
+    folded = [c for c in (_fold_to_repo(c, env) for c in verified) if c is not None]
+    deduped = _dedupe(folded)
+    for cand in deduped:
+        _annotate(cand, env)
     imported_keys = {_path_key(w) for w in existing_workspaces if w}
     if imported_keys:
         for cand in deduped:
@@ -183,6 +207,7 @@ def _scan_claude_code(projects_dir: str) -> list[ImportCandidate]:
                 session_count=len(sessions),
                 last_activity=_iso(_safe_mtime(sessions[0])),
                 sources=[SOURCE_CLAUDE_CODE],
+                by_agent={SOURCE_CLAUDE_CODE: len(sessions)},
             )
         )
     return out
@@ -320,6 +345,7 @@ def _codex_candidates_from_rows(
             session_count=g["count"],
             last_activity=g["latest"],
             sources=[SOURCE_CODEX],
+            by_agent={SOURCE_CODEX: g["count"]},
         )
         for cwd, g in grouped.items()
     ]
@@ -351,6 +377,7 @@ def _scan_codex_sessions(sessions_dir: str) -> list[ImportCandidate]:
             session_count=g["count"],
             last_activity=g["latest"],
             sources=[SOURCE_CODEX],
+            by_agent={SOURCE_CODEX: g["count"]},
         )
         for cwd, g in grouped.items()
     ]
@@ -472,9 +499,12 @@ def _dedupe(candidates: list[ImportCandidate]) -> list[ImportCandidate]:
                 session_count=cand.session_count,
                 last_activity=cand.last_activity,
                 sources=list(cand.sources or [cand.source]),
+                by_agent=dict(cand.by_agent),
             )
             continue
         existing.session_count += cand.session_count
+        for agent, n in cand.by_agent.items():
+            existing.by_agent[agent] = existing.by_agent.get(agent, 0) + n
         existing.last_activity = _max_iso(existing.last_activity, cand.last_activity)
         for s in cand.sources or [cand.source]:
             if s not in existing.sources:
@@ -507,6 +537,36 @@ def strip_extended_prefix(path: str) -> str:
     if path.startswith(_EXTENDED_PREFIX):
         return path[len(_EXTENDED_PREFIX):]
     return path
+
+
+def _fold_to_repo(cand: ImportCandidate, env: HistoryEnv) -> ImportCandidate | None:
+    """Pass 1: a folder inside a git repo becomes the repo's main root (so a
+    worktree folds onto its repo); container and temp folders are dropped."""
+    from agent_os.onboarding.history import git_main_root
+
+    path = os.path.normpath(cand.path)
+    if cand.source in _AGENT_SOURCES:
+        root = git_main_root(path)
+        if root and root != path and not env.is_container(root) and not env.is_temp(root) \
+                and _path_is_live(root):
+            cand.path = root
+            cand.name = os.path.basename(root.rstrip("/\\")) or root
+            path = root
+    if env.is_container(path) or env.is_temp(path):
+        return None
+    return cand
+
+
+def _annotate(cand: ImportCandidate, env: HistoryEnv) -> None:
+    from agent_os.onboarding.history import MIN_FOLDER_SESSIONS, git_main_root
+
+    root = git_main_root(os.path.normpath(cand.path))
+    # A repo rooted at a container (a dotfiles repo in ~) says nothing.
+    cand.is_git = root is not None and not env.is_container(root)
+    cand.has_agent_md = any(os.path.isfile(os.path.join(cand.path, n))
+                            for n in ("AGENTS.md", "CLAUDE.md"))
+    cand.minor = (cand.source in _AGENT_SOURCES and not cand.is_git
+                  and not cand.has_agent_md and cand.session_count < MIN_FOLDER_SESSIONS)
 
 
 def _path_key(path: str) -> str:

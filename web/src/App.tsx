@@ -30,6 +30,8 @@ import EdgeStrip from './components/EdgeStrip';
 import CreateProject from './components/CreateProject';
 import { requestOnboardingKickoff } from './utils/onboardingKickoff';
 import FirstRunHome from './components/FirstRunHome';
+import ImportProjectsDialog from './components/ImportProjectsDialog';
+import { markFreshSession } from './utils/freshSession';
 import { isFirstRun, needsSetupWizard, wizardLandingProjectId } from './utils/firstRun';
 import FirstJourneyTour from './tour/FirstJourneyTour';
 import {
@@ -551,21 +553,54 @@ export default function App() {
     setMobileView('sidebar');
   }
 
+  // Spec 138: open an imported project on a NEW session, so its empty chat
+  // shows the left-off cards. The minted id is marked fresh before the route
+  // flips (spec 107: no history fetch for a session that cannot exist yet).
+  async function openProjectOnNewSession(projectId: string) {
+    let sessionId: string | undefined;
+    try {
+      const minted = await api<{ session_id?: string }>(
+        `/api/v2/agents/${encodeURIComponent(projectId)}/new-session`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      sessionId = minted?.session_id || undefined;
+      if (sessionId) markFreshSession(projectId, sessionId);
+    } catch {
+      // Still open the project; ChatTab picks its most recent session.
+    }
+    setRoute({ name: 'project', projectId, tab: 'chat', sessionId });
+    setMobileView('content');
+  }
+
+  // "Import projects from your agents" (spec 138) — the dialog for users past
+  // the wizard. Opens the most recently active imported project.
+  const [importOpen, setImportOpen] = useState(false);
+  async function handleImported(landingProjectId: string | null) {
+    setImportOpen(false);
+    const loaded = await listProjects();
+    if (landingProjectId && loaded.some((p) => p.project_id === landingProjectId)) {
+      await openProjectOnNewSession(landingProjectId);
+    }
+  }
+
   // First-run wizard (before setup gate)
   if (needsWizard === true) {
     return (
       <SetupWizard
-        onComplete={async () => {
+        onComplete={async (outcome) => {
           setNeedsWizard(false);
           setSetupComplete(true);
           // Hand off straight into a project instead of the bare list: the
-          // one the wizard's import step just added if there is one,
-          // otherwise the Create Project dialog. A new user was never told
-          // that creating a project is the next step — so make it the next
-          // step. Closing the dialog falls back to the first-run home.
+          // most recently active one the wizard just imported, on a new
+          // session; otherwise the Create Project dialog. A new user was
+          // never told that creating a project is the next step — so make it
+          // the next step. Closing the dialog falls back to the first-run home.
           const loaded = await listProjects();
+          const imported = outcome?.landingProjectId ?? null;
           const landing = wizardLandingProjectId(loaded);
-          if (landing) {
+          if (imported && loaded.some((p) => p.project_id === imported)) {
+            await openProjectOnNewSession(imported);
+          } else if (landing) {
             setRoute({ name: 'project', projectId: landing, tab: 'chat', sessionId: undefined });
           } else {
             setRoute({ name: 'create' });
@@ -644,6 +679,7 @@ export default function App() {
     onSelectCalendar: handleSelectCalendar,
     onSelectWorkbench: handleSelectWorkbench,
     onNewProject: handleNewProject,
+    onImportProjects: () => setImportOpen(true),
     onReorderProjects: reorderProjects,
     onSettings: () => {
       setGlobalSettingsSection(undefined);
@@ -826,7 +862,7 @@ export default function App() {
             the Create Project dialog's backdrop: the screen is not blank
             under it, and cancelling does not replay the entrance. */}
         {(route.name === 'list' || route.name === 'create') && isFirstRun(projects) && (
-          <FirstRunHome onNewProject={handleNewProject} />
+          <FirstRunHome onNewProject={handleNewProject} onImportProjects={() => setImportOpen(true)} />
         )}
         {route.name === 'list' && !isFirstRun(projects) && (
           <div className="flex flex-col items-center justify-center flex-1 min-h-0 gap-4">
@@ -854,6 +890,13 @@ export default function App() {
           }
           agentNames={(agentsAvailable ?? []).map((a) => a.name)}
           onClose={closeTour}
+        />
+      )}
+
+      {importOpen && (
+        <ImportProjectsDialog
+          onClose={() => setImportOpen(false)}
+          onImported={(_result, landing) => { void handleImported(landing); }}
         />
       )}
 

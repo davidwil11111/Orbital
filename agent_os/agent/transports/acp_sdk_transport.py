@@ -357,7 +357,11 @@ class ACPSDKTransport(AgentTransport):
                 session_response = await self._connection.new_session(cwd=self._workspace)
                 self._session_id = session_response.session_id
             except RequestError as exc:
-                if exc.code != -32002:  # ACP resource-not-found
+                # ACP resource-not-found, or invalid-params: the agent refused
+                # this session for this request — MiniMax Code does so when
+                # the cwd differs from the session's own folder (spec 138: a
+                # group project's imported session). Fresh + recap instead.
+                if exc.code not in (-32002, -32602):
                     raise
                 logger.warning(
                     "ACPSDKTransport: session %s could not be resumed; starting fresh: %s",

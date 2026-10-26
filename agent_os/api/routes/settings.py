@@ -152,6 +152,8 @@ class UpdateSettingsRequest(BaseModel):
     telemetry_enabled: bool | None = None
     # First-run wizard "Skip for now" (keyless mode). Omitted = untouched.
     setup_api_key_skipped: bool | None = None
+    # Spec 138: global hidden sub-agents (replace). Omitted = untouched.
+    sub_agents_hidden: list[str] | None = None
 
 
 class SetApiKeyRequest(BaseModel):
@@ -458,6 +460,9 @@ async def update_settings(req: UpdateSettingsRequest):
         current.telemetry_enabled = req.telemetry_enabled
     if req.setup_api_key_skipped is not None:
         current.setup_api_key_skipped = req.setup_api_key_skipped
+    if req.sub_agents_hidden is not None:
+        current.sub_agents_hidden = sorted(
+            {h.strip() for h in req.sub_agents_hidden if isinstance(h, str) and h.strip()})
 
     # Write user preferences content to file
     if req.user_preferences_content is not None:
@@ -494,6 +499,9 @@ async def update_settings(req: UpdateSettingsRequest):
         telemetry.emit("key_set",
                        {"provider": card.provider if card else "custom"})
         telemetry.latch("key_set")
+    if req.setup_api_key_skipped:
+        # Spec 138: the wizard's "Skip for now" on the Orbital-agent key step.
+        telemetry.latch("key_skipped")
 
     return _settings_store.get_masked()
 

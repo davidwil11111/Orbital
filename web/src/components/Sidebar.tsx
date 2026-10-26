@@ -44,6 +44,8 @@ interface SidebarProps {
   onSelectCalendar: () => void;
   onSelectWorkbench: () => void;
   onNewProject: () => void;
+  /** "Import projects from your agents" (spec 138); absent = no entry. */
+  onImportProjects?: () => void;
   onSettings: () => void;
   /** Persist a new manual order for the regular-projects block (spec 056).
    *  Receives the COMPLETE ordered id list. The caller applies it
@@ -184,6 +186,7 @@ export default function Sidebar({
   onSelectCalendar,
   onSelectWorkbench,
   onNewProject,
+  onImportProjects,
   onSettings,
   onReorderProjects,
   narrow = false,
@@ -478,6 +481,16 @@ export default function Sidebar({
         >
           {t('app.newProject')}
         </button>
+        {onImportProjects && (
+          <button
+            type="button"
+            onClick={onImportProjects}
+            data-testid="sidebar-import-projects"
+            className="w-full truncate rounded-lg px-3 py-1 text-left text-xs text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
+          >
+            {t('importProjects.entry')}
+          </button>
+        )}
 
         <button
           onClick={onSettings}

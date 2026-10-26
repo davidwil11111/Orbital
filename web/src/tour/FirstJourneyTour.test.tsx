@@ -11,9 +11,15 @@ import FirstJourneyTour from './FirstJourneyTour';
 /** Put `data-tour` anchors on the page. jsdom does no layout, so every element
  * measures 0×0 — which the tour (rightly) reads as "not on screen". Give the
  * listed anchors a real box. */
-function mountAnchors(ids: string[]) {
+function mountAnchors(ids: string[], leftOffAnswered = true) {
   const host = document.createElement('div');
   host.id = 'anchors';
+  // The empty chat's left-off answer: "no cards" unless the cards are mounted.
+  if (leftOffAnswered && !ids.includes('left-off')) {
+    const marker = document.createElement('span');
+    marker.setAttribute('data-left-off-state', 'none');
+    host.appendChild(marker);
+  }
   for (const id of ids) {
     const el = document.createElement('div');
     el.setAttribute('data-tour', id);
@@ -24,7 +30,7 @@ function mountAnchors(ids: string[]) {
   document.body.appendChild(host);
 }
 
-const ALL = ['project-header', 'composer', 'pin-select', 'workspace-panel', 'tab-files', 'tab-queue', 'project-settings', 'edge-strip'];
+const ALL = ['project-header', 'pin-select', 'workspace-panel', 'tab-files', 'tab-queue', 'project-settings', 'edge-strip'];
 
 beforeEach(() => {
   Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true });
@@ -38,7 +44,7 @@ afterEach(() => {
 const stepId = () => screen.getByTestId('tour-card').getAttribute('data-step');
 
 describe('FirstJourneyTour', () => {
-  it('walks all eight stops in order, then closes on Done', async () => {
+  it('walks all seven stops in order (no composer stop), then closes on Done', async () => {
     mountAnchors(ALL);
     const onClose = vi.fn();
     render(<FirstJourneyTour folderName="copenhagen" agentNames={['Claude Code', 'Codex']} onClose={onClose} />);
@@ -46,14 +52,14 @@ describe('FirstJourneyTour', () => {
     await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
     expect(stepId()).toBe('project');
     expect(screen.getByTestId('tour-card').textContent).toContain('Your agent works from the context in copenhagen');
-    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 8');
+    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 7');
 
     const seen = [stepId()];
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < 6; i++) {
       fireEvent.click(screen.getByTestId('tour-next'));
       seen.push(stepId());
     }
-    expect(seen).toEqual(['project', 'composer', 'agents', 'panel', 'files', 'tasks', 'settings', 'quickTasks']);
+    expect(seen).toEqual(['project', 'agents', 'panel', 'files', 'tasks', 'settings', 'quickTasks']);
     // The last stop offers Done and no Skip.
     expect(screen.getByTestId('tour-next').textContent).toBe('Done');
     expect(screen.queryByTestId('tour-skip')).toBeNull();
@@ -68,7 +74,6 @@ describe('FirstJourneyTour', () => {
     render(<FirstJourneyTour folderName="x" agentNames={['Claude Code', 'Codex']} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
     fireEvent.click(screen.getByTestId('tour-next'));
-    fireEvent.click(screen.getByTestId('tour-next'));
     expect(stepId()).toBe('agents');
     expect(screen.getByTestId('tour-card').textContent).toContain('Orbital found Claude Code, Codex on this computer');
   });
@@ -78,13 +83,63 @@ describe('FirstJourneyTour', () => {
     render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
-    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 6');
+    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 5');
     const seen = [stepId()];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 4; i++) {
       fireEvent.click(screen.getByTestId('tour-next'));
       seen.push(stepId());
     }
-    expect(seen).toEqual(['project', 'composer', 'files', 'tasks', 'settings', 'quickTasks']);
+    expect(seen).toEqual(['project', 'files', 'tasks', 'settings', 'quickTasks']);
+  });
+
+  it('with left-off cards showing, opens on them and goes to the agents stop next', async () => {
+    mountAnchors(['left-off', ...ALL]);
+    render(<FirstJourneyTour folderName="x" agentNames={['Codex']} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
+    expect(stepId()).toBe('leftOff');
+    expect(screen.getByTestId('tour-card').textContent).toContain('Pick up where you left off');
+    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 8');
+    fireEvent.click(screen.getByTestId('tour-next'));
+    expect(stepId()).toBe('agents');
+    fireEvent.click(screen.getByTestId('tour-next'));
+    expect(stepId()).toBe('project');
+  });
+
+  it('the left-off cards stay clickable on their stop, and opening one moves the tour on', async () => {
+    mountAnchors(['left-off', ...ALL]);
+    render(<FirstJourneyTour folderName="x" agentNames={['Codex']} onClose={vi.fn()} />);
+    await waitFor(() => expect(stepId()).toBe('leftOff'));
+    // No full-page blocker over the cards: four blockers frame the hole.
+    expect(screen.getAllByTestId('tour-blocker')).toHaveLength(4);
+    fireEvent.click(document.querySelector('[data-tour="left-off"]')!);
+    await waitFor(() => expect(stepId()).toBe('agents'));
+    expect(screen.queryAllByTestId('tour-blocker')).toHaveLength(0);
+  });
+
+  it('waits for the left-off answer before fixing its stops', async () => {
+    // The header is up but the empty chat has not answered yet (still
+    // loading, or not even mounted).
+    mountAnchors(ALL, false);
+    const marker = document.createElement('div');
+    marker.setAttribute('data-left-off-state', 'loading');
+    document.getElementById('anchors')!.appendChild(marker);
+    render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(screen.queryByTestId('tour-card')).toBeNull();
+
+    // The answer lands with cards.
+    marker.remove();
+    mountAnchors(['left-off']);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
+    expect(stepId()).toBe('leftOff');
+    document.querySelectorAll('#anchors').forEach((n) => n.remove());
+  });
+
+  it('goes on without the left-off stop when no answer ever comes (a session with messages is open)', async () => {
+    mountAnchors(ALL, false);
+    render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy(), { timeout: 3000 });
+    expect(stepId()).toBe('project');
   });
 
   it('falls back to the panel handle when the panel is collapsed', async () => {

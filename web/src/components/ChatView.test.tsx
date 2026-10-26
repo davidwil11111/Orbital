@@ -58,6 +58,10 @@ let runStatusTerminalEvent: unknown = null;
 // a test can answer only for the session it scopes to). Default: none pending.
 let pendingApprovalResponder: (path: string) => unknown = () => ({ pending: false });
 
+// Spec 138: GET /projects/{pid}/left-off and the telemetry events posted.
+let leftOffResponse: unknown = { last_time: null, unfinished: [] };
+const telemetryEvents: string[] = [];
+
 // Keyless onboarding: GET /projects/{pid}/sessions (useSessions) answers this
 // list, and PUT /projects/{pid} (the no-session sticky pin) is logged.
 let sessionsListResponse: unknown[] = [];
@@ -77,6 +81,11 @@ vi.mock('../config', () => ({
     }
     if (!opts?.method && /\/projects\/[^/]+\/sessions$/.test(path)) {
       return sessionsListResponse;
+    }
+    if (path.endsWith('/left-off')) return leftOffResponse;
+    if (path === '/api/v2/telemetry/event') {
+      telemetryEvents.push(JSON.parse(opts?.body ?? '{}').event);
+      return undefined;
     }
     // Session pin PATCH (spec 074) — gated for the lock-race test.
     if (opts?.method === 'PATCH' && path.includes('/sessions/')) {
@@ -342,6 +351,8 @@ beforeEach(() => {
   runStatusHolder = null;
   runStatusTerminalEvent = null;
   pendingApprovalResponder = () => ({ pending: false });
+  leftOffResponse = { last_time: null, unfinished: [] };
+  telemetryEvents.length = 0;
   sessionsListResponse = [];
   chatLatestResponse = [];
   projectPutCalls.length = 0;
@@ -1385,6 +1396,57 @@ describe('Spec 074: pinned worker response survives the next send (terminal catc
     });
     await flushEffects();
     expect(apiWithTotalCalls.length).toBe(fetchesAfterMount);
+  });
+});
+
+// Spec 138: the left-off cards take the examples' place in a new session's
+// empty chat; a card opens its session through the parent, and picking a
+// different agent there before the first send is reported once.
+describe('Spec 138: left-off cards in the empty chat', () => {
+  const LAST = { session_id: 'imp_codex_1', agent: 'codex', user_text: 'add a hide list', at: new Date().toISOString(), git: null };
+
+  it('replaces the example prompts when the project has history, and a card opens its session', async () => {
+    leftOffResponse = { last_time: LAST, unfinished: [] };
+    const onOpenSession = vi.fn();
+    await act(async () => {
+      root.render(
+        <ChatView projectId="p1" project={project} agentStatus={'idle' as never} agents={[]} sessionId="s-new" onOpenSession={onOpenSession} />,
+      );
+    });
+    await flushEffects();
+    expect(container.querySelector('[data-testid="chat-empty-examples"]')).toBeNull();
+    const card = container.querySelector('[data-testid="left-off-last"]') as HTMLButtonElement;
+    expect(card.textContent).toContain('add a hide list');
+    await act(async () => { card.click(); });
+    expect(onOpenSession).toHaveBeenCalledWith('imp_codex_1');
+  });
+
+  it('reports agent_switch_after_open when the pin changes in the opened session before a send', async () => {
+    leftOffResponse = { last_time: LAST, unfinished: [] };
+    const agents = [{ slug: 'claude-code', name: 'Claude Code' }];
+    const onOpenSession = vi.fn();
+    const draw = (sessionId: string) => act(async () => {
+      root.render(
+        <ChatView projectId="p1" project={project} agentStatus={'idle' as never} agents={agents} sessionId={sessionId} onOpenSession={onOpenSession} />,
+      );
+    });
+    await draw('s-new');
+    await flushEffects();
+    await act(async () => { (container.querySelector('[data-testid="left-off-last"]') as HTMLButtonElement).click(); });
+    // The parent navigates to the opened session.
+    await draw('imp_codex_1');
+    await flushEffects();
+
+    const pick = async (label: string) => {
+      await act(async () => { (container.querySelector('[data-testid="pin-target-select"] > button') as HTMLButtonElement).click(); });
+      const option = Array.from(container.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes(label)) as HTMLButtonElement;
+      await act(async () => { option.click(); });
+    };
+    await pick('Claude Code');
+    expect(telemetryEvents.filter((e) => e === 'agent_switch_after_open')).toHaveLength(1);
+    // Once per open.
+    await pick('Orbital');
+    expect(telemetryEvents.filter((e) => e === 'agent_switch_after_open')).toHaveLength(1);
   });
 });
 

@@ -652,9 +652,15 @@ def _assemble_app(app: FastAPI, data_dir: str | None) -> FastAPI:
     # data, surfaced as ranked candidates the setup wizard confirms one-by-one.
     # Stateless and metadata-only — creates nothing (confirmed candidates route
     # back through POST /api/v2/projects).
+    # Spec 138 adds the history scan (cached under the data dir), the batch
+    # import, the per-project left-off cards and the allowlisted UI telemetry
+    # events on the same module.
     from agent_os.api.routes import onboarding as onboarding_routes
-    onboarding_routes.configure(project_store=project_store)
+    onboarding_routes.configure(project_store=project_store, data_dir=store_dir,
+                                setup_engine=setup_engine)
     app.include_router(onboarding_routes.router)
+    app.include_router(onboarding_routes.projects_router)
+    app.include_router(onboarding_routes.telemetry_router)
 
     # 7c-pricing. Pricing-table routes (resolved rates + per-field origin GET,
     # validated override PUT). Stateless — reads providers.json defaults and

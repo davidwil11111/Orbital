@@ -5,228 +5,228 @@
 // @vitest-environment jsdom
 
 /**
- * ImportProjectsStep unit tests (backlog #34).
- *
- * Covers the locked MVP contract:
- *  - disclose-then-scan: the disclosure renders and NO scan fires on mount;
- *  - Scan calls GET /api/v2/onboarding/importable-projects and renders the
- *    ranked candidates in the order the API returned them;
- *  - confirm-each: clicking Add on a row POSTs the EXISTING /api/v2/projects
- *    with {name, workspace:path} (link-only) and the row flips to "Added";
- *  - a scanner/network failure surfaces an error + retry, never a broken list;
- *  - an empty result shows the empty state.
- *
- * The api client is mocked — no network.
+ * ImportProjectsStep — the project checklist from the user's agent history
+ * (spec 138): what is checked by default, what "Import N projects" counts,
+ * group folders, and the single POST /onboarding/import.
  */
 
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { OnboardingScan } from '../hooks/useOnboardingScan';
+import type { ImportableResponse } from '../utils/onboarding';
 
-let apiFn = vi.fn();
-vi.mock('../config', () => ({
-  api: (...args: unknown[]) => apiFn(...args),
-  ApiError: class ApiError extends Error {
-    constructor(public status: number, public detail: string) {
-      super(detail);
-      this.name = 'ApiError';
-    }
-  },
-  isRelayMode: false,
-  BASE_URL: 'http://localhost:8000',
+const apiMock = vi.hoisted(() => vi.fn());
+vi.mock('../config', () => ({ api: apiMock }));
+vi.mock('./FolderBrowserPanel', () => ({
+  default: ({ onSelect }: { onSelect: (p: string) => void }) => (
+    <button type="button" data-testid="fake-browser" onClick={() => onSelect('/Users/x/new-decks')}>
+      pick
+    </button>
+  ),
 }));
 
 import ImportProjectsStep from './ImportProjectsStep';
-import { ApiError } from '../config';
 
-const IMPORT_PATH = '/api/v2/onboarding/importable-projects';
+const DAY = 86_400_000;
+const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
 
-const CANDIDATES = [
-  { source: 'claude-code', name: 'orbital', path: '/Users/x/orbital', session_count: 12, last_activity: '2026-08-01T00:00:00+00:00' },
-  { source: 'codex', name: 'api-svc', path: '/Users/x/api-svc', session_count: 1, last_activity: '2026-07-20T00:00:00+00:00' },
-  { source: 'obsidian', name: 'notes', path: '/Users/x/notes', session_count: 0, last_activity: '2026-08-05T00:00:00+00:00' },
-];
+const DATA: ImportableResponse = {
+  status: 'ready',
+  candidates: [
+    { source: 'claude-code', name: 'orbital-test', path: '/Users/x/orbital-test', session_count: 223, last_activity: iso(DAY), already_imported: false, kind: 'folder', minor: false, is_git: true, by_agent: { 'claude-code': 182, codex: 41 } },
+    { source: 'codex', name: 'website', path: '/Users/x/website', session_count: 9, last_activity: iso(3 * DAY), already_imported: true, kind: 'folder', minor: false, is_git: true, by_agent: { codex: 9 } },
+    { source: 'claude-code', name: 'scratch-a', path: '/Users/x/scratch-a', session_count: 2, last_activity: iso(5 * DAY), already_imported: false, kind: 'folder', minor: true, is_git: false, by_agent: { 'claude-code': 2 } },
+    { source: 'codex', name: 'scratch-b', path: '/Users/x/scratch-b', session_count: 1, last_activity: iso(6 * DAY), already_imported: false, kind: 'folder', minor: true, is_git: false, by_agent: { codex: 1 } },
+  ],
+  groups: [
+    {
+      id: 'grp_decks', session_count: 13, last_activity: iso(2 * DAY), by_agent: { 'claude-code': 9, codex: 4 },
+      reasons: [
+        { kind: 'same_skill', value: 'pptx', count: 6 },
+        { kind: 'same_files', value: 'Q3-review.pptx', count: 4 },
+        { kind: 'same_request', value: "write this week's report from", count: 5 },
+        { kind: 'same_folder', value: '/Users/x/Desktop/decks', count: 3 },
+      ],
+      suggested_folder: '/Users/x/Desktop/decks',
+      members: [{ agent: 'codex', native_id: 'a' }],
+    },
+    {
+      id: 'grp_loose', session_count: 3, last_activity: iso(4 * DAY), by_agent: { codex: 3 },
+      reasons: [{ kind: 'same_request', value: 'summarize the meeting notes', count: 3 }],
+      suggested_folder: null,
+      members: [{ agent: 'codex', native_id: 'b' }],
+    },
+  ],
+};
+
+function scanOf(over: Partial<OnboardingScan> = {}): OnboardingScan {
+  return { history: null, importable: DATA, error: false, settled: true, retry: vi.fn(), ...over };
+}
+
+const telemetry: Array<{ event: string; fields: Record<string, unknown> }> = [];
+let importResponse: () => Promise<unknown>;
 
 beforeEach(() => {
-  apiFn = vi.fn();
+  telemetry.length = 0;
+  apiMock.mockReset();
+  importResponse = async () => ({
+    created: [
+      { project_id: 'p_orb', name: 'orbital-test', workspace: '/Users/x/orbital-test', from: 'folder' },
+      { project_id: 'p_decks', name: 'decks', workspace: '/Users/x/Desktop/decks', from: 'group' },
+    ],
+    skipped: [],
+  });
+  apiMock.mockImplementation(async (path: string, opts?: { method?: string; body?: string }) => {
+    if (path === '/api/v2/telemetry/event') {
+      telemetry.push(JSON.parse(opts?.body ?? '{}'));
+      return undefined;
+    }
+    if (path === '/api/v2/onboarding/import') return importResponse();
+    return {};
+  });
 });
 afterEach(() => cleanup());
 
-describe('ImportProjectsStep', () => {
-  it('shows the disclosure and does NOT scan on mount (disclose-then-scan)', () => {
-    render(<ImportProjectsStep />);
-    expect(screen.getByTestId('import-disclosure')).toBeInTheDocument();
-    expect(screen.getByText(/never your conversations/)).toBeInTheDocument();
-    expect(screen.getByTestId('import-scan')).toBeInTheDocument();
-    // No network before the user opts in.
-    expect(apiFn).not.toHaveBeenCalled();
+const submit = () => screen.getByTestId('import-submit') as HTMLButtonElement;
+const check = (testId: string) => screen.getByTestId(testId) as HTMLInputElement;
+
+describe('ImportProjectsStep — what is offered, and checked', () => {
+  it('checks the worked-in folders, shows imported ones as imported, and collapses the minor ones', () => {
+    render(<ImportProjectsStep scan={scanOf()} onImported={vi.fn()} />);
+    expect(check('import-check-/Users/x/orbital-test').checked).toBe(true);
+    expect(screen.queryByTestId('import-check-/Users/x/website')).toBeNull();
+    expect(screen.getByTestId('import-imported-/Users/x/website').textContent).toBe('Already imported');
+    // per-agent counts, biggest first
+    expect(screen.getByTestId('import-candidate-/Users/x/orbital-test').textContent).toContain('Claude Code 182 · Codex 41');
+
+    const toggle = screen.getByTestId('import-minor-toggle');
+    expect(toggle.textContent).toBe('2 more folders with one or two conversations');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('import-check-/Users/x/scratch-a')).toBeNull();
+    fireEvent.click(toggle);
+    expect(check('import-check-/Users/x/scratch-a').checked).toBe(false);
+    expect(check('import-check-/Users/x/scratch-b').checked).toBe(false);
   });
 
-  it('scans on click and renders candidates in the returned order', async () => {
-    apiFn.mockResolvedValueOnce({ candidates: CANDIDATES });
-    render(<ImportProjectsStep />);
+  it('renders each group with its folder name, meta line and reason chips', () => {
+    render(<ImportProjectsStep scan={scanOf()} onImported={vi.fn()} />);
+    const decks = screen.getByTestId('import-group-grp_decks');
+    expect(screen.getByTestId('import-group-title-grp_decks').textContent).toBe('decks');
+    expect(decks.textContent).toContain('13 conversations · Claude Code, Codex · last one 2d ago');
+    expect(decks.textContent).toContain('used the pptx skill');
+    expect(decks.textContent).toContain('wrote the same files: Q3-review.pptx');
+    expect(decks.textContent).toContain('started with the same request ×5: "write this week\'s report from…"');
+    expect(decks.textContent).toContain('ran in the same folder: /Users/x/Desktop/decks');
+    expect(check('import-group-check-grp_decks').checked).toBe(true);
 
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
+    const loose = screen.getByTestId('import-group-title-grp_loose');
+    expect(loose.textContent).toBe('Needs a folder');
+    expect(loose.className).toContain('warning');
+    expect(screen.getByTestId('import-group-grp_loose').textContent).toContain('Choose a folder before importing');
+    expect(screen.getByTestId('import-group-choose-grp_loose').textContent).toBe('Choose folder');
+    expect(screen.getByTestId('import-group-choose-grp_decks').textContent).toBe('Change');
+  });
+});
 
-    expect(apiFn).toHaveBeenCalledWith(IMPORT_PATH);
-    await waitFor(() => expect(screen.getByTestId('import-list')).toBeInTheDocument());
+describe('ImportProjectsStep — the Import count', () => {
+  it('counts checked folders plus checked groups that have a folder', () => {
+    render(<ImportProjectsStep scan={scanOf()} onImported={vi.fn()} />);
+    // orbital-test + grp_decks; grp_loose has no folder; minor ones unchecked.
+    expect(submit().textContent).toBe('Import 2 projects');
 
-    const rows = screen.getAllByRole('listitem');
-    expect(rows).toHaveLength(3);
-    // Order preserved (server already ranked: agents above the vault).
-    expect(rows[0]).toHaveTextContent('orbital');
-    expect(rows[2]).toHaveTextContent('notes');
-    // Obsidian shows "Vault", agent projects show a session count.
-    expect(rows[2]).toHaveTextContent('Vault');
-    expect(rows[0]).toHaveTextContent('12 sessions');
-    expect(rows[1]).toHaveTextContent('1 session');
+    fireEvent.click(check('import-check-/Users/x/orbital-test'));
+    expect(submit().textContent).toBe('Import 1 project');
+
+    fireEvent.click(screen.getByTestId('import-minor-toggle'));
+    fireEvent.click(check('import-check-/Users/x/scratch-a'));
+    expect(submit().textContent).toBe('Import 2 projects');
+
+    fireEvent.click(check('import-group-check-grp_decks'));
+    fireEvent.click(check('import-check-/Users/x/scratch-a'));
+    expect(submit().textContent).toBe('Import 0 projects');
+    expect(submit().disabled).toBe(true);
   });
 
-  it('confirming a row POSTs the existing /api/v2/projects (link-only) and flips to Added', async () => {
-    apiFn.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === IMPORT_PATH) return { candidates: CANDIDATES };
-      if (path === '/api/v2/projects' && options?.method === 'POST') {
-        return { project_id: 'p1', name: 'orbital', workspace: '/Users/x/orbital' };
-      }
-      throw new Error(`unexpected ${path}`);
-    });
-    const onCreated = vi.fn();
-    render(<ImportProjectsStep onProjectCreated={onCreated} />);
+  it('a group counts once a folder is chosen through the folder browser', () => {
+    render(<ImportProjectsStep scan={scanOf()} onImported={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('import-group-choose-grp_loose'));
+    fireEvent.click(screen.getByTestId('fake-browser'));
+    expect(screen.getByTestId('import-group-title-grp_loose').textContent).toBe('new-decks');
+    expect(screen.queryByTestId('import-group-browser-grp_loose')).toBeNull();
+    expect(submit().textContent).toBe('Import 3 projects');
+  });
+});
 
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
+describe('ImportProjectsStep — Import', () => {
+  it('POSTs one import with the checked folders and groups, reports unchecks, and hands back the landing project', async () => {
+    importResponse = async () => ({
+      created: [
+        { project_id: 'p_loose', name: 'new-decks', workspace: '/Users/x/new-decks', from: 'group' },
+        { project_id: 'p_decks', name: 'decks', workspace: '/Users/x/Desktop/decks', from: 'group' },
+      ],
+      skipped: [],
     });
-    await waitFor(() => expect(screen.getByTestId('import-list')).toBeInTheDocument());
+    const onImported = vi.fn();
+    render(<ImportProjectsStep scan={scanOf()} onImported={onImported} />);
+    fireEvent.click(screen.getByTestId('import-group-choose-grp_loose'));
+    fireEvent.click(screen.getByTestId('fake-browser'));
+    fireEvent.click(check('import-check-/Users/x/orbital-test')); // uncheck one
 
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-add-/Users/x/orbital'));
-    });
+    await act(async () => { fireEvent.click(submit()); });
 
-    // Exact link-only create payload against the EXISTING projects endpoint.
-    expect(apiFn).toHaveBeenCalledWith('/api/v2/projects', {
-      method: 'POST',
-      body: JSON.stringify({ name: 'orbital', workspace: '/Users/x/orbital', auto_unique_name: true }),
+    const post = apiMock.mock.calls.find(([p]) => p === '/api/v2/onboarding/import');
+    expect(post?.[1]?.method).toBe('POST');
+    expect(JSON.parse(post?.[1]?.body)).toEqual({
+      folders: [],
+      groups: [
+        { id: 'grp_decks', workspace: '/Users/x/Desktop/decks' },
+        { id: 'grp_loose', workspace: '/Users/x/new-decks' },
+      ],
     });
-    await waitFor(() =>
-      expect(screen.getByTestId('import-added-/Users/x/orbital')).toBeInTheDocument(),
+    expect(telemetry).toContainEqual({ event: 'projects_unchecked', fields: { n: 1 } });
+    // grp_decks (2 days ago) is more recent than grp_loose (4 days ago).
+    await waitFor(() => expect(onImported).toHaveBeenCalledTimes(1));
+    expect(onImported.mock.calls[0][1]).toBe('p_decks');
+  });
+
+  it('a failed import says so and stays put', async () => {
+    importResponse = async () => { throw new Error('boom'); };
+    const onImported = vi.fn();
+    render(<ImportProjectsStep scan={scanOf()} onImported={onImported} />);
+    await act(async () => { fireEvent.click(submit()); });
+    expect(screen.getByTestId('import-failed').textContent).toBe("Couldn't import. Try again.");
+    expect(onImported).not.toHaveBeenCalled();
+    expect(submit().disabled).toBe(false);
+  });
+
+  it('offers Back and Skip when given them', () => {
+    const onBack = vi.fn();
+    const onSkip = vi.fn();
+    render(<ImportProjectsStep scan={scanOf()} onImported={vi.fn()} onBack={onBack} onSkip={onSkip} />);
+    fireEvent.click(screen.getByTestId('import-back'));
+    fireEvent.click(screen.getByTestId('import-skip'));
+    expect(onBack).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('import-skip').textContent).toBe('Skip');
+  });
+});
+
+describe('ImportProjectsStep — while the scan runs', () => {
+  it('shows candidates at once and says groups are still coming', () => {
+    render(
+      <ImportProjectsStep
+        scan={scanOf({ settled: false, importable: { status: 'scanning', candidates: DATA.candidates, groups: [] } })}
+        onImported={vi.fn()}
+      />,
     );
-    expect(onCreated).toHaveBeenCalledTimes(1);
-    // Other rows keep their Add buttons.
-    expect(screen.getByTestId('import-add-/Users/x/api-svc')).toBeInTheDocument();
+    expect(screen.getByTestId('import-candidate-/Users/x/orbital-test')).toBeTruthy();
+    expect(screen.getByTestId('import-groups-scanning').textContent).toBe('Still reading your conversations…');
   });
 
-  it('surfaces a create failure inline and leaves the row retryable', async () => {
-    apiFn.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === IMPORT_PATH) return { candidates: CANDIDATES };
-      if (path === '/api/v2/projects' && options?.method === 'POST') {
-        throw new Error('workspace does not exist');
-      }
-      throw new Error(`unexpected ${path}`);
-    });
-    render(<ImportProjectsStep />);
-
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
-    await waitFor(() => expect(screen.getByTestId('import-list')).toBeInTheDocument());
-
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-add-/Users/x/api-svc'));
-    });
-
-    await waitFor(() =>
-      expect(screen.getByTestId('import-add-error-/Users/x/api-svc')).toBeInTheDocument(),
-    );
-    // Still retryable.
-    expect(screen.getByTestId('import-add-/Users/x/api-svc')).toBeInTheDocument();
-  });
-
-  it('shows the empty state when nothing is found', async () => {
-    apiFn.mockResolvedValueOnce({ candidates: [] });
-    render(<ImportProjectsStep />);
-
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
-    await waitFor(() => expect(screen.getByTestId('import-empty')).toBeInTheDocument());
-  });
-
-  it('shows an error with a retry when the scan fails', async () => {
-    apiFn.mockRejectedValueOnce(new Error('boom'));
-    render(<ImportProjectsStep />);
-
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
-    await waitFor(() => expect(screen.getByTestId('import-error')).toBeInTheDocument());
-    expect(screen.getByTestId('import-rescan')).toBeInTheDocument();
-  });
-  // ---- spec 084: failures keyed by status; already-imported rows ----
-
-  async function scanThenAdd(path: string) {
-    render(<ImportProjectsStep />);
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
-    await waitFor(() => expect(screen.getByTestId('import-list')).toBeInTheDocument());
-    await act(async () => {
-      fireEvent.click(screen.getByTestId(`import-add-${path}`));
-    });
-  }
-
-  it('a 409 renders the name-conflict message, not the retryable one', async () => {
-    apiFn.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === IMPORT_PATH) return { candidates: CANDIDATES };
-      if (path === '/api/v2/projects' && options?.method === 'POST') {
-        throw new ApiError(409, "agent_name 'api-svc' already in use");
-      }
-      throw new Error(`unexpected ${path}`);
-    });
-    await scanThenAdd('/Users/x/api-svc');
-    const err = await screen.findByTestId('import-add-error-/Users/x/api-svc');
-    expect(err).toHaveTextContent(/already exists/);
-    expect(err).not.toHaveTextContent(/try again/i);
-  });
-
-  it('a 400 renders the folder-gone message', async () => {
-    apiFn.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === IMPORT_PATH) return { candidates: CANDIDATES };
-      if (path === '/api/v2/projects' && options?.method === 'POST') {
-        throw new ApiError(400, 'Workspace path does not exist');
-      }
-      throw new Error(`unexpected ${path}`);
-    });
-    await scanThenAdd('/Users/x/api-svc');
-    const err = await screen.findByTestId('import-add-error-/Users/x/api-svc');
-    expect(err).toHaveTextContent(/no longer exists/);
-  });
-
-  it('a 500 keeps the retryable message', async () => {
-    apiFn.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === IMPORT_PATH) return { candidates: CANDIDATES };
-      if (path === '/api/v2/projects' && options?.method === 'POST') {
-        throw new ApiError(500, 'boom');
-      }
-      throw new Error(`unexpected ${path}`);
-    });
-    await scanThenAdd('/Users/x/api-svc');
-    const err = await screen.findByTestId('import-add-error-/Users/x/api-svc');
-    expect(err).toHaveTextContent(/try again/i);
-  });
-
-  it('an already-imported candidate renders the check state with no Add button', async () => {
-    apiFn.mockResolvedValueOnce({
-      candidates: [{ ...CANDIDATES[0], already_imported: true }, CANDIDATES[1]],
-    });
-    render(<ImportProjectsStep />);
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('import-scan'));
-    });
-    await waitFor(() => expect(screen.getByTestId('import-list')).toBeInTheDocument());
-    expect(screen.queryByTestId('import-add-/Users/x/orbital')).toBeNull();
-    expect(screen.getByTestId('import-added-/Users/x/orbital')).toHaveTextContent('Already imported');
-    // The other row is untouched.
-    expect(screen.getByTestId('import-add-/Users/x/api-svc')).toBeInTheDocument();
+  it('an unreadable history offers Try again', () => {
+    const retry = vi.fn();
+    render(<ImportProjectsStep scan={scanOf({ importable: null, error: true, retry })} onImported={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('import-retry'));
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 });

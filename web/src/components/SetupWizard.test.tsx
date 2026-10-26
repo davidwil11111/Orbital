@@ -5,18 +5,19 @@
 // @vitest-environment jsdom
 
 /**
- * SetupWizard unit tests — Task I1 (Spec 011 §0.7).
+ * SetupWizard unit tests — Task I1 (Spec 011 §0.7), spec 138 step flow.
  *
  * Covers:
- *  - step flow api_key → accounts → complete (Get Started calls onComplete);
- *  - the sandbox step is gone: advancing never fetches /api/v2/platform/status
- *    (nor POSTs /platform/skip or /platform/setup);
- *  - featured filter: only `featured && status === 'available'` connectors
- *    render as cards;
- *  - connect: busy "waiting for browser consent" state, 400 → client-hint,
- *    success → list refetch showing "Connected as {account}";
- *  - zero-featured / fetch-failure fallback: browser sign-in group alone;
- *  - Skip calls onComplete.
+ *  - spec 138 flow: agents → projects → api_key → accounts; projects skipped
+ *    when the scan finds nothing; the key step skipped when a key exists;
+ *    zero agents → the key step is compulsory (no Skip, amber note, way back);
+ *  - the Agents step: statuses with history counts, Sign in through the
+ *    sub-agent login job, unchecked agents → PUT sub_agents_hidden, the
+ *    not-found chips opening the locate card;
+ *  - Finish: telemetry, the tour marked pending on a fresh install, and the
+ *    landing project handed to App;
+ *  - the sandbox step is gone; featured connectors; connect flow; language
+ *    widget; agent browser sign-in; skipping the key (keyless onboarding).
  *
  * The api client (web/src/config.ts `api`) is mocked — no network. The
  * LLMProviderSettings form is stubbed out (it has its own coverage).
@@ -27,6 +28,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Connector } from '../types';
 import { LocaleProvider } from '../i18n/LocaleContext';
 import { LOCALE_STORAGE_KEY } from '../i18n/locales';
+import { TOUR_STORAGE_KEY } from '../tour/tourLogic';
 
 const apiMock = vi.hoisted(() => vi.fn());
 const MockApiError = vi.hoisted(() => {
@@ -44,6 +46,23 @@ vi.mock('../config', () => ({ api: apiMock, ApiError: MockApiError }));
 vi.mock('./LLMProviderSettings', () => ({
   default: () => <div data-testid="llm-provider-settings-stub" />,
 }));
+
+type WsHandler = (event: unknown) => void;
+const wsHandlers = vi.hoisted(() => new Map<string, Set<(event: unknown) => void>>());
+vi.mock('../hooks/useWebSocket', () => ({
+  useWebSocket: () => ({
+    on: (type: string, fn: WsHandler) => {
+      if (!wsHandlers.has(type)) wsHandlers.set(type, new Set());
+      wsHandlers.get(type)!.add(fn);
+    },
+    off: (type: string, fn: WsHandler) => { wsHandlers.get(type)?.delete(fn); },
+    connectionState: 'connected',
+    subscribe: vi.fn(),
+  }),
+}));
+function emitWs(type: string, payload: Record<string, unknown>) {
+  act(() => { for (const fn of wsHandlers.get(type) ?? []) fn({ type, ...payload }); });
+}
 
 import SetupWizard from './SetupWizard';
 
@@ -68,23 +87,71 @@ function makeConnector(overrides: Partial<Connector> = {}): Connector {
   };
 }
 
+interface AgentFixture {
+  slug: string;
+  name: string;
+  installed: boolean;
+  credentials_configured: boolean;
+  supports_login?: boolean;
+}
+
+const AGENTS: AgentFixture[] = [
+  { slug: 'claude-code', name: 'Claude Code', installed: true, credentials_configured: true },
+  { slug: 'codex', name: 'Codex', installed: true, credentials_configured: false, supports_login: true },
+  { slug: 'gemini-cli', name: 'Gemini CLI', installed: true, credentials_configured: true },
+  { slug: 'kimi-code', name: 'Kimi Code', installed: false, credentials_configured: false },
+  { slug: 'pi', name: 'Pi', installed: false, credentials_configured: false },
+];
+
+const NO_PROJECTS = { status: 'ready', candidates: [], groups: [] };
+const SOME_PROJECTS = {
+  status: 'ready',
+  candidates: [{
+    source: 'claude-code', name: 'orbital-test', path: '/Users/x/orbital-test', session_count: 40,
+    last_activity: '2026-10-26T08:00:00+00:00', already_imported: false, kind: 'folder', minor: false,
+    is_git: true, by_agent: { 'claude-code': 40 },
+  }],
+  groups: [],
+};
+
 interface MockRoutes {
   apiKeySet?: boolean;
-  /** PUT /api/v2/settings (the Skip-the-key persist). Default resolves. */
-  settingsPut?: () => Promise<unknown>;
+  hidden?: string[];
+  /** PUT /api/v2/settings. Default resolves. */
+  settingsPut?: (body: Record<string, unknown>) => Promise<unknown>;
+  agents?: AgentFixture[];
+  importable?: unknown;
+  projects?: unknown[];
   connectors?: Connector[] | Error;
   connect?: () => Promise<unknown>;
+  importResult?: unknown;
 }
+
+const telemetry: Array<{ event: string; fields: Record<string, unknown> }> = [];
 
 /** Route the api mock by path; unmatched paths resolve to {}. */
 function mockApi(routes: MockRoutes) {
   apiMock.mockImplementation(async (path: string, options?: RequestInit) => {
+    if (path === '/api/v2/telemetry/event') {
+      telemetry.push(JSON.parse(String(options?.body ?? '{}')));
+      return undefined;
+    }
     if (path === '/api/v2/settings' && options?.method === 'PUT') {
-      return routes.settingsPut ? routes.settingsPut() : {};
+      const body = JSON.parse(String(options.body ?? '{}'));
+      return routes.settingsPut ? routes.settingsPut(body) : {};
     }
     if (path === '/api/v2/settings') {
-      return { llm: { api_key_set: routes.apiKeySet ?? true } };
+      return { llm: { api_key_set: routes.apiKeySet ?? true }, sub_agents_hidden: routes.hidden ?? [] };
     }
+    if (path === '/api/v2/settings/sub-agents' || path === '/api/v2/settings/sub-agents/refresh') {
+      return routes.agents ?? AGENTS;
+    }
+    if (path === '/api/v2/onboarding/history') {
+      return { status: 'ready', sessions_total: 296, by_agent: { 'claude-code': 214, codex: 71, pi: 0, 'kimi-code': 3, 'minimax-code': 8 } };
+    }
+    if (path === '/api/v2/onboarding/importable-projects') return routes.importable ?? NO_PROJECTS;
+    if (path === '/api/v2/onboarding/import') return routes.importResult ?? { created: [], skipped: [] };
+    if (path === '/api/v2/projects') return routes.projects ?? [{ project_id: 'scratch', is_scratch: true }];
     if (path === '/api/v2/connectors') {
       if (routes.connectors instanceof Error) throw routes.connectors;
       return { connectors: routes.connectors ?? [] };
@@ -103,58 +170,267 @@ function calledPaths(): string[] {
   return apiMock.mock.calls.map(([path]) => path as string);
 }
 
+function settingsPuts(): Record<string, unknown>[] {
+  return apiMock.mock.calls
+    .filter(([path, opts]) => path === '/api/v2/settings' && opts?.method === 'PUT')
+    .map(([, opts]) => JSON.parse(opts.body));
+}
+
+/** Click Continue on the Agents step once the agent list is in. */
+async function continueFromAgents() {
+  const btn = await waitFor(() => {
+    const b = screen.getByTestId('wizard-agents-continue') as HTMLButtonElement;
+    expect(b.disabled).toBe(false);
+    return b;
+  });
+  // The importable list must be in before Continue decides to skip Projects.
+  await waitFor(() => expect(calledPaths()).toContain('/api/v2/onboarding/importable-projects'));
+  await act(async () => { fireEvent.click(btn); });
+}
+
+/** Render and walk to the accounts step (key set, nothing to import). */
+async function renderAtAccounts(ui = <SetupWizard onComplete={vi.fn()} />) {
+  render(ui);
+  await continueFromAgents();
+  await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
+}
+
+/** Render and walk to the key step (no key, nothing to import). */
+async function renderAtKey(ui = <SetupWizard onComplete={vi.fn()} />) {
+  render(ui);
+  await continueFromAgents();
+  await waitFor(() => expect(screen.getByText('The Orbital agent')).toBeTruthy());
+}
+
 beforeEach(() => {
   apiMock.mockReset();
+  wsHandlers.clear();
+  telemetry.length = 0;
+  localStorage.removeItem(TOUR_STORAGE_KEY);
 });
 
-describe('SetupWizard — step flow', () => {
-  it('stays on api_key when no key is set, then advances to accounts on Next', async () => {
+describe('SetupWizard — spec 138 step flow', () => {
+  it('opens on the Agents step with the step indicator', async () => {
     mockApi({ apiKeySet: false });
     render(<SetupWizard onComplete={vi.fn()} />);
-
-    // api_key step visible
     expect(screen.getByText('Welcome to Orbital')).toBeTruthy();
-    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/v2/settings'));
-    expect(screen.queryByText('Connect Your Accounts')).toBeNull();
+    const steps = screen.getByTestId('wizard-steps');
+    expect(steps.textContent).toBe('1 Agents·2 Projects·3 Orbital agent·4 Accounts');
+    expect(steps.querySelector('[aria-current="step"]')?.textContent).toBe('1 Agents');
+    // The history scan starts with the wizard.
+    await waitFor(() => expect(calledPaths()).toContain('/api/v2/onboarding/history'));
+  });
 
-    // Key now set — Next advances
+  it('skips Projects when the scan found nothing, then goes to the key step', async () => {
+    mockApi({ apiKeySet: false, importable: NO_PROJECTS });
+    await renderAtKey();
+    expect(screen.queryByText('Your projects')).toBeNull();
+    expect(screen.getByTestId('wizard-steps').querySelector('[aria-current="step"]')?.textContent).toBe('3 Orbital agent');
+  });
+
+  it('shows Projects when there is something to import; Back returns, Skip moves on', async () => {
+    mockApi({ apiKeySet: false, importable: SOME_PROJECTS });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('Your projects')).toBeTruthy());
+    expect(screen.getByText(/^Found in 296 conversations with your agents\./)).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('import-back'));
+    expect(screen.getByText('Welcome to Orbital')).toBeTruthy();
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('Your projects')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('import-skip'));
+    expect(screen.getByText('The Orbital agent')).toBeTruthy();
+  });
+
+  it('skips the key step when a key already exists', async () => {
+    mockApi({ apiKeySet: true });
+    await renderAtAccounts();
+    expect(screen.queryByText('The Orbital agent')).toBeNull();
+  });
+
+  it('Next on the key step advances to accounts once the key is saved', async () => {
+    mockApi({ apiKeySet: false });
+    await renderAtKey();
     mockApi({ apiKeySet: true });
     fireEvent.click(screen.getByText('Next →'));
     await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
   });
 
-  it('auto-advances to accounts when the key is already configured', async () => {
-    mockApi({ apiKeySet: true });
+  it('reports each step reached once, and done at Finish', async () => {
+    mockApi({ apiKeySet: false, importable: SOME_PROJECTS });
     render(<SetupWizard onComplete={vi.fn()} />);
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('Your projects')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('import-back'));
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('Your projects')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('import-skip'));
+    mockApi({ apiKeySet: false });
+    await act(async () => { fireEvent.click(screen.getByTestId('wizard-skip-key')); });
     await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('wizard-get-started'));
+    await waitFor(() => expect(telemetry.filter((e) => e.event === 'wizard_step_reached').map((e) => e.fields.step))
+      .toEqual(['agents', 'projects', 'key', 'accounts', 'done']));
+  });
+});
+
+describe('SetupWizard — Agents step', () => {
+  it('lists installed agents checked, with sign-in status and history counts', async () => {
+    mockApi({ apiKeySet: false });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('wizard-agent-claude-code')).toBeTruthy());
+    expect(screen.getByText(/Orbital found these coding agents on this computer\./)).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByTestId('wizard-agent-status-claude-code').textContent).toBe('Signed in · 214 conversations'),
+    );
+    expect(screen.getByTestId('wizard-agent-status-codex').textContent).toBe('Installed · not signed in');
+    expect(screen.getByTestId('wizard-agent-login-codex').textContent).toBe('Sign in');
+    // No history reader for gemini-cli → no count.
+    expect(screen.getByTestId('wizard-agent-status-gemini-cli').textContent).toBe('Signed in');
+    for (const slug of ['claude-code', 'codex', 'gemini-cli']) {
+      expect((screen.getByTestId(`wizard-agent-check-${slug}`) as HTMLInputElement).checked).toBe(true);
+    }
+    expect(screen.getByTestId('wizard-agents-continue').textContent).toBe('Continue with 3 agents');
   });
 
-  it('Get Started calls onComplete', async () => {
-    mockApi({ apiKeySet: true });
+  it('unchecked agents go into sub_agents_hidden on Continue (keeping hidden ones not on the list)', async () => {
+    mockApi({ apiKeySet: false, hidden: ['aider'] });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('wizard-agent-check-codex')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('wizard-agent-check-codex'));
+    expect(screen.getByTestId('wizard-agents-continue').textContent).toBe('Continue with 2 agents');
+    await continueFromAgents();
+    expect(settingsPuts()).toEqual([{ sub_agents_hidden: ['aider', 'codex'] }]);
+  });
+
+  it('an agent with no login flow says where its key goes instead of offering Sign in', async () => {
+    mockApi({
+      apiKeySet: false,
+      agents: [{ slug: 'gemini-cli', name: 'Gemini CLI', installed: true, credentials_configured: false, supports_login: false }],
+    });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() =>
+      expect(screen.getByTestId('wizard-agent-status-gemini-cli').textContent).toBe('Installed · add its key later in Settings'),
+    );
+    expect(screen.queryByTestId('wizard-agent-login-gemini-cli')).toBeNull();
+  });
+
+  it('an agent already hidden starts unchecked', async () => {
+    mockApi({ apiKeySet: false, hidden: ['gemini-cli'] });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() =>
+      expect((screen.getByTestId('wizard-agent-check-gemini-cli') as HTMLInputElement).checked).toBe(false),
+    );
+  });
+
+  it('Sign in starts the agent\'s login job and refetches when it completes', async () => {
+    mockApi({ apiKeySet: false });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('wizard-agent-login-codex')).toBeTruthy());
+    await act(async () => { fireEvent.click(screen.getByTestId('wizard-agent-login-codex')); });
+    expect(apiMock).toHaveBeenCalledWith('/api/v2/settings/sub-agents/codex/login', { method: 'POST' });
+
+    const before = calledPaths().filter((p) => p === '/api/v2/settings/sub-agents').length;
+    mockApi({ apiKeySet: false, agents: AGENTS.map((a) => (a.slug === 'codex' ? { ...a, credentials_configured: true } : a)) });
+    emitWs('login.complete', { slug: 'codex' });
+    await waitFor(() => expect(screen.getByTestId('wizard-agent-status-codex').textContent).toBe('Signed in · 71 conversations'));
+    expect(calledPaths().filter((p) => p === '/api/v2/settings/sub-agents').length).toBe(before + 1);
+  });
+
+  it('agents not found are chips that open the existing locate card', async () => {
+    mockApi({ apiKeySet: false });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('wizard-not-found')).toBeTruthy());
+    expect(screen.getByText('Not found on this computer')).toBeTruthy();
+    expect(screen.queryByTestId('sub-agent-not-detected-kimi-code')).toBeNull();
+    fireEvent.click(screen.getByTestId('wizard-locate-chip-kimi-code'));
+    expect(screen.getByTestId('sub-agent-not-detected-kimi-code')).toBeTruthy();
+    expect(screen.getByText('Copy this into Kimi Code and paste its answer below.')).toBeTruthy();
+  });
+});
+
+describe('SetupWizard — no coding agent found', () => {
+  const NONE = AGENTS.map((a) => ({ ...a, installed: false, credentials_configured: false }));
+
+  it('leads with the locate card and install names; Continue makes the key compulsory', async () => {
+    mockApi({ apiKeySet: false, agents: NONE });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText('Installed but not found?')).toBeTruthy());
+    expect(screen.getByText(/We didn't find a coding agent on this computer\./)).toBeTruthy();
+    // The first chip's card is open by default.
+    expect(screen.getByTestId('sub-agent-not-detected-claude-code')).toBeTruthy();
+    expect(screen.getByTestId('wizard-install-line').textContent).toContain('Claude Code · Codex · Gemini CLI · Kimi Code · Pi');
+    expect(screen.getByTestId('wizard-agents-continue').textContent).toBe('Continue');
+
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('The Orbital agent')).toBeTruthy());
+    expect(screen.queryByTestId('wizard-skip-key')).toBeNull();
+    expect(screen.getByTestId('wizard-key-compulsory').textContent).toContain(
+      'Without a coding agent, Orbital needs this key to do anything.',
+    );
+    fireEvent.click(screen.getByTestId('wizard-key-back-to-agents'));
+    expect(screen.getByText('Installed but not found?')).toBeTruthy();
+  });
+
+  it('unchecking every found agent also makes the key compulsory', async () => {
+    mockApi({ apiKeySet: false, agents: [AGENTS[0]] });
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('wizard-agent-check-claude-code')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('wizard-agent-check-claude-code'));
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByTestId('wizard-key-compulsory')).toBeTruthy());
+  });
+});
+
+describe('SetupWizard — Finish', () => {
+  it('lands in the most recently active imported project and marks the tour pending on a fresh install', async () => {
+    mockApi({
+      apiKeySet: true,
+      importable: SOME_PROJECTS,
+      importResult: { created: [{ project_id: 'p_orb', name: 'orbital-test', workspace: '/Users/x/orbital-test', from: 'folder' }], skipped: [] },
+    });
     const onComplete = vi.fn();
     render(<SetupWizard onComplete={onComplete} />);
+    await continueFromAgents();
+    await waitFor(() => expect(screen.getByText('Your projects')).toBeTruthy());
+    await act(async () => { fireEvent.click(screen.getByTestId('import-submit')); });
     await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
 
     fireEvent.click(screen.getByTestId('wizard-get-started'));
-    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith({ landingProjectId: 'p_orb' });
+    expect(localStorage.getItem(TOUR_STORAGE_KEY)).toBe('pending');
   });
 
-  it('Skip calls onComplete', async () => {
+  it('without an import, hands App no landing project (Create Project follows)', async () => {
     mockApi({ apiKeySet: true });
     const onComplete = vi.fn();
-    render(<SetupWizard onComplete={onComplete} />);
-    await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
-
+    await renderAtAccounts(<SetupWizard onComplete={onComplete} />);
     fireEvent.click(screen.getByTestId('wizard-skip'));
-    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(onComplete).toHaveBeenCalledWith({ landingProjectId: null });
+  });
+
+  it('does not reopen a tour this device already finished', async () => {
+    localStorage.setItem(TOUR_STORAGE_KEY, 'done');
+    mockApi({ apiKeySet: true });
+    await renderAtAccounts();
+    fireEvent.click(screen.getByTestId('wizard-get-started'));
+    expect(localStorage.getItem(TOUR_STORAGE_KEY)).toBe('done');
+  });
+
+  it('an install that already has its own projects is not marked for the tour', async () => {
+    mockApi({ apiKeySet: true, projects: [{ project_id: 'scratch', is_scratch: true }, { project_id: 'mine', is_scratch: false }] });
+    await renderAtAccounts();
+    await waitFor(() => expect(calledPaths()).toContain('/api/v2/projects'));
+    fireEvent.click(screen.getByTestId('wizard-get-started'));
+    expect(localStorage.getItem(TOUR_STORAGE_KEY)).toBeNull();
   });
 });
 
 describe('SetupWizard — sandbox step is gone', () => {
   it('never touches the platform sandbox endpoints while advancing', async () => {
     mockApi({ apiKeySet: true, connectors: [makeConnector()] });
-    render(<SetupWizard onComplete={vi.fn()} />);
-    await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
+    await renderAtAccounts();
     await waitFor(() => expect(calledPaths()).toContain('/api/v2/connectors'));
 
     expect(calledPaths()).not.toContain('/api/v2/platform/status');
@@ -176,7 +452,7 @@ describe('SetupWizard — featured connector cards', () => {
         makeConnector({ id: 'custom-x', name: 'Custom X', featured: false }),
       ],
     });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
 
     await waitFor(() =>
       expect(screen.getByTestId('wizard-connector-google-calendar')).toBeTruthy(),
@@ -191,7 +467,7 @@ describe('SetupWizard — featured connector cards', () => {
       apiKeySet: true,
       connectors: [makeConnector({ id: 'gmail', status: 'pending_verification' })],
     });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
     await waitFor(() => expect(calledPaths()).toContain('/api/v2/connectors'));
 
     expect(screen.queryByTestId('wizard-connectors-group')).toBeNull();
@@ -201,7 +477,7 @@ describe('SetupWizard — featured connector cards', () => {
 
   it('shows the browser group alone when the connectors fetch fails', async () => {
     mockApi({ apiKeySet: true, connectors: new Error('boom') });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
     await waitFor(() => expect(calledPaths()).toContain('/api/v2/connectors'));
 
     expect(screen.queryByTestId('wizard-connectors-group')).toBeNull();
@@ -220,7 +496,7 @@ describe('SetupWizard — connect flow', () => {
       connectors: [makeConnector()],
       connect: () => new Promise((resolve) => { resolveConnect = resolve; }),
     });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
     await waitFor(() =>
       expect(screen.getByTestId('wizard-connector-connect-google-calendar')).toBeTruthy(),
     );
@@ -243,7 +519,7 @@ describe('SetupWizard — connect flow', () => {
       connectors: [makeConnector()],
       connect: () => Promise.reject(new MockApiError(400, 'Google OAuth client not configured')),
     });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
     await waitFor(() =>
       expect(screen.getByTestId('wizard-connector-connect-google-calendar')).toBeTruthy(),
     );
@@ -267,28 +543,19 @@ describe('SetupWizard — connect flow', () => {
   it('refetches the list on success and shows Connected as {account}', async () => {
     const disconnected = makeConnector();
     const connected = makeConnector({ connected: true, account: 'alice@example.com' });
-    let listCalls = 0;
-    apiMock.mockImplementation(async (path: string, options?: RequestInit) => {
-      if (path === '/api/v2/settings') return { llm: { api_key_set: true } };
-      if (path === '/api/v2/connectors') {
-        listCalls += 1;
-        return { connectors: [listCalls > 1 ? connected : disconnected] };
-      }
-      if (path === '/api/v2/connectors/google-calendar/connect' && options?.method === 'POST') {
-        return {};
-      }
-      return {};
-    });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    mockApi({ apiKeySet: true, connectors: [disconnected] });
+    await renderAtAccounts();
     await waitFor(() =>
       expect(screen.getByTestId('wizard-connector-connect-google-calendar')).toBeTruthy(),
     );
 
+    mockApi({ apiKeySet: true, connectors: [connected] });
+    const before = calledPaths().filter((p) => p === '/api/v2/connectors').length;
     await act(async () => {
       fireEvent.click(screen.getByTestId('wizard-connector-connect-google-calendar'));
     });
 
-    expect(listCalls).toBe(2);
+    expect(calledPaths().filter((p) => p === '/api/v2/connectors').length).toBe(before + 1);
     await waitFor(() =>
       expect(
         screen.getByTestId('wizard-connector-status-google-calendar').textContent,
@@ -303,7 +570,7 @@ describe('SetupWizard — language widget (Spec 008 A2)', () => {
     localStorage.clear();
   });
 
-  it('renders on the api_key step, switches locale on change, and persists to localStorage', async () => {
+  it('renders on the first step, switches locale on change, and persists to localStorage', async () => {
     mockApi({ apiKeySet: false });
     render(
       <LocaleProvider>
@@ -323,12 +590,11 @@ describe('SetupWizard — language widget (Spec 008 A2)', () => {
 
   it('renders on the accounts step too — ambient on every step', async () => {
     mockApi({ apiKeySet: true });
-    render(
+    await renderAtAccounts(
       <LocaleProvider>
         <SetupWizard onComplete={vi.fn()} />
       </LocaleProvider>,
     );
-    await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
     expect(screen.getByTestId('wizard-locale-select')).toBeTruthy();
   });
 });
@@ -336,7 +602,7 @@ describe('SetupWizard — language widget (Spec 008 A2)', () => {
 describe('SetupWizard — agent browser sign-in group', () => {
   it('POSTs the warmup endpoint and shows the opening state', async () => {
     mockApi({ apiKeySet: true });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtAccounts();
     await waitFor(() => expect(screen.getByTestId('wizard-open-browser')).toBeTruthy());
 
     await act(async () => {
@@ -358,7 +624,7 @@ describe('SetupWizard — agent browser sign-in group', () => {
 describe('SetupWizard — skip the key step', () => {
   it('says what the key is for, and offers Skip with its hint under Next', async () => {
     mockApi({ apiKeySet: false });
-    render(<SetupWizard onComplete={vi.fn()} />);
+    await renderAtKey();
     expect(
       screen.getByText(/Add an API key for the Orbital agent/),
     ).toBeTruthy();
@@ -373,31 +639,27 @@ describe('SetupWizard — skip the key step', () => {
 
   it('Skip persists setup_api_key_skipped and advances to the accounts step', async () => {
     mockApi({ apiKeySet: false });
-    render(<SetupWizard onComplete={vi.fn()} />);
-    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/v2/settings'));
+    await renderAtKey();
 
     fireEvent.click(screen.getByTestId('wizard-skip-key'));
     await waitFor(() => expect(screen.getByText('Connect Your Accounts')).toBeTruthy());
 
-    const puts = apiMock.mock.calls.filter(([path, opts]) =>
-      path === '/api/v2/settings' && opts?.method === 'PUT');
-    expect(puts).toHaveLength(1);
-    expect(JSON.parse(puts[0][1].body)).toEqual({ setup_api_key_skipped: true });
+    // [0] is the Agents step's hidden list.
+    expect(settingsPuts().slice(1)).toEqual([{ setup_api_key_skipped: true }]);
   });
 
   it('a failed Skip shows an error line and stays on the key step', async () => {
     mockApi({
       apiKeySet: false,
-      settingsPut: () => Promise.reject(new MockApiError(500, 'boom')),
+      settingsPut: (body) => ('setup_api_key_skipped' in body ? Promise.reject(new MockApiError(500, 'boom')) : Promise.resolve({})),
     });
-    render(<SetupWizard onComplete={vi.fn()} />);
-    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/api/v2/settings'));
+    await renderAtKey();
 
     fireEvent.click(screen.getByTestId('wizard-skip-key'));
     await waitFor(() => expect(screen.getByTestId('wizard-skip-error')).toBeTruthy());
     expect(screen.getByTestId('wizard-skip-error').textContent).toMatch(/Couldn’t save\. Try again\./);
     expect(screen.queryByText('Connect Your Accounts')).toBeNull();
-    expect(screen.getByText('Welcome to Orbital')).toBeTruthy();
+    expect(screen.getByText('The Orbital agent')).toBeTruthy();
   });
 
   it('zh: the Skip button and hint follow the contract copy', async () => {
@@ -409,6 +671,8 @@ describe('SetupWizard — skip the key step', () => {
           <SetupWizard onComplete={vi.fn()} />
         </LocaleProvider>,
       );
+      await continueFromAgents();
+      await waitFor(() => expect(screen.getByTestId('wizard-skip-key')).toBeTruthy());
       expect(screen.getByTestId('wizard-skip-key').textContent).toBe('暂时跳过，使用已有 Agent');
       expect(screen.getByTestId('wizard-skip-key-hint').textContent).toBe(
         '之后可在设置中添加。',

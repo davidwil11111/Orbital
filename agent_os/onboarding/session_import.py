@@ -2,11 +2,11 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Claude Code / Codex conversations of a project folder, as Orbital sessions.
+"""A project's native agent conversations, as Orbital sessions.
 
 A folder a user brings to Orbital often already holds conversations they had
-with Claude Code or Codex in it. This module finds them and turns one into
-Orbital's own row shapes:
+with Claude Code, Codex, pi, Kimi Code or MiniMax Code in it. This module
+finds them and turns one into Orbital's own row shapes:
 
 * :func:`list_native_sessions` — the folder's native sessions, metadata only
   (a sqlite row or a bounded head + tail read of a Claude transcript for the
@@ -19,10 +19,21 @@ Orbital's own row shapes:
   Ends with the ``sub_agent_thread`` resume record that makes the next send
   resume the native thread through the existing resume path.
 
-Strictly read-only against ``~/.claude`` and ``~/.codex``: nothing here opens a
-native file for writing. Sessions Orbital itself started (its Codex app-server
-threads, its Claude SDK sessions) are skipped — they already are Orbital
-sessions.
+User text is read through :func:`text_clean.clean_user_text` (spec 138):
+Orbital's own injected turns are dropped with their replies, an automation
+turn keeps only its task, a recap keeps only the words after it.
+
+A project made from a group of conversations that ran elsewhere names them
+(``imported_sessions`` on the project); :func:`list_native_sessions` lists
+those ``members`` beside the folder's own.
+
+pi / Kimi Code / MiniMax Code are parsed by their spec 138 history readers
+(``agent_os.onboarding.sources``), so a format is parsed in one place.
+
+Strictly read-only against every native store: nothing here opens a native
+file for writing. Sessions Orbital itself started (its Codex app-server
+threads, its Claude SDK sessions, and the kimi / mcode ACP sessions its own
+session records name) are skipped — they already are Orbital sessions.
 """
 
 from __future__ import annotations
@@ -38,13 +49,34 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from agent_os.onboarding.import_scanner import claude_project_dirs_for, path_key
+from agent_os.onboarding.sources import kimi_code as _kimi_src
+from agent_os.onboarding.sources import minimax_code as _minimax_src
+from agent_os.onboarding.sources import pi as _pi_src
+from agent_os.onboarding.sources._native import cleaned_turns, history_home
+from agent_os.onboarding.text_clean import KIND_INJECTED, clean_user_text
 
 logger = logging.getLogger(__name__)
 
 AGENT_CLAUDE = "claude-code"
 AGENT_CODEX = "codex"
+AGENT_PI = "pi"
+AGENT_KIMI = "kimi-code"
+AGENT_MINIMAX = "minimax-code"
 
-AGENT_DISPLAY_NAMES = {AGENT_CLAUDE: "Claude Code", AGENT_CODEX: "Codex"}
+AGENT_DISPLAY_NAMES = {AGENT_CLAUDE: "Claude Code", AGENT_CODEX: "Codex", AGENT_PI: "Pi",
+                       AGENT_KIMI: "Kimi Code", AGENT_MINIMAX: "MiniMax Code"}
+
+# Spec 138 readers by agent: they parse these agents' stores for both the
+# history scan and this module.
+_HISTORY_SOURCES = {AGENT_PI: _pi_src.SOURCE, AGENT_KIMI: _kimi_src.SOURCE,
+                    AGENT_MINIMAX: _minimax_src.SOURCE}
+
+# ACP agents keep no mark of the client that drove a session; Orbital's own
+# runs are known by the ids its session records hold.
+_ACP_AGENTS = frozenset({AGENT_KIMI, AGENT_MINIMAX})
+
+# Agents whose thread record carries the native file the transport reopens.
+_RESUME_PATH_AGENTS = frozenset({AGENT_CODEX, AGENT_PI})
 
 IMPORTED_SESSION_PREFIX = "imp_"
 
@@ -91,11 +123,13 @@ _CODEX_AGENTS_MD_PREFIX = "# AGENTS.md instructions for"
 
 
 def claude_home(claude_dir: str | None = None) -> str:
-    """``$CLAUDE_CONFIG_DIR`` or ``~/.claude`` (an explicit arg wins)."""
+    """``$CLAUDE_CONFIG_DIR`` or ``~/.claude`` (an explicit arg wins). Resolved
+    by ``history_paths`` so the session list and the history scan always read
+    the same folder (``ORBITAL_HISTORY_HOME`` included)."""
     if claude_dir:
         return claude_dir
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude")
+    from agent_os.onboarding import history_paths
+    return history_paths.claude_dir()
 
 
 def codex_home(codex_dir: str | None = None) -> str:
@@ -105,8 +139,8 @@ def codex_home(codex_dir: str | None = None) -> str:
     moving codex's own auth/config (smokes)."""
     if codex_dir:
         return codex_dir
-    return (os.environ.get("ORBITAL_CODEX_HOME") or os.environ.get("CODEX_HOME")
-            or os.path.join(os.path.expanduser("~"), ".codex"))
+    from agent_os.onboarding import history_paths
+    return history_paths.codex_dir()
 
 
 def imported_session_id(agent: str, native_id: str) -> str:
@@ -121,7 +155,8 @@ def imported_session_id(agent: str, native_id: str) -> str:
 
 # Full shape, not a prefix: a project named "Imp" mints ``imp_<hex8>`` chat ids.
 _IMPORTED_SESSION_ID_RE = re.compile(
-    rf"{IMPORTED_SESSION_PREFIX}(?:{AGENT_CLAUDE}|{AGENT_CODEX})_[0-9A-Za-z]{{16}}")
+    rf"{IMPORTED_SESSION_PREFIX}(?:{'|'.join(map(re.escape, AGENT_DISPLAY_NAMES))})"
+    r"_[0-9A-Za-z]{1,16}")
 
 
 def is_imported_session_id(session_id: str | None) -> bool:
@@ -136,13 +171,13 @@ def is_imported_session_id(session_id: str | None) -> bool:
 
 @dataclass
 class NativeSession:
-    agent: str               # "claude-code" | "codex"
-    native_id: str           # Claude session id / Codex thread id
-    path: str                # the transcript (Claude JSONL / Codex rollout)
+    agent: str               # claude-code | codex | pi | kimi-code | minimax-code
+    native_id: str           # the id the agent resumes by
+    path: str                # the transcript the reader parses
     title: str | None
     last_activity: str | None  # ISO-8601 UTC
     size_bytes: int
-    rollout_path: str | None = None  # Codex only
+    rollout_path: str | None = None  # the file resume reopens: Codex rollout, pi session
 
     @property
     def session_id(self) -> str:
@@ -172,34 +207,148 @@ def clear_cache() -> None:
         _cache.clear()
 
 
-def list_native_sessions(workspace: str, *, claude_dir: str | None = None,
-                         codex_dir: str | None = None) -> list[NativeSession]:
-    """Every Claude Code / Codex session that ran in ``workspace``, newest first.
+def list_native_sessions(workspace: str, *, members=None, claude_dir: str | None = None,
+                         codex_dir: str | None = None,
+                         history_dir: str | None = None) -> list[NativeSession]:
+    """Every native session that ran in ``workspace``, plus the ``members``
+    (``[{"agent", "native_id"}]``, a group project's ``imported_sessions``)
+    wherever they ran — newest first, each once.
 
     Metadata only. Sessions with no user message (sidechains, empty) and
     sessions Orbital itself started are skipped. Never raises: a source that is
-    missing or unreadable contributes nothing.
+    missing or unreadable contributes nothing. ``history_dir`` is the home the
+    pi / Kimi Code / MiniMax Code stores sit in (``$ORBITAL_HISTORY_HOME``,
+    else ``~``).
     """
     if not workspace or not os.path.isdir(workspace):
         return []
+    homes = {AGENT_CLAUDE: claude_home(claude_dir), AGENT_CODEX: codex_home(codex_dir),
+             "history": history_home(history_dir)}
     out: list[NativeSession] = []
-    for fn, home in ((_list_claude, claude_home(claude_dir)),
-                     (_list_codex, codex_home(codex_dir))):
+    for fn, home in ((_list_claude, homes[AGENT_CLAUDE]), (_list_codex, homes[AGENT_CODEX]),
+                     (_list_pi, homes["history"]), (_list_kimi, homes["history"]),
+                     (_list_minimax, homes["history"])):
         try:
             out.extend(fn(workspace, home))
         except Exception:
             logger.warning("session import: %s listing failed for %s",
                            fn.__name__, workspace, exc_info=True)
+    if any(s.agent in _ACP_AGENTS for s in out):
+        own = orbital_thread_ids(workspace)
+        out = [s for s in out if s.agent not in _ACP_AGENTS or s.native_id not in own]
+    seen = {(s.agent, s.native_id) for s in out}
+    for agent, native_id in _member_pairs(members):
+        if (agent, native_id) in seen:
+            continue
+        seen.add((agent, native_id))
+        try:
+            native = _find_member(agent, native_id, homes)
+        except Exception:
+            logger.warning("session import: member %s %s lookup failed",
+                           agent, native_id, exc_info=True)
+            native = None
+        if native is not None:
+            out.append(native)
     out.sort(key=lambda s: s.last_activity or "", reverse=True)
     return out
 
 
-def find_native_session(workspace: str, session_id: str, **dirs) -> NativeSession | None:
+def find_native_session(workspace: str, session_id: str, **kwargs) -> NativeSession | None:
     """The native session behind an ``imp_…`` id, or None."""
-    for native in list_native_sessions(workspace, **dirs):
+    for native in list_native_sessions(workspace, **kwargs):
         if native.session_id == session_id:
             return native
     return None
+
+
+def _member_pairs(members) -> list[tuple[str, str]]:
+    pairs = []
+    for m in members or []:
+        if not isinstance(m, dict):
+            continue
+        agent, native_id = m.get("agent"), m.get("native_id")
+        if (agent in AGENT_DISPLAY_NAMES and isinstance(native_id, str) and native_id
+                and (agent, native_id) not in pairs):
+            pairs.append((agent, native_id))
+    return pairs
+
+
+def _find_member(agent: str, native_id: str, homes: dict) -> NativeSession | None:
+    if agent == AGENT_CLAUDE:
+        return _claude_member(native_id, homes[AGENT_CLAUDE])
+    if agent == AGENT_CODEX:
+        return _codex_member(native_id, homes[AGENT_CODEX])
+    if agent == AGENT_PI:
+        home = homes["history"]
+        suffix = f"_{native_id}.jsonl"
+        for path in _pi_src.SOURCE.session_files(home):
+            if path.endswith(suffix) or (_pi_header(path) or {}).get("id") == native_id:
+                return _history_native(AGENT_PI, path)
+        return None
+    if agent == AGENT_KIMI:
+        for sdir in _kimi_src.SOURCE.session_dirs(homes["history"]):
+            if os.path.basename(sdir) == native_id:
+                return _history_native(AGENT_KIMI,
+                                       os.path.join(sdir, "agents", "main", "wire.jsonl"))
+        return None
+    if agent == AGENT_MINIMAX:
+        v2 = _minimax_src.SOURCE.root(homes["history"])
+        row = _minimax_src.SOURCE.runtime_rows(v2).get(native_id)
+        path = _minimax_messages_path(v2, row) if row else None
+        if path is None:
+            for sdir in _minimax_src.SOURCE.session_dirs(homes["history"]):
+                if _minimax_src.SOURCE.session_id_of(sdir) == native_id:
+                    path = os.path.join(sdir, "messages.jsonl")
+                    break
+        return _history_native(AGENT_MINIMAX, path) if path else None
+    return None
+
+
+def orbital_thread_ids(workspace: str) -> set[str]:
+    """Native ids the project's own Orbital sessions hold as worker threads
+    (``sub_agent_thread`` records) — the kimi / mcode sessions Orbital ran.
+    Each session file is read once per ``(path, mtime, size)``."""
+    from agent_os.agent.project_paths import ProjectPaths
+    sessions_dir = ProjectPaths(workspace).sessions_dir
+    ids: set[str] = set()
+    try:
+        names = os.listdir(sessions_dir)
+    except OSError:
+        return ids
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        fpath = os.path.join(sessions_dir, name)
+        try:
+            st = os.stat(fpath)
+        except OSError:
+            continue
+        key = ("orbital-threads", fpath, st.st_mtime_ns, st.st_size)
+        found = _cache_get(key)
+        if found is None:
+            found = frozenset(_thread_ids_in(fpath))
+            _cache_put(key, found)
+        ids |= found
+    return ids
+
+
+def _thread_ids_in(path: str) -> set[str]:
+    found: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if '"sub_agent_thread"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                thread = rec.get("thread") if isinstance(rec, dict) else None
+                if isinstance(thread, dict) and isinstance(thread.get("session_id"), str):
+                    found.add(thread["session_id"])
+    except OSError:
+        pass
+    return found
 
 
 # ---- Claude Code -----------------------------------------------------------
@@ -236,30 +385,53 @@ def _list_claude(workspace: str, home: str) -> list[NativeSession]:
         for name in names:
             if not name.endswith(".jsonl"):
                 continue
-            fpath = os.path.join(d, name)
-            try:
-                st = os.stat(fpath)
-            except OSError:
-                continue
-            key = ("claude-meta", fpath, st.st_mtime_ns, st.st_size)
-            meta = _cache_get(key)
-            if meta is None:
-                meta = _claude_metadata(fpath, st)
-                _cache_put(key, meta)
-            if not meta or not meta.get("has_user"):
-                continue
-            if meta.get("entrypoint") in _CLAUDE_SKIP_ENTRYPOINTS:
-                continue
-            cwd = meta.get("cwd")
-            if cwd and path_key(cwd) != want:
-                continue  # lossy slug: another folder that encodes the same
-            native_id = meta.get("session_id") or name[:-len(".jsonl")]
-            out.append(NativeSession(
-                agent=AGENT_CLAUDE, native_id=native_id, path=fpath,
-                title=meta.get("title"), last_activity=meta.get("last_activity"),
-                size_bytes=st.st_size,
-            ))
+            native = _claude_native(os.path.join(d, name), want)
+            if native is not None:
+                out.append(native)
     return out
+
+
+def _claude_native(fpath: str, want: str | None) -> NativeSession | None:
+    """One Claude transcript as a listing entry, or None when it has no user
+    message, is Orbital's own, or ran in another folder than ``want`` (None:
+    any folder — a named group member)."""
+    try:
+        st = os.stat(fpath)
+    except OSError:
+        return None
+    key = ("claude-meta", fpath, st.st_mtime_ns, st.st_size)
+    meta = _cache_get(key)
+    if meta is None:
+        meta = _claude_metadata(fpath, st)
+        _cache_put(key, meta)
+    if not meta or not meta.get("has_user"):
+        return None
+    if meta.get("entrypoint") in _CLAUDE_SKIP_ENTRYPOINTS:
+        return None
+    cwd = meta.get("cwd")
+    if want is not None and cwd and path_key(cwd) != want:
+        return None  # lossy slug: another folder that encodes the same
+    native_id = meta.get("session_id") or os.path.basename(fpath)[:-len(".jsonl")]
+    return NativeSession(
+        agent=AGENT_CLAUDE, native_id=native_id, path=fpath,
+        title=meta.get("title"), last_activity=meta.get("last_activity"),
+        size_bytes=st.st_size,
+    )
+
+
+def _claude_member(native_id: str, home: str) -> NativeSession | None:
+    projects_dir = os.path.join(home, "projects")
+    try:
+        dirs = os.listdir(projects_dir)
+    except OSError:
+        return None
+    for d in dirs:
+        fpath = os.path.join(projects_dir, d, f"{native_id}.jsonl")
+        if os.path.isfile(fpath):
+            native = _claude_native(fpath, None)
+            if native is not None:
+                return native
+    return None
 
 
 def _read_bounded(path: str, size: int) -> tuple[list[str], list[str]]:
@@ -324,7 +496,8 @@ def _claude_metadata(path: str, st: os.stat_result) -> dict:
         if rtype == "user" and first_user_text is None:
             text = _claude_user_text(rec)
             if text:
-                first_user_text = text
+                # Title from the user's words, not a recap / trigger header.
+                first_user_text = _cleaned(text) or text
                 meta["has_user"] = True
     from agent_os.agent.session import _derive_name
     meta["title"] = (custom_title or title or _derive_name(first_user_text))
@@ -430,34 +603,179 @@ def _codex_row_is_own(row: dict) -> bool:
 
 
 def _codex_sessions_from_rows(rows: list[dict], workspace: str) -> list[NativeSession]:
-    from agent_os.agent.session import _derive_name
     want = path_key(workspace)
     out: list[NativeSession] = []
     for row in rows:
         cwd = row.get("cwd")
         if not isinstance(cwd, str) or not cwd or path_key(cwd) != want:
             continue
-        if _codex_row_is_own(row):
-            continue
-        first = (row.get("first_user_message") or "").strip()
-        if not first:
-            continue  # no user message
-        rollout = row.get("rollout_path")
-        if not isinstance(rollout, str) or not rollout:
-            continue
+        native = _codex_native_from_row(row)
+        if native is not None:
+            out.append(native)
+    return out
+
+
+def _codex_native_from_row(row: dict) -> NativeSession | None:
+    from agent_os.agent.session import _derive_name
+    if _codex_row_is_own(row):
+        return None
+    first = (row.get("first_user_message") or "").strip()
+    if not first:
+        return None  # no user message
+    rollout = row.get("rollout_path")
+    if not isinstance(rollout, str) or not rollout:
+        return None
+    try:
+        size = os.path.getsize(rollout)
+    except OSError:
+        return None  # the transcript is gone: nothing to open
+    ms = row.get("updated_at_ms")
+    last = (_iso_epoch(ms / 1000.0) if isinstance(ms, (int, float)) and ms
+            else _iso_epoch(row.get("updated_at")))
+    title = (row.get("title") or "").strip() or first
+    return NativeSession(
+        agent=AGENT_CODEX, native_id=str(row["id"]), path=rollout,
+        title=_derive_name(title), last_activity=last, size_bytes=size,
+        rollout_path=rollout,
+    )
+
+
+def _codex_member(native_id: str, home: str) -> NativeSession | None:
+    index = os.path.join(home, "state_5.sqlite")
+    rows = _codex_threads(index) if os.path.isfile(index) else None
+    if rows is not None:
+        row = next((r for r in rows if str(r.get("id")) == native_id), None)
+        return _codex_native_from_row(row) if row else None
+    from agent_os.agent.session import _derive_name
+    for root, _dirs, files in os.walk(os.path.join(home, "sessions")):
+        for fname in files:
+            if not (fname.startswith("rollout-") and fname.endswith(f"{native_id}.jsonl")):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            meta = _codex_rollout_metadata(fpath, st)
+            if meta.get("id") == native_id and not meta.get("own") and meta.get("first_user"):
+                return NativeSession(
+                    agent=AGENT_CODEX, native_id=native_id, path=fpath,
+                    title=_derive_name(meta["first_user"]),
+                    last_activity=meta.get("last_activity") or _iso_epoch(st.st_mtime),
+                    size_bytes=st.st_size, rollout_path=fpath)
+    return None
+
+
+# ---- pi / Kimi Code / MiniMax Code (spec 138 readers) -----------------------
+
+
+def _history_native(agent: str, path: str | None, want: str | None = None) -> NativeSession | None:
+    """A session file read by the agent's spec 138 reader as a listing entry,
+    memoized by ``(path, mtime, size)``. None when nobody said anything in
+    it, or when ``want`` is a folder key and the session ran elsewhere."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = ("history-meta", agent, path, st.st_mtime_ns, st.st_size)
+    meta = _cache_get(key)
+    if meta is None:
+        meta = _history_metadata(agent, path, st)
+        _cache_put(key, meta)
+    if not meta:
+        return None
+    if want is not None and (not meta.get("cwd") or path_key(meta["cwd"]) != want):
+        return None
+    return NativeSession(
+        agent=agent, native_id=meta["native_id"], path=path, title=meta.get("title"),
+        last_activity=meta.get("last_activity"), size_bytes=st.st_size,
+        rollout_path=path if agent == AGENT_PI else None,
+    )
+
+
+def _history_metadata(agent: str, path: str, st: os.stat_result) -> dict:
+    from agent_os.agent.session import _derive_name
+    hs = _HISTORY_SOURCES[agent].read(path)
+    if hs is None:
+        return {}
+    return {"native_id": hs.native_id, "cwd": hs.cwd,
+            "title": hs.title or _derive_name(hs.first_user_text or hs.last_user_text),
+            "last_activity": hs.ended_at or _iso_epoch(st.st_mtime)}
+
+
+def _pi_header(path: str) -> dict | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = ("pi-head", path, st.st_mtime_ns, st.st_size)
+    head = _cache_get(key)
+    if head is None:
+        head = _pi_src.SOURCE.header(path) or {}
+        _cache_put(key, head)
+    return head
+
+
+def _list_pi(workspace: str, home: str) -> list[NativeSession]:
+    want = path_key(workspace)
+    out: list[NativeSession] = []
+    for path in _pi_src.SOURCE.session_files(home):
+        cwd = (_pi_header(path) or {}).get("cwd")
+        if not isinstance(cwd, str) or path_key(cwd) != want:
+            continue  # the one-line header decides before a full read
+        native = _history_native(AGENT_PI, path, want)
+        if native is not None:
+            out.append(native)
+    return out
+
+
+def _list_kimi(workspace: str, home: str) -> list[NativeSession]:
+    want = path_key(workspace)
+    out: list[NativeSession] = []
+    for sdir in _kimi_src.SOURCE.session_dirs(home):
+        state_path = os.path.join(sdir, "state.json")
         try:
-            size = os.path.getsize(rollout)
+            st = os.stat(state_path)
         except OSError:
-            continue  # the transcript is gone: nothing to open
-        ms = row.get("updated_at_ms")
-        last = (_iso_epoch(ms / 1000.0) if isinstance(ms, (int, float)) and ms
-                else _iso_epoch(row.get("updated_at")))
-        title = (row.get("title") or "").strip() or first
-        out.append(NativeSession(
-            agent=AGENT_CODEX, native_id=str(row["id"]), path=rollout,
-            title=_derive_name(title), last_activity=last, size_bytes=size,
-            rollout_path=rollout,
-        ))
+            continue
+        key = ("kimi-state", state_path, st.st_mtime_ns, st.st_size)
+        state = _cache_get(key)
+        if state is None:
+            state = _kimi_src.SOURCE.state(sdir)
+            _cache_put(key, state)
+        cwd = state.get("cwd")
+        if not isinstance(cwd, str) or path_key(cwd) != want:
+            continue
+        native = _history_native(
+            AGENT_KIMI, os.path.join(sdir, "agents", "main", "wire.jsonl"), want)
+        if native is not None:
+            out.append(native)
+    return out
+
+
+def _minimax_messages_path(v2: str, row: dict) -> str | None:
+    rel = row.get("history_relative_dir")
+    if not isinstance(rel, str) or not rel or rel.startswith(("/", "\\")) or ".." in rel:
+        return None
+    path = os.path.join(v2, "sessions", *rel.split("/"), "messages.jsonl")
+    return path if os.path.isfile(path) else None
+
+
+def _list_minimax(workspace: str, home: str) -> list[NativeSession]:
+    want = path_key(workspace)
+    v2 = _minimax_src.SOURCE.root(home)
+    out: list[NativeSession] = []
+    for row in _minimax_src.SOURCE.runtime_rows(v2).values():
+        cwd = row.get("workspace_dir")
+        if not isinstance(cwd, str) or not cwd or path_key(cwd) != want:
+            continue
+        if not _minimax_src.SOURCE.is_listed(row):
+            continue
+        native = _history_native(AGENT_MINIMAX, _minimax_messages_path(v2, row), want)
+        if native is not None:
+            out.append(native)
     return out
 
 
@@ -565,6 +883,8 @@ class _Turn:
     texts: list[str] = field(default_factory=list)
     tools: "OrderedDict[str, int]" = field(default_factory=OrderedDict)
     reply_ts: str | None = None
+    # Orbital's own injected turn: never pushed, so it and its reply drop out.
+    dropped: bool = False
 
     def has_output(self) -> bool:
         return bool(self.texts or self.tools)
@@ -594,8 +914,9 @@ def convert_transcript(agent: str, path: str, *, handle: str | None = None,
     """Convert one native transcript into Orbital rows (contract §6).
 
     ``handle`` is the worker slug the rows are attributed to (defaults to
-    ``agent``); ``native_id`` the resume id (defaults to the Claude file stem /
-    the Codex ``session_meta`` id). Reads the whole file, streaming; keeps only
+    ``agent``); ``native_id`` the resume id (defaults to the id the transcript
+    records); ``rollout_path`` the file resume reopens (Codex rollout, pi
+    session; defaults to ``path``). Reads the whole file, streaming; keeps only
     the last ``MAX_TURNS`` turns and ``MAX_REPLY_BYTES`` of reply text.
     """
     handle = handle or agent
@@ -618,6 +939,11 @@ def convert_transcript(agent: str, path: str, *, handle: str | None = None,
         found_id = _codex_turns(path, push)
         native_id = native_id or found_id
         rollout_path = rollout_path or path
+    elif agent in _HISTORY_SOURCES:
+        found_id = _history_turns(agent, path, push)
+        native_id = native_id or found_id
+        if agent == AGENT_PI:
+            rollout_path = rollout_path or path
     else:
         raise ValueError(f"unknown agent {agent!r}")
 
@@ -682,7 +1008,7 @@ def convert_transcript(agent: str, path: str, *, handle: str | None = None,
         },
     }
     thread = {"session_id": native_id, "model": None, "last_used_at": now}
-    if agent == AGENT_CODEX and rollout_path:
+    if agent in _RESUME_PATH_AGENTS and rollout_path:
         thread["rollout_path"] = rollout_path
     thread_record = {
         "role": "meta", "event": "sub_agent_thread", "timestamp": now,
@@ -713,6 +1039,10 @@ def _claude_turns(path: str, push) -> str | None:
             text = _claude_user_text(rec)
             if text is None:
                 continue  # tool results, meta rows, command plumbing
+            text = _cleaned(text)
+            if text is None:
+                current = _Turn(dropped=True)  # Orbital's own turn
+                continue
             current = _Turn(user=text, user_ts=rec.get("timestamp"))
             push(current)
         elif rtype == "assistant":
@@ -761,14 +1091,18 @@ def _codex_turns(path: str, push) -> str | None:
             if role == "user":
                 text = _codex_user_text(payload)
                 if text:
-                    if current is not None and current.user is None and not current.has_output():
+                    text = _cleaned(text)
+                    if text is None:
+                        current = _Turn(dropped=True)  # Orbital's own turn
+                    elif (current is not None and not current.dropped
+                          and current.user is None and not current.has_output()):
                         current.user, current.user_ts = text, ts
-                    elif current is not None and not current.has_output():
+                    elif current is not None and not current.dropped and not current.has_output():
                         current.user = f"{current.user}\n\n{text}"
                     else:
                         current = _Turn(user=text, user_ts=ts)
                         push(current)
-                elif current is None or current.has_output():
+                elif current is None or current.has_output() or current.dropped:
                     # Injected context only (environment, AGENTS.md, an
                     # automation heartbeat): a turn boundary with no user row.
                     current = _Turn(user_ts=ts)
@@ -791,6 +1125,27 @@ def _codex_turns(path: str, push) -> str | None:
             current.reply_ts = ts or current.reply_ts
         # *_call_output, reasoning, anything else: dropped
     return thread_id
+
+
+def _history_turns(agent: str, path: str, push) -> str | None:
+    """A spec 138 reader's turns, cleaned; returns the native id."""
+    transcript = _HISTORY_SOURCES[agent].transcript(path)
+    if transcript is None:
+        return None
+    for turn, kind, text in cleaned_turns(transcript):
+        push(_Turn(user=text if kind is not None else None, user_ts=turn.user_ts,
+                   texts=list(turn.texts), tools=OrderedDict(turn.tools),
+                   reply_ts=turn.reply_ts))
+    return transcript.native_id
+
+
+def _cleaned(text: str) -> str | None:
+    """The user's words in a native user turn, or None when the whole turn is
+    Orbital's (an automation turn keeps its task)."""
+    cleaned = clean_user_text(text)
+    if cleaned.kind == KIND_INJECTED:
+        return None
+    return cleaned.text
 
 
 # --------------------------------------------------------------------------
@@ -842,7 +1197,9 @@ def materialize_session(workspace: str, native: NativeSession, *,
             session.append(dict(row))
         session.set_sub_agent_thread(
             native.agent, session_id=native.native_id,
-            rollout_path=native.rollout_path if native.agent == AGENT_CODEX else None,
+            # Codex: the rollout. pi: the native session file the pi
+            # transport reopens with ``--session <file>`` (contract §5).
+            rollout_path=native.rollout_path if native.agent in _RESUME_PATH_AGENTS else None,
         )
         os.replace(tmp_path, final_path)
     except BaseException:

@@ -56,6 +56,9 @@ class TestRollup:
         assert ping["milestones"] == {
             "key_set": True, "first_project": False,
             "first_session": False, "first_turn": True,
+            # Spec 138 onboarding milestones.
+            "key_skipped": False, "first_import": False,
+            "first_leftoff_open": False, "first_imported_send": False,
         }
         c = ping["counters"]
         assert c["app_starts"] == 2

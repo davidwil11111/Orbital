@@ -321,6 +321,57 @@ def test_recap_for_a_resumed_import_skips_the_native_rows(env):
 
 
 # --------------------------------------------------------------------------
+# Spec 138 — group members, pi / ACP resume records
+# --------------------------------------------------------------------------
+
+
+def test_group_members_are_listed_and_opened_though_they_ran_elsewhere(env, tmp_path,
+                                                                       monkeypatch):
+    from tests.unit import _history_138_builders as hb
+    hhome = str(tmp_path / "history-home")
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", hhome)
+    desk = str(tmp_path / "Desktop")
+    os.makedirs(desk)
+    hb.install_kimi(hhome, desk)
+    pi_path = hb.install_pi(hhome, desk)
+    mgr, pid, ws, store = env["mgr"], env["pid"], env["ws"], env["store"]
+    kimi_sid = si.imported_session_id("kimi-code", hb.KIMI_ID)
+    pi_sid = si.imported_session_id("pi", hb.PI_ID)
+    assert kimi_sid not in _by_id(mgr.list_sessions(pid))
+    store.update_project(pid, {"imported_sessions": [
+        {"agent": "kimi-code", "native_id": hb.KIMI_ID},
+        {"agent": "pi", "native_id": hb.PI_ID}]})
+    entries = _by_id(mgr.list_sessions(pid))
+    assert entries[kimi_sid]["pinned_target"] == "kimi-code"
+    assert entries[kimi_sid]["imported"]["native_id"] == hb.KIMI_ID
+    assert entries[pi_sid]["pinned_target"] == "pi"
+
+    assert mgr.materialize_imported_session(pid, kimi_sid) == "materialized"
+    rows = _read_jsonl(os.path.join(ws, "orbital", "sessions", f"{kimi_sid}.jsonl"))
+    assert rows[0]["imported_from"] == {"agent": "kimi-code", "native_id": hb.KIMI_ID}
+    assert rows[-1]["event"] == "sub_agent_thread"
+    assert rows[-1]["thread"]["session_id"] == hb.KIMI_ID
+    assert "rollout_path" not in rows[-1]["thread"]  # ACP resumes by id alone
+
+    assert mgr.materialize_imported_session(pid, pi_sid) == "materialized"
+    rows = _read_jsonl(os.path.join(ws, "orbital", "sessions", f"{pi_sid}.jsonl"))
+    assert rows[-1]["thread"]["session_id"] == hb.PI_ID
+    assert rows[-1]["thread"]["rollout_path"] == pi_path  # pi reopens the native file
+
+    # The materialized imports are listed once, as ordinary sessions.
+    listed = [e for e in mgr.list_sessions(pid) if e["session_id"] in (kimi_sid, pi_sid)]
+    assert len(listed) == 2 and all(e["imported"]["materialized"] for e in listed)
+
+    # Resume decision: provider-owned identity goes to the transport as is.
+    for handle, sid, transport in (("kimi-code", kimi_sid, "acp-sdk"),
+                                   ("pi", pi_sid, "pi-rpc")):
+        sam = _sub_agent_manager(mgr, transport)
+        rec, status, reason = sam._determine_resume(ws, pid, handle, sid)
+        assert (status, reason) == ("resumed", None)
+    assert rec["rollout_path"] == pi_path
+
+
+# --------------------------------------------------------------------------
 # I6 — automatic sync call sites
 # --------------------------------------------------------------------------
 

@@ -553,3 +553,188 @@ def test_resume_pre_check_reads_the_same_claude_home_as_the_importer(ws, homes, 
     assert [s.native_id for s in si.list_native_sessions(ws)] == [CLAUDE_ID]
     assert SDKTransport.resume_source_exists(ws, CLAUDE_ID) is True
     assert SDKTransport.resume_source_exists(ws, "00000000-0000-0000-0000-000000000000") is False
+
+
+# --------------------------------------------------------------------------
+# Spec 138 — Orbital's injected prompts are not the user's words
+# --------------------------------------------------------------------------
+
+RECAP = ("Conversation so far (earlier messages in this chat):\n\nuser: hi\n\n"
+         "--- end of conversation so far ---\n\nNow add the docs")
+
+
+def test_claude_conversion_reads_user_text_through_the_cleaner(ws, homes):
+    claude_dir, _ = homes
+    rows = [
+        _claude_user("[Triggered by schedule 'nightly' (every day at 9)]\n\nRun the suite",
+                     "2026-10-01T09:00:00Z", ws),
+        _claude_assistant([{"type": "text", "text": "Suite green."}], "2026-10-01T09:00:01Z", ws),
+        _claude_user("[Orbital memory] Your last turn is ending; record it.",
+                     "2026-10-01T09:01:00Z", ws),
+        _claude_assistant([{"type": "text", "text": "Recorded."}], "2026-10-01T09:01:01Z", ws),
+        _claude_user("<system-reminder>\nctx\n</system-reminder>\n" + RECAP,
+                     "2026-10-01T09:02:00Z", ws),
+        _claude_assistant([{"type": "text", "text": "Docs added."}], "2026-10-01T09:02:01Z", ws),
+    ]
+    conv = si.convert_transcript("claude-code", write_claude_session(claude_dir, ws, rows))
+    users = [r["content"] for r in conv.rows if r["role"] == "user"]
+    assert users == ["Run the suite", "Now add the docs"]
+    replies = [r["_meta"]["reply"] for r in _terminals(conv.rows)]
+    assert replies == ["Suite green.", "Docs added."]  # the memory turn is gone with its reply
+    assert "Orbital memory" not in json.dumps(conv.rows)
+
+
+def test_codex_conversion_reads_user_text_through_the_cleaner(ws, homes):
+    _, codex_dir = homes
+    rows = codex_rollout_rows(ws) + [
+        {"timestamp": "2026-10-03T10:00:00Z", "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": RECAP}]}},
+        {"timestamp": "2026-10-03T10:00:05Z", "type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Docs added."}]}},
+    ]
+    conv = si.convert_transcript("codex", write_codex_rollout(codex_dir, ws, rows))
+    users = [r["content"] for r in conv.rows if r["role"] == "user"]
+    assert users == ["Rename the helper", "Now add the docs"]
+
+
+# --------------------------------------------------------------------------
+# Spec 138 — pi / Kimi Code / MiniMax Code sessions, and group members
+# --------------------------------------------------------------------------
+
+from tests.unit import _history_138_builders as hb  # noqa: E402
+
+
+@pytest.fixture
+def hhome(tmp_path, monkeypatch):
+    h = tmp_path / "history-home"
+    h.mkdir()
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", str(h))
+    return str(h)
+
+
+def _three(hhome, cwd):
+    return {
+        "pi": hb.install_pi(hhome, cwd),
+        "kimi-code": hb.install_kimi(hhome, cwd),
+        "minimax-code": hb.install_minimax(hhome, cwd),
+    }
+
+
+def test_lists_pi_kimi_and_minimax_sessions_of_the_folder(ws, hhome, tmp_path):
+    paths = _three(hhome, ws)
+    other = str(tmp_path / "elsewhere")
+    os.makedirs(other)
+    hb.install_pi(hhome, other, sid="0199bbbb-0000-7000-8000-000000000000")
+    found = {s.agent: s for s in si.list_native_sessions(ws)}
+    assert set(found) == {"pi", "kimi-code", "minimax-code"}
+    p, k, m = found["pi"], found["kimi-code"], found["minimax-code"]
+    assert (p.native_id, p.path, p.rollout_path) == (hb.PI_ID, paths["pi"], paths["pi"])
+    assert p.title == "Rename helper" and p.last_activity == "2026-10-20T10:00:04+00:00"
+    assert p.session_id == "imp_pi_0199aaaa11117222"
+    assert (k.native_id, k.path, k.title) == (hb.KIMI_ID, paths["kimi-code"],
+                                              "Add a test for app.py")
+    assert k.rollout_path is None
+    assert (m.native_id, m.title) == (hb.MINIMAX_ID, "Summarise README")
+    assert m.size_bytes == os.path.getsize(paths["minimax-code"])
+    for s in found.values():
+        assert si.is_imported_session_id(s.session_id)
+        assert si.find_native_session(ws, s.session_id).native_id == s.native_id
+
+
+def test_members_list_sessions_that_ran_in_another_folder(ws, homes, hhome, tmp_path,
+                                                          monkeypatch):
+    claude_dir, codex_dir = homes
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_dir)
+    monkeypatch.setenv("ORBITAL_CODEX_HOME", codex_dir)
+    desk = str(tmp_path / "Desktop")
+    os.makedirs(desk)
+    _three(hhome, desk)
+    write_claude_session(claude_dir, desk, basic_claude_rows(desk))
+    rollout = write_codex_rollout(codex_dir, desk, codex_rollout_rows(desk))
+    make_codex_home(codex_dir, [{"id": CODEX_ID, "cwd": desk, "rollout_path": rollout,
+                                 "first_user_message": "Rename the helper"}])
+    assert si.list_native_sessions(ws) == []
+    members = [{"agent": "pi", "native_id": hb.PI_ID},
+               {"agent": "kimi-code", "native_id": hb.KIMI_ID},
+               {"agent": "minimax-code", "native_id": hb.MINIMAX_ID},
+               {"agent": "claude-code", "native_id": CLAUDE_ID},
+               {"agent": "codex", "native_id": CODEX_ID},
+               {"agent": "codex", "native_id": "019f0000-dead-7000-8000-000000000000"},
+               {"agent": "nope", "native_id": "x"}, "garbage"]
+    found = si.list_native_sessions(ws, members=members)
+    assert sorted((s.agent, s.native_id) for s in found) == sorted([
+        ("pi", hb.PI_ID), ("kimi-code", hb.KIMI_ID), ("minimax-code", hb.MINIMAX_ID),
+        ("claude-code", CLAUDE_ID), ("codex", CODEX_ID)])
+    codex = next(s for s in found if s.agent == "codex")
+    assert codex.rollout_path == rollout
+    sid = si.imported_session_id("kimi-code", hb.KIMI_ID)
+    assert si.find_native_session(ws, sid) is None
+    assert si.find_native_session(ws, sid, members=members).native_id == hb.KIMI_ID
+
+
+def test_a_member_that_also_ran_here_is_listed_once(ws, hhome):
+    hb.install_pi(hhome, ws)
+    found = si.list_native_sessions(ws, members=[{"agent": "pi", "native_id": hb.PI_ID}])
+    assert [(s.agent, s.native_id) for s in found] == [("pi", hb.PI_ID)]
+
+
+def test_acp_sessions_orbital_itself_runs_are_not_listed(ws, hhome):
+    """Orbital's kimi / mcode workers leave ordinary native sessions in the
+    project folder; the thread records in the project's sessions say which."""
+    _three(hhome, ws)
+    sessions = os.path.join(ws, "orbital", "sessions")
+    os.makedirs(sessions)
+    with open(os.path.join(sessions, "s1.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"role": "meta", "event": "session_start"}) + "\n")
+        for handle, nid in (("kimi-code", hb.KIMI_ID), ("minimax-code", hb.MINIMAX_ID)):
+            fh.write(json.dumps({"role": "meta", "event": "sub_agent_thread", "handle": handle,
+                                 "thread": {"session_id": nid}}) + "\n")
+    assert [s.agent for s in si.list_native_sessions(ws)] == ["pi"]
+
+
+def test_pi_kimi_minimax_conversion_and_resume_records(ws, hhome):
+    paths = _three(hhome, ws)
+    pi_conv = si.convert_transcript("pi", paths["pi"], now="2026-10-21T00:00:00+00:00")
+    header, *rows = pi_conv.rows
+    assert header["content"] == "[Imported] Conversation imported from Pi (last active 2026-10-20)"
+    assert header["_meta"]["native_id"] == hb.PI_ID
+    assert [r["role"] for r in rows] == ["user", "system"]
+    assert rows[0]["content"] == f"Rename the helper in {ws}/src/util.py"
+    assert rows[0]["target"] == "pi"
+    assert rows[1]["_meta"]["reply"] == "Renamed it to tool.\n\n(tools: read ×2, edit ×1)"
+    assert pi_conv.thread_record["thread"] == {
+        "session_id": hb.PI_ID, "model": None, "last_used_at": "2026-10-21T00:00:00+00:00",
+        "rollout_path": paths["pi"]}
+    kimi = si.convert_transcript("kimi-code", paths["kimi-code"])
+    assert kimi.rows[0]["content"].startswith("[Imported] Conversation imported from Kimi Code ")
+    assert [r["content"] for r in kimi.rows if r["role"] == "user"] == [
+        f"Add a test for {ws}/app.py"]
+    assert [r["_meta"]["reply"] for r in _terminals(kimi.rows)] == [
+        "Writing it.\n\nAdded the test.\n\n(tools: Write ×1, Read ×1)"]
+    assert set(kimi.thread_record["thread"]) == {"session_id", "model", "last_used_at"}
+    assert kimi.thread_record["thread"]["session_id"] == hb.KIMI_ID
+    mm = si.convert_transcript("minimax-code", paths["minimax-code"])
+    assert [r["content"] for r in mm.rows if r["role"] == "user"] == [
+        f"Summarise {ws}/README.md"]
+    assert "agent-context" not in json.dumps(mm.all_rows())
+    assert mm.thread_record["thread"]["session_id"] == hb.MINIMAX_ID
+
+
+def test_session_list_reads_the_same_home_as_the_history_scan(monkeypatch, tmp_path):
+    """Spec 138: the session list and the history scan must agree on where
+    Claude Code and Codex history lives, or a project's cards name sessions
+    its own list does not show."""
+    from agent_os.onboarding import history_paths
+    from agent_os.onboarding import session_import as si
+    home = str(tmp_path / "staged")
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", home)
+    monkeypatch.delenv("ORBITAL_CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert si.claude_home() == history_paths.claude_dir() == os.path.join(home, ".claude")
+    assert si.codex_home() == history_paths.codex_dir() == os.path.join(home, ".codex")
+    # The agents' own variables still win, for both readers alike.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    assert si.claude_home() == history_paths.claude_dir() == str(tmp_path / "elsewhere")

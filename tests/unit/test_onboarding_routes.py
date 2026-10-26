@@ -6,7 +6,9 @@
 
 Mounts only the onboarding router over an in-process ASGI transport and stubs
 the scanner so the route contract (shape + best-effort error handling) is tested
-without touching real home directories."""
+without touching real home directories. Spec 138 extended the payload with
+``status`` / ``groups`` and each candidate with ``kind`` / ``minor`` /
+``is_git`` / ``by_agent``; the history scanner is stubbed too."""
 
 import httpx
 import pytest
@@ -15,11 +17,27 @@ from fastapi import FastAPI
 from agent_os.api.routes import onboarding as onboarding_routes
 from agent_os.onboarding.import_scanner import ImportCandidate
 
+CANDIDATE_KEYS = {"source", "name", "path", "session_count", "last_activity",
+                  "already_imported", "kind", "minor", "is_git", "by_agent"}
+
+
+class _StubScanner:
+    """A history scan that is still running: no groups yet."""
+
+    def start(self):
+        pass
+
+    def status(self):
+        return {"status": "scanning", "sessions_total": 0, "by_agent": {}}
+
+    def analysis(self):
+        return None
+
 
 @pytest.fixture
 def client():
     app = FastAPI()
-    onboarding_routes.configure()
+    onboarding_routes.configure(scanner=_StubScanner())
     app.include_router(onboarding_routes.router)
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test")
@@ -45,8 +63,8 @@ async def test_returns_ranked_candidates(client, monkeypatch):
     body = r.json()
     assert [c["name"] for c in body["candidates"]] == ["alpha", "notes"]
     first = body["candidates"][0]
-    assert set(first) == {"source", "name", "path", "session_count", "last_activity",
-                          "already_imported"}
+    assert set(first) == CANDIDATE_KEYS
+    assert body["status"] == "scanning" and body["groups"] == []
     assert first["source"] == "claude-code"
     assert first["session_count"] == 3
 
@@ -60,7 +78,7 @@ async def test_scanner_failure_yields_empty_list_not_500(client, monkeypatch):
     async with client:
         r = await client.get("/api/v2/onboarding/importable-projects")
     assert r.status_code == 200
-    assert r.json() == {"candidates": []}
+    assert r.json() == {"status": "scanning", "candidates": [], "groups": []}
 
 
 async def test_route_passes_store_workspaces_and_payload_carries_flag(monkeypatch):
@@ -78,7 +96,7 @@ async def test_route_passes_store_workspaces_and_payload_carries_flag(monkeypatc
                                 already_imported=True)]
 
     app = FastAPI()
-    onboarding_routes.configure(project_store=FakeStore())
+    onboarding_routes.configure(project_store=FakeStore(), scanner=_StubScanner())
     app.include_router(onboarding_routes.router)
     monkeypatch.setattr(onboarding_routes, "scan_importable_projects", fake_scan)
     transport = httpx.ASGITransport(app=app)
@@ -88,8 +106,7 @@ async def test_route_passes_store_workspaces_and_payload_carries_flag(monkeypatc
     assert seen["existing"] == {"/p/alpha", "/p/zeta"}
     cand = r.json()["candidates"][0]
     assert cand["already_imported"] is True
-    assert set(cand) == {"source", "name", "path", "session_count",
-                         "last_activity", "already_imported"}
+    assert set(cand) == CANDIDATE_KEYS
 
 
 async def test_route_without_a_store_scans_without_exclusion(client, monkeypatch):
