@@ -5,8 +5,10 @@
 import { useState, type CSSProperties } from 'react';
 import type { DisplayItem } from '../utils/chatTransform';
 import { parseAttachmentsBlock } from '../lib/attachment-parsing';
+import { parseSkillBlock } from '../lib/skill-parsing';
 import { splitQuotesBlock } from '../utils/annotations';
 import AttachmentChip from './AttachmentChip';
+import SkillChip from './SkillChip';
 import MarkdownContent from './MarkdownContent';
 import MessageAvatar from './MessageAvatar';
 import CopyButton from './CopyButton';
@@ -95,9 +97,11 @@ export default function ChatMessage({ message, agentName, workspace, onOpenPath 
   const [quotesOpen, setQuotesOpen] = useState(false);
 
   if (message.type === 'user_message') {
-    const { strippedContent, attachments } = parseAttachmentsBlock(message.content);
+    const { strippedContent: afterAttachments, attachments } = parseAttachmentsBlock(message.content);
+    // Spec 132: a `/`-picked skill's block follows the attachments block.
+    const { strippedContent, skill } = parseSkillBlock(afterAttachments);
     const { text: bodyText, quotes, count: annotationCount } = splitQuotesBlock(strippedContent);
-    const hasChips = attachments.length > 0;
+    const hasChips = attachments.length > 0 || skill !== null;
     const hasText = bodyText.length > 0;
     const senderLabel = message.target
       ? t('chat.message.youTo', { target: message.target })
@@ -118,7 +122,7 @@ export default function ChatMessage({ message, agentName, workspace, onOpenPath 
           <span className="text-secondary">{senderLabel}</span>
           {time && <span className="text-muted">· {time}</span>}
           {/* Copy carries the message's own text, with the <attached_files>
-              block already stripped — that block is machine markup the user
+              and <use_skill> blocks already stripped — that block is machine markup the user
               never typed and must not be pasted back. */}
           <CopyButton
             text={bodyText}
@@ -136,6 +140,9 @@ export default function ChatMessage({ message, agentName, workspace, onOpenPath 
         <div className="inline-block max-w-[min(70%,680px)] rounded-lg rounded-tr-sm bg-bubble px-3 py-2 text-[13px] leading-[1.55] text-bubble-text whitespace-pre-wrap break-words">
           {hasChips && (
             <div className="flex flex-wrap gap-2 mb-2">
+              {skill && (
+                <SkillChip name={skill.name} title={skill.path} data-testid="message-skill-chip" />
+              )}
               {attachments.map((a, i) => (
                 <AttachmentChip
                   key={`${i}-${a.path}`}

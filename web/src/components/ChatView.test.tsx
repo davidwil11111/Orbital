@@ -17,7 +17,7 @@
 // here), mount ChatView, wait for the mount effect, then inspect the call
 // log and rendered DOM.
 
-import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 
@@ -65,6 +65,8 @@ let sessionsListResponse: unknown[] = [];
 // /chat through `api` (not apiWithTotal). Tests set this to hand it a row.
 let chatLatestResponse: unknown[] = [];
 const projectPutCalls: Array<{ path: string; body: unknown }> = [];
+// Spec 132: GET /projects/{pid}/skill-catalog (the `/` skill picker).
+let skillCatalogResponse: unknown[] = [];
 
 vi.mock('../config', () => ({
   api: vi.fn(async (path: string, opts?: { method?: string; body?: string }) => {
@@ -81,6 +83,9 @@ vi.mock('../config', () => ({
       sessionsPatchCalls.push(path);
       if (sessionsPatchGate) await sessionsPatchGate;
       return {};
+    }
+    if (!opts?.method && path.includes('/skill-catalog')) {
+      return skillCatalogResponse;
     }
     // run-status returns the configured slot holder so ChatView can decide
     // whether the viewed session is the holder.
@@ -283,6 +288,7 @@ import ChatView, {
   appendLiveReasoning,
   __clearChatHistoryCacheForTests,
 } from './ChatView';
+import { __clearSkillCatalogCacheForTests } from '../lib/skill-catalog';
 // Spec 078 §5.4 — the composer reads annotation drafts out of the per-session
 // store the panel writes into; the tests seed it directly.
 import {
@@ -291,7 +297,7 @@ import {
 } from '../hooks/useAnnotations';
 import type { Annotation } from '../utils/annotations';
 import { formatQuotes } from '../utils/annotations';
-import { markFreshSession, consumeFreshSession } from '../utils/freshSession';
+import { markFreshSession } from '../utils/freshSession';
 import { useAgent } from '../hooks/useAgent';
 import type { DisplayItem } from '../utils/chatTransform';
 import type { Project } from '../types';
@@ -339,6 +345,8 @@ beforeEach(() => {
   sessionsListResponse = [];
   chatLatestResponse = [];
   projectPutCalls.length = 0;
+  skillCatalogResponse = [];
+  __clearSkillCatalogCacheForTests();
   chatInitialResponse = { data: [], total: 0 };
   chatOlderResponse = { data: [], total: 0 };
   queueState = 'idle';
@@ -2831,26 +2839,24 @@ describe('Spec 107 FE-1: a freshly minted session id does not fetch history', ()
     expect(chatFetchesFor('unknown_9').length).toBe(1);
   });
 
-  it('the /new slash command marks the id it mints', async () => {
+  it('typing /new no longer mints a session: it is sent as text (spec 132)', async () => {
     const { newSession } = useAgent();
-    (newSession as unknown as Mock).mockResolvedValueOnce({
-      status: 'ok',
-      session_id: 'sess_from_slash',
-      session_uuid: 'sess_from_slash',
-    });
     await renderChat({ sessionId: 's1' });
     await flushEffects();
 
     await act(async () => {
       typeInComposer('/new');
     });
+    await flushEffects();
+    expect(container.textContent ?? '').not.toContain('Start a fresh session');
     await act(async () => {
       pressKey('Enter');
     });
     await flushEffects();
 
-    expect(newSession).toHaveBeenCalledWith('p1', 's1');
-    expect(consumeFreshSession('p1', 'sess_from_slash')).toBe(true);
+    expect(newSession).not.toHaveBeenCalled();
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][1]).toBe('/new');
   });
 });
 
@@ -4800,5 +4806,201 @@ describe('ChatView: the idle catch-up ignores memory record rows (spec 131 A)', 
     expect(container.textContent ?? '').toContain('A-RECOVERED-CLOSING-TEXT');
     expect(container.textContent ?? '').not.toContain(RECORD_TEXT);
     expect(bubbles()).toBe(1);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Spec 132 — type `/` in the composer to pick an installed skill.
+// ---------------------------------------------------------------------------
+
+describe('ChatView: the / skill picker (spec 132)', () => {
+  const TASK = {
+    key: 'task planning',
+    name: 'Task Planning',
+    description: 'Match planning effort to task complexity.',
+    source: 'project',
+    path: '/ws/orbital/skills/task-planning/SKILL.md',
+    dir_name: 'task-planning',
+  };
+  const MSG = {
+    key: 'wecomcli-msg',
+    name: 'wecomcli-msg',
+    description: '企业微信消息技能',
+    source: 'agents',
+    path: '/home/.agents/skills/wecomcli-msg/SKILL.md',
+    dir_name: 'wecomcli-msg',
+  };
+  const DOC = { ...MSG, key: 'wecomcli-doc', name: 'wecomcli-doc', dir_name: 'wecomcli-doc', path: '/home/.agents/skills/wecomcli-doc/SKILL.md' };
+
+  const menu = () => container.querySelector('[data-testid="skill-menu"]');
+  const optionNames = () =>
+    Array.from(container.querySelectorAll('[data-testid="skill-option"]')).map(
+      (el) => el.getAttribute('data-skill-name'),
+    );
+  const composerChip = () => container.querySelector('[data-testid="composer-skill-chip"]');
+  const textarea = () => container.querySelector('textarea') as HTMLTextAreaElement;
+
+  async function type(text: string) {
+    await act(async () => { typeInComposer(text); });
+    await flushEffects();
+  }
+  async function press(key: string): Promise<boolean> {
+    const ev = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(ev); });
+    await flushEffects();
+    return ev.defaultPrevented;
+  }
+
+  beforeEach(() => {
+    skillCatalogResponse = [TASK, MSG, DOC];
+  });
+
+  it('a message starting with a path sends with Enter (the old Enter-swallow bug)', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/Users/me/a.txt hi');
+    expect(menu()).toBeNull();
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][1]).toBe('/Users/me/a.txt hi');
+  });
+
+  it('an unmatched /word sends with Enter and Tab is not swallowed', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/zzz');
+    expect(menu()).toBeNull();
+    expect(await press('Tab')).toBe(false);
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][1]).toBe('/zzz');
+  });
+
+  it('/tas lists Task Planning; Enter adds a chip, clears the text, sends nothing', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/tas');
+    expect(optionNames()).toEqual(['Task Planning']);
+    await press('Enter');
+    expect(injectCalls).toHaveLength(0);
+    expect(textarea().value).toBe('');
+    expect(menu()).toBeNull();
+    expect(composerChip()?.textContent).toContain('Task Planning');
+
+    await type('plan my week');
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][1]).toBe('plan my week');
+    // injectMessage(projectId, content, target, nonce, attachments, sessionId, pinned, skill)
+    expect(injectCalls[0][7]).toEqual({ key: TASK.key, path: TASK.path });
+    expect(composerChip()).toBeNull();
+    // The optimistic bubble shows the chip, not the block.
+    const bubble = container.querySelector('[data-testid="user-message"]');
+    expect(bubble?.querySelector('[data-testid="message-skill-chip"]')?.textContent).toContain('Task Planning');
+    expect(bubble?.textContent).not.toContain('use_skill');
+  });
+
+  it('Enter with only a chip sends the skill alone', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/tas');
+    await press('Enter');
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][1]).toBe('');
+    expect(injectCalls[0][7]).toEqual({ key: TASK.key, path: TASK.path });
+  });
+
+  it('segment prefix: /wec lists both wecomcli-*, /msg finds wecomcli-msg', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/wec');
+    expect(optionNames()).toEqual(['wecomcli-doc', 'wecomcli-msg']);
+    await type('/msg');
+    expect(optionNames()).toEqual(['wecomcli-msg']);
+  });
+
+  it('arrow keys pick the second row; a second pick replaces the first chip', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/wec');
+    await press('ArrowDown');
+    await press('Tab');
+    expect(composerChip()?.textContent).toContain('wecomcli-msg');
+    await type('/tas');
+    await press('Enter');
+    const chips = container.querySelectorAll('[data-testid="composer-skill-chip"]');
+    expect(chips).toHaveLength(1);
+    expect(chips[0].textContent).toContain('Task Planning');
+  });
+
+  it('the chip × removes the skill', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/tas');
+    await press('Enter');
+    const remove = container.querySelector('[data-testid="composer-skill-chip-remove"]') as HTMLButtonElement;
+    await act(async () => { remove.click(); });
+    expect(composerChip()).toBeNull();
+  });
+
+  it('Esc keeps the text, stays closed while typing on, and reopens after clearing', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/ta');
+    expect(menu()).not.toBeNull();
+    await press('Escape');
+    expect(menu()).toBeNull();
+    expect(textarea().value).toBe('/ta');
+    await type('/tas');
+    expect(menu()).toBeNull();
+    await type('');
+    await type('/');
+    expect(menu()).not.toBeNull();
+  });
+
+  it('a space or a second / closes the menu; a / mid-text never opens it', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/w');
+    expect(menu()).not.toBeNull();
+    await type('/w b');
+    expect(menu()).toBeNull();
+    await type('/w/b');
+    expect(menu()).toBeNull();
+    await type('see /w');
+    expect(menu()).toBeNull();
+  });
+
+  it('no skills installed: / shows a hint and Enter still sends', async () => {
+    skillCatalogResponse = [];
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/');
+    expect(container.querySelector('[data-testid="skill-menu-empty"]')).not.toBeNull();
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+  });
+
+  it('the catalog is fetched once per project, on the first /', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    const catalogCalls = () => apiCalls.filter((p) => p.includes('/skill-catalog'));
+    expect(catalogCalls()).toHaveLength(0);
+    await type('/');
+    await type('/t');
+    await type('');
+    await type('/');
+    expect(catalogCalls()).toEqual(['/api/v2/projects/p1/skill-catalog']);
+  });
+
+  it('/new is not a menu entry', async () => {
+    skillCatalogResponse = [];
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/n');
+    expect(optionNames()).toEqual([]);
+    expect(container.textContent ?? '').not.toContain('Start a fresh session');
   });
 });
