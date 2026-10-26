@@ -23,18 +23,44 @@ def _get_log_path() -> str:
         return os.path.join(os.path.expanduser("~"), ".orbital", "logs")
 
 
+#: Spec 134 A4: the stderr log is appended across launches, and moves to
+#: ``orbital-stderr.log.1`` once it passes this size.
+STDERR_LOG_MAX_BYTES = 1024 * 1024
+#: The first line each launch writes, so the failure dialog reads only this
+#: launch's lines.
+_LAUNCH_MARKER = "=== Orbital launch"
+
+
+def _open_stderr_log(log_dir: str):
+    """Open ``orbital-stderr.log`` for this launch: append, size-capped.
+
+    It used to be opened ``"w"``, so a relaunch that failed against a frozen
+    instance overwrote the frozen run's stderr — the one piece of evidence
+    (spec 134 W6). The rotation is best-effort: on Windows a running
+    instance may still hold the file, and then this launch just appends.
+    """
+    path = os.path.join(log_dir, "orbital-stderr.log")
+    try:
+        if os.path.getsize(path) > STDERR_LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    # utf-8: tracebacks can carry non-ANSI text (e.g. Chinese filenames);
+    # the platform-default codec would raise while writing the evidence.
+    f = open(path, "a", encoding="utf-8", errors="replace")
+    f.write(f"\n{_LAUNCH_MARKER} {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"pid {os.getpid()} ===\n")
+    f.flush()
+    return f
+
+
 # PyInstaller windowed mode (console=False) sets sys.stdout/stderr to None.
 # Uvicorn's log formatter calls sys.stderr.isatty() on init and crashes.
 # Redirect to a log file so errors are visible for debugging.
 if getattr(sys, "frozen", False) and sys.stderr is None:
     _log_dir = _get_log_path()
     os.makedirs(_log_dir, exist_ok=True)
-    # utf-8: tracebacks can carry non-ANSI text (e.g. Chinese filenames);
-    # the platform-default codec would raise while writing the evidence.
-    _log_file = open(
-        os.path.join(_log_dir, "orbital-stderr.log"), "w",
-        encoding="utf-8", errors="replace",
-    )
+    _log_file = _open_stderr_log(_log_dir)
     sys.stdout = _log_file
     sys.stderr = _log_file
 
@@ -299,6 +325,11 @@ def _stderr_log_tail(max_lines: int = 5) -> str:
         path = os.path.join(_get_log_path(), "orbital-stderr.log")
         with open(path, encoding="utf-8", errors="replace") as f:
             lines = [line.rstrip() for line in f if line.strip()]
+        # The file is appended across launches: only this launch's lines.
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith(_LAUNCH_MARKER):
+                lines = lines[i + 1:]
+                break
         errors = [line for line in lines if "ERROR" in line]
         return "\n".join((errors or lines)[-max_lines:])
     except Exception:
@@ -1410,6 +1441,260 @@ def _activate_existing_window(title: str = "Orbital") -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Spec 134 A4 — always come back
+# ---------------------------------------------------------------------------
+#
+# A frozen Orbital stays alive (on Windows the close button hides it to the
+# tray), keeps the single-instance mutex and the daemon PID file, and every
+# relaunch used to either re-show the frozen window or die on an uncaught
+# ``DaemonAlreadyRunning``. Now: a frozen instance is detected (hung window,
+# or its daemon does not answer), the user is asked "End it and start
+# again", and any boot failure is logged at ERROR and shown in a window.
+
+_DAEMON_ANSWER_TIMEOUT_S = 5.0
+
+
+def _boot_logger():
+    import logging
+
+    return logging.getLogger("agent_os.desktop")
+
+
+def _can_offer_end_and_restart() -> bool:
+    """Only the packaged app offers to end another instance. A run from
+    source (tests start this module) never kills a process on a click."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _recorded_daemon() -> tuple[int | None, dict | None]:
+    """The PID in the daemon PID file and its identity sidecar."""
+    from agent_os.utils import pid_file
+
+    path = pid_file._DEFAULT_PID_PATH
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None, None
+    return pid, pid_file.read_pid_meta(path)
+
+
+def _daemon_answers(meta: dict | None,
+                    timeout: float = _DAEMON_ANSWER_TIMEOUT_S) -> bool:
+    """Whether the recorded daemon serves its health route in *timeout* s."""
+    port = 8000
+    try:
+        if meta and meta.get("port"):
+            port = int(meta["port"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        resp = _local_opener().open(
+            f"http://127.0.0.1:{port}/api/v2/settings", timeout=timeout)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def _window_is_hung(title: str = "Orbital") -> bool:
+    """Windows: the running shell's window exists and is not answering."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, title)
+        return bool(hwnd) and bool(user32.IsHungAppWindow(hwnd))
+    except Exception:
+        return False
+
+
+def _existing_instance_is_responsive() -> bool:
+    """The running shell can be handed the launch: its window answers and,
+    when a daemon is recorded, the daemon answers too."""
+    if _window_is_hung():
+        return False
+    pid, meta = _recorded_daemon()
+    if pid is None:
+        return True
+    return _daemon_answers(meta)
+
+
+def _unresponsive_prompt() -> tuple[str, str, str, str]:
+    """(title, message, end label, cancel label) in the OS language."""
+    if _os_localization() is not None:
+        return (
+            "Orbital 没有响应",
+            "Orbital 正在运行，但没有响应。\n\n要结束它并重新启动吗？"
+            "它正在运行的命令也会被结束。",
+            "结束并重新启动", "取消",
+        )
+    return (
+        "Orbital is not responding",
+        "Orbital is running but not responding.\n\nEnd it and start again? "
+        "Commands it is running will be stopped too.",
+        "End and Start Again", "Cancel",
+    )
+
+
+def _applescript_str(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _confirm_end_unresponsive() -> bool:
+    """Native Yes/No: "Orbital is not responding — End it and start again"."""
+    title, message, end_label, cancel_label = _unresponsive_prompt()
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            MB_YESNO, MB_ICONWARNING, MB_SETFOREGROUND, IDYES = 0x4, 0x30, 0x10000, 6
+            answer = ctypes.windll.user32.MessageBoxW(
+                0, message, title, MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND)
+            return answer == IDYES
+        if sys.platform == "darwin":
+            import subprocess
+
+            from agent_os.utils.subprocess_flags import win_no_window_flags
+
+            script = (
+                f"display dialog {_applescript_str(message)} "
+                f"with title {_applescript_str(title)} "
+                f"buttons {{{_applescript_str(cancel_label)}, {_applescript_str(end_label)}}} "
+                f"default button 2 cancel button 1 with icon caution"
+            )
+            result = subprocess.run(
+                ["osascript", "-e", script], capture_output=True,
+                encoding="utf-8", errors="replace", timeout=600,
+                creationflags=win_no_window_flags(),
+            )
+            return result.returncode == 0 and end_label in (result.stdout or "")
+    except Exception:
+        _boot_logger().exception("Could not show the not-responding dialog")
+    return False
+
+
+def _looks_like_orbital(proc) -> bool:
+    # Only packaged builds offer to end a process, and there the daemon is
+    # the Orbital binary itself, never a Python interpreter: a reused PID now
+    # held by someone's python script must not be ended.
+    try:
+        name = (proc.name() or "").lower()
+    except Exception:
+        return False
+    return name.startswith("orbital")
+
+
+def _end_process_tree(pid: int, meta: dict | None) -> bool:
+    """End the unresponsive instance and what it started. True when gone.
+
+    Only the process the PID file describes: with a sidecar its create time
+    must match (a reused PID is left alone and counts as gone); without one
+    (an older build) it must at least look like Orbital.
+    """
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        if meta and meta.get("pid") == pid and meta.get("create_time") is not None:
+            if abs(proc.create_time() - float(meta["create_time"])) > 1.0:
+                return True
+        elif not _looks_like_orbital(proc):
+            _boot_logger().error("PID %d does not look like Orbital; not ending it", pid)
+            return False
+        procs = proc.children(recursive=True) + [proc]
+    except psutil.NoSuchProcess:
+        return True
+    except Exception:
+        _boot_logger().exception("Could not inspect PID %d", pid)
+        return False
+    for p in procs:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            _boot_logger().warning("Could not end PID %s", getattr(p, "pid", "?"))
+    _gone, alive = psutil.wait_procs(procs, timeout=10)
+    if proc in alive:
+        _boot_logger().error("PID %d did not exit after being ended", pid)
+        return False
+    _boot_logger().warning("Ended the unresponsive Orbital (PID %d)", pid)
+    return True
+
+
+def _offer_end_and_restart(pid: int, meta: dict | None) -> bool:
+    """Ask, then end. True when the old instance is gone and boot may go on."""
+    if not _can_offer_end_and_restart():
+        return False
+    if not _confirm_end_unresponsive():
+        _boot_logger().info("User kept the unresponsive Orbital (PID %d)", pid)
+        return False
+    return _end_process_tree(pid, meta)
+
+
+def _show_boot_failure(headline: str, message: str | None = None) -> None:
+    """The "could not start" window (pywebview), with the stderr tail."""
+    import html as _html
+    import webview
+
+    detail = _stderr_log_tail()
+    message_html = f"<p>{_html.escape(message)}</p>" if message else ""
+    detail_html = (
+        f"<pre style='white-space:pre-wrap'>{_html.escape(detail)}</pre>"
+        if detail
+        else ""
+    )
+    webview.create_window(
+        "Orbital \u2014 Error",
+        html=f"<h2>{_html.escape(headline)}</h2>{message_html}{detail_html}"
+        f"<p>Check logs in {_get_log_path()}</p>",
+    )
+    webview.start()
+
+
+def _boot_or_report(preferred: int, _retried: bool = False):
+    """Boot the daemon; on failure log at ERROR, show a window, return None.
+
+    ``DaemonAlreadyRunning`` means another instance owns the PID file. If its
+    daemon answers, this launch opens a window on it. If not, the user may
+    end it and this launch boots in its place.
+    """
+    from agent_os.utils.pid_file import DaemonAlreadyRunning
+
+    try:
+        port, _server, _thread = boot_daemon_with_retry(preferred)
+    except DaemonAlreadyRunning as exc:
+        _boot_logger().error("Orbital could not start: %s", exc)
+        pid, meta = _recorded_daemon()
+        if meta is not None and meta.get("pid") == exc.existing_pid and _daemon_answers(meta):
+            return int(meta.get("port") or preferred)
+        if not _retried and _offer_end_and_restart(exc.existing_pid, meta):
+            return _boot_or_report(preferred, _retried=True)
+        _show_boot_failure(
+            "Orbital is already running",
+            f"Another Orbital (PID {exc.existing_pid}) is running but not "
+            "responding. End it in Task Manager (Windows) or Activity Monitor "
+            "(macOS), then start Orbital again.",
+        )
+        return None
+    except Exception as exc:
+        _boot_logger().exception("Orbital could not start")
+        try:
+            import traceback
+
+            traceback.print_exc()  # the frozen build's stderr is the log file
+        except Exception:
+            pass
+        _show_boot_failure("Failed to start daemon", str(exc) or type(exc).__name__)
+        return None
+    if port is None:
+        _boot_logger().error("Orbital could not start: the daemon did not answer")
+        _show_boot_failure("Failed to start daemon")
+    return port
+
+
 def main():
     # Refuse to start the GUI on arguments we do not understand. A stray argv
     # used to fall straight through to the daemon + window + tray path — which
@@ -1448,8 +1733,17 @@ def main():
     # --setup-sandbox / --teardown-sandbox while an instance may be live, so
     # they must never be swallowed by this guard.
     if not _acquire_single_instance():
-        if _activate_existing_window():
-            sys.exit(0)
+        if _existing_instance_is_responsive():
+            if _activate_existing_window():
+                sys.exit(0)
+        else:
+            # Spec 134 W6: the running instance is frozen (hung window, or a
+            # daemon that does not answer). Re-showing it is no help; offer
+            # to end it and start again.
+            pid, meta = _recorded_daemon()
+            if pid is None or not _offer_end_and_restart(pid, meta):
+                _activate_existing_window()
+                sys.exit(0)
         # Fail OPEN: the mutex is held but nothing answers to it — a wedged
         # instance with no window. Being locked out of Orbital entirely is a
         # worse bug than the duplicate icon this guard exists to prevent.
@@ -1465,23 +1759,8 @@ def main():
     if is_already_running(PORT):
         port = PORT
     else:
-        port, server, thread = boot_daemon_with_retry(PORT)
-
+        port = _boot_or_report(PORT)
         if port is None:
-            import html as _html
-            import webview
-            detail = _stderr_log_tail()
-            detail_html = (
-                f"<pre style='white-space:pre-wrap'>{_html.escape(detail)}</pre>"
-                if detail
-                else ""
-            )
-            webview.create_window(
-                "Orbital \u2014 Error",
-                html=f"<h2>Failed to start daemon</h2>{detail_html}"
-                f"<p>Check logs in {_get_log_path()}</p>",
-            )
-            webview.start()
             return
 
     # Daemon is up — provision Chromium (extract bundled archive, or a
@@ -1489,8 +1768,11 @@ def main():
     from agent_os.desktop.migration import provision_browsers_background
     provision_browsers_background()
 
+    from agent_os.utils.pid_file import release_pid_file
+
     def shutdown():
         flush_telemetry_before_exit(port)
+        release_pid_file()  # os._exit skips atexit (spec 134 W7)
         os._exit(0)
 
     # On macOS, pystray's Cocoa backend must run on the main thread, but
@@ -1514,6 +1796,7 @@ def main():
         # macOS: no system tray, so window close = app close.
         # This is standard macOS behavior for non-document-based apps.
         flush_telemetry_before_exit(port)
+        release_pid_file()  # os._exit skips atexit (spec 134 W7)
         os._exit(0)
     else:
         # Windows/Linux: system tray keeps app alive after window close.

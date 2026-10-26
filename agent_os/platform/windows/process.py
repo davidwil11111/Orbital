@@ -9,6 +9,12 @@ import os
 
 import uuid
 
+from agent_os.platform.proc_runner import (
+    WindowsJob,
+    keep_log,
+    kill_process_tree,
+    read_bounded,
+)
 from agent_os.platform.types import (
     CommandResult,
     ProcessHandle,
@@ -191,6 +197,14 @@ _UpdateProcThreadAttribute.argtypes = [
 _DeleteProcThreadAttributeList = kernel32.DeleteProcThreadAttributeList
 _DeleteProcThreadAttributeList.restype = None
 _DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+
+
+def _close_process_handles(handle: ProcessHandle) -> None:
+    """Close a launched process's handles (a finished run used to leak them)."""
+    for key in ("process_handle", "thread_handle"):
+        native = handle._native_handles.get(key)
+        if native:
+            _CloseHandle(native)
 
 
 # ---- ProcessLauncher ----
@@ -564,9 +578,18 @@ class ProcessLauncher:
         """Launch a command as the sandbox user and capture stdout/stderr via temp files.
 
         Returns a CommandResult with exit_code, stdout, stderr, and timed_out flag.
+
+        Spec 134 A1/W5: the process goes into a Job Object (no kill-on-close:
+        a normal exit leaves whatever it started running), and a timeout
+        kills the whole tree — job, ``cmd``, and the psutil-listed
+        descendants — instead of only ``cmd``, which left the script running
+        and writing the temp file. The files are read back bounded (head and
+        tail), and a truncated one is kept under the workspace's
+        shell-output folder.
         """
         from agent_os.agent.project_paths import ProjectPaths
-        tmp_dir = ProjectPaths(working_dir).tmp_dir
+        paths = ProjectPaths(working_dir)
+        tmp_dir = paths.tmp_dir
         os.makedirs(tmp_dir, exist_ok=True)
 
         run_id = uuid.uuid4().hex[:12]
@@ -586,6 +609,7 @@ class ProcessLauncher:
         exit_code = 1
         stdout_text = ""
         stderr_text = ""
+        kept: set[str] = set()
 
         try:
             handle = self.launch(
@@ -595,29 +619,43 @@ class ProcessLauncher:
                 env_vars=env_vars,
                 inherit_env=inherit_env,
             )
+            job = WindowsJob.create(kill_on_close=False)
+            if job is not None:
+                job.assign(handle._native_handles["process_handle"])
 
             try:
-                exit_code = self.wait(handle, timeout_sec=timeout_sec)
-            except TimeoutError:
-                timed_out = True
-                self.terminate(handle)
+                try:
+                    exit_code = self.wait(handle, timeout_sec=timeout_sec)
+                except TimeoutError:
+                    timed_out = True
+                    logger.info("pid=%d timed out after %ss; killing its tree",
+                                handle.pid, timeout_sec)
+                    kill_process_tree(handle.pid, job=job)
+                    _TerminateProcess(handle._native_handles["process_handle"], 1)
+                    _WaitForSingleObject(handle._native_handles["process_handle"], 5000)
+            finally:
+                if job is not None:
+                    job.close()
+                _close_process_handles(handle)
 
-            # Read captured output
-            try:
-                with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
-                    stdout_text = f.read()
-            except FileNotFoundError:
-                pass
-
-            try:
-                with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
-                    stderr_text = f.read()
-            except FileNotFoundError:
-                pass
+            # Read captured output, bounded.
+            for path in (stdout_path, stderr_path):
+                out = read_bounded(path)
+                text = out.render(None)
+                if out.truncated:
+                    saved = keep_log(path, paths.shell_output_dir)
+                    kept.add(path)
+                    text = out.render(saved)
+                if path == stdout_path:
+                    stdout_text = text
+                else:
+                    stderr_text = text
 
         finally:
-            # Clean up temp files
+            # Clean up temp files (a survivor may still hold one; it stays).
             for path in (stdout_path, stderr_path):
+                if path in kept:
+                    continue
                 try:
                     os.remove(path)
                 except OSError:

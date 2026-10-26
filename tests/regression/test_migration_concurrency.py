@@ -287,10 +287,19 @@ def test_a_stale_pid_file_admits_exactly_one_racer(tmp_path):
 
 
 def test_a_live_pid_file_is_still_refused(tmp_path):
-    pid_path = tmp_path / "daemon.pid"
-    pid_path.write_text(str(os.getppid()))
-    import agent_os.utils.pid_file as pf
-    pf._active_pid_path = None
-    with pytest.raises(DaemonAlreadyRunning):
-        acquire_pid_file(pid_path)
-    pf._active_pid_path = None
+    # A live process that could be a daemon (spec 134: a PID file with no
+    # sidecar counts only an Orbital or Python process as live).
+    import subprocess
+    import sys
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        pid_path = tmp_path / "daemon.pid"
+        pid_path.write_text(str(holder.pid))
+        import agent_os.utils.pid_file as pf
+        pf._active_pid_path = None
+        with pytest.raises(DaemonAlreadyRunning):
+            acquire_pid_file(pid_path)
+        pf._active_pid_path = None
+    finally:
+        holder.kill()
+        holder.wait()

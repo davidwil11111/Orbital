@@ -28,6 +28,8 @@ from unittest.mock import patch
 
 import pytest
 
+from agent_os.platform.proc_runner import read_bounded
+from tests.shell_doubles import fake_shell_run
 from agent_os.agent.tools.shell import (
     ACCESS_DENIED_MARKER,
     ShellTool,
@@ -65,17 +67,16 @@ def test_script_writes_its_output_as_utf8_before_the_command_runs():
 
 
 def test_unsandboxed_output_is_decoded_as_utf8(tmp_path):
-    # ``text=True`` alone decodes with the locale code page (cp1252/cp936).
+    # ``text=True`` alone decoded with the locale code page (cp1252/cp936).
+    # Spec 134 A1: the output is now a file the runner reads back as UTF-8
+    # (errors replaced), whatever the locale.
     tool = ShellTool(workspace=str(tmp_path), os_type="windows")
-    seen = {}
-
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        return subprocess.CompletedProcess(cmd, 0, stdout="中文\n", stderr="")
-
-    with patch("agent_os.agent.tools.shell.subprocess.run", side_effect=fake_run):
-        tool._execute_unsandboxed("Write-Output 中文", {"network": False, "domains": []})
-    assert seen.get("encoding") == "utf-8" and seen.get("errors") == "replace"
+    with fake_shell_run(stdout="中文\n"):
+        result = tool._execute_unsandboxed("Write-Output 中文", {"network": False, "domains": []})
+    assert "中文" in result.content
+    log = tmp_path / "raw.log"
+    log.write_bytes("中文".encode("utf-8") + b"\xff\n")
+    assert read_bounded(str(log)).text == "中文\ufffd\n"
 
 
 def test_windows_build_cmd_runs_a_script_file(tmp_path):
@@ -101,12 +102,11 @@ def test_the_script_is_removed_after_the_run(tmp_path):
     tool = ShellTool(workspace=str(tmp_path), os_type="windows")
     seen = {}
 
-    def fake_run(cmd, **kwargs):
+    def on_call(cmd):
         seen["path"] = cmd[cmd.index("-File") + 1]
         assert os.path.exists(seen["path"])
-        return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
 
-    with patch("agent_os.agent.tools.shell.subprocess.run", side_effect=fake_run):
+    with fake_shell_run(stdout="ok\n", on_call=on_call):
         result = tool._execute_unsandboxed("Write-Output ok", {"network": False, "domains": []})
     assert "ok" in result.content
     assert not os.path.exists(seen["path"])
@@ -140,10 +140,7 @@ def test_a_clean_exit_without_the_marker_is_not_a_denial():
 def test_the_marker_never_reaches_the_agent(tmp_path):
     tool = ShellTool(workspace=str(tmp_path), os_type="windows")
 
-    def fake_run(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=f"denied\n{ACCESS_DENIED_MARKER}\n")
-
-    with patch("agent_os.agent.tools.shell.subprocess.run", side_effect=fake_run):
+    with fake_shell_run(returncode=1, stderr=f"denied\n{ACCESS_DENIED_MARKER}\n"):
         result = tool._execute_unsandboxed("Get-ChildItem x", {"network": False, "domains": []})
     assert ACCESS_DENIED_MARKER not in result.content
 

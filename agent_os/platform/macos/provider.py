@@ -15,7 +15,9 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
+from agent_os.agent.project_paths import ProjectPaths
 from agent_os.platform.base import PlatformProvider
+from agent_os.platform.proc_runner import run_foreground
 from agent_os.platform.shared.network import NetworkProxy
 from agent_os.platform.types import (
     CommandResult,
@@ -292,23 +294,27 @@ class MacOSPlatformProvider(PlatformProvider):
 
         cmd = ["sandbox-exec", "-p", profile, command] + args
 
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=working_dir,
-                env=env,
-                timeout=timeout_sec,
-            )
-            return CommandResult(
-                exit_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
-            )
-        except subprocess.TimeoutExpired:
-            return CommandResult(exit_code=1, stdout="", stderr="", timed_out=True)
+        # Spec 134 A1: the runner that cannot hang — output to a file in the
+        # workspace (the sandbox may write there), own process group, the
+        # whole tree killed on timeout only, partial output kept, bounded
+        # read-back. ``stdout`` carries the rendered head+tail, so the shell
+        # tool's own 200-line cut is a no-op on it.
+        paths = ProjectPaths(working_dir)
+        run = await asyncio.to_thread(
+            run_foreground,
+            cmd,
+            cwd=working_dir,
+            timeout=timeout_sec,
+            env=env,
+            log_dir=paths.tmp_dir,
+            keep_dir=paths.shell_output_dir,
+        )
+        return CommandResult(
+            exit_code=1 if run.timed_out else run.exit_code,
+            stdout=run.output.render(run.log_path),
+            stderr="",
+            timed_out=run.timed_out,
+        )
 
     async def stop_process(self, project_id: str, timeout_sec: int = 10) -> bool:
         entry = self._processes.pop(project_id, None)

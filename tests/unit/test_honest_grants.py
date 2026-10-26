@@ -27,6 +27,7 @@ from unittest.mock import patch
 import pytest
 
 from agent_os.agent.tools.shell import ShellTool
+from tests.shell_doubles import fake_shell_run
 
 _WHICH = "agent_os.agent.tools.shell.shutil.which"
 
@@ -112,13 +113,12 @@ def test_a_run_as_the_user_reads_its_script_from_the_user_temp(tmp_path):
     tool = ShellTool(workspace=str(workspace), os_type="windows")
     seen = {}
 
-    def fake_run(cmd, **kwargs):
+    def on_call(cmd):
         seen["path"] = cmd[cmd.index("-File") + 1]
         with open(seen["path"], encoding="utf-8-sig") as f:
             seen["text"] = f.read()
-        return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
 
-    with patch("agent_os.agent.tools.shell.subprocess.run", side_effect=fake_run):
+    with fake_shell_run(stdout="ok\n", on_call=on_call):
         tool._execute_unsandboxed('Write-Output "a b"', {"network": False, "domains": []})
 
     path = os.path.realpath(seen["path"])

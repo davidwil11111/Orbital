@@ -61,11 +61,12 @@ _COMPLIANT_MARKERS = ("win_no_window_flags", "CREATE_NO_WINDOW")
 #: assertion: adding a bare call to an allowlisted file still fails the test.
 _ALLOWLIST: dict[str, tuple[int, str]] = {
     "agent_os/platform/macos/provider.py": (
-        4,
+        3,
         "macOS-only module. MacOSPlatformProvider is instantiated only when "
         "sys.platform == 'darwin' (agent_os/platform/__init__.py), and it "
         "spawns sandbox-exec/caffeinate — never reachable on Windows. "
-        "Permanent exemption.",
+        "Permanent exemption. (``run_command`` moved to the spec 134 runner, "
+        "agent_os/platform/proc_runner.py, which carries the flag.)",
     ),
 }
 

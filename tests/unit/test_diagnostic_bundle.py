@@ -267,3 +267,40 @@ def test_feedback_url_is_derived_from_the_ingest_endpoint():
     assert db.feedback_url("http://127.0.0.1:9/ingest/") == "http://127.0.0.1:9/feedback"
     # An endpoint without the /ingest suffix gets /feedback appended.
     assert db.feedback_url("http://127.0.0.1:9") == "http://127.0.0.1:9/feedback"
+
+
+# ---------------------------------------------------------------------------
+# spec 134 A3 — hang.log rides along
+# ---------------------------------------------------------------------------
+
+def test_bundle_includes_the_hang_log_tail(tmp_path):
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    hang = data / "logs" / "hang.log"
+    hang.write_text(
+        "=== event loop stalled: no answer for 5.2 s ===\n"
+        'File "/Users/alice/orbital/agent_os/agent/tools/shell.py", line 9 in execute\n',
+        encoding="utf-8")
+    src = db.BundleSources(data_dir=data, daemon_log=None, stderr_log=None, hang_log=hang)
+    text = _build(src)
+    assert "== hang.log" in text
+    assert "event loop stalled" in text
+    assert "/Users/alice" not in text  # sanitised like the other logs
+
+
+def test_bundle_says_when_there_is_no_hang_log(tmp_path):
+    src = db.BundleSources(data_dir=tmp_path, daemon_log=None, stderr_log=None,
+                           hang_log=tmp_path / "logs" / "hang.log")
+    assert "hang.log: not found" in _build(src)
+
+
+def test_default_sources_put_hang_log_next_to_daemon_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "_daemon_log_from_root_logger", lambda: None)
+    src = db.default_sources(data_dir=tmp_path)
+    assert src.hang_log == tmp_path / "logs" / "hang.log"
+
+
+def test_the_three_log_tails_fit_one_upload():
+    overhead = 64 * 1024  # header, sub-agents, failures
+    assert (db.DAEMON_LOG_TAIL_BYTES + db.STDERR_LOG_MAX_BYTES
+            + db.HANG_LOG_TAIL_BYTES + overhead) <= db.MAX_UPLOAD_BYTES

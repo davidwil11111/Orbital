@@ -24,6 +24,7 @@ from agent_os.agent.tools.write import WriteTool
 from agent_os.agent.tools.edit import EditTool
 from agent_os.agent.tools.shell import ShellTool
 from agent_os.agent.tools.request_access import RequestAccessTool
+from tests.shell_doubles import fake_shell_run
 from agent_os.agent.tools.agent_message import AgentMessageTool
 
 
@@ -432,17 +433,11 @@ class TestShellToolBasic:
         # to avoid actually running bash on Windows
         tool = ShellTool(workspace=workspace, os_type="linux")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="hello\n",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="hello\n", stderr="") as mock_run:
             result = tool.execute(command="echo hello")
 
             # Verify bash was used
-            call_args = mock_run.call_args
-            cmd = call_args[0][0] if call_args[0] else call_args[1].get("args", [])
+            cmd = mock_run.calls[0]["argv"]
             # Should use bash for linux
             assert any("bash" in str(c).lower() for c in (cmd if isinstance(cmd, list) else [cmd]))
 
@@ -453,12 +448,7 @@ class TestShellToolBasic:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=1,
-                stdout="",
-                stderr="some error",
-            )
+        with fake_shell_run(returncode=1, stdout="", stderr="some error") as mock_run:
             result = tool.execute(command="exit 1")
 
         assert isinstance(result, ToolResult)
@@ -479,12 +469,7 @@ class TestShellToolTruncation:
         lines = [f"line {i}" for i in range(300)]
         long_output = "\n".join(lines)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=long_output,
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout=long_output, stderr="") as mock_run:
             result = tool.execute(command="some-long-command")
 
         assert isinstance(result, ToolResult)
@@ -506,12 +491,7 @@ class TestShellToolTruncation:
         lines = [f"line {i}" for i in range(300)]
         long_output = "\n".join(lines)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=long_output,
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout=long_output, stderr="") as mock_run:
             result = tool.execute(command="some-long-command")
 
         # Check that a tempfile was saved under workspace/orbital/output/shell-output/
@@ -530,12 +510,7 @@ class TestShellToolTruncation:
         lines = [f"line {i}" for i in range(50)]
         short_output = "\n".join(lines)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=short_output,
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout=short_output, stderr="") as mock_run:
             result = tool.execute(command="some-command")
 
         assert isinstance(result, ToolResult)
@@ -557,8 +532,7 @@ class TestShellToolTimeout:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=120)
+        with fake_shell_run(timed_out=True):
             result = tool.execute(command="sleep 999")
 
         assert isinstance(result, ToolResult)
@@ -569,8 +543,7 @@ class TestShellToolTimeout:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(cmd="sleep 999", timeout=120)
+        with fake_shell_run(timed_out=True):
             try:
                 result = tool.execute(command="sleep 999")
             except Exception:
@@ -589,12 +562,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="<html>...</html>",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="<html>...</html>", stderr="") as mock_run:
             result = tool.execute(command="curl example.com")
 
         assert isinstance(result, ToolResult)
@@ -606,12 +574,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="linux")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="downloaded",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="downloaded", stderr="") as mock_run:
             result = tool.execute(command="wget https://github.com/repo/file.tar.gz")
 
         assert isinstance(result, ToolResult)
@@ -623,12 +586,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="added 42 packages",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="added 42 packages", stderr="") as mock_run:
             result = tool.execute(command="npm install express")
 
         assert isinstance(result, ToolResult)
@@ -639,12 +597,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="linux")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="Successfully installed requests",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="Successfully installed requests", stderr="") as mock_run:
             result = tool.execute(command="pip install requests")
 
         assert isinstance(result, ToolResult)
@@ -655,12 +608,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="hello",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="hello", stderr="") as mock_run:
             result = tool.execute(command="echo hello")
 
         assert result.meta is not None
@@ -671,12 +619,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="ok",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="ok", stderr="") as mock_run:
             result = tool.execute(command="curl https://api.github.com/repos")
 
         assert result.meta is not None
@@ -687,12 +630,7 @@ class TestShellToolNetworkDetection:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="Cloning into...",
-                stderr="",
-            )
+        with fake_shell_run(returncode=0, stdout="Cloning into...", stderr="") as mock_run:
             result = tool.execute(command="git clone https://github.com/user/repo.git")
 
         assert result.meta is not None
@@ -911,7 +849,7 @@ class TestToolsNeverRaise:
         workspace = str(tmp_path)
         tool = ShellTool(workspace=workspace, os_type="windows")
 
-        with patch("subprocess.run", side_effect=OSError("no such shell")):
+        with fake_shell_run(side_effect=OSError("no such shell")):
             try:
                 result = tool.execute(command="echo test")
             except Exception:

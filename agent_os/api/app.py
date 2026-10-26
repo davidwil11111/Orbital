@@ -204,6 +204,19 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     # 0. Singleton enforcement via PID file
     acquire_pid_file()
 
+    # Spec 134 A4: a startup that fails after the claim gives the PID file
+    # back, so the next launch is not refused by a process that is only
+    # showing the error window. The caller (desktop main) logs and shows it.
+    try:
+        return _assemble_app(app, data_dir)
+    except BaseException:
+        logger.exception("Daemon startup failed; releasing the PID file")
+        release_pid_file()
+        raise
+
+
+def _assemble_app(app: FastAPI, data_dir: str | None) -> FastAPI:
+    """The body of ``create_app`` after the PID claim."""
     # 0. CORS middleware (required for React dev server on different port)
     app.add_middleware(
         CORSMiddleware,
@@ -529,6 +542,25 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _release_pid():
         release_pid_file()
+
+    # 6f. Loop-stall detector (spec 134 A3): a plain thread pings the loop
+    # every second and, when it goes 5 s without an answer, writes every
+    # thread's stack to logs/hang.log next to daemon.log (included in the
+    # Send-feedback bundle).
+    @app.on_event("startup")
+    async def _start_stall_watch():
+        from agent_os.utils import stall_watch
+
+        stall_watch.start(
+            asyncio.get_running_loop(),
+            os.path.join(data_dir or "orbital-data", "logs", "hang.log"),
+        )
+
+    @app.on_event("shutdown")
+    async def _stop_stall_watch():
+        from agent_os.utils import stall_watch
+
+        stall_watch.stop()
 
     @app.on_event("shutdown")
     async def _stop_triggers():
