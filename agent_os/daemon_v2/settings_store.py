@@ -152,6 +152,10 @@ class GlobalSettings(BaseModel):
     # ``!llm.api_key_set && !setup.api_key_skipped``. Saving a key later does
     # not reset it — once a key exists the flag is simply irrelevant.
     setup_api_key_skipped: bool = False
+    # Spec 138: sub-agent slugs unchecked in the wizard's Agents step. Seeds
+    # each NEW project's ``disabled_sub_agents``; per-project settings win
+    # and existing projects are untouched. Nothing is uninstalled.
+    sub_agents_hidden: list[str] = []
 
 
 # ---------------------------------------------------------------------------

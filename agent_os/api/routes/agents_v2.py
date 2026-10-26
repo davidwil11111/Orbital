@@ -37,6 +37,7 @@ from agent_os.daemon_v2.agent_md_seeder import (
 from agent_os.daemon_v2.default_skills_installer import install_default_skills
 from agent_os.daemon_v2.sub_agent_transcript import read_sub_agent_summary
 from agent_os.daemon_v2.provider_errors import ProviderConfigError
+from agent_os.onboarding.deferred_seed import DEFERRED_SEED_FIELD, ensure_project_seeded
 from agent_os.utils.file_lock import FileLockError
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.api.routes._attachment_formatter import (
@@ -774,11 +775,35 @@ def _project_sort_key(project: dict) -> float:
 
 # ---- Project Endpoints ----
 
+def _hidden_sub_agents() -> list[str]:
+    """The global hidden-agents default (spec 138) a new project's
+    ``disabled_sub_agents`` starts from."""
+    if _settings_store is None:
+        return []
+    try:
+        hidden = getattr(_settings_store.get(), "sub_agents_hidden", None) or []
+    except Exception:
+        logger.warning("could not read sub_agents_hidden", exc_info=True)
+        return []
+    return [h for h in hidden if isinstance(h, str) and h]
+
+
 @router.post("/projects", status_code=201)
 async def create_project(req: CreateProjectRequest):
     if not os.path.isdir(req.workspace):
         raise HTTPException(status_code=400, detail="Workspace path does not exist")
     _warn_legacy_llm_fields("POST /projects")
+    return await create_project_from_request(req)
+
+
+async def create_project_from_request(req: CreateProjectRequest, *,
+                                      deferred_seed: bool = False,
+                                      extra_fields: dict | None = None) -> dict:
+    """The one project-creation path (``POST /projects`` and the spec 138
+    batch import). ``deferred_seed`` skips the AGENTS.md seed, the default
+    skills (``orbital/``) and the queue dispatcher (it writes
+    ``orbital/queue.json``) until first use — see
+    :mod:`agent_os.onboarding.deferred_seed`. Raises HTTPException."""
     _require_known_card(req.card_id)
     project_data = {
         "name": req.name,
@@ -807,6 +832,12 @@ async def create_project(req: CreateProjectRequest):
         project_data["enabled_sub_agents"] = req.enabled_sub_agents
     if req.disabled_sub_agents is not None:
         project_data["disabled_sub_agents"] = req.disabled_sub_agents
+    else:
+        # Spec 138: agents unchecked in the wizard stay hidden in new
+        # projects; an explicit per-project list still wins.
+        hidden = _hidden_sub_agents()
+        if hidden:
+            project_data["disabled_sub_agents"] = hidden
     if req.sub_agent_deployment_instructions is not None:
         project_data["sub_agent_deployment_instructions"] = (
             req.sub_agent_deployment_instructions.strip()
@@ -834,11 +865,40 @@ async def create_project(req: CreateProjectRequest):
     elif req.budget_limit_usd is not None:
         card_provider, card_model = _card_provider_model(req.card_id)
         project_data["budget_currency"] = _provider_currency(card_provider, card_model)
+    if extra_fields:
+        project_data.update(extra_fields)
+    if deferred_seed:
+        project_data[DEFERRED_SEED_FIELD] = True
     try:
         pid = _project_store.create_project(project_data)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
+    if not deferred_seed:
+        _seed_new_project(pid)
+
+    project = _project_store.get_project(pid)
+    await _warm_agent_status()
+    # Create the project's dispatcher now (project-scoped lifecycle manager) so
+    # queue work can be picked up without waiting for a daemon restart.
+    if not deferred_seed:
+        try:
+            await _agent_manager._ensure_dispatcher(pid, project.get("workspace", ""))
+        except Exception:
+            logger.warning(
+                "failed to create dispatcher for new project %s", pid, exc_info=True,
+            )
+    # Session import (contract §6): list the folder's Claude Code / Codex
+    # sessions and import its Codex automations now, not on the first list.
+    try:
+        await asyncio.to_thread(_agent_manager.sync_imports, pid)
+    except Exception:
+        logger.warning("session import: sync failed for new project %s", pid,
+                       exc_info=True)
+    return _redact_project(project)
+
+
+def _seed_new_project(pid: str) -> None:
     # Seed default skills via the shared installer. Any failure here must not
     # fail project creation — missing skills will reconcile on first agent
     # start because `default_skills_reconciled` stays False.
@@ -853,7 +913,8 @@ async def create_project(req: CreateProjectRequest):
     # Seed the workspace-root AGENTS.md signpost. Same failure posture as the
     # skills seed — the file is a convenience for external agentic tools, and
     # a missing one is never worth failing project creation over. Seeded once
-    # here only; there is deliberately no reconcile-on-start counterpart.
+    # here (or on first use for a deferred import, spec 138); there is
+    # deliberately no reconcile-on-start counterpart.
     try:
         seed_project_agent_md(_project_store, pid)
     except Exception:
@@ -862,24 +923,19 @@ async def create_project(req: CreateProjectRequest):
             pid, exc_info=True,
         )
 
-    project = _project_store.get_project(pid)
-    await _warm_agent_status()
-    # Create the project's dispatcher now (project-scoped lifecycle manager) so
-    # queue work can be picked up without waiting for a daemon restart.
+
+async def _ensure_seeded(project_id: str) -> None:
+    """First use of a deferred-seed project (spec 138): write its AGENTS.md
+    and ``orbital/`` now, then start the queue dispatcher that creation
+    skipped. A no-op for every other project; never raises."""
+    if not ensure_project_seeded(_project_store, project_id):
+        return
+    project = _project_store.get_project(project_id) or {}
     try:
-        await _agent_manager._ensure_dispatcher(pid, project.get("workspace", ""))
+        await _agent_manager._ensure_dispatcher(project_id, project.get("workspace", ""))
     except Exception:
-        logger.warning(
-            "failed to create dispatcher for new project %s", pid, exc_info=True,
-        )
-    # Session import (contract §6): list the folder's Claude Code / Codex
-    # sessions and import its Codex automations now, not on the first list.
-    try:
-        await asyncio.to_thread(_agent_manager.sync_imports, pid)
-    except Exception:
-        logger.warning("session import: sync failed for new project %s", pid,
-                       exc_info=True)
-    return _redact_project(project)
+        logger.warning("failed to create dispatcher for seeded project %s",
+                       project_id, exc_info=True)
 
 
 @router.get("/projects")
@@ -1603,6 +1659,7 @@ async def start_onboarding(project_id: str):
         raise HTTPException(status_code=409, detail="project already has goals")
     if project_id in _ONBOARDING_STARTING:
         raise HTTPException(status_code=409, detail="onboarding already starting")
+    await _ensure_seeded(project_id)
     _ONBOARDING_STARTING.add(project_id)
     try:
         sessions = await asyncio.to_thread(_agent_manager.list_sessions, project_id)
@@ -1676,6 +1733,7 @@ async def _materialize_if_imported(project_id: str, session_id: str | None) -> N
     from agent_os.onboarding.session_import import is_imported_session_id
     if not is_imported_session_id(session_id):
         return
+    await _ensure_seeded(project_id)
     try:
         await asyncio.to_thread(
             _agent_manager.materialize_imported_session, project_id, session_id)
@@ -1690,7 +1748,14 @@ async def inject_message(project_id: str, req: InjectRequest):
     project = _project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    await _ensure_seeded(project_id)
     await _materialize_if_imported(project_id, req.session_id)
+    from agent_os.onboarding.session_import import is_imported_session_id
+    if is_imported_session_id(req.session_id):
+        # Spec 138: the first send in a session that came from another
+        # agent's history.
+        from agent_os import telemetry
+        telemetry.latch("first_imported_send")
 
     # The "Conversation so far" block a worker receives is built by
     # SubAgentManager at dispatch time (agent_os/daemon_v2/recap.py) for
@@ -2525,6 +2590,7 @@ async def add_queue_item(project_id: str, req: QueueAddItemRequest) -> dict:
     POST /queue/start (or implicitly via /queue/resume if paused)."""
     if not req.content or not req.content.strip():
         raise HTTPException(status_code=400, detail="content must be non-empty")
+    await _ensure_seeded(project_id)
     store = _resolve_queue_store(project_id)
     item = store.add_item(
         content=req.content,

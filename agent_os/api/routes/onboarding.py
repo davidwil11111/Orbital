@@ -2,64 +2,343 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""REST endpoints for first-run onboarding import discovery (backlog #34).
+"""REST endpoints for onboarding from the user's agent history (backlog #34,
+spec 138).
 
-Surfaces the read-only :mod:`agent_os.onboarding.import_scanner` to the setup
-wizard: a single ``GET`` that returns ranked, deduplicated, path-verified
-candidate projects discovered from other CLI agents (Claude Code, Codex) and
-Obsidian vaults. It reads only metadata (paths, cwd, names, timestamps, counts)
-— never transcript bodies — and creates nothing. Confirmed candidates are
-created by the caller through the existing ``POST /api/v2/projects`` flow.
+* ``GET /onboarding/history`` — starts the background history scan once and
+  reports its progress (never blocks).
+* ``GET /onboarding/importable-projects`` — folder candidates from the
+  metadata-only :mod:`agent_os.onboarding.import_scanner` (available at
+  once) plus, when the scan is done, the groups of scattered conversations.
+* ``POST /onboarding/import`` — creates the checked folders and groups as
+  projects through the one project-creation path, with the AGENTS.md seed and
+  ``orbital/`` deferred to first use.
+* ``GET /projects/{id}/left-off`` — the "Last time" / "Didn't finish" cards.
+* ``POST /telemetry/event`` — the allowlisted onboarding events the web UI
+  reports (counters and enums only).
+
+Everything is local; nothing read here leaves the machine.
 """
 
+import asyncio
 import logging
+import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel
 
 from agent_os.onboarding import scan_importable_projects
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v2/onboarding")
+projects_router = APIRouter(prefix="/api/v2/projects")
+telemetry_router = APIRouter(prefix="/api/v2/telemetry")
 
 _project_store = None
+_data_dir: str | None = None
+_setup_engine = None
+_scanner = None
+
+# How long an import waits for the scan before groups are reported missing.
+_IMPORT_SCAN_WAIT_SECONDS = 30.0
 
 
-def configure(project_store=None) -> None:
+def configure(project_store=None, *, data_dir: str | None = None, setup_engine=None,
+              scanner=None) -> None:
     """Inject the project store (spec 084 §3.2) so the scan can mark folders
-    that are already a project's workspace. Optional: with no store the scan
-    runs without exclusion, which keeps the pure-scanner tests dependency-free.
+    that are already a project's workspace, the daemon data dir (history
+    cache) and the setup engine (``agents_detected``). All optional: with no
+    store the scan runs without exclusion, which keeps the pure-scanner tests
+    dependency-free.
     """
-    global _project_store
+    global _project_store, _data_dir, _setup_engine, _scanner
     _project_store = project_store
+    _data_dir = data_dir
+    _setup_engine = setup_engine
+    _scanner = scanner
+
+
+def get_scanner():
+    """The process's history scanner (created on first use)."""
+    global _scanner
+    if _scanner is None:
+        from agent_os.onboarding.history import HistoryScanner
+        _scanner = HistoryScanner(_data_dir, on_ready=_report_scan)
+    return _scanner
+
+
+def _report_scan(scanner) -> None:
+    """Telemetry once the first scan is done: how much history there was and
+    how many supported agents are installed. Counts only."""
+    from agent_os import telemetry
+    from agent_os.telemetry.rollup import history_bucket
+
+    telemetry.emit("history_sessions_bucket",
+                   {"bucket": history_bucket(scanner.status()["sessions_total"])})
+    if _setup_engine is not None:
+        try:
+            n = sum(1 for s in _setup_engine.check_all()
+                    if s.slug != "built-in" and s.installed)
+            telemetry.emit("agents_detected", {"n": n})
+        except Exception:
+            logger.warning("agents_detected: could not check agents", exc_info=True)
+
+
+def _existing_projects() -> list[dict]:
+    if _project_store is None:
+        return []
+    try:
+        return list(_project_store.list_projects())
+    except Exception:
+        logger.exception("importable-projects: could not list existing projects")
+        return []
 
 
 def _existing_workspaces() -> set[str]:
-    if _project_store is None:
-        return set()
-    try:
-        return {
-            p.get("workspace") for p in _project_store.list_projects()
-            if p.get("workspace")
-        }
-    except Exception:
-        logger.exception("importable-projects: could not list existing projects")
-        return set()
+    return {p.get("workspace") for p in _existing_projects() if p.get("workspace")}
+
+
+def _imported_members() -> set[tuple]:
+    out = set()
+    for p in _existing_projects():
+        for m in p.get("imported_sessions") or []:
+            if isinstance(m, dict):
+                out.add((m.get("agent"), m.get("native_id")))
+    return out
+
+
+# --------------------------------------------------------------------------
+# History scan + candidates
+# --------------------------------------------------------------------------
+
+
+@router.get("/history")
+async def history_status():
+    """Start the background scan (idempotent) and report where it is."""
+    scanner = get_scanner()
+    scanner.start()
+    return scanner.status()
+
+
+def _groups_payload(scanner) -> list[dict]:
+    analysis = scanner.analysis()
+    if analysis is None:
+        return []
+    taken = _imported_members()
+    out = []
+    for group in analysis.groups:
+        if any((s.agent, s.native_id) in taken for s in group.members):
+            continue  # already brought in as a project
+        out.append(group.to_dict())
+    return out
 
 
 @router.get("/importable-projects")
 async def importable_projects():
-    """Ranked, deduped, path-verified candidates for link-only import.
-
-    Each candidate is ``{source, name, path, session_count, last_activity,
-    already_imported}``. The scan is best-effort and never raises: an
-    unreadable or missing source contributes nothing rather than failing the
-    whole response.
-    """
+    """Ranked, deduped, path-verified folder candidates for link-only import
+    (metadata only, available at once) plus, once the history scan is done,
+    the groups of scattered conversations (spec 138 contract §3). Never
+    raises: an unreadable or missing source contributes nothing."""
+    scanner = get_scanner()
+    scanner.start()
     try:
-        candidates = scan_importable_projects(
-            existing_workspaces=_existing_workspaces())
+        candidates = await asyncio.to_thread(
+            lambda: scan_importable_projects(existing_workspaces=_existing_workspaces()))
     except Exception:
         logger.exception("importable-projects scan failed")
         candidates = []
-    return {"candidates": [c.to_dict() for c in candidates]}
+    try:
+        groups = _groups_payload(scanner)
+    except Exception:
+        logger.exception("importable-projects: grouping failed")
+        groups = []
+    return {"status": scanner.status()["status"],
+            "candidates": [c.to_dict() for c in candidates],
+            "groups": groups}
+
+
+# --------------------------------------------------------------------------
+# Batch import
+# --------------------------------------------------------------------------
+
+
+class ImportGroupBody(BaseModel):
+    id: str
+    workspace: str | None = None
+
+
+class ImportBody(BaseModel):
+    folders: list[str] = []
+    groups: list[ImportGroupBody] = []
+
+
+def _members_json(sessions) -> list[dict]:
+    return [{"agent": s.agent, "native_id": s.native_id} for s in sessions]
+
+
+def _folder_members(analysis, folder: str) -> list[dict]:
+    """Sessions placed in ``folder`` that its own folder match would miss
+    (worktrees, and sessions attached by the files they touched): stored so
+    the project's session list and left-off cards include them."""
+    if analysis is None:
+        return []
+    from agent_os.onboarding.import_scanner import path_key
+    want = path_key(folder)
+    for root, project in analysis.projects.items():
+        if path_key(root) == want:
+            return _members_json(s for s in project.sessions
+                                 if not s.cwd or path_key(s.cwd) != want)
+    return []
+
+
+async def _create_imported(folder: str, members: list[dict]) -> dict:
+    from agent_os.api.routes import agents_v2
+    req = agents_v2.CreateProjectRequest(
+        name=os.path.basename(os.path.normpath(folder)) or folder,
+        workspace=folder, auto_unique_name=True)
+    extra = {"imported_sessions": members} if members else None
+    return await agents_v2.create_project_from_request(
+        req, deferred_seed=True, extra_fields=extra)
+
+
+@router.post("/import")
+async def import_projects(body: ImportBody):
+    """Create the checked folders and groups as projects (contract §3)."""
+    from agent_os import telemetry
+    from agent_os.onboarding.import_scanner import path_key
+
+    if _project_store is None:
+        raise HTTPException(status_code=503, detail="project store unavailable")
+    scanner = get_scanner()
+    scanner.start()
+    if body.groups or body.folders:
+        await asyncio.to_thread(scanner.wait, _IMPORT_SCAN_WAIT_SECONDS)
+    analysis = scanner.analysis()
+    taken = {path_key(w) for w in _existing_workspaces()}
+    created: list[dict] = []
+    skipped: list[dict] = []
+
+    async def create(path: str, origin: str, members: list[dict]) -> None:
+        if not path or not os.path.isabs(path):
+            skipped.append({"path": path, "reason": "invalid"})
+            return
+        if not os.path.isdir(path):
+            skipped.append({"path": path, "reason": "missing"})
+            return
+        if path_key(path) in taken:
+            skipped.append({"path": path, "reason": "already_imported"})
+            return
+        try:
+            project = await _create_imported(path, members)
+        except HTTPException as e:
+            logger.warning("onboarding import: %s refused (%s)", path, e.detail)
+            skipped.append({"path": path, "reason": "invalid"})
+            return
+        except Exception:
+            logger.exception("onboarding import: could not create a project for %s", path)
+            skipped.append({"path": path, "reason": "invalid"})
+            return
+        taken.add(path_key(path))
+        created.append({"project_id": project.get("project_id"), "name": project.get("name"),
+                        "workspace": project.get("workspace"), "from": origin})
+
+    for folder in body.folders:
+        await create(folder, "folder", _folder_members(analysis, folder) if folder else [])
+    for g in body.groups:
+        group = analysis.group(g.id) if analysis is not None else None
+        if group is None:
+            skipped.append({"path": g.workspace or g.id, "reason": "invalid"})
+            continue
+        await create(g.workspace or "", "group", _members_json(group.members))
+
+    n_folder = sum(1 for c in created if c["from"] == "folder")
+    n_group = len(created) - n_folder
+    if created:
+        telemetry.emit("projects_imported", {"folder": n_folder, "group": n_group})
+        telemetry.latch("first_import")
+    return {"created": created, "skipped": skipped}
+
+
+# --------------------------------------------------------------------------
+# Left-off cards
+# --------------------------------------------------------------------------
+
+
+@projects_router.get("/{project_id}/left-off")
+async def project_left_off(project_id: str):
+    if _project_store is None:
+        raise HTTPException(status_code=503, detail="project store unavailable")
+    project = _project_store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    from agent_os.onboarding.left_off import left_off_for_project
+    try:
+        return await asyncio.to_thread(left_off_for_project, dict(project), get_scanner())
+    except Exception:
+        logger.exception("left-off failed for %s", project_id)
+        return {"last_time": None, "unfinished": []}
+
+
+# --------------------------------------------------------------------------
+# Allowlisted UI telemetry events
+# --------------------------------------------------------------------------
+
+
+class TelemetryEventBody(BaseModel):
+    event: str
+    fields: dict = {}
+
+
+def _enum(fields: dict, key: str, allowed: tuple, *, required: bool = True):
+    value = fields.get(key)
+    if value is None and not required:
+        return None
+    if value not in allowed:
+        raise ValueError(f"{key} must be one of {', '.join(allowed)}")
+    return value
+
+
+def _int(fields: dict, key: str) -> int:
+    value = fields.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100_000:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return value
+
+
+def _validate_event(event: str, fields: dict) -> dict:
+    """The spooled fields of an allowlisted event; ValueError otherwise.
+    Only enum and integer values ever pass — never text."""
+    from agent_os.telemetry.rollup import LEFTOFF_KINDS, STOP_CAUSES, WIZARD_STEPS
+
+    if event == "wizard_step_reached":
+        return {"step": _enum(fields, "step", WIZARD_STEPS)}
+    if event in ("agent_located", "leftoff_shown", "agent_switch_after_open"):
+        return {}
+    if event == "leftoff_opened":
+        out = {"kind": _enum(fields, "kind", LEFTOFF_KINDS)}
+        cause = _enum(fields, "cause", STOP_CAUSES, required=False)
+        if cause is not None:
+            out["cause"] = cause
+        return out
+    if event == "projects_unchecked":
+        return {"n": _int(fields, "n")}
+    raise ValueError(f"unknown event {event!r}")
+
+
+_MILESTONE_FOR_EVENT = {"leftoff_opened": "first_leftoff_open"}
+
+
+@telemetry_router.post("/event", status_code=204)
+async def telemetry_event(body: TelemetryEventBody):
+    from agent_os import telemetry
+
+    try:
+        fields = _validate_event(body.event, body.fields if isinstance(body.fields, dict) else {})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    telemetry.emit(body.event, fields)
+    milestone = _MILESTONE_FOR_EVENT.get(body.event)
+    if milestone:
+        telemetry.latch(milestone)
+    return Response(status_code=204)

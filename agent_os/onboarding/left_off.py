@@ -1,0 +1,239 @@
+# Orbital — An operating system for AI agents
+# Copyright (C) 2026 Orbital Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Where the user left off in one project (spec 138 "Left-off cards").
+
+Sources: the project's own Orbital sessions (their JSONL) and its native
+sessions — the scanned history whose folder is the workspace, plus the
+``imported_sessions`` members a group project stores. A native session that
+was opened in Orbital (materialised) but not continued there keeps the stop
+cause its native transcript recorded; once the user wrote in it, Orbital's
+own rows decide. Blocking I/O — call off the event loop.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+
+from agent_os.onboarding.history import (
+    HistoryScanner, LeftOffEntry, git_facts, is_noise, resets_at_if_future, select_left_off,
+)
+from agent_os.onboarding.history_types import CAUSE_NETWORK_AUTH, HistorySession
+from agent_os.onboarding.sources._common import TurnState, iter_json_lines, norm_ts
+
+logger = logging.getLogger(__name__)
+
+_orbital_cache: dict[tuple, "OrbitalSession | None"] = {}
+_orbital_lock = threading.Lock()
+_ORBITAL_CACHE_MAX = 2048
+
+
+class OrbitalSession:
+    __slots__ = ("session_id", "agent", "entry", "own_rows", "skip")
+
+    def __init__(self, session_id: str, agent: str | None, entry: LeftOffEntry,
+                 own_rows: bool, skip: bool):
+        self.session_id = session_id
+        self.agent = agent
+        self.entry = entry
+        self.own_rows = own_rows   # any conversation row written in Orbital (not imported)
+        self.skip = skip           # memory / automation / fan-out child: never a card
+
+
+def _row_imported(row: dict) -> bool:
+    meta = row.get("_meta")
+    return isinstance(meta, dict) and bool(meta.get("imported"))
+
+
+def read_orbital_session(path: str) -> OrbitalSession | None:
+    """One Orbital session JSONL → its left-off facts. None when unreadable
+    or it holds no conversation."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    with _orbital_lock:
+        if key in _orbital_cache:
+            return _orbital_cache[key]
+    result = _read_orbital(path)
+    with _orbital_lock:
+        if len(_orbital_cache) >= _ORBITAL_CACHE_MAX:
+            _orbital_cache.clear()
+        _orbital_cache[key] = result
+    return result
+
+
+def _read_orbital(path: str) -> OrbitalSession | None:
+    stem = os.path.basename(path)[:-len(".jsonl")]
+    probe = HistorySession(agent="orbital", native_id=stem, path=path)
+    turn = TurnState(probe)
+    session_id = None
+    agent = None
+    skip = False
+    own_rows = False
+    any_row = False
+    try:
+        for row in iter_json_lines(path):
+            if session_id is None and isinstance(row.get("session_id"), str):
+                session_id = row["session_id"]
+            role = row.get("role")
+            ts = norm_ts(row.get("timestamp"))
+            meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+            if role == "meta":
+                event = row.get("event")
+                if event == "session_start":
+                    if row.get("origin") == "memory" or row.get("trigger_type"):
+                        skip = True
+                elif event == "session_kind":
+                    skip = True
+                continue
+            imported = _row_imported(row)
+            if role == "user":
+                if row.get("source") == "daemon":
+                    continue
+                any_row = True
+                own_rows = own_rows or not imported
+                target = row.get("target")
+                agent = target if isinstance(target, str) and target else None
+                probe.ended_at = ts or probe.ended_at
+                turn.user_text(row.get("content"), ts)
+            elif role == "assistant":
+                any_row = True
+                own_rows = own_rows or not imported
+                probe.ended_at = ts or probe.ended_at
+                if row.get("tool_calls"):
+                    turn.working()
+                elif isinstance(row.get("content"), str) and row["content"].strip():
+                    turn.answered()
+            elif role == "tool":
+                any_row = True
+                turn.working()
+            elif role == "system":
+                content = row.get("content") if isinstance(row.get("content"), str) else ""
+                event = meta.get("event")
+                if event == "sub_agent_terminal":
+                    any_row = True
+                    own_rows = own_rows or not imported
+                    probe.ended_at = ts or probe.ended_at
+                    kind = meta.get("kind")
+                    if kind == "error":
+                        turn.error(content, ts)
+                    elif kind == "stopped":
+                        turn.interrupted("stopped")
+                    else:
+                        turn.answered()
+                elif row.get("source") == "management":
+                    if content.startswith("LLM error") or "API key was rejected" in content:
+                        probe.ended_at = ts or probe.ended_at
+                        turn.error(content, ts, fallback=CAUSE_NETWORK_AUTH)
+                    elif content.startswith("[cancelled by user]"):
+                        probe.ended_at = ts or probe.ended_at
+                        turn.interrupted("cancelled")
+                elif content.startswith("[Sub-agent]") and "stopped with error" in content:
+                    probe.ended_at = ts or probe.ended_at
+                    turn.error(content, ts)
+    except OSError:
+        return None
+    if not any_row:
+        return None
+    turn.finish()
+    entry = LeftOffEntry(
+        session_id=session_id or stem,
+        agent=agent,
+        user_text=probe.last_user_text,
+        at=probe.ended_at or probe.last_user_at,
+        stop=probe.stop,
+    )
+    return OrbitalSession(entry.session_id, entry.agent, entry, own_rows,
+                          skip or probe.automation)
+
+
+def _orbital_entries(workspace: str) -> list[OrbitalSession]:
+    from agent_os.agent.project_paths import ProjectPaths
+    sessions_dir = ProjectPaths(workspace).sessions_dir
+    try:
+        names = os.listdir(sessions_dir)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        parsed = read_orbital_session(os.path.join(sessions_dir, name))
+        if parsed is not None and not parsed.skip:
+            out.append(parsed)
+    return out
+
+
+def _native_entry(s: HistorySession) -> LeftOffEntry:
+    from agent_os.onboarding.session_import import imported_session_id
+    return LeftOffEntry(
+        session_id=imported_session_id(s.agent, s.native_id),
+        agent=s.agent,
+        user_text=s.last_user_text,
+        at=s.ended_at or s.last_user_at,
+        stop=s.stop,
+        branch=s.branch,
+    )
+
+
+def project_native_sessions(project: dict, sessions: list[HistorySession],
+                            env) -> list[HistorySession]:
+    """The scanned sessions of a project: same folder, or a stored member."""
+    from agent_os.onboarding.import_scanner import path_key
+    workspace = project.get("workspace") or ""
+    want = path_key(workspace) if workspace else None
+    members = {(m.get("agent"), m.get("native_id"))
+               for m in project.get("imported_sessions") or [] if isinstance(m, dict)}
+    out = []
+    for s in sessions:
+        if is_noise(s, env):
+            continue
+        if (s.agent, s.native_id) in members or (want and s.cwd and path_key(s.cwd) == want):
+            out.append(s)
+    return out
+
+
+def _entry_json(e: LeftOffEntry) -> dict:
+    return {"session_id": e.session_id, "agent": e.agent, "user_text": e.user_text, "at": e.at}
+
+
+def left_off_for_project(project: dict, scanner: HistoryScanner | None, *,
+                         now=None) -> dict:
+    workspace = project.get("workspace") or ""
+    entries: dict[str, LeftOffEntry] = {}
+    natives: dict[str, LeftOffEntry] = {}
+    if scanner is not None and not project.get("is_scratch"):
+        try:
+            sessions = scanner.collect()
+            for s in project_native_sessions(project, sessions, scanner.env()):
+                e = _native_entry(s)
+                natives[e.session_id] = e
+        except Exception:
+            logger.warning("left-off: native history unavailable", exc_info=True)
+    entries.update(natives)
+    if workspace and os.path.isdir(workspace):
+        for o in _orbital_entries(workspace):
+            # An imported session the user never wrote in keeps the native
+            # transcript's ending (materialising one rewrites every reply as
+            # a completed row).
+            if o.session_id in natives and not o.own_rows:
+                continue
+            entries[o.session_id] = o.entry
+    picked = select_left_off(list(entries.values()), now=now)
+    last = picked["last_time"]
+    last_json = None
+    if last is not None:
+        last_json = _entry_json(last)
+        last_json["git"] = git_facts(workspace, last.at, last.branch) if workspace else None
+    unfinished = []
+    for e in picked["unfinished"]:
+        item = _entry_json(e)
+        item["cause"] = e.stop.cause
+        item["resets_at"] = resets_at_if_future(e.stop, now)
+        unfinished.append(item)
+    return {"last_time": last_json, "unfinished": unfinished}

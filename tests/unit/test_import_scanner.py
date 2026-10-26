@@ -19,6 +19,7 @@ import sqlite3
 import pytest
 
 from agent_os.onboarding import scan_importable_projects
+from agent_os.onboarding.history_paths import HistoryEnv
 from agent_os.onboarding.import_scanner import (
     SOURCE_CLAUDE_CODE,
     SOURCE_CODEX,
@@ -109,12 +110,17 @@ def home(tmp_path):
 
 
 def _scan(home, tmp_path):
-    """Run the scanner against the fixture home's default-derived locations."""
+    """Run the scanner against the fixture home's default-derived locations.
+
+    Spec 138: temp roots are never offered, and pytest's tmp_path is one, so
+    the fixture runs with an env for the fixture home (whose temp ancestors
+    do not count)."""
     obsidian_cfg = str(tmp_path / "obsidian" / "obsidian.json")
     return scan_importable_projects(
         claude_projects_dir=str(home / ".claude" / "projects"),
         codex_dir=str(home / ".codex"),
         obsidian_config_path=obsidian_cfg,
+        env=HistoryEnv.for_home(str(home)),
     )
 
 
@@ -293,6 +299,7 @@ def test_missing_sources_yield_empty_not_error(tmp_path):
         claude_projects_dir=str(tmp_path / "nope-claude"),
         codex_dir=str(tmp_path / "nope-codex"),
         obsidian_config_path=str(tmp_path / "nope" / "obsidian.json"),
+        env=HistoryEnv.for_home(str(tmp_path)),
     )
     assert cands == []
 
@@ -378,3 +385,84 @@ def test_claude_project_dirs_for_matches_by_recorded_cwd(home, tmp_path):
         return  # no symlink privilege (Windows): the realpath leg is covered elsewhere
     assert claude_project_dirs_for(projects, str(link)) == [d_target]
     assert claude_project_dirs_for(str(tmp_path / "none"), str(target)) == []
+
+
+# --------------------------------------------------------------------------
+# Spec 138 pass 1 — repo folding, never-a-project folders, minor folders
+# --------------------------------------------------------------------------
+
+
+def _git_repo_with_worktree(root, wt):
+    import subprocess
+    subprocess.run(["git", "init", "-q", root], check=True)
+    subprocess.run(["git", "-C", root, "-c", "user.email=a@b", "-c", "user.name=a",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", root, "worktree", "add", "-q", wt], check=True)
+
+
+def test_worktree_sessions_fold_onto_the_main_repo(home, tmp_path):
+    from agent_os.onboarding.history import clear_git_cache
+    clear_git_cache()
+    repo = str(tmp_path / "work" / "app")
+    wt = str(tmp_path / "work" / "app-wt")
+    os.makedirs(os.path.dirname(repo), exist_ok=True)
+    _git_repo_with_worktree(repo, wt)
+    _write_claude_project(str(home / ".claude" / "projects"), repo, n_sessions=1)
+    _write_claude_project(str(home / ".claude" / "projects"), wt, n_sessions=1)
+    _write_codex_index(str(home / ".codex"), [(os.path.join(wt, "sub"), 1_777_000_000)])
+    os.makedirs(os.path.join(wt, "sub"))
+
+    cands = _scan(home, tmp_path)
+    assert len(cands) == 1
+    c = cands[0].to_dict()
+    assert os.path.realpath(c["path"]) == os.path.realpath(repo)
+    assert c["name"] == "app"
+    assert c["session_count"] == 3
+    assert c["by_agent"] == {"claude-code": 2, "codex": 1}
+    assert c["is_git"] is True and c["minor"] is False and c["kind"] == "folder"
+
+
+def test_containers_and_temp_roots_are_never_candidates(home, tmp_path):
+    desktop = str(home / "Desktop")
+    os.makedirs(desktop)
+    scratch = str(home / "Library" / "Caches" / "x")
+    os.makedirs(scratch)
+    _write_claude_project(str(home / ".claude" / "projects"), str(home), n_sessions=4)
+    _write_claude_project(str(home / ".claude" / "projects"), desktop, n_sessions=4)
+    _write_claude_project(str(home / ".claude" / "projects"), scratch, n_sessions=4)
+    assert _scan(home, tmp_path) == []
+
+
+def test_minor_folder_and_agent_md_folder(home, tmp_path):
+    small = str(tmp_path / "small")
+    md = str(tmp_path / "with-md")
+    many = str(tmp_path / "many")
+    for p in (small, md, many):
+        os.makedirs(p)
+    open(os.path.join(md, "AGENTS.md"), "w").close()
+    projects = str(home / ".claude" / "projects")
+    _write_claude_project(projects, small, n_sessions=2)
+    _write_claude_project(projects, md, n_sessions=1)
+    _write_claude_project(projects, many, n_sessions=3)
+    by_path = {c.path: c.to_dict() for c in _scan(home, tmp_path)}
+    assert by_path[small]["minor"] is True
+    assert by_path[md]["minor"] is False and by_path[md]["is_git"] is False
+    assert by_path[many]["minor"] is False
+
+
+def test_obsidian_vault_is_never_minor(home, tmp_path):
+    vault = str(tmp_path / "vault")
+    os.makedirs(vault)
+    _write_obsidian(str(tmp_path / "obsidian" / "obsidian.json"), [(vault, 1_777_000_000_000)])
+    (c,) = _scan(home, tmp_path)
+    assert c.to_dict()["minor"] is False and c.to_dict()["kind"] == "folder"
+
+
+def test_history_home_env_moves_the_default_roots(tmp_path, monkeypatch):
+    staged = tmp_path / "staged"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _write_claude_project(str(staged / ".claude" / "projects"), str(proj), n_sessions=3)
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", str(staged))
+    monkeypatch.delenv("ORBITAL_CODEX_HOME", raising=False)
+    assert [c.path for c in scan_importable_projects()] == [str(proj)]

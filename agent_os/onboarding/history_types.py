@@ -62,6 +62,7 @@ class HistorySession:
     skills: list[str] = field(default_factory=list)         # skill names used
     stop: StopInfo | None = None     # None = the last turn ended in a real answer
     resume_path: str | None = None   # file the agent's resume needs (Codex rollout, pi session file)
+    branch: str | None = None        # git branch the session ran on, when recorded
 
 
 class HistorySource(Protocol):

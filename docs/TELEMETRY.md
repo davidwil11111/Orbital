@@ -35,7 +35,11 @@ machine. The exact outbound JSON is also inspectable in-app, verbatim, under
     "key_set": true,
     "first_project": true,
     "first_session": true,
-    "first_turn": true
+    "first_turn": true,
+    "key_skipped": false,
+    "first_import": true,
+    "first_leftoff_open": true,
+    "first_imported_send": false
   },
   "counters": {
     "app_starts": 2,
@@ -87,7 +91,20 @@ machine. The exact outbound JSON is also inspectable in-app, verbatim, under
         "error_class": null,
         "stderr_category": "other"
       }
-    ]
+    ],
+    "wizard_step_reached": { "agents": 1, "projects": 1, "key": 1, "accounts": 1, "done": 1 },
+    "agents_detected": 2,
+    "agents_located": 0,
+    "history_sessions_bucket": "100+",
+    "projects_imported": { "folder": 3, "group": 1 },
+    "projects_unchecked": 2,
+    "leftoff_shown": 4,
+    "leftoff_opened": { "last_time": 0, "unfinished": 1 },
+    "unfinished_opened_by_cause": {
+      "usage_limit": 1, "model_unavailable": 0, "network_auth": 0,
+      "interrupted": 0, "no_reply": 0
+    },
+    "agent_switch_after_open": 1
   }
 }
 ```
@@ -101,7 +118,7 @@ machine. The exact outbound JSON is also inspectable in-app, verbatim, under
 | `os` | enum | `darwin` \| `windows` \| `linux`. |
 | `date` | ISO date | The UTC day this aggregate covers. |
 | `first_seen` | ISO date | When this install id was minted. |
-| `milestones` | booleans | Lifetime activation flags: API key set, first project, first session, first turn. |
+| `milestones` | booleans | Lifetime activation flags: API key set, first project, first session, first turn. Since spec 138 also: `key_skipped` (the setup wizard's Orbital-agent key step was skipped), `first_import` (projects were first imported from the user's agent history), `first_leftoff_open` (a "Last time" / "Didn't finish" card was first opened), `first_imported_send` (a first message was sent in a conversation that came from another agent's history). |
 | `counters.app_starts` | int | Daemon starts that day. |
 | `counters.projects_created` | int | Projects created (the auto-created scratch workspace is not counted). |
 | `counters.sessions` | int | Chat sessions created. |
@@ -121,6 +138,17 @@ machine. The exact outbound JSON is also inspectable in-app, verbatim, under
 | `counters.subagent_failed_by_reason` | map | `subagent_failed` split by a fixed enum: `spawn` (the process never started), `runtime_error` (the task errored), `adapter_broken` (Orbital's own transport failed), `not_authenticated` (refused before dispatch: the CLI is installed but not signed in / has no key), `update_needed` (refused before dispatch: the CLI is older than the version Orbital needs), `unknown` (rows from before the enum). |
 | `counters.subagent_by_agent` | map | Per sub-agent: `{agent: {dispatched, failed, failed_by_reason}}`, with `failed_by_reason` the same enum as above. Keys are built-in sub-agent names only (`claude-code`, `codex`, `gemini-cli`, …), `native` for Orbital's own fanout workers, and `other` for any name that is not built in — so no free text leaves the machine. |
 | `counters.recent_failures` | list | The day's last 20 `login_failed` / `login_unverified` / `update_failed` / `subagent_failed` events with structured diagnostics, so a failing install can be understood without asking for logs. Every field is an enum or a number: `ts` (ISO time), `event`, `agent` (allowlisted as above), `reason` (the enums above), `exit_code` (int or null), `cli_version` (the dotted version number read from `--version`, or null), `install_kind` (`npm` / `native` / `unknown`, judged from where the binary was found), `duration_ms`, `error_class` (an exception class name from a fixed set, `other`, or null), `stderr_category` (`unknown_command` / `not_logged_in` / `network` / `timeout` / `batch_refused` / `other` — the CLI's output mapped through fixed patterns; the text itself never leaves). |
+
+| `counters.wizard_step_reached` | map | Setup-wizard steps reached that day: `agents`, `projects`, `key`, `accounts`, `done` (a fixed enum; one count per arrival). |
+| `counters.agents_detected` | int or null | How many supported coding agents (Claude Code, Codex, …) were found installed when the wizard read the history — the day's latest figure; `null` when not measured that day. A count only, never which ones. |
+| `counters.agents_located` | int | Agents the user pointed Orbital at by hand ("Installed but not found?"). |
+| `counters.history_sessions_bucket` | enum or null | How many past conversations Orbital found on this machine, as a bucket: `0`, `1-10`, `11-100`, `100+`. Never the conversations, their folders or their text — those are read locally and never leave the machine. |
+| `counters.projects_imported` | map | Projects created by the import: `folder` (a folder the user had worked in) and `group` (scattered conversations brought together). Counts only. |
+| `counters.projects_unchecked` | int | Suggested projects the user unchecked before importing. |
+| `counters.leftoff_shown` | int | Times the "where you left off" cards were shown in a project's new-session view. |
+| `counters.leftoff_opened` | map | Cards opened: `last_time` or `unfinished`. |
+| `counters.unfinished_opened_by_cause` | map | Opened "Didn't finish" cards by why the conversation stopped (fixed enum: `usage_limit`, `model_unavailable`, `network_auth`, `interrupted`, `no_reply`). Never the error text. |
+| `counters.agent_switch_after_open` | int | Times the user picked a different agent after opening a card. |
 
 `counters.sessions` counts sessions at the point they are minted, so every
 path produces one: the "+ New session" button, the first-run cold-start scan,
