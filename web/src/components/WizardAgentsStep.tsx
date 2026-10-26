@@ -23,7 +23,7 @@ import { useT } from '../i18n/useT';
 import { useWebSocket } from '../hooks/useWebSocket';
 import type { WebSocketEvent } from '../types';
 import { pickLoginUrl } from '../utils/loginUrl';
-import type { HistoryStatus } from '../utils/onboarding';
+import { conversationCount, type HistoryStatus } from '../utils/onboarding';
 import { sendTelemetry } from '../utils/telemetry';
 import MessageAvatar from './MessageAvatar';
 import NotDetectedRow from './NotDetectedRow';
@@ -172,10 +172,8 @@ export default function WizardAgentsStep({ entries, history, ticks, onToggle, re
     await reload();
   }, [reload]);
 
-  const conversationsFor = (slug: string): number | null => {
-    const n = history?.by_agent?.[slug];
-    return typeof n === 'number' ? n : null;
-  };
+  const conversationsFor = (slug: string): number | null =>
+    conversationCount(history?.by_agent, slug);
 
   const notFound = missing.length > 0 && (
     <section className={none ? '' : 'mt-6 border-t border-border pt-5'} data-testid="wizard-not-found">

@@ -29,13 +29,17 @@ interface TourStep {
   anchors: string[];
   titleKey: StringKey;
   bodyKey: StringKey;
+  /** The spotlit control stays clickable, and using it moves the tour on.
+   *  The left-off stop says "open one" — a blocker over the cards would make
+   *  that the one thing the user cannot do. */
+  interactive?: boolean;
 }
 
 // Listed in the no-history order; orderTourStops moves the left-off cards
 // (spec 138: shown only when the project has history) to the front with the
 // agents stop right behind them.
 const STEPS: TourStep[] = [
-  { id: 'leftOff', anchors: ['left-off'], titleKey: 'tour.leftOff.title', bodyKey: 'tour.leftOff.body' },
+  { id: 'leftOff', anchors: ['left-off'], titleKey: 'tour.leftOff.title', bodyKey: 'tour.leftOff.body', interactive: true },
   { id: 'project', anchors: ['project-header'], titleKey: 'tour.project.title', bodyKey: 'tour.project.body' },
   { id: 'agents', anchors: ['pin-select'], titleKey: 'tour.agents.title', bodyKey: 'tour.agents.body' },
   { id: 'panel', anchors: ['workspace-panel', 'panel-handle'], titleKey: 'tour.panel.title', bodyKey: 'tour.panel.body' },
@@ -157,6 +161,22 @@ export default function FirstJourneyTour({ folderName, agentNames, onClose }: Fi
     else setIndex((i) => i + 1);
   }, [steps, index, onClose]);
 
+  // An interactive stop: a click inside the spotlit control is the user doing
+  // what the stop asked, so the tour steps on once the next screen has
+  // mounted (opening a card swaps the empty chat for the session).
+  useEffect(() => {
+    if (!step?.interactive) return;
+    const el = findAnchor(step);
+    if (!el) return;
+    let timer = 0;
+    const onClick = () => { timer = window.setTimeout(advance, 400); };
+    el.addEventListener('click', onClick);
+    return () => {
+      el.removeEventListener('click', onClick);
+      window.clearTimeout(timer);
+    };
+  }, [step, anchorBox, advance]);
+
   // Esc skips. Capture phase + stopPropagation so a dialog underneath (none is
   // expected mid-tour, but the listeners are window-level) does not also act.
   useEffect(() => {
@@ -186,8 +206,14 @@ export default function FirstJourneyTour({ folderName, agentNames, onClose }: Fi
   return createPortal(
     <div data-testid="first-journey-tour">
       {/* Click blocker: the tour is modal — a stray click on the app beneath
-          would navigate away from the thing being explained. */}
-      <div className="fixed inset-0 z-[200]" />
+          would navigate away from the thing being explained. An interactive
+          stop blocks everything AROUND the spotlight instead, so the spotlit
+          control itself still takes clicks. */}
+      {step.interactive ? (
+        <InteractiveBlocker box={anchorBox} pad={SPOTLIGHT_PAD} />
+      ) : (
+        <div className="fixed inset-0 z-[200]" />
+      )}
       {/* Spotlight: a hole the size of the anchor, everything else dimmed by
           one huge box-shadow. pointer-events-none — the blocker owns clicks. */}
       <div
@@ -247,5 +273,23 @@ export default function FirstJourneyTour({ folderName, agentNames, onClose }: Fi
       </div>
     </div>,
     document.body,
+  );
+}
+
+/** Four blockers framing the spotlight hole: the page around it is inert, the
+ *  hole itself passes clicks to the control underneath. */
+function InteractiveBlocker({ box, pad }: { box: Box; pad: number }) {
+  const top = Math.max(0, box.top - pad);
+  const left = Math.max(0, box.left - pad);
+  const bottom = box.top + box.height + pad;
+  const right = box.left + box.width + pad;
+  const cls = 'fixed z-[200]';
+  return (
+    <>
+      <div data-testid="tour-blocker" className={cls} style={{ left: 0, top: 0, right: 0, height: top }} />
+      <div data-testid="tour-blocker" className={cls} style={{ left: 0, top: bottom, right: 0, bottom: 0 }} />
+      <div data-testid="tour-blocker" className={cls} style={{ left: 0, top, width: left, height: bottom - top }} />
+      <div data-testid="tour-blocker" className={cls} style={{ left: right, top, right: 0, height: bottom - top }} />
+    </>
   );
 }

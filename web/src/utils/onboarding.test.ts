@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  conversationCount,
   agentDisplayName,
   buildImportRequest,
   folderKey,
@@ -169,5 +170,15 @@ describe('agentDisplayName', () => {
     expect(agentDisplayName('minimax-code')).toBe('MiniMax Code');
     expect(agentDisplayName('mystery')).toBe('mystery');
     expect(agentDisplayName(null)).toBe('Orbital');
+  });
+});
+
+describe('conversationCount — the Agents step count', () => {
+  it('shows a count only when the agent has history here', () => {
+    const by = { 'claude-code': 214, 'kimi-code': 0 };
+    expect(conversationCount(by, 'claude-code')).toBe(214);
+    expect(conversationCount(by, 'kimi-code')).toBeNull();
+    expect(conversationCount(by, 'gemini-cli')).toBeNull();
+    expect(conversationCount(undefined, 'codex')).toBeNull();
   });
 });

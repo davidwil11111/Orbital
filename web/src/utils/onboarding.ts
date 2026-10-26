@@ -257,3 +257,14 @@ export function parseLeftOff(raw: unknown): LeftOffResponse | null {
 export function hasLeftOff(r: LeftOffResponse | null): boolean {
   return !!r && (r.last_time !== null || r.unfinished.length > 0);
 }
+
+/** The "N conversations" count the Agents step shows for one agent: null
+ *  (no count) when the agent has no history reader, and also when it has
+ *  none on this computer — "0 conversations" reads like something broke. */
+export function conversationCount(
+  byAgent: Record<string, number> | undefined,
+  slug: string,
+): number | null {
+  const n = byAgent?.[slug];
+  return typeof n === 'number' && n > 0 ? n : null;
+}

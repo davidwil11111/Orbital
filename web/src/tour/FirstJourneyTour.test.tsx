@@ -105,6 +105,17 @@ describe('FirstJourneyTour', () => {
     expect(stepId()).toBe('project');
   });
 
+  it('the left-off cards stay clickable on their stop, and opening one moves the tour on', async () => {
+    mountAnchors(['left-off', ...ALL]);
+    render(<FirstJourneyTour folderName="x" agentNames={['Codex']} onClose={vi.fn()} />);
+    await waitFor(() => expect(stepId()).toBe('leftOff'));
+    // No full-page blocker over the cards: four blockers frame the hole.
+    expect(screen.getAllByTestId('tour-blocker')).toHaveLength(4);
+    fireEvent.click(document.querySelector('[data-tour="left-off"]')!);
+    await waitFor(() => expect(stepId()).toBe('agents'));
+    expect(screen.queryAllByTestId('tour-blocker')).toHaveLength(0);
+  });
+
   it('waits for the left-off answer before fixing its stops', async () => {
     // The header is up but the empty chat has not answered yet (still
     // loading, or not even mounted).
