@@ -100,6 +100,30 @@ def test_the_bg_cmd_launcher_records_output_and_exit_code(tmp_path):
     assert row["session_id"] == SID
 
 
+def test_the_bg_cmd_job_sees_the_callers_path(tmp_path):
+    # Batch 1026 Windows pass (D6): the WMI-created job got the account's
+    # default environment, so in safe mode the worker's job could not find
+    # the per-user python the sandboxed shell had on its PATH.
+    job_launcher.ensure_launcher(str(tmp_path))
+    tools = tmp_path / "only (on) caller path"
+    tools.mkdir()
+    (tools / "orbtool.cmd").write_text("@echo orbtool-ran\r\n")
+    env = {**os.environ, "ORBITAL_SESSION_ID": SID, "ORBITAL_PROJECT_ID": "p",
+           "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+    out = subprocess.run(
+        [os.path.join(str(tmp_path), "orbital", "bin", "bg.cmd"), "orbtool"],
+        cwd=str(tmp_path), capture_output=True, text=True, env=env, timeout=60)
+    assert out.returncode == 0, out.stderr
+    job_id = out.stdout.split("Started background job ")[1].split(" ")[0]
+    d = os.path.join(str(tmp_path), "orbital", "jobs", job_id)
+    exit_path = os.path.join(d, "exit")
+    deadline = time.monotonic() + 30
+    while not os.path.exists(exit_path) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert "orbtool-ran" in open(os.path.join(d, "output.log"), errors="replace").read()
+    assert open(exit_path).read().split()[0] == "0"
+
+
 def test_the_bg_cmd_launcher_survives_a_bare_exit_and_keeps_bangs(tmp_path):
     # Windows pass 2026-10-27: the command's own `exit` ended the cmd.exe that
     # was meant to record the exit code, its /v:on ate every `!`, and the

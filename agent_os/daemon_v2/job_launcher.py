@@ -92,8 +92,11 @@ BG_CMD = '@echo off\r\n' \
 
 # Windows. Win32_Process.Create (WMI) starts the runner outside the calling
 # process's Job Object, so a CLI that kills its job at turn end does not take
-# the job with it. The WMI-created process gets the user's default
-# environment, not the calling shell's.
+# the job with it. The WMI-created process gets the account's default
+# environment, not the calling shell's; bg.ps1 saves the caller's PATH in the
+# job folder and the runner restores it, since without it a safe-mode job
+# (worker account) could not find the per-user python or node the sandboxed
+# shell had on its PATH (Windows pass 2026-10-27).
 #
 # The runner is a batch file (bg-run.cmd), not one compound ``cmd /c "(cmd) &
 # echo !errorlevel! …"`` line: a command that ran ``exit`` ended that cmd.exe
@@ -123,6 +126,7 @@ $id = 'job_' + (-join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum
 $dir = Join-Path $jobs $id
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 [IO.File]::WriteAllText((Join-Path $dir 'cmd'), $cmd + "`n")
+[IO.File]::WriteAllText((Join-Path $dir 'path'), $env:PATH + "`n")
 [IO.File]::WriteAllText((Join-Path $dir 'output.log'), '')
 $line = 'conhost.exe cmd.exe /d /s /c ""' + (Join-Path $bin 'bg-run.cmd') + '" "' + $dir + '""'
 $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
@@ -157,6 +161,9 @@ BG_RUN_CMD = '\r\n'.join([
     'set "d=%~1"',
     'set "c="',
     'for /f usebackq^ delims^=^ eol^= %%L in ("%d%\\cmd") do if not defined c set "c=%%L"',
+    'set "p="',
+    'if exist "%d%\\path" for /f usebackq^ delims^=^ eol^= %%L in ("%d%\\path") do if not defined p set "p=%%L"',
+    'if defined p set "PATH=%p%"',
     'setlocal EnableDelayedExpansion',
     'cmd.exe /d /s /c "(!c!) >>"!d!\\output.log" 2>&1"',
     'set "rc=!errorlevel!"',
