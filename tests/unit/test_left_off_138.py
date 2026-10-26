@@ -226,3 +226,23 @@ def test_route_404_and_shape(world, tmp_path):
         assert r.json() == {"last_time": None, "unfinished": []}
     finally:
         onboarding_routes.configure()
+
+
+def test_native_session_orbital_ran_as_a_worker_is_not_a_card(world):
+    """Kimi Code / MiniMax Code / pi mark nothing as Orbital-started: a native
+    session one of Orbital's own sessions drove (its sub_agent_thread record)
+    is that Orbital session, never a second "your history" card."""
+    home, ws, _desk, scanner = world
+    codex_session(home, "019a-driven", ws, user="worker task text", at=iso(1), aborted=True)
+    codex_session(home, "019a-users", ws, user="the user's own chat", at=iso(2), aborted=True)
+    orbital_session(ws, "orb_w", [
+        {"role": "user", "source": "user", "content": "fix the build", "timestamp": iso(1)},
+        {"role": "meta", "event": "sub_agent_thread", "timestamp": iso(1),
+         "handle": "codex", "thread": {"session_id": "019a-driven"}},
+        {"role": "assistant", "source": "management", "content": "Fixed.", "timestamp": iso(1)},
+    ])
+    out = lo.left_off_for_project({"workspace": ws}, scanner)
+    ids = [u["session_id"] for u in out["unfinished"]]
+    assert imported_session_id("codex", "019a-driven") not in ids
+    assert ids == [imported_session_id("codex", "019a-users")]
+    assert out["last_time"]["session_id"] == "orb_w"

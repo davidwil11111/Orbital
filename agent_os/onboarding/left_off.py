@@ -207,17 +207,29 @@ def left_off_for_project(project: dict, scanner: HistoryScanner | None, *,
     workspace = project.get("workspace") or ""
     entries: dict[str, LeftOffEntry] = {}
     natives: dict[str, LeftOffEntry] = {}
+    native_ids: dict[str, str] = {}
     if scanner is not None and not project.get("is_scratch"):
         try:
             sessions = scanner.collect()
             for s in project_native_sessions(project, sessions, scanner.env()):
                 e = _native_entry(s)
                 natives[e.session_id] = e
+                native_ids[e.session_id] = s.native_id
         except Exception:
             logger.warning("left-off: native history unavailable", exc_info=True)
     entries.update(natives)
     if workspace and os.path.isdir(workspace):
-        for o in _orbital_entries(workspace):
+        orbital = _orbital_entries(workspace)
+        # A native session one of Orbital's own sessions ran as its worker
+        # thread is that Orbital session, not the user's history (Kimi Code,
+        # MiniMax Code and pi leave no marker of who started them).
+        from agent_os.onboarding.session_import import orbital_thread_ids
+        own_ids = {o.session_id for o in orbital}
+        driven = orbital_thread_ids(workspace)
+        for sid in natives:
+            if native_ids[sid] in driven and sid not in own_ids:
+                entries.pop(sid, None)
+        for o in orbital:
             # An imported session the user never wrote in keeps the native
             # transcript's ending (materialising one rewrites every reply as
             # a completed row).
