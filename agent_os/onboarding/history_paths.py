@@ -23,9 +23,11 @@ def history_home() -> str:
 
 
 def claude_dir(home: str | None = None) -> str:
-    """``~/.claude`` under ``home``. ``CLAUDE_CONFIG_DIR`` wins only when no
-    history home override is set (the override is the smoke's whole point)."""
-    if home is None and not os.environ.get("ORBITAL_HISTORY_HOME"):
+    """``$CLAUDE_CONFIG_DIR``, else ``~/.claude`` under ``home``. An explicit
+    ``home`` wins over the variable; the ``ORBITAL_HISTORY_HOME`` override
+    does not (the session list has always honoured ``CLAUDE_CONFIG_DIR``,
+    and a user who set it keeps their history there)."""
+    if home is None:
         env = os.environ.get("CLAUDE_CONFIG_DIR")
         if env:
             return env
@@ -33,12 +35,12 @@ def claude_dir(home: str | None = None) -> str:
 
 
 def codex_dir(home: str | None = None) -> str:
-    """``$ORBITAL_CODEX_HOME`` > ``~/.codex`` under ``home``; ``CODEX_HOME``
-    only when no history home override is set."""
+    """``$ORBITAL_CODEX_HOME`` > ``$CODEX_HOME`` > ``~/.codex`` under ``home``
+    (an explicit ``home`` wins over ``CODEX_HOME``)."""
     env = os.environ.get("ORBITAL_CODEX_HOME")
     if env:
         return env
-    if home is None and not os.environ.get("ORBITAL_HISTORY_HOME"):
+    if home is None:
         env = os.environ.get("CODEX_HOME")
         if env:
             return env

@@ -720,3 +720,21 @@ def test_pi_kimi_minimax_conversion_and_resume_records(ws, hhome):
         f"Summarise {ws}/README.md"]
     assert "agent-context" not in json.dumps(mm.all_rows())
     assert mm.thread_record["thread"]["session_id"] == hb.MINIMAX_ID
+
+
+def test_session_list_reads_the_same_home_as_the_history_scan(monkeypatch, tmp_path):
+    """Spec 138: the session list and the history scan must agree on where
+    Claude Code and Codex history lives, or a project's cards name sessions
+    its own list does not show."""
+    from agent_os.onboarding import history_paths
+    from agent_os.onboarding import session_import as si
+    home = str(tmp_path / "staged")
+    monkeypatch.setenv("ORBITAL_HISTORY_HOME", home)
+    monkeypatch.delenv("ORBITAL_CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert si.claude_home() == history_paths.claude_dir() == os.path.join(home, ".claude")
+    assert si.codex_home() == history_paths.codex_dir() == os.path.join(home, ".codex")
+    # The agents' own variables still win, for both readers alike.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    assert si.claude_home() == history_paths.claude_dir() == str(tmp_path / "elsewhere")

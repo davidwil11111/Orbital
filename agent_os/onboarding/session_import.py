@@ -123,11 +123,13 @@ _CODEX_AGENTS_MD_PREFIX = "# AGENTS.md instructions for"
 
 
 def claude_home(claude_dir: str | None = None) -> str:
-    """``$CLAUDE_CONFIG_DIR`` or ``~/.claude`` (an explicit arg wins)."""
+    """``$CLAUDE_CONFIG_DIR`` or ``~/.claude`` (an explicit arg wins). Resolved
+    by ``history_paths`` so the session list and the history scan always read
+    the same folder (``ORBITAL_HISTORY_HOME`` included)."""
     if claude_dir:
         return claude_dir
-    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude")
+    from agent_os.onboarding import history_paths
+    return history_paths.claude_dir()
 
 
 def codex_home(codex_dir: str | None = None) -> str:
@@ -137,8 +139,8 @@ def codex_home(codex_dir: str | None = None) -> str:
     moving codex's own auth/config (smokes)."""
     if codex_dir:
         return codex_dir
-    return (os.environ.get("ORBITAL_CODEX_HOME") or os.environ.get("CODEX_HOME")
-            or os.path.join(os.path.expanduser("~"), ".codex"))
+    from agent_os.onboarding import history_paths
+    return history_paths.codex_dir()
 
 
 def imported_session_id(agent: str, native_id: str) -> str:
