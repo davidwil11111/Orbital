@@ -94,6 +94,23 @@ BG_CMD = '@echo off\r\n' \
 # process's Job Object, so a CLI that kills its job at turn end does not take
 # the job with it. The WMI-created process gets the user's default
 # environment, not the calling shell's.
+#
+# The runner is a batch file (bg-run.cmd), not one compound ``cmd /c "(cmd) &
+# echo !errorlevel! …"`` line: a command that ran ``exit`` ended that cmd.exe
+# before it wrote the exit code, and its ``/v:on`` ate every ``!`` in the
+# command (Windows pass 2026-10-27). The runner starts the command in its own
+# cmd.exe and records that child's exit code. It reads the command from the
+# job's ``cmd`` file with delayed expansion off, and hands it on through
+# ``!c!``, which cmd expands after parsing, so the command is parsed once,
+# by the child, exactly as before.
+#
+# WMI starts conhost.exe, which hosts the runner's cmd.exe. On the Windows
+# test machine the process Win32_Process.Create makes cannot itself start
+# cmd.exe or powershell.exe ("Access is denied"; python, ping and the like
+# start fine), so a job running ``powershell …``, ``cmd /c …`` or npm's own
+# nested cmd failed; a process one level below it is not restricted. With
+# ShowWindow 0 the conhost window stays hidden. Its command line names the
+# job folder, which the registry's identity check looks for.
 BG_PS1 = r'''# Orbital background-job launcher. Usage: orbital\bin\bg.cmd "<command>"
 # Written by Orbital.
 $ErrorActionPreference = 'Stop'
@@ -106,11 +123,8 @@ $id = 'job_' + (-join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum
 $dir = Join-Path $jobs $id
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 [IO.File]::WriteAllText((Join-Path $dir 'cmd'), $cmd + "`n")
-$log = Join-Path $dir 'output.log'
-[IO.File]::WriteAllText($log, '')
-$exitTmp = Join-Path $dir 'exit.tmp'
-$exitFile = Join-Path $dir 'exit'
-$line = 'cmd.exe /d /v:on /s /c "(' + $cmd + ') >>"' + $log + '" 2>&1 & echo !errorlevel! 0 >"' + $exitTmp + '" & move /y "' + $exitTmp + '" "' + $exitFile + '" >nul"'
+[IO.File]::WriteAllText((Join-Path $dir 'output.log'), '')
+$line = 'conhost.exe cmd.exe /d /s /c ""' + (Join-Path $bin 'bg-run.cmd') + '" "' + $dir + '""'
 $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
   CommandLine = $line; CurrentDirectory = (Get-Location).Path; ProcessStartupInformation = $startup }
@@ -132,11 +146,31 @@ if ($sid) {
 Write-Output "To check early: read the output file. To stop it: taskkill /T /F /PID $procId"
 '''
 
+# ``delims^=^ eol^=`` turns off both FOR /F's field split and its ``;``
+# comment character, so the first line of ``cmd`` arrives whole.
+BG_RUN_CMD = '\r\n'.join([
+    '@echo off',
+    'rem Orbital background-job runner, started by bg.ps1. Usage: bg-run.cmd <job folder>',
+    'rem Runs the job\'s command in its own cmd.exe, appends its output to output.log',
+    'rem and writes its exit code to exit. Written by Orbital.',
+    'setlocal DisableDelayedExpansion',
+    'set "d=%~1"',
+    'set "c="',
+    'for /f usebackq^ delims^=^ eol^= %%L in ("%d%\\cmd") do if not defined c set "c=%%L"',
+    'setlocal EnableDelayedExpansion',
+    'cmd.exe /d /s /c "(!c!) >>"!d!\\output.log" 2>&1"',
+    'set "rc=!errorlevel!"',
+    '>"!d!\\exit.tmp" echo !rc! 0',
+    'move /y "!d!\\exit.tmp" "!d!\\exit" >nul',
+    '',
+])
+
 #: file name -> (content, executable)
 LAUNCHER_FILES: dict[str, tuple[str, bool]] = {
     "bg": (BG_SH, True),
     "bg.cmd": (BG_CMD, False),
     "bg.ps1": (BG_PS1, False),
+    "bg-run.cmd": (BG_RUN_CMD, False),
 }
 
 

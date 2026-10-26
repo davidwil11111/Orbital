@@ -98,3 +98,29 @@ def test_the_bg_cmd_launcher_records_output_and_exit_code(tmp_path):
     asyncio.run(reg.tick())
     [row] = reg.list_jobs("p")
     assert row["session_id"] == SID
+
+
+def test_the_bg_cmd_launcher_survives_a_bare_exit_and_keeps_bangs(tmp_path):
+    # Windows pass 2026-10-27: the command's own `exit` ended the cmd.exe that
+    # was meant to record the exit code, its /v:on ate every `!`, and the
+    # WMI-created cmd.exe could not start a nested cmd.exe ("Access is denied").
+    job_launcher.ensure_launcher(str(tmp_path))
+    env = {**os.environ, "ORBITAL_SESSION_ID": SID, "ORBITAL_PROJECT_ID": "p"}
+    out = subprocess.run(
+        [os.path.join(str(tmp_path), "orbital", "bin", "bg.cmd"),
+         'echo bang! & echo a^&b & cmd /d /c echo nested-ok & '
+         'python -c "print(\'x y\')" & exit 4'],
+        cwd=str(tmp_path), capture_output=True, text=True, env=env, timeout=60)
+    assert out.returncode == 0, out.stderr
+    job_id = out.stdout.split("Started background job ")[1].split(" ")[0]
+    d = os.path.join(str(tmp_path), "orbital", "jobs", job_id)
+    exit_path = os.path.join(d, "exit")
+    deadline = time.monotonic() + 30
+    while not os.path.exists(exit_path) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert open(exit_path).read().split()[0] == "4"
+    log = open(os.path.join(d, "output.log"), errors="replace").read()
+    assert "bang!" in log
+    assert "x y" in log
+    assert "a&b" in log                                    # parsed once, by the child
+    assert "nested-ok" in log

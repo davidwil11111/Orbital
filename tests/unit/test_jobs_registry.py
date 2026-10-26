@@ -530,7 +530,7 @@ def test_ensure_launcher_writes_executable_files_once(tmp_path):
     d = job_launcher.ensure_launcher(str(tmp_path))
     bg = os.path.join(d, "bg")
     assert os.access(bg, os.X_OK)
-    assert sorted(os.listdir(d)) == ["bg", "bg.cmd", "bg.ps1"]
+    assert sorted(os.listdir(d)) == ["bg", "bg-run.cmd", "bg.cmd", "bg.ps1"]
     mtime = os.stat(bg).st_mtime_ns
     time.sleep(0.01)
     job_launcher.ensure_launcher(str(tmp_path))
