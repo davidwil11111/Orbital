@@ -148,3 +148,54 @@ def test_the_bg_cmd_launcher_survives_a_bare_exit_and_keeps_bangs(tmp_path):
     assert "x y" in log
     assert "a&b" in log                                    # parsed once, by the child
     assert "nested-ok" in log
+
+
+class _RunningProvider:
+    """A provider whose sandbox is set up and which just runs the command."""
+
+    def get_capabilities(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(setup_complete=True)
+
+    async def run_command(self, *, project_id, command, args, working_dir, timeout_sec):
+        from types import SimpleNamespace
+        out = subprocess.run([command, *args], cwd=working_dir, capture_output=True,
+                             text=True, timeout=timeout_sec)
+        return SimpleNamespace(stdout=out.stdout, stderr=out.stderr,
+                               exit_code=out.returncode, timed_out=False)
+
+
+def test_a_sandboxed_background_call_runs_powershell_like_every_other_call(tmp_path):
+    # Batch 1026 Windows pass (D6): in a safe-mode project the manager's
+    # background command went to the launcher raw and ran under cmd.exe, so
+    # `Write-Output hi` failed with "'Write-Output' is not recognized" while
+    # the same call worked in an open project and in the foreground.
+    import contextvars
+    from agent_os.agent import loop as loop_mod
+    from agent_os.agent.tools.shell import ShellTool
+
+    reg = _registry()
+    tool = ShellTool(workspace=str(tmp_path), os_type="windows", project_id="p",
+                     platform_provider=_RunningProvider(), safe_mode_cb=lambda: True,
+                     jobs=reg, session_id=SID)
+    command = "Write-Output hi; Start-Sleep 1; Write-Output bye"
+    ctx = contextvars.copy_context()
+
+    def run():
+        loop_mod._tool_batch.set("batch-w")
+        return tool.execute(command=command, background=True)
+
+    try:
+        result = ctx.run(run)
+        job = reg.get(result.meta["background_job"]["job_id"])
+        assert job is not None and job.source == "launcher", result.content
+        assert job.command == command
+        exit_path = os.path.join(job.dir, "exit")
+        deadline = time.monotonic() + 30
+        while not os.path.exists(exit_path) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert open(exit_path).read().split()[0] == "0"
+        log = open(job.log_path, errors="replace").read()
+        assert "hi" in log and "bye" in log
+    finally:
+        reg.stop_all()

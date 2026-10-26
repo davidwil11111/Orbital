@@ -839,6 +839,14 @@ class ShellTool(Tool):
 
         ensure_launcher(self._workspace)
         bin_dir = ProjectPaths(self._workspace).bin_dir
+        script = None
+        launched = command
+        if self._os_type == "windows":
+            # The launcher runs its command with cmd.exe; every other call of
+            # this tool runs PowerShell, so hand it the same .ps1 wrapper
+            # (batch 1026 Windows pass: `Write-Output` was "not recognized").
+            argv, script = self._build_cmd(command)
+            launched = subprocess.list2cmdline(argv)
         assignments = {
             "ORBITAL_SESSION_ID": group.session_id,
             "ORBITAL_PROJECT_ID": group.project_id,
@@ -848,7 +856,7 @@ class ShellTool(Tool):
             def ps(v: str) -> str:
                 return "'" + v.replace("'", "''") + "'"
             launch = "; ".join(f"$env:{k}={ps(v)}" for k, v in assignments.items())
-            launch += f"; & {ps(os.path.join(bin_dir, 'bg.ps1'))} {ps(command)}"
+            launch += f"; & {ps(os.path.join(bin_dir, 'bg.ps1'))} {ps(launched)}"
         else:
             launch = " ".join(f"{k}={shlex.quote(v)}" for k, v in assignments.items())
             launch += f" {shlex.quote(os.path.join(bin_dir, 'bg'))} {shlex.quote(command)}"
@@ -857,8 +865,12 @@ class ShellTool(Tool):
         job = None
         if match:
             job = self._jobs.adopt(ProjectPaths(self._workspace).job_dir(match.group(1)),
-                                   group=group, project_id=self._project_id)
+                                   group=group, project_id=self._project_id,
+                                   command=command)
+        if job is not None and script:
+            job.scratch.append(script)
         if job is None:
+            self._remove_script(script)
             return None, ToolResult(
                 content=f"Error: the background job could not start:\n{result.content}",
                 meta=result.meta)

@@ -526,8 +526,13 @@ class JobRegistry:
         return job
 
     def adopt(self, job_dir: str, *, group: JobGroup | None = None,
-              project_id: str | None = None) -> Job | None:
-        """Track a job the launcher started (its folder has ``job.json``)."""
+              project_id: str | None = None,
+              command: str | None = None) -> Job | None:
+        """Track a job the launcher started (its folder has ``job.json``).
+
+        ``command`` is what the job card and wakes show, when the launcher
+        ran a wrapper around it (the shell tool's Windows ``.ps1``); by
+        default it is the launcher's own record of the command."""
         data = _read_json(os.path.join(job_dir, "job.json"))
         if not data:
             return None
@@ -539,12 +544,13 @@ class JobRegistry:
         if data.get("state", RUNNING) != RUNNING:
             return None
         workspace = os.path.dirname(os.path.dirname(os.path.dirname(job_dir)))
-        try:
-            with open(os.path.join(job_dir, "cmd"), "r", encoding="utf-8",
-                      errors="replace") as f:
-                command = f.read().strip()
-        except OSError:
-            command = str(data.get("command") or "")
+        if not command:
+            try:
+                with open(os.path.join(job_dir, "cmd"), "r", encoding="utf-8",
+                          errors="replace") as f:
+                    command = f.read().strip()
+            except OSError:
+                command = str(data.get("command") or "")
         pid = data.get("pid")
         pid = int(pid) if isinstance(pid, (int, float)) or str(pid).isdigit() else None
         session_id = str(data.get("session_id") or "")

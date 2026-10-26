@@ -7,6 +7,7 @@ they are pinned on every host. The real thing runs on CI windows-latest
 (tests/platform/test_jobs_windows.py)."""
 
 import os
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -106,8 +107,13 @@ def test_a_sandboxed_windows_background_call_runs_bg_ps1_with_the_attribution(
     script = calls[0]
     assert "$env:ORBITAL_SESSION_ID='sess-1'" in script
     assert "$env:ORBITAL_PROJECT_ID='proj'" in script
-    assert "bg.ps1' 'npm run build it''s'" in script        # PowerShell quoting
+    # The launcher runs cmd.exe, so it is handed the same .ps1 wrapper every
+    # other call runs (batch 1026 Windows pass); the job keeps the command.
+    assert "bg.ps1' 'powershell -NoProfile -NonInteractive" in script
+    wrapper = re.search(r"-File (\S+cmd_[0-9a-f]{12}\.ps1)", script).group(1)
+    assert "npm run build it's" in open(wrapper, encoding="utf-8-sig").read()
     assert result.meta["background_job"]["job_id"] == "job_0000abcd"
+    assert registry.get("job_0000abcd").command == "npm run build it's"
 
 
 def test_a_launcher_that_did_not_start_is_an_error(tmp_path):
