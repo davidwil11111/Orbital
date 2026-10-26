@@ -592,12 +592,13 @@ def _suggest_folder(members: list[HistorySession], env: HistoryEnv, isdir) -> st
     file counts toward each of its ancestors; containers, temp and the
     agents' own dirs never qualify; the deepest folder wins a tie."""
     counts: Counter = Counter()
-    home = env.home.rstrip(os.sep) + os.sep
+    from agent_os.onboarding.history_paths import _key
+    home = _key(env.home).rstrip(os.sep) + os.sep
     for s in members:
         for path in set(_written(s, env)):
             d = os.path.dirname(os.path.normpath(path))
             while d and d != os.path.dirname(d):
-                above_home = home.startswith(d.rstrip(os.sep) + os.sep)
+                above_home = home.startswith(_key(d).rstrip(os.sep) + os.sep)
                 if not (above_home or env.is_container(d) or env.is_temp(d)
                         or env.is_private(d)):
                     counts[d] += 1

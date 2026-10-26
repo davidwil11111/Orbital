@@ -452,3 +452,25 @@ class TestSelectLeftOff:
         stop = StopInfo(CAUSE_USAGE_LIMIT, resets_at="2026-10-27T14:00:00+00:00")
         assert h.resets_at_if_future(stop, NOW) == "2026-10-27T14:00:00+00:00"
         assert h.resets_at_if_future(stop, datetime(2026, 10, 28, tzinfo=timezone.utc)) is None
+
+
+class TestWindowsFolderRules:
+    """Spec 138 never-a-project folders with Windows shapes (run on any OS)."""
+
+    def test_appdata_and_agent_dirs(self, tmp_path):
+        from agent_os.onboarding.history_paths import HistoryEnv
+        home = str(tmp_path / "Users" / "x")
+        env = HistoryEnv.for_home(home, temp_roots=None)
+        assert env.is_temp(os.path.join(home, "AppData", "Local", "Temp", "a"))
+        assert env.is_temp(os.path.join(home, "AppData", "Roaming", "Orbital", "ws"))
+        for agent_dir in (".pi", ".kimi-code", ".minimax"):
+            assert env.is_private(os.path.join(home, agent_dir, "sessions", "f.md"))
+
+    def test_folder_checks_ignore_case_where_the_os_does(self, tmp_path, monkeypatch):
+        from agent_os.onboarding import history_paths
+        monkeypatch.setattr(history_paths, "_normcase", str.lower)
+        home = str(tmp_path / "Users" / "Kea")
+        env = history_paths.HistoryEnv.for_home(home, temp_roots=())
+        assert env.is_container(home.upper())
+        assert env.is_container(os.path.join(home.lower(), "desktop"))
+        assert env.is_private(os.path.join(home.upper(), ".CODEX", "x"))

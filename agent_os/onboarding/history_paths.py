@@ -51,6 +51,16 @@ def _norm(path: str) -> str:
     return os.path.normpath(path)
 
 
+# Indirection so a test can stand in for Windows' case folding on a Mac.
+_normcase = os.path.normcase
+
+
+def _key(path: str) -> str:
+    """Comparison form of a folder: normalised, and case-folded where the
+    file system ignores case (Windows: ``C:\\Users\\x`` == ``c:\\users\\x``)."""
+    return _normcase(os.path.normpath(path))
+
+
 @dataclass(frozen=True)
 class HistoryEnv:
     """The folders the grouping rules treat specially, resolved for one home.
@@ -70,7 +80,9 @@ class HistoryEnv:
         home = _norm(home or history_home())
         if temp_roots is None:
             roots = {"/tmp", "/private/tmp", "/private/var/folders", "/var/folders",
-                     os.path.join(home, "Library")}
+                     os.path.join(home, "Library"),
+                     # Windows: app data and caches, the ~/Library of Windows.
+                     os.path.join(home, "AppData")}
             try:
                 roots.add(os.path.realpath(tempfile.gettempdir()))
             except OSError:
@@ -82,22 +94,25 @@ class HistoryEnv:
                      if not (home + os.sep).startswith(r.rstrip(os.sep) + os.sep)
                      and not (real_home + os.sep).startswith(r.rstrip(os.sep) + os.sep)}
             temp_roots = tuple(sorted(roots))
-        containers = frozenset(_norm(p) for p in (
+        drive = os.path.splitdrive(home)[0]
+        containers = frozenset(_key(p) for p in (
             home, os.path.join(home, "Desktop"), os.path.join(home, "Documents"),
-            os.path.join(home, "Downloads"), "/", "/tmp", "/private/tmp"))
-        private = tuple(os.path.join(home, d) for d in (".claude", ".codex", ".codebuddy"))
-        return cls(home=home, temp_roots=tuple(_norm(r) for r in temp_roots),
+            os.path.join(home, "Downloads"), "/", "/tmp", "/private/tmp",
+            *((drive + os.sep,) if drive else ())))
+        private = tuple(_key(os.path.join(home, d)) for d in (
+            ".claude", ".codex", ".codebuddy", ".pi", ".kimi-code", ".minimax", ".agents"))
+        return cls(home=home, temp_roots=tuple(_key(r) for r in temp_roots),
                    containers=containers, private_roots=private)
 
     def is_temp(self, path: str | None) -> bool:
         if not path:
             return False
-        p = _norm(path)
+        p = _key(path)
         return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in self.temp_roots)
 
     def is_container(self, path: str | None) -> bool:
-        return bool(path) and _norm(path) in self.containers
+        return bool(path) and _key(path) in self.containers
 
     def is_private(self, path: str) -> bool:
-        p = _norm(path)
+        p = _key(path)
         return any(p == r or p.startswith(r + os.sep) for r in self.private_roots)
