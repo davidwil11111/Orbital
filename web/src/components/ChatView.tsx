@@ -8,6 +8,8 @@ import {
   Clock, CornerDownLeft, FolderSearch, ListChecks, type LucideIcon,
 } from 'lucide-react';
 import ExamplePrompt from './ExamplePrompt';
+import LeftOffCards from './LeftOffCards';
+import { sendTelemetry } from '../utils/telemetry';
 import OrbitalMark from './OrbitalMark';
 import { api, apiWithTotal, ApiError } from '../config';
 import { useWebSocket } from '../hooks/useWebSocket';
@@ -743,6 +745,8 @@ interface ChatViewProps {
    * transition so the header's budget/cost reflects the just-finished turn.
    */
   onRefreshProject?: (id: string) => void;
+  /** Open another session of this project (the left-off cards, spec 138). */
+  onOpenSession?: (sessionId: string) => void;
 }
 
 interface StreamState {
@@ -787,7 +791,7 @@ interface PendingApproval {
   reason?: string;
 }
 
-export default function ChatView({ projectId, project, agentStatus, statusTick, agents, sessionId, initialDraft, onDraftConsumed, onRefreshProject }: ChatViewProps) {
+export default function ChatView({ projectId, project, agentStatus, statusTick, agents, sessionId, initialDraft, onDraftConsumed, onRefreshProject, onOpenSession }: ChatViewProps) {
   const t = useT();
   const { locale } = useLocale();
   // Chrome-only translator for the annotation chip's fallback label (the
@@ -893,6 +897,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // send message"). Track the in-flight PATCH so handleSend can serialize
   // behind it; outcome is irrelevant (failure keeps the optimistic pin).
   const pinPatchInFlightRef = useRef<Promise<void> | null>(null);
+  // Spec 138: the session last opened from a left-off card, until its first
+  // send — a pin change in between is the "switched agent after opening" signal.
+  const leftOffOpenedRef = useRef<string | null>(null);
   const persistPin = useCallback((sid: string, slug: string | null) => {
     const done: Promise<void> = pinAgent(sid, slug)
       .then(() => undefined, () => undefined)
@@ -3071,6 +3078,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   }
 
   async function handleSend() {
+    leftOffOpenedRef.current = null;
     const text = inputText.trim();
     const doneAttachments = attachments.filter((a) => a.status === 'done');
     const pendingAnnotations = annotations;
@@ -3584,7 +3592,16 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                   FILLS the composer and never sends: the user reads, edits
                   and sends it themselves. Not in Quick Tasks, whose scratch
                   workspace makes "this folder" / "this project" meaningless. */}
-              {!project?.is_scratch && (
+              {/* Spec 138: with sessions to pick up (its own or imported), the
+                  left-off cards take the examples' place. */}
+              <LeftOffCards
+                projectId={projectId}
+                agents={agents}
+                onOpen={(sid) => {
+                  leftOffOpenedRef.current = sid;
+                  onOpenSession?.(sid);
+                }}
+                fallback={!project?.is_scratch && (
                 <div
                   role="group"
                   aria-label={t('chat.empty.examples')}
@@ -3612,6 +3629,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                   ))}
                 </div>
               )}
+              />
             </div>
           )
         )}
@@ -4228,6 +4246,10 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               runningSlugs={runningSubAgents}
               managerReady={managerReady}
               onChange={(slug) => {
+                if (leftOffOpenedRef.current !== null && leftOffOpenedRef.current === sessionId && slug !== pinnedTarget) {
+                  leftOffOpenedRef.current = null;
+                  sendTelemetry('agent_switch_after_open');
+                }
                 setLocalPin({ sessionId, slug });
                 if (sessionId === undefined) {
                   // No session yet: the choice is the project's sticky pin,

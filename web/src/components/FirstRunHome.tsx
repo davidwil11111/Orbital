@@ -23,6 +23,8 @@ import OrbitalMark from './OrbitalMark';
 
 interface FirstRunHomeProps {
   onNewProject: () => void;
+  /** "Import projects from your agents" (spec 138); absent = no entry. */
+  onImportProjects?: () => void;
 }
 
 function FileCard({
@@ -72,7 +74,7 @@ function Illustration() {
   );
 }
 
-export default function FirstRunHome({ onNewProject }: FirstRunHomeProps) {
+export default function FirstRunHome({ onNewProject, onImportProjects }: FirstRunHomeProps) {
   const t = useT();
   return (
     <div
@@ -104,6 +106,16 @@ export default function FirstRunHome({ onNewProject }: FirstRunHomeProps) {
           <Plus size={16} aria-hidden="true" />
           {t('firstRun.cta')}
         </button>
+        {onImportProjects && (
+          <button
+            type="button"
+            onClick={onImportProjects}
+            data-testid="first-run-import-projects"
+            className="mt-3 text-sm font-medium text-secondary underline-offset-2 transition-colors duration-150 hover:text-primary hover:underline max-md:min-h-[44px]"
+          >
+            {t('importProjects.entry')}
+          </button>
+        )}
       </div>
     </div>
   );

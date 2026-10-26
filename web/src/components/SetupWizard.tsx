@@ -3,45 +3,85 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * SetupWizard — first-run onboarding (Spec 011 §0.7, Task I1).
+ * SetupWizard — first-run onboarding (Spec 011 §0.7, Task I1; spec 138).
  *
- * Two steps: `api_key` → `accounts`. The old `sandbox_status` step is gone on
- * all platforms — macOS needs nothing (sandbox-exec ships with the OS) and
- * Windows sandbox setup moved into the installer. The standalone sandbox
- * warning banner in App.tsx covers the installer-skipped/failed case.
+ * Four steps: `agents` → `projects` → `api_key` → `accounts`.
+ *
+ *  1. Agents — the coding agents found on this computer, all checked. An
+ *     unchecked one goes into the global `sub_agents_hidden` denylist, which
+ *     seeds new projects' disabled agents. Agents not found are chips that open
+ *     the existing locate card. Continuing with no agent at all makes step 3
+ *     compulsory (the Orbital agent is then the only thing that can work).
+ *  2. Projects — the folders and groups found in the user's agent history
+ *     (ImportProjectsStep). Skipped when the scan finds nothing to import.
+ *     The scan starts the moment the wizard mounts (useOnboardingScan).
+ *  3. The Orbital agent — the key form, skippable unless compulsory; skipped
+ *     entirely when a key already exists.
+ *  4. Connect Your Accounts — connectors and the agent browser sign-in.
  *
  * The `accounts` step merges the former `browser_warmup` step with featured
  * connector cards into one "Connect Your Accounts" screen with two labeled
  * groups (API connectors / agent browser sign-in) — two back-to-back Google
- * prompts on separate screens would otherwise confuse users. Everything is
- * skippable; wizard completion stays derived from `llm.api_key_set` upstream.
+ * prompts on separate screens would otherwise confuse users.
  *
- * Keyless onboarding (2026-10-21): the key step is skippable too. The key is
+ * Keyless onboarding (2026-10-21): the key step is skippable. The key is
  * Orbital's own (its management agent); coding agents keep their own logins,
  * so a user without a key can still work through a pinned agent. Skip
  * persists `setup_api_key_skipped` so the first-run gate stops showing the
  * wizard (see `needsSetupWizard` in utils/firstRun).
+ *
+ * Finish hands App the project to land in (the most recently active imported
+ * one) and, on a fresh install, marks the first-journey tour pending — the
+ * import would otherwise make a new user look like an upgrade to the tour's
+ * once-only decision.
  */
 
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import { Loader2, Globe, Plug } from 'lucide-react';
 import { api, ApiError } from '../config';
 import { useCredentialCards } from '../hooks/useCredentialCards';
-import type { Connector, ConnectorListResponse } from '../types';
+import type { Connector, ConnectorListResponse, Project } from '../types';
 import LLMProviderSettings from './LLMProviderSettings';
 import ImportProjectsStep from './ImportProjectsStep';
+import WizardAgentsStep from './WizardAgentsStep';
+import { useSubAgentList } from '../hooks/useSubAgentList';
+import { useOnboardingScan } from '../hooks/useOnboardingScan';
+import { hasImportables, importIntro } from '../utils/onboarding';
+import { sendTelemetry } from '../utils/telemetry';
+import { isFirstRun } from '../utils/firstRun';
+import { readTourState, writeTourState } from '../tour/tourLogic';
 import { useT } from '../i18n/useT';
+import type { StringKey } from '../i18n/strings';
 import BetaBadge from './BetaBadge';
 import { useLocale } from '../i18n/LocaleContext';
 import { LOCALES } from '../i18n/locales';
 import { warmupUrlForLocale } from '../utils/warmupUrl';
 import Select from './Select';
 
-type WizardStep = 'api_key' | 'accounts';
+type WizardStep = 'agents' | 'projects' | 'api_key' | 'accounts';
 
+const STEP_ORDER: WizardStep[] = ['agents', 'projects', 'api_key', 'accounts'];
+const STEP_LABEL: Record<WizardStep, StringKey> = {
+  agents: 'wizard.steps.agents',
+  projects: 'wizard.steps.projects',
+  api_key: 'wizard.steps.key',
+  accounts: 'wizard.steps.accounts',
+};
+/** The `wizard_step_reached` enum (telemetry allowlist). */
+const STEP_TELEMETRY: Record<WizardStep, string> = {
+  agents: 'agents',
+  projects: 'projects',
+  api_key: 'key',
+  accounts: 'accounts',
+};
+
+export interface WizardOutcome {
+  /** The imported project to land in, on a new session. null = none. */
+  landingProjectId: string | null;
+}
 
 interface SetupWizardProps {
-  onComplete: () => void;
+  onComplete: (outcome?: WizardOutcome) => void;
 }
 
 /** Ambient language toggle (Spec 008 A2), reachable on every wizard step.
@@ -68,9 +108,29 @@ function LocaleToggle() {
   );
 }
 
-/** Shared card chrome for both wizard steps.
+/** "1 Agents · 2 Projects · 3 Orbital agent · 4 Accounts" */
+function StepIndicator({ current }: { current: WizardStep }) {
+  const t = useT();
+  return (
+    <ol className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-secondary" data-testid="wizard-steps">
+      {STEP_ORDER.map((s, i) => (
+        <li key={s} className="inline-flex items-center gap-2">
+          {i > 0 && <span aria-hidden="true" className="text-secondary/50">·</span>}
+          <span
+            aria-current={s === current ? 'step' : undefined}
+            className={s === current ? 'font-medium text-primary' : undefined}
+          >
+            <span className="font-mono">{i + 1}</span> {t(STEP_LABEL[s])}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** Shared card chrome for every wizard step.
  *
- *  The language toggle lives here rather than above the card because the two
+ *  The language toggle lives here rather than above the card because the
  *  steps render separate cards — hoisting it out of them was what left it
  *  floating as loose chrome over the dialog. Declaring it once in the shared
  *  header keeps it inside the card and identical across steps.
@@ -80,16 +140,19 @@ function LocaleToggle() {
  *  the same token as the page behind them, leaving a 1px border to do all the
  *  separation work — the exact flatness that ladder was introduced to fix. */
 function WizardCard({
+  step,
   title,
   intro,
   children,
 }: {
+  step: WizardStep;
   title: string;
   intro: string;
   children: ReactNode;
 }) {
   return (
-    <div className="bg-card border border-border rounded-lg p-8">
+    <div className="bg-card border border-border rounded-lg p-8 max-md:p-5">
+      <StepIndicator current={step} />
       <div className="flex items-start justify-between gap-4 mb-3">
         <h1 className="text-2xl font-semibold text-primary">{title}</h1>
         <LocaleToggle />
@@ -103,7 +166,7 @@ function WizardCard({
 export default function SetupWizard({ onComplete }: SetupWizardProps) {
   const t = useT();
   const { locale } = useLocale();
-  const [step, setStep] = useState<WizardStep>('api_key');
+  const [step, setStep] = useState<WizardStep>('agents');
   const [nextError, setNextError] = useState<string | null>(null);
   const [skippingKey, setSkippingKey] = useState(false);
   const [skipError, setSkipError] = useState<string | null>(null);
@@ -131,22 +194,91 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     if (pollRef.current !== null) clearInterval(pollRef.current);
   }, []);
 
-  // Auto-advance if API key is already configured
+  // Settings at mount: whether a key exists (step 3 is then skipped) and the
+  // agents already hidden (they start unchecked).
+  const [keySet, setKeySet] = useState(false);
+  const [hiddenBefore, setHiddenBefore] = useState<string[]>([]);
   useEffect(() => {
     let cancelled = false;
-    async function checkKey() {
-      try {
-        const data = await api<{ llm: { api_key_set: boolean } }>('/api/v2/settings');
-        if (!cancelled && data.llm.api_key_set) {
-          setStep('accounts');
-        }
-      } catch {
-        // ignore
-      }
-    }
-    checkKey();
+    api<{ llm: { api_key_set: boolean }; sub_agents_hidden?: string[] }>('/api/v2/settings')
+      .then((data) => {
+        if (cancelled || !data) return;
+        setKeySet(data.llm?.api_key_set === true);
+        if (Array.isArray(data.sub_agents_hidden)) setHiddenBefore(data.sub_agents_hidden);
+      })
+      .catch(() => { /* ignore */ });
     return () => { cancelled = true; };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
+
+  // A fresh install: no project of its own yet and no tour decision made. The
+  // tour is marked pending at Finish so an import does not opt them out.
+  const freshRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (readTourState() === 'done') { freshRef.current = false; return; }
+    api<Project[]>('/api/v2/projects')
+      .then((list) => { freshRef.current = !Array.isArray(list) || list.length === 0 || isFirstRun(list); })
+      .catch(() => { freshRef.current = true; });
+  }, []);
+
+  // ── Step 1: agents. The history scan starts here (it feeds the counts). ──
+  const scan = useOnboardingScan();
+  const { entries: agentEntries, reload: reloadAgents } = useSubAgentList();
+  const [agentTicks, setAgentTicks] = useState<Record<string, boolean>>({});
+  const installedAgents = (agentEntries ?? []).filter((e) => e.installed);
+  const agentChecked = (slug: string) => agentTicks[slug] ?? !hiddenBefore.includes(slug);
+  const checkedAgents = installedAgents.filter((e) => agentChecked(e.slug)).length;
+  const noAgents = agentEntries !== null && installedAgents.length === 0;
+  const [savingAgents, setSavingAgents] = useState(false);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  // No coding agent to continue with: the key step loses its Skip.
+  const [keyCompulsory, setKeyCompulsory] = useState(false);
+  // The project Finish lands in, from the import.
+  const landingRef = useRef<string | null>(null);
+
+  const reportedRef = useRef(new Set<WizardStep>());
+  useEffect(() => {
+    if (reportedRef.current.has(step)) return;
+    reportedRef.current.add(step);
+    sendTelemetry('wizard_step_reached', { step: STEP_TELEMETRY[step] });
+  }, [step]);
+
+  // A key that already exists answers step 3, compulsory or not.
+  const afterProjects = useCallback(() => {
+    setStep(keySet ? 'accounts' : 'api_key');
+  }, [keySet]);
+
+  const nothingToImport = scan.settled && (scan.error || !scan.importable || !hasImportables(scan.importable));
+
+  const handleAgentsContinue = useCallback(async () => {
+    setSavingAgents(true);
+    setAgentsError(null);
+    const installedSlugs = new Set(installedAgents.map((e) => e.slug));
+    const hidden = [
+      // Hidden agents that are not on this list keep their state.
+      ...hiddenBefore.filter((slug) => !installedSlugs.has(slug)),
+      ...installedAgents.filter((e) => !agentChecked(e.slug)).map((e) => e.slug),
+    ];
+    try {
+      await api('/api/v2/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ sub_agents_hidden: hidden }),
+      });
+    } catch {
+      setAgentsError(t('wizard.skipKey.failed'));
+      setSavingAgents(false);
+      return;
+    }
+    setSavingAgents(false);
+    setKeyCompulsory(checkedAgents === 0);
+    if (nothingToImport) afterProjects();
+    else setStep('projects');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [installedAgents, hiddenBefore, agentTicks, checkedAgents, nothingToImport, afterProjects, t]);
+
+  // The scan can finish empty after the user reached the Projects step.
+  useEffect(() => {
+    if (step === 'projects' && nothingToImport && !scan.error) afterProjects();
+  }, [step, nothingToImport, scan.error, afterProjects]);
 
   // Featured connector catalog — fetched on entering the accounts step and
   // re-fetched after every successful connect (connectors sharing an
@@ -282,16 +414,84 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
     }, 2000);
   }, [t, locale]);
 
+  const finish = useCallback(() => {
+    sendTelemetry('wizard_step_reached', { step: 'done' });
+    // null = the projects check has not answered: the wizard showing at all
+    // is the strong signal of a fresh install.
+    if (freshRef.current !== false) writeTourState('pending');
+    onComplete({ landingProjectId: landingRef.current });
+  }, [onComplete]);
+
   return (
     // pt-titlebar: this is a full-screen surface rendered outside the app
     // shell, so it clears the macOS titlebar band itself — the native titlebar
     // view sits above the webview and eats clicks in that strip. Safe against
     // min-h-screen because box-sizing is border-box globally, so the padding
     // comes out of the 100vh rather than adding to it.
-    <div className="min-h-screen flex items-center justify-center bg-background px-4 pt-titlebar">
-      <div className="w-full max-w-lg">
+    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-8 pt-titlebar">
+      <div className="w-full max-w-xl">
+        {step === 'agents' && (
+          <WizardCard
+            step="agents"
+            title={t('wizard.welcome')}
+            intro={noAgents ? t('wizard.agents.introNone') : t('wizard.agents.intro')}
+          >
+            {agentEntries === null ? (
+              <div className="inline-flex items-center gap-2 text-sm text-secondary" data-testid="wizard-agents-loading">
+                <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                {t('wizard.agents.loading')}
+              </div>
+            ) : (
+              <WizardAgentsStep
+                entries={agentEntries}
+                history={scan.history}
+                ticks={Object.fromEntries(installedAgents.map((e) => [e.slug, agentChecked(e.slug)]))}
+                onToggle={(slug, checked) => setAgentTicks((prev) => ({ ...prev, [slug]: checked }))}
+                reload={reloadAgents}
+              />
+            )}
+            <div className="mt-6 flex flex-col items-end">
+              <button
+                type="button"
+                onClick={handleAgentsContinue}
+                disabled={agentEntries === null || savingAgents}
+                data-testid="wizard-agents-continue"
+                className="bg-accent text-white text-sm font-medium rounded-lg px-5 py-2.5 hover:bg-accent/90 transition-all duration-150 disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                {savingAgents && <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />}
+                {checkedAgents === 0
+                  ? t('wizard.agents.continueNone')
+                  : t(checkedAgents === 1 ? 'wizard.agents.continue.one' : 'wizard.agents.continue.other', { n: checkedAgents })}
+              </button>
+              {agentsError && (
+                <p className="text-xs text-error mt-2" role="alert" data-testid="wizard-agents-error">
+                  {agentsError}
+                </p>
+              )}
+            </div>
+          </WizardCard>
+        )}
+
+        {step === 'projects' && (
+          <WizardCard
+            step="projects"
+            title={t('importProjects.title')}
+            intro={importIntro(t, scan.history?.sessions_total, scan.importable)}
+          >
+            <ImportProjectsStep
+              scan={scan}
+              onBack={() => setStep('agents')}
+              onSkip={afterProjects}
+              onImported={(_result, landing) => {
+                landingRef.current = landing;
+                afterProjects();
+              }}
+            />
+          </WizardCard>
+        )}
+
         {step === 'api_key' && (
-          <WizardCard title={t('wizard.welcome')} intro={t('wizard.intro')}>
+          <WizardCard step="api_key" title={t('wizard.apiKey.title')} intro={t('wizard.intro')}>
             {/* `card` = the default provider, so Save PUTs it. Without this the
                 form takes its "create a new one" branch every press. */}
             <LLMProviderSettings
@@ -339,34 +539,53 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
             </div>
 
             {/* Keyless path: a quiet secondary action under Next, with the
-                consequence spelled out right beside it. */}
-            <div className="mt-5 pt-4 border-t border-border flex flex-col items-end text-right">
-              <button
-                type="button"
-                onClick={handleSkipKey}
-                disabled={checkingKey || skippingKey}
-                data-testid="wizard-skip-key"
-                className="text-sm font-medium text-secondary hover:text-primary underline-offset-2 hover:underline transition-colors duration-150 disabled:opacity-50 max-md:min-h-[44px]"
+                consequence spelled out right beside it. Not offered when the
+                user continued without any coding agent — the key is then the
+                only way anything gets done. */}
+            {keyCompulsory ? (
+              <div
+                className="mt-5 rounded-lg border border-warning/30 bg-warning-surface px-3.5 py-3 text-xs leading-relaxed text-warning-text"
+                data-testid="wizard-key-compulsory"
               >
-                {t('wizard.skipKey')}
-              </button>
-              <p
-                className="mt-1 text-xs text-secondary/80 leading-relaxed max-w-[380px]"
-                data-testid="wizard-skip-key-hint"
-              >
-                {t('wizard.skipKey.hint')}
-              </p>
-              {skipError && (
-                <p className="text-xs text-error mt-2" role="alert" data-testid="wizard-skip-error">
-                  {skipError}
+                {t('wizard.apiKey.compulsory')}{' '}
+                <button
+                  type="button"
+                  onClick={() => setStep('agents')}
+                  data-testid="wizard-key-back-to-agents"
+                  className="font-medium underline underline-offset-2 hover:no-underline"
+                >
+                  {t('wizard.apiKey.compulsoryBack')}
+                </button>
+              </div>
+            ) : (
+              <div className="mt-5 pt-4 border-t border-border flex flex-col items-end text-right">
+                <button
+                  type="button"
+                  onClick={handleSkipKey}
+                  disabled={checkingKey || skippingKey}
+                  data-testid="wizard-skip-key"
+                  className="text-sm font-medium text-secondary hover:text-primary underline-offset-2 hover:underline transition-colors duration-150 disabled:opacity-50 max-md:min-h-[44px]"
+                >
+                  {t('wizard.skipKey')}
+                </button>
+                <p
+                  className="mt-1 text-xs text-secondary/80 leading-relaxed max-w-[380px]"
+                  data-testid="wizard-skip-key-hint"
+                >
+                  {t('wizard.skipKey.hint')}
                 </p>
-              )}
-            </div>
+                {skipError && (
+                  <p className="text-xs text-error mt-2" role="alert" data-testid="wizard-skip-error">
+                    {skipError}
+                  </p>
+                )}
+              </div>
+            )}
           </WizardCard>
         )}
 
         {step === 'accounts' && (
-          <WizardCard title={t('wizard.accounts.title')} intro={t('wizard.accounts.intro')}>
+          <WizardCard step="accounts" title={t('wizard.accounts.title')} intro={t('wizard.accounts.intro')}>
             {/* Group (a): API connectors — featured, available catalog
                 entries only. Hidden entirely when the fetch failed or
                 nothing qualifies. */}
@@ -492,24 +711,16 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
               )}
             </div>
 
-            {/* Group (c): import existing projects — a disclose-then-scan,
-                confirm-each list of projects discovered on disk from other CLI
-                agents and Obsidian (backlog #34). Link-only; each confirmed row
-                calls the standard project-creation flow. */}
-            <div className="mt-6 pt-6 border-t border-border">
-              <ImportProjectsStep />
-            </div>
-
             <div className="mt-8 flex justify-end gap-3">
               <button
-                onClick={onComplete}
+                onClick={finish}
                 data-testid="wizard-skip"
                 className="border border-border text-primary text-sm font-medium rounded-lg px-5 py-2.5 hover:bg-surface transition-all duration-150"
               >
                 {t('wizard.skip')}
               </button>
               <button
-                onClick={onComplete}
+                onClick={finish}
                 data-testid="wizard-get-started"
                 className="bg-accent text-white text-sm font-medium rounded-lg px-5 py-2.5 hover:bg-accent/90 transition-all duration-150"
               >

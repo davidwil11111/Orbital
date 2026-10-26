@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { describe, it, expect } from 'vitest';
-import { decideTourState, placeCard, shouldStartTour } from './tourLogic';
+import { decideTourState, orderTourStops, placeCard, shouldStartTour } from './tourLogic';
 
 const scratch = { project_id: 's', is_scratch: true };
 const own = { project_id: 'a', is_scratch: false };
@@ -44,6 +44,25 @@ describe('shouldStartTour — the trigger', () => {
   });
 });
 
+describe('orderTourStops', () => {
+  const ids = (xs: { id: string }[]) => xs.map((x) => x.id);
+  const stops = (...names: string[]) => names.map((id) => ({ id }));
+
+  it('keeps the listed order when there are no left-off cards (no history → today\'s tour)', () => {
+    expect(ids(orderTourStops(stops('project', 'agents', 'panel', 'files')))).toEqual(['project', 'agents', 'panel', 'files']);
+  });
+
+  it('puts the left-off cards first and the agents stop second', () => {
+    expect(ids(orderTourStops(stops('leftOff', 'project', 'agents', 'panel', 'quickTasks')))).toEqual(
+      ['leftOff', 'agents', 'project', 'panel', 'quickTasks'],
+    );
+  });
+
+  it('copes with no agents stop (no sub-agents installed)', () => {
+    expect(ids(orderTourStops(stops('project', 'leftOff', 'files')))).toEqual(['leftOff', 'project', 'files']);
+  });
+});
+
 describe('placeCard', () => {
   const viewport = { width: 1280, height: 800 };
   const card = { width: 320, height: 180 };
@@ -58,7 +77,7 @@ describe('placeCard', () => {
     expect(edge.left).toBe(1280 - 320 - 12);
   });
 
-  it('flips above for an anchor near the bottom (the composer)', () => {
+  it('flips above for an anchor near the bottom of the window', () => {
     const p = placeCard({ left: 300, top: 720, width: 700, height: 60 }, card, viewport);
     expect(p.side).toBe('top');
     expect(p.top).toBe(720 - 14 - 180);

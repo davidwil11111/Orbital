@@ -458,6 +458,7 @@ export default function ChatTab({
             initialDraft={route.draft}
             onDraftConsumed={handleDraftConsumed}
             onRefreshProject={onRefreshProject}
+            onOpenSession={handleSessionSelect}
           />
         </div>
       </div>

@@ -3,262 +3,364 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * ImportProjectsStep — first-run onboarding import surface (backlog #34).
+ * ImportProjectsStep — the project checklist built from the user's agent
+ * history (spec 138, wizard step 2 and the "Import projects from your agents"
+ * dialog).
  *
- * A confirm-each list of candidate projects discovered from other CLI agents
- * (Claude Code, Codex) and Obsidian vaults on disk. Nothing is created
- * automatically:
+ * Everything is offered checked and the user unchecks: folders they worked in
+ * (git repos, folders with AGENTS.md / CLAUDE.md, or 3+ conversations), then
+ * — collapsed and unchecked — folders with only one or two conversations, then
+ * groups of scattered conversations that belong together. A group needs a
+ * folder before it can be imported; without one it stays on the list but is
+ * neither sent nor counted. One POST /onboarding/import creates them all
+ * (link-only: Orbital writes nothing into a folder until it is first used).
  *
- *   1. Disclose-then-scan — a one-line disclosure that Orbital will read other
- *      apps' local data is shown BEFORE any scan; the scan runs only when the
- *      user clicks "Scan".
- *   2. The GET /api/v2/onboarding/importable-projects route returns ranked,
- *      deduplicated, path-verified candidates (metadata only — never
- *      conversation content).
- *   3. Each row the user confirms calls the EXISTING POST /api/v2/projects with
- *      the real folder as the workspace (link-only) — reusing the standard
- *      project-creation flow (which triggers the cold-start scan) verbatim.
+ * Candidates render at once; groups arrive when the scan is ready (the
+ * `scan` prop polls). Data comes from `useOnboardingScan` so the wizard can
+ * decide whether to show this step before it does.
  */
 
-import { useCallback, useState } from 'react';
-import { Loader2, Search, Check, FolderPlus } from 'lucide-react';
-import { api, ApiError } from '../config';
-import type { Project } from '../types';
+import { useState } from 'react';
+import { Check, ChevronDown, ChevronRight, FolderOpen, Loader2 } from 'lucide-react';
+import { api } from '../config';
 import { useT } from '../i18n/useT';
-
-/** Candidate shape returned by /api/v2/onboarding/importable-projects. */
-export interface ImportCandidate {
-  source: 'claude-code' | 'codex' | 'obsidian' | string;
-  name: string;
-  path: string;
-  session_count: number;
-  last_activity: string | null;
-  /** Spec 084: the folder is already a project's workspace (no Add offered). */
-  already_imported?: boolean;
-}
-
-interface ImportableResponse {
-  candidates: ImportCandidate[];
-}
-
-type ScanPhase = 'idle' | 'scanning' | 'done' | 'error';
-type RowStatus = 'idle' | 'adding' | 'added' | 'error';
-
-/**
- * Spec 084: why an Add failed, keyed by HTTP status so the row can say
- * something true. A 409 is a name collision the backend will return forever
- * (retry cannot fix it); a 400 is a folder that vanished between scan and
- * click; anything else is genuinely retryable.
- */
-type AddFailure = 'conflict' | 'gone' | 'failed';
-
-function classifyAddFailure(err: unknown): AddFailure {
-  if (err instanceof ApiError) {
-    if (err.status === 409) return 'conflict';
-    if (err.status === 400) return 'gone';
-  }
-  return 'failed';
-}
-
-function addFailureKey(f: AddFailure): 'import.addConflict' | 'import.addGone' | 'import.addFailed' {
-  switch (f) {
-    case 'conflict':
-      return 'import.addConflict';
-    case 'gone':
-      return 'import.addGone';
-    default:
-      return 'import.addFailed';
-  }
-}
+import type { StringKey } from '../i18n/strings';
+import { formatRelativeTime } from '../utils/relativeTime';
+import {
+  agentDisplayName,
+  buildImportRequest,
+  folderKey,
+  groupFolder,
+  groupKey,
+  isFolderChecked,
+  isGroupChecked,
+  landingProjectId,
+  uncheckedCount,
+  type GroupReason,
+  type ImportCandidate,
+  type ImportGroup,
+  type ImportResult,
+  type TickOverrides,
+} from '../utils/onboarding';
+import { sendTelemetry } from '../utils/telemetry';
+import type { OnboardingScan } from '../hooks/useOnboardingScan';
+import FolderBrowserPanel from './FolderBrowserPanel';
 
 interface ImportProjectsStepProps {
-  /** Called after a candidate is successfully created (link-only). */
-  onProjectCreated?: (project: Project) => void;
+  scan: OnboardingScan;
+  /** After a successful import: what was created, and the project to land in
+   *  (the most recently active one; null when nothing was created). */
+  onImported: (result: ImportResult, landingProjectId: string | null) => void;
+  onBack?: () => void;
+  /** Leave without importing. The wizard labels it Skip, the dialog Cancel. */
+  onSkip?: () => void;
+  skipLabel?: string;
 }
 
-function sourceLabel(t: ReturnType<typeof useT>, source: string): string {
-  switch (source) {
-    case 'claude-code':
-      return t('import.source.claudeCode');
-    case 'codex':
-      return t('import.source.codex');
-    case 'obsidian':
-      return t('import.source.obsidian');
-    default:
-      return source;
-  }
+const basename = (p: string) => p.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? p;
+
+/** "Claude Code 182 · Codex 41" — product names and numbers, not translated. */
+function agentCounts(byAgent: Record<string, number> | undefined): string {
+  return Object.entries(byAgent ?? {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([slug, n]) => `${agentDisplayName(slug)} ${n}`)
+    .join(' · ');
 }
 
-/** "N sessions" for agent projects; "Vault" for Obsidian (no sessions). */
-function metaLabel(t: ReturnType<typeof useT>, c: ImportCandidate): string {
-  if (c.source === 'obsidian') return t('import.vault');
-  const n = c.session_count;
-  return n === 1
-    ? t('import.sessions.one', { n })
-    : t('import.sessions.other', { n });
+const REASON_KEY: Record<string, StringKey> = {
+  same_skill: 'importProjects.reason.sameSkill',
+  same_files: 'importProjects.reason.sameFiles',
+  same_request: 'importProjects.reason.sameRequest',
+  same_folder: 'importProjects.reason.sameFolder',
+};
+
+function reasonText(t: ReturnType<typeof useT>, r: GroupReason): string | null {
+  const key = REASON_KEY[r.kind];
+  return key ? t(key, { value: r.value, count: r.count }) : null;
 }
 
-export default function ImportProjectsStep({ onProjectCreated }: ImportProjectsStepProps) {
+const checkboxClass = 'mt-0.5 h-4 w-4 shrink-0 accent-accent cursor-pointer';
+
+export default function ImportProjectsStep({
+  scan,
+  onImported,
+  onBack,
+  onSkip,
+  skipLabel,
+}: ImportProjectsStepProps) {
   const t = useT();
-  const [phase, setPhase] = useState<ScanPhase>('idle');
-  const [candidates, setCandidates] = useState<ImportCandidate[]>([]);
-  // Keyed by candidate path (paths are unique post-dedup).
-  const [rowStatus, setRowStatus] = useState<Record<string, RowStatus>>({});
-  const [rowFailure, setRowFailure] = useState<Record<string, AddFailure>>({});
+  const [ticks, setTicks] = useState<TickOverrides>({});
+  const [chosen, setChosen] = useState<Record<string, string>>({});
+  const [showMinor, setShowMinor] = useState(false);
+  const [browsingGroup, setBrowsingGroup] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState(false);
 
-  const handleScan = useCallback(async () => {
-    setPhase('scanning');
+  const data = scan.importable;
+  const candidates = data?.candidates ?? [];
+  const groups = data?.groups ?? [];
+  const major = candidates.filter((c) => !c.minor);
+  const minor = candidates.filter((c) => c.minor);
+  const request = data ? buildImportRequest(data, ticks, chosen) : { folders: [], groups: [] };
+  const count = request.folders.length + request.groups.length;
+  const scanning = !scan.settled && data?.status === 'scanning';
+
+  const toggle = (key: string, checked: boolean) =>
+    setTicks((prev) => ({ ...prev, [key]: checked }));
+
+  async function handleImport() {
+    if (!data || count === 0 || importing) return;
+    setImporting(true);
+    setImportError(false);
+    sendTelemetry('projects_unchecked', { n: uncheckedCount(data, ticks) });
     try {
-      const data = await api<ImportableResponse>('/api/v2/onboarding/importable-projects');
-      setCandidates(data.candidates ?? []);
-      setPhase('done');
+      const result = await api<ImportResult>('/api/v2/onboarding/import', {
+        method: 'POST',
+        body: JSON.stringify(request),
+      });
+      const safe: ImportResult = {
+        created: Array.isArray(result?.created) ? result.created : [],
+        skipped: Array.isArray(result?.skipped) ? result.skipped : [],
+      };
+      onImported(safe, landingProjectId(safe, request, data));
     } catch {
-      setPhase('error');
+      setImportError(true);
+    } finally {
+      setImporting(false);
     }
-  }, []);
+  }
 
-  const handleAdd = useCallback(
-    async (c: ImportCandidate) => {
-      setRowStatus((s) => ({ ...s, [c.path]: 'adding' }));
-      try {
-        // Reuse the standard project-creation flow verbatim: link-only, the
-        // real folder IS the workspace. Backend triggers the cold-start scan.
-        // auto_unique_name (spec 084): the name is the folder basename, not
-        // something the user typed, so a taken name becomes name-2 rather
-        // than a 409 the wizard could never get past.
-        const project = await api<Project>('/api/v2/projects', {
-          method: 'POST',
-          body: JSON.stringify({ name: c.name, workspace: c.path, auto_unique_name: true }),
-        });
-        setRowStatus((s) => ({ ...s, [c.path]: 'added' }));
-        onProjectCreated?.(project);
-      } catch (err) {
-        setRowFailure((s) => ({ ...s, [c.path]: classifyAddFailure(err) }));
-        setRowStatus((s) => ({ ...s, [c.path]: 'error' }));
-      }
-    },
-    [onProjectCreated],
-  );
+  function renderFolder(c: ImportCandidate) {
+    const checked = isFolderChecked(c, ticks);
+    const counts = c.source === 'obsidian' && !c.by_agent ? t('importProjects.vault') : agentCounts(c.by_agent ?? { [c.source]: c.session_count });
+    const body = (
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="min-w-0 flex-1 truncate text-sm font-medium text-primary">{c.name}</span>
+          {c.already_imported && (
+            <span className="shrink-0 text-xs text-success" data-testid={`import-imported-${c.path}`}>
+              {t('importProjects.alreadyImported')}
+            </span>
+          )}
+          {c.last_activity && (
+            <span className="shrink-0 text-xs text-secondary">{formatRelativeTime(c.last_activity, t)}</span>
+          )}
+        </div>
+        <p className="truncate font-mono text-[11px] text-secondary" title={c.path}>{c.path}</p>
+        {counts && <p className="text-xs text-secondary/80">{counts}</p>}
+      </div>
+    );
+    if (c.already_imported) {
+      return (
+        <li key={c.path} data-testid={`import-candidate-${c.path}`} className="flex items-start gap-3 rounded-lg border border-border px-3 py-2.5 opacity-75">
+          <Check className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+          {body}
+        </li>
+      );
+    }
+    return (
+      <li key={c.path} data-testid={`import-candidate-${c.path}`}>
+        <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border px-3 py-2.5 transition-colors duration-150 hover:bg-surface max-md:min-h-[44px]">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={(e) => toggle(folderKey(c.path), e.target.checked)}
+            data-testid={`import-check-${c.path}`}
+            className={checkboxClass}
+          />
+          {body}
+        </label>
+      </li>
+    );
+  }
+
+  function renderGroup(g: ImportGroup) {
+    const checked = isGroupChecked(g, ticks);
+    const folder = groupFolder(g, chosen);
+    const agents = Object.keys(g.by_agent ?? {})
+      .filter((s) => (g.by_agent[s] ?? 0) > 0)
+      .map((s) => agentDisplayName(s))
+      .join(', ');
+    const meta = t(g.session_count === 1 ? 'importProjects.group.meta.one' : 'importProjects.group.meta.other', {
+      n: g.session_count,
+      agents,
+      when: formatRelativeTime(g.last_activity, t),
+    });
+    const reasons = (g.reasons ?? []).map((r) => reasonText(t, r)).filter((s): s is string => !!s);
+    const titleId = `import-group-title-${g.id}`;
+    return (
+      <li key={g.id} data-testid={`import-group-${g.id}`} className="rounded-lg border border-border px-3 py-2.5">
+        <div className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={(e) => toggle(groupKey(g.id), e.target.checked)}
+            aria-labelledby={titleId}
+            data-testid={`import-group-check-${g.id}`}
+            className={checkboxClass}
+          />
+          <div className="min-w-0 flex-1">
+            <p
+              id={titleId}
+              className={`truncate text-sm font-medium ${folder ? 'text-primary' : 'text-warning-text'}`}
+              data-testid={`import-group-title-${g.id}`}
+            >
+              {folder ? basename(folder) : t('importProjects.group.needsFolder')}
+            </p>
+            <p className="text-xs text-secondary">{meta}</p>
+            {reasons.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {reasons.map((r) => (
+                  <span key={r} className="max-w-full truncate rounded-full border border-border bg-sidebar px-2 py-0.5 text-[11px] text-secondary">
+                    {r}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="mt-2 flex items-center gap-2">
+              <span className="shrink-0 text-xs text-secondary">{t('importProjects.group.folder')}</span>
+              <span
+                className={`min-w-0 flex-1 truncate text-xs ${folder ? 'font-mono text-primary' : 'text-warning-text'}`}
+                title={folder ?? undefined}
+              >
+                {folder ?? t('importProjects.group.chooseHint')}
+              </span>
+              <button
+                type="button"
+                onClick={() => setBrowsingGroup((cur) => (cur === g.id ? null : g.id))}
+                aria-expanded={browsingGroup === g.id}
+                data-testid={`import-group-choose-${g.id}`}
+                className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1 text-xs font-medium text-primary transition-colors duration-150 hover:bg-surface max-md:min-h-[44px]"
+              >
+                <FolderOpen className="h-3.5 w-3.5" aria-hidden="true" />
+                {folder ? t('importProjects.group.change') : t('importProjects.group.choose')}
+              </button>
+            </div>
+            {browsingGroup === g.id && (
+              <div className="mt-2 overflow-hidden rounded-lg border border-border" data-testid={`import-group-browser-${g.id}`}>
+                <FolderBrowserPanel
+                  compact
+                  suggestedFolderName={folder ? basename(folder) : ''}
+                  onSelect={(path) => {
+                    setChosen((prev) => ({ ...prev, [g.id]: path }));
+                    setBrowsingGroup(null);
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      </li>
+    );
+  }
+
+  const nothing = scan.settled && !scan.error && candidates.length === 0 && groups.length === 0;
 
   return (
-    <div data-testid="wizard-import-group">
-      <div className="flex items-center gap-2 mb-1">
-        <FolderPlus className="w-4 h-4 text-accent" />
-        <h2 className="text-sm font-medium text-primary">{t('import.heading')}</h2>
-      </div>
-      {/* Disclose-then-scan: the disclosure is always shown before the scan. */}
-      <p className="text-xs text-secondary mb-3" data-testid="import-disclosure">
-        {t('import.disclosure')}
-      </p>
-
-      {phase === 'idle' && (
-        <button
-          type="button"
-          onClick={handleScan}
-          data-testid="import-scan"
-          className="border border-border text-primary text-sm font-medium rounded-lg px-4 py-2 hover:bg-surface transition-all duration-150 inline-flex items-center gap-2"
-        >
-          <Search className="w-4 h-4" />
-          {t('import.scan')}
-        </button>
-      )}
-
-      {phase === 'scanning' && (
-        <div className="inline-flex items-center gap-2 text-sm text-secondary">
-          <Loader2 className="w-4 h-4 animate-spin" />
-          {t('import.scanning')}
-        </div>
-      )}
-
-      {phase === 'error' && (
-        <div className="text-sm text-error" role="alert" data-testid="import-error">
-          {t('import.error')}{' '}
-          <button
-            type="button"
-            onClick={handleScan}
-            className="underline hover:no-underline"
-            data-testid="import-rescan"
-          >
-            {t('import.rescan')}
+    <div data-testid="import-projects">
+      {scan.error && (
+        <div className="mb-4 text-sm text-error" role="alert" data-testid="import-error">
+          {t('importProjects.error')}{' '}
+          <button type="button" onClick={scan.retry} className="underline hover:no-underline" data-testid="import-retry">
+            {t('importProjects.retry')}
           </button>
         </div>
       )}
 
-      {phase === 'done' && candidates.length === 0 && (
-        <p className="text-sm text-secondary" data-testid="import-empty">
-          {t('import.empty')}
+      {!data && !scan.error && (
+        <div className="mb-4 inline-flex items-center gap-2 text-sm text-secondary">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          {t('importProjects.scanning')}
+        </div>
+      )}
+
+      {nothing && (
+        <p className="mb-4 text-sm text-secondary" data-testid="import-empty">{t('importProjects.empty')}</p>
+      )}
+
+      {(major.length > 0 || minor.length > 0) && (
+        <section className="mb-5" aria-labelledby="import-folders-heading">
+          <h2 id="import-folders-heading" className="mb-2 text-sm font-medium text-primary">
+            {t('importProjects.folders.heading')}
+          </h2>
+          {major.length > 0 && <ul className="space-y-2" data-testid="import-list">{major.map(renderFolder)}</ul>}
+          {minor.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowMinor((v) => !v)}
+                aria-expanded={showMinor}
+                data-testid="import-minor-toggle"
+                className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
+              >
+                {showMinor ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
+                {t(minor.length === 1 ? 'importProjects.minor.toggle.one' : 'importProjects.minor.toggle.other', { n: minor.length })}
+              </button>
+              {showMinor && <ul className="mt-2 space-y-2" data-testid="import-minor-list">{minor.map(renderFolder)}</ul>}
+            </>
+          )}
+        </section>
+      )}
+
+      {(groups.length > 0 || scanning) && (
+        <section className="mb-5" aria-labelledby="import-groups-heading">
+          <h2 id="import-groups-heading" className="text-sm font-medium text-primary">
+            {t('importProjects.groups.heading')}
+          </h2>
+          <p className="mb-2 text-xs text-secondary">{t('importProjects.groups.sub')}</p>
+          {groups.length > 0 && <ul className="space-y-2" data-testid="import-groups">{groups.map(renderGroup)}</ul>}
+          {scanning && (
+            <div className="mt-1 inline-flex items-center gap-2 text-xs text-secondary" data-testid="import-groups-scanning">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              {t('importProjects.scanning')}
+            </div>
+          )}
+        </section>
+      )}
+
+      {importError && (
+        <p className="mb-2 text-right text-xs text-error" role="alert" data-testid="import-failed">
+          {t('importProjects.importFailed')}
         </p>
       )}
 
-      {phase === 'done' && candidates.length > 0 && (
-        <ul className="space-y-2" data-testid="import-list">
-          {candidates.map((c) => {
-            const status = rowStatus[c.path] ?? 'idle';
-            // Spec 084: an already-imported folder shows the same check state
-            // as a row added in this session, labelled honestly.
-            const imported = status === 'added' || c.already_imported === true;
-            return (
-              <li
-                key={c.path}
-                data-testid={`import-candidate-${c.path}`}
-                className="border border-border rounded-lg px-3 py-2.5"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-primary truncate">
-                        {c.name}
-                      </span>
-                      <span className="shrink-0 text-[10px] uppercase tracking-wide text-secondary border border-border rounded px-1.5 py-0.5">
-                        {sourceLabel(t, c.source)}
-                      </span>
-                    </div>
-                    <p className="text-xs text-secondary truncate" title={c.path}>
-                      {c.path}
-                    </p>
-                    <p className="text-xs text-secondary/80">{metaLabel(t, c)}</p>
-                  </div>
-                  {imported ? (
-                    <span
-                      className="shrink-0 inline-flex items-center gap-1 text-xs text-success"
-                      data-testid={`import-added-${c.path}`}
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      {status === 'added' ? t('import.added') : t('import.alreadyImported')}
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      data-testid={`import-add-${c.path}`}
-                      disabled={status === 'adding'}
-                      onClick={() => handleAdd(c)}
-                      className="shrink-0 text-xs font-medium text-white bg-accent rounded-lg px-3 py-1.5 hover:bg-accent/90 transition-all duration-150 disabled:opacity-60 inline-flex items-center gap-1.5 max-md:min-h-[44px]"
-                    >
-                      {status === 'adding' ? (
-                        <>
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          {t('import.adding')}
-                        </>
-                      ) : (
-                        t('import.add')
-                      )}
-                    </button>
-                  )}
-                </div>
-                {status === 'error' && (
-                  <p
-                    className="mt-2 text-xs text-error"
-                    role="alert"
-                    data-testid={`import-add-error-${c.path}`}
-                  >
-                    {t(addFailureKey(rowFailure[c.path] ?? 'failed'))}
-                  </p>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      <div className="mt-6 flex items-center gap-3">
+        {onBack && (
+          <button
+            type="button"
+            onClick={onBack}
+            data-testid="import-back"
+            className="text-sm font-medium text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
+          >
+            {t('global.back')}
+          </button>
+        )}
+        <div className="ml-auto flex items-center gap-3">
+          {onSkip && (
+            <button
+              type="button"
+              onClick={onSkip}
+              data-testid="import-skip"
+              className="rounded-lg border border-border px-5 py-2.5 text-sm font-medium text-primary transition-all duration-150 hover:bg-surface"
+            >
+              {skipLabel ?? t('wizard.skip')}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleImport}
+            disabled={count === 0 || importing}
+            data-testid="import-submit"
+            className="inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-all duration-150 hover:bg-accent/90 disabled:opacity-50"
+          >
+            {importing && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
+            {importing
+              ? t('importProjects.importing')
+              : t(count === 1 ? 'importProjects.import.one' : 'importProjects.import.other', { n: count })}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -39,6 +39,8 @@ export function decideTourState(
 }
 
 /** The trigger: entering a project the user created, while still pending.
+ * A fresh install that imported projects in the wizard is still pending: the
+ * wizard writes `pending` at Finish, before the first project list loads.
  * Not at wizard completion — no project exists then, so most stops would have
  * nothing to point at. */
 export function shouldStartTour(
@@ -62,6 +64,23 @@ export function writeTourState(state: TourState): void {
   } catch {
     /* storage unavailable — the tour simply is not remembered */
   }
+}
+
+/**
+ * The order of the stops that are on screen. With the left-off cards showing
+ * (a project that has history), they come first and the agents stop second —
+ * "open one and continue with any agent" is the point of the tour then.
+ * Otherwise the order is as listed.
+ */
+export function orderTourStops<T extends { id: string }>(present: readonly T[]): T[] {
+  const leftOff = present.find((s) => s.id === 'leftOff');
+  if (!leftOff) return [...present];
+  const agents = present.find((s) => s.id === 'agents');
+  return [
+    leftOff,
+    ...(agents ? [agents] : []),
+    ...present.filter((s) => s !== leftOff && s !== agents),
+  ];
 }
 
 // ── Coachmark placement ─────────────────────────────────────────────────────
