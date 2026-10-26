@@ -84,10 +84,14 @@ class HistorySource(Protocol):
 
 _USAGE_LIMIT_RE = re.compile(
     r"hit your (?:session|usage|weekly|daily) limit|out of (?:usage )?credits"
-    r"|usage limit (?:reached|exceeded)|rate limit reached for your plan",
+    r"|usage limit (?:reached|exceeded)|rate limit reached for your plan"
+    r"|credit balance is too low|requires more credits|insufficient (?:credits|balance|quota)"
+    r"|exceeded your current quota",
     re.IGNORECASE)
 _MODEL_RE = re.compile(r"model (?:is )?not (?:supported|available|found)|unsupported model"
-                       r"|does not have access to (?:the )?model", re.IGNORECASE)
+                       r"|does not have access to (?:the )?model"
+                       # MiniMax Code: 'Model "minimax/X" is not available for the … route'
+                       r"|model \"[^\"\n]*\" is not (?:supported|available)", re.IGNORECASE)
 _NETWORK_AUTH_RE = re.compile(
     r"ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up|network error|connection (?:reset|refused|error)"
     r"|\b40[13]\b|failed to authenticate|authentication (?:failed|error)|invalid api key"

@@ -1,0 +1,1 @@
+{"id":"{ID}","version":2,"cwd":"{CWD}","createdAt":1792490400000,"updatedAt":1792490403100,"archived":false,"agents":{"main":{"homedir":"{DIR}/agents/main","type":"main"}},"custom":{},"lastPrompt":"Add a test for app.py","title":"Add a test for app.py","titleKind":"replaceable","lastTurnReason":"completed","isCustomTitle":false}

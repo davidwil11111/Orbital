@@ -5258,6 +5258,14 @@ class AgentManager:
             return None
         return workspace
 
+    def _imported_members(self, project_id: str) -> list:
+        """Spec 138: the native sessions a group project was made from
+        (``imported_sessions``: ``[{"agent", "native_id"}]``), listed and
+        opened although they ran in another folder."""
+        project = self._project_store.get_project(project_id) if self._project_store else None
+        members = project.get("imported_sessions") if isinstance(project, dict) else None
+        return members if isinstance(members, list) else []
+
     def _imported_session_entries(self, project_id: str, seen_uuids: set,
                                   seen_native_ids: set) -> list[dict]:
         """Virtual list entries for the folder's native sessions (metadata
@@ -5268,7 +5276,8 @@ class AgentManager:
             if workspace is None:
                 return []
             from agent_os.onboarding.session_import import list_native_sessions
-            natives = list_native_sessions(workspace)
+            natives = list_native_sessions(
+                workspace, members=self._imported_members(project_id))
         except Exception:
             logger.warning("session import: listing failed for %s", project_id,
                            exc_info=True)
@@ -5325,7 +5334,8 @@ class AgentManager:
         with lock:
             if os.path.exists(target):
                 return "exists"
-            native = si.find_native_session(workspace, session_id)
+            native = si.find_native_session(
+                workspace, session_id, members=self._imported_members(project_id))
             if native is None:
                 return "unknown"
             si.materialize_session(workspace, native, project_id=project_id)
