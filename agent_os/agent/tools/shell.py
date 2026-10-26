@@ -362,8 +362,12 @@ def build_windows_script(command: str) -> str:
 
     ``-File`` exits 0 unless the script throws or calls ``exit``, while
     ``-Command`` exited 1 when the last statement failed; the trailer keeps
-    the ``-Command`` behaviour. ``$?`` is read on the line straight after the
-    command, before the trailer's own statements reset it. The marker is
+    the ``-Command`` behaviour, except that a failed native program's own
+    exit code is kept instead of 1, as on POSIX (batch 1026 Windows pass:
+    ``SystemExit(7)`` was reported as exit 1). ``$?`` is read on the line
+    straight after the command, before the trailer's own statements reset
+    it; ``$LASTEXITCODE`` is cleared before the command so a value left
+    over from before it is never reported. The marker is
     printed when any error record is a permission denial, independent of the
     UI language and of the exit code. The first line makes the redirected
     output UTF-8: PowerShell 5.1 otherwise encodes it in the OEM code page
@@ -373,13 +377,15 @@ def build_windows_script(command: str) -> str:
     return (
         "try { $OutputEncoding = [Console]::OutputEncoding = "
         "New-Object System.Text.UTF8Encoding $false } catch {}\n"
+        "$global:LASTEXITCODE = 0\n"
         f"{command}\n"
         "$__orbital_ok = $?\n"
+        "$__orbital_code = $LASTEXITCODE\n"
         "if ($Error | Where-Object { $_.CategoryInfo.Category -eq 'PermissionDenied' "
         "-or $_.Exception -is [System.UnauthorizedAccessException] }) {\n"
         f"    [Console]::Error.WriteLine('{ACCESS_DENIED_MARKER}')\n"
         "}\n"
-        "if (-not $__orbital_ok) { exit 1 }\n"
+        "if (-not $__orbital_ok) { if ($__orbital_code) { exit $__orbital_code } else { exit 1 } }\n"
     )
 
 
