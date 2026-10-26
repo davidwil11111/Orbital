@@ -836,6 +836,19 @@ export interface FanoutTaskDescriptor {
   handle: string;
   label: string;
   session_uuid?: string | null;
+  /** Spec 134 Part B: set when the row is a background job (the card then
+   *  shows the command, its state and a Cancel button instead of a
+   *  drill-in). `handle` is the job id and `label` its command. */
+  job?: JobRef;
+}
+
+/** A background job a card row points at (spec 134 Part B). */
+export interface JobRef {
+  project_id: string;
+  job_id: string;
+  agent?: string | null;
+  /** Wall-clock ms the job ended, when known from history. */
+  ended_at_ms?: number | null;
 }
 
 export interface FanoutStartedEvent {
@@ -844,6 +857,8 @@ export interface FanoutStartedEvent {
   session_id?: string;
   fanout_id: string;
   tasks: FanoutTaskDescriptor[];
+  /** 'jobs' for a background job group (spec 134 Part B). */
+  kind?: 'jobs';
 }
 
 export interface FanoutTaskUpdateEvent {

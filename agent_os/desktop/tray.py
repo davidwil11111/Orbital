@@ -65,13 +65,21 @@ def hide_tray() -> None:
         logger.debug("Tray icon hide failed (ignored)", exc_info=True)
 
 
-def start_tray(port: int, open_window_fn, shutdown_fn):
+def start_tray(port: int, open_window_fn, shutdown_fn, confirm_quit_fn=None):
+    """``confirm_quit_fn() -> bool`` (spec 134 Part B): False keeps Orbital
+    running — asked before the icon goes away."""
     global _icon
 
     def on_open(icon, item):
         open_window_fn()
 
     def on_quit(icon, item):
+        if confirm_quit_fn is not None:
+            try:
+                if not confirm_quit_fn():
+                    return
+            except Exception:
+                logger.exception("quit confirmation failed; quitting")
         # Delete the icon before stopping the loop: this callback is dispatched
         # on the loop thread, so a posted WM_STOP cannot be processed until it
         # returns, and shutdown_fn() (os._exit) means it never did.

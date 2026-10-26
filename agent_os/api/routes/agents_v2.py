@@ -1366,6 +1366,47 @@ def _remove_safe(path: str) -> None:
         _cleanup_logger.warning("Failed to remove file: %s", path)
 
 
+def _job_registry():
+    """Spec 134 Part B: the daemon's JobRegistry, or None (tests, old wiring)."""
+    return getattr(_agent_manager, "_job_registry", None)
+
+
+async def _cancel_jobs(project_id: str, session_id: str | None = None) -> None:
+    """Cancel a project's (or one session's) running background jobs, without
+    waking anyone, before the project or session is deleted — so no rmtree
+    ever runs under a live job."""
+    registry = _job_registry()
+    if registry is None:
+        return
+    try:
+        await asyncio.to_thread(registry.cancel_scope, project_id, session_id)
+    except Exception:
+        _cleanup_logger.warning("cancelling background jobs of %s/%s failed",
+                                project_id, session_id, exc_info=True)
+
+
+@router.get("/projects/{project_id}/jobs")
+async def list_project_jobs(project_id: str, session_id: str | None = None) -> dict:
+    """Background jobs of a project (spec 134 Part B), optionally one session's."""
+    registry = _job_registry()
+    if registry is None:
+        return {"jobs": []}
+    return {"jobs": registry.list_jobs(project_id, session_id=session_id)}
+
+
+@router.post("/projects/{project_id}/jobs/{job_id}/cancel")
+async def cancel_project_job(project_id: str, job_id: str) -> dict:
+    """Stop a background job and everything it started (the job card's
+    Cancel). The session is told, like any other job end."""
+    registry = _job_registry()
+    job = None
+    if registry is not None:
+        job = await asyncio.to_thread(registry.cancel, project_id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.describe()}
+
+
 @router.delete("/projects/bulk")
 async def bulk_delete_projects(body: BulkDeleteRequest):
     """Delete multiple projects by filter criteria."""
@@ -1411,6 +1452,7 @@ async def bulk_delete_projects(body: BulkDeleteRequest):
                 await _agent_manager.stop_agent(
                     pid, session_id=_agent_manager.current_holder_session_id(pid),
                 )
+            await _cancel_jobs(pid)
             workspace = p.get("workspace", "")
             if workspace:
                 _cleanup_project_files(workspace)
@@ -1444,6 +1486,9 @@ async def delete_project(project_id: str):
     # Tear down the project's dispatcher. It is project-scoped and survives
     # agent stop, so deletion must shut it down explicitly.
     await _agent_manager.shutdown_dispatcher(project_id)
+
+    # Spec 134 §3.7: background jobs end before their folders are removed.
+    await _cancel_jobs(project_id)
 
     # Clean up project files on disk
     workspace = project.get("workspace", "")
@@ -2425,11 +2470,16 @@ async def delete_session(project_id: str, session_id: str):
     if _project_store is not None and _project_store.get_project(project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        return await _agent_manager.delete_session(project_id, session_id)
+        result = await _agent_manager.delete_session(project_id, session_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    # Spec 134 §3.7: the session's background jobs end with it (after the
+    # delete succeeded: a refused delete must not kill them; the session's
+    # deletion removes no job folder).
+    await _cancel_jobs(project_id, session_id)
+    return result
 
 
 @router.get("/blocked")

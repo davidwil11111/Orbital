@@ -20,6 +20,8 @@ _PDFS = "pdfs"
 _SHELL_OUTPUT = "shell-output"
 _SKILLS = "skills"
 _TMP = ".tmp"
+_JOBS = "jobs"
+_BIN = "bin"
 _PROJECT_STATE = "PROJECT_STATE.md"
 _DECISIONS = "DECISIONS.md"
 _LESSONS = "LESSONS.md"
@@ -219,6 +221,20 @@ class ProjectPaths:
     @property
     def tmp_dir(self) -> str:
         return os.path.join(self.orbital_dir, _TMP)
+
+    @property
+    def jobs_dir(self) -> str:
+        """Background jobs (spec 134 Part B): one folder per job under
+        ``orbital/jobs/<job_id>/`` holding ``job.json`` and ``output.log``."""
+        return os.path.join(self.orbital_dir, _JOBS)
+
+    def job_dir(self, job_id: str) -> str:
+        return os.path.join(self.jobs_dir, job_id)
+
+    @property
+    def bin_dir(self) -> str:
+        """Launchers Orbital ships into the workspace (``orbital/bin/bg``)."""
+        return os.path.join(self.orbital_dir, _BIN)
 
     @property
     def approval_history(self) -> str:

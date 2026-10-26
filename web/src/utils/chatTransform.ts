@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { ChatMessage, ToolCall, ActivityCategory, FanoutTaskStatus, SubAgentToolRow } from '../types';
+import type { ChatMessage, ToolCall, ActivityCategory, FanoutTaskStatus, JobRef, SubAgentToolRow } from '../types';
 import { translate } from '../i18n/useT';
 import type { StringKey } from '../i18n/strings';
 
@@ -262,7 +262,7 @@ export type DisplayItem =
        */
       type: 'fanout_card';
       fanout_id: string;
-      tasks: Array<{ handle: string; label: string }>;
+      tasks: Array<{ handle: string; label: string; job?: JobRef }>;
       timestamp: string;
       isHistorical?: boolean;
       /**
@@ -674,6 +674,67 @@ function parseFanoutSummary(
   return { fanoutId: header[1], statuses };
 }
 
+// Spec 134 Part B: background job groups reuse the fanout card. A
+// `shell(background=true)` result carries `_meta.background_job`; the
+// daemon's job rows carry `_meta.job_group` ({group_id, jobs: [...]}) and an
+// `event` from this set. `job_started` (a Codex/Pi launcher job, which has no
+// tool row here) only builds the card; the others render their
+// display_content as a system row and backfill the card's row statuses.
+const JOB_ROW_EVENTS = new Set(['job_terminal', 'job_checkin', 'job_note', 'job_started']);
+const FANOUT_STATUSES = new Set<FanoutTaskStatus>(['running', 'completed', 'error', 'stalled', 'interrupted']);
+
+interface JobGroupMeta {
+  group_id: string;
+  jobs: Array<{
+    job_id: string;
+    command: string;
+    status: FanoutTaskStatus;
+    project_id?: string;
+    agent?: string | null;
+    ended_at_ms?: number | null;
+  }>;
+}
+
+function parseBackgroundJob(
+  meta: Record<string, unknown> | undefined,
+): { groupId: string; task: { handle: string; label: string; job: JobRef } } | null {
+  const raw = meta?.background_job as Record<string, unknown> | undefined;
+  if (!raw || typeof raw.job_id !== 'string' || typeof raw.group_id !== 'string') return null;
+  return {
+    groupId: raw.group_id,
+    task: {
+      handle: raw.job_id,
+      label: typeof raw.command === 'string' ? raw.command : raw.job_id,
+      job: {
+        project_id: typeof raw.project_id === 'string' ? raw.project_id : '',
+        job_id: raw.job_id,
+        agent: null,
+      },
+    },
+  };
+}
+
+function parseJobGroup(meta: Record<string, unknown> | undefined): JobGroupMeta | null {
+  const raw = meta?.job_group as Record<string, unknown> | undefined;
+  if (!raw || typeof raw.group_id !== 'string' || !Array.isArray(raw.jobs)) return null;
+  const jobs: JobGroupMeta['jobs'] = [];
+  for (const j of raw.jobs as Array<Record<string, unknown>>) {
+    if (!j || typeof j.job_id !== 'string') continue;
+    const status = FANOUT_STATUSES.has(j.status as FanoutTaskStatus)
+      ? (j.status as FanoutTaskStatus)
+      : 'error';
+    jobs.push({
+      job_id: j.job_id,
+      command: typeof j.command === 'string' ? j.command : j.job_id,
+      status,
+      project_id: typeof j.project_id === 'string' ? j.project_id : undefined,
+      agent: typeof j.agent === 'string' ? j.agent : null,
+      ended_at_ms: typeof j.ended_at_ms === 'number' ? j.ended_at_ms : null,
+    });
+  }
+  return { group_id: raw.group_id, jobs };
+}
+
 type SubAgentActivity = Extract<DisplayItem, { type: 'sub_agent_activity' }>;
 
 /**
@@ -943,6 +1004,32 @@ export function transformChatHistory(
   // branch below) or an unrelated later boundary (next assistant/user
   // message, session boundary, end of stream) finalizes it first.
   let deferredFanoutCards: Extract<DisplayItem, { type: 'fanout_card' }>[] = [];
+
+  // Spec 134 Part B: the card of background job group `groupId`, wherever it
+  // is (still deferred behind its capsule, or already emitted).
+  function findJobCard(groupId: string): Extract<DisplayItem, { type: 'fanout_card' }> | undefined {
+    const deferred = deferredFanoutCards.find((c) => c.fanout_id === groupId);
+    if (deferred) return deferred;
+    for (let k = items.length - 1; k >= 0; k--) {
+      const it = items[k];
+      if (it.type === 'fanout_card' && it.fanout_id === groupId) return it;
+    }
+    return undefined;
+  }
+
+  function addJobTask(groupId: string, task: { handle: string; label: string; job: JobRef },
+                      timestamp: string, deferred: boolean): void {
+    const card = findJobCard(groupId);
+    if (card) {
+      if (!card.tasks.some((t) => t.handle === task.handle)) card.tasks.push(task);
+      return;
+    }
+    const fresh: Extract<DisplayItem, { type: 'fanout_card' }> = {
+      type: 'fanout_card', fanout_id: groupId, tasks: [task], timestamp,
+    };
+    if (deferred) deferredFanoutCards.push(fresh);
+    else items.push(fresh);
+  }
 
   function tsToMs(ts: string): number {
     const n = Date.parse(ts);
@@ -1368,6 +1455,47 @@ export function transformChatHistory(
         i++;
         continue;
       }
+      // Spec 134 Part B: background job rows (join, check-in, notes) and a
+      // worker's job start. See JOB_ROW_EVENTS.
+      const jobEvent = msg._meta?.event;
+      if (typeof jobEvent === 'string' && JOB_ROW_EVENTS.has(jobEvent)) {
+        finalizeCapsule();
+        const group = parseJobGroup(msg._meta);
+        if (group && jobEvent === 'job_started') {
+          for (const j of group.jobs) {
+            addJobTask(group.group_id, {
+              handle: j.job_id, label: j.command,
+              job: { project_id: j.project_id ?? '', job_id: j.job_id, agent: j.agent ?? null },
+            }, msg.timestamp, false);
+          }
+          i++;
+          continue;
+        }
+        const card = group ? findJobCard(group.group_id) : undefined;
+        if (group && card) {
+          const statuses: Record<string, FanoutTaskStatus> = { ...(card.statuses ?? {}) };
+          for (const j of group.jobs) {
+            statuses[j.job_id] = j.status;
+            const task = card.tasks.find((t) => t.handle === j.job_id);
+            if (task?.job && j.ended_at_ms) task.job = { ...task.job, ended_at_ms: j.ended_at_ms };
+          }
+          card.statuses = statuses;
+          const allEnded = card.tasks.every((t) => statuses[t.handle] && statuses[t.handle] !== 'running');
+          if (allEnded) card.completedAtMs = tsToMs(msg.timestamp);
+        }
+        const displayContent =
+          typeof msg._meta?.display_content === 'string'
+            ? (msg._meta.display_content as string)
+            : (msg.content ?? '');
+        items.push({
+          type: 'fanout_summary',
+          fanout_id: group?.group_id ?? '',
+          content: displayContent,
+          timestamp: msg.timestamp,
+        });
+        i++;
+        continue;
+      }
       // Fanout join-summary (spec 009 §0.5 item 4): renders as a plain system
       // row AND backfills the matching fanout_card's terminal statuses so a
       // reload of a COMPLETED fanout doesn't show every row stuck "running"
@@ -1632,6 +1760,11 @@ export function transformChatHistory(
     }
 
     if (msg.role === 'tool') {
+      // Spec 134 Part B: a background job's start joins its group's card,
+      // which waits (deferred) until the capsule holding the shell call
+      // finalizes. The row itself still pairs normally below.
+      const bgJob = parseBackgroundJob(msg._meta);
+      if (bgJob) addJobTask(bgJob.groupId, bgJob.task, msg.timestamp, true);
       const pendingFanout = pendingFanoutCalls.get(msg.tool_call_id ?? '');
       if (pendingFanout) {
         pendingFanoutCalls.delete(msg.tool_call_id ?? '');
