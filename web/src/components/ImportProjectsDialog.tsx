@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useId } from 'react';
+import { X } from 'lucide-react';
 import { useT } from '../i18n/useT';
 import { useOnboardingScan } from '../hooks/useOnboardingScan';
 import { importIntro, type ImportResult } from '../utils/onboarding';
@@ -46,20 +47,30 @@ export default function ImportProjectsDialog({ onClose, onImported }: ImportProj
         data-testid="import-projects-dialog"
         className="flex max-h-[85vh] w-full max-w-xl flex-col rounded-xl border border-border bg-elevated shadow-lg"
       >
-        <div className="px-6 pt-5 pb-3">
-          <h2 id={titleId} className="text-[15px] font-semibold text-primary">{t('importProjects.entry')}</h2>
-          <p className="mt-1 text-xs leading-relaxed text-secondary">
-            {importIntro(t, scan.history?.sessions_total, scan.importable)}
-          </p>
+        <div className="flex items-start gap-3 border-b border-border pt-5 pb-3 pl-6 pr-4">
+          <div className="min-w-0 flex-1">
+            <h2 id={titleId} className="text-[15px] font-semibold text-primary">{t('importProjects.entry')}</h2>
+            <p className="mt-1 text-xs leading-relaxed text-secondary">
+              {importIntro(t, scan.history?.sessions_total, scan.importable)}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t('importProjects.close')}
+            data-testid="import-dialog-close"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-secondary transition-colors duration-150 hover:bg-surface hover:text-primary"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-5">
-          <ImportProjectsStep
-            scan={scan}
-            onSkip={onClose}
-            skipLabel={t('importProjects.cancel')}
-            onImported={onImported}
-          />
-        </div>
+        <ImportProjectsStep
+          scan={scan}
+          onSkip={onClose}
+          skipLabel={t('importProjects.cancel')}
+          onImported={onImported}
+          scrollable
+        />
       </div>
     </div>
   );

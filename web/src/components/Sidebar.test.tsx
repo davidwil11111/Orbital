@@ -381,3 +381,48 @@ describe('Sidebar — safe-mode upgrade notice (spec 117)', () => {
     expect(screen.queryByTestId('safe-mode-notice')).toBeNull();
   });
 });
+
+describe('Sidebar — import entry on the New Project split button (batch 1026)', () => {
+  it('shows no menu toggle when import is not offered', () => {
+    render(<Sidebar {...defaultProps} />);
+    expect(screen.queryByTestId('new-project-more')).toBeNull();
+  });
+
+  it('opens a one-item menu above the button and imports from it', () => {
+    const onImportProjects = vi.fn();
+    const onNewProject = vi.fn();
+    render(<Sidebar {...defaultProps} onNewProject={onNewProject} onImportProjects={onImportProjects} />);
+    const more = screen.getByTestId('new-project-more');
+    expect(more.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('new-project-menu')).toBeNull();
+
+    fireEvent.click(more);
+    expect(more.getAttribute('aria-expanded')).toBe('true');
+    const menu = screen.getByTestId('new-project-menu');
+    expect(within(menu).getAllByRole('menuitem')).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId('sidebar-import-projects'));
+    expect(onImportProjects).toHaveBeenCalledTimes(1);
+    expect(onNewProject).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('new-project-menu')).toBeNull();
+  });
+
+  it('keeps New Project a single click', () => {
+    const onNewProject = vi.fn();
+    render(<Sidebar {...defaultProps} onNewProject={onNewProject} onImportProjects={vi.fn()} />);
+    fireEvent.click(screen.getByText('+ New Project'));
+    expect(onNewProject).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('new-project-menu')).toBeNull();
+  });
+
+  it('closes on Escape and on a click outside', () => {
+    render(<Sidebar {...defaultProps} onImportProjects={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('new-project-more'));
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByTestId('new-project-menu')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('new-project-more'));
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByTestId('new-project-menu')).toBeNull();
+  });
+});

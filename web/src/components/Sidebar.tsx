@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
-import { Calendar, GripVertical, Inbox, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Calendar, ChevronUp, FolderInput, GripVertical, Inbox, X } from 'lucide-react';
 import {
   DndContext,
   MouseSensor,
@@ -194,6 +194,28 @@ export default function Sidebar({
   const t = useT();
   const selectedProjectId = route.name === 'project' ? route.projectId : null;
   const workbenchCount = useWorkbenchCount();
+
+  // The New Project split button's menu: closes on Escape and on a press
+  // anywhere outside it. composedPath(), not contains(): the item that was
+  // pressed may unmount before the listener runs.
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const newProjectMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!importMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setImportMenuOpen(false);
+    };
+    const onPointer = (e: Event) => {
+      const wrap = newProjectMenuRef.current;
+      if (wrap && !e.composedPath().includes(wrap)) setImportMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onPointer);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('pointerdown', onPointer);
+    };
+  }, [importMenuOpen]);
 
   // Spec 117 D10: the sandbox is off for NEW projects; projects that predate
   // the build keep it on. The notice exists for the people with such a
@@ -475,22 +497,63 @@ export default function Sidebar({
 
       {/* Bottom section */}
       <div className="px-3 pb-3 pt-2 border-t border-border space-y-2">
-        <button
-          onClick={onNewProject}
-          className="w-full rounded-lg border border-border/60 bg-card/55 px-3 py-2 text-sm font-medium text-primary shadow-[0_1px_2px_rgb(0_0_0/0.05)] transition-[box-shadow,transform,background-color] duration-100 ease-out hover:bg-card/80 hover:shadow-[0_2px_5px_rgb(0_0_0/0.07)] active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100 max-md:min-h-[44px]"
-        >
-          {t('app.newProject')}
-        </button>
-        {onImportProjects && (
-          <button
-            type="button"
-            onClick={onImportProjects}
-            data-testid="sidebar-import-projects"
-            className="w-full truncate rounded-lg px-3 py-1 text-left text-xs text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
-          >
-            {t('importProjects.entry')}
-          </button>
-        )}
+        {/* New Project is one click; importing from other agents sits behind
+            the ⌃ half of the split button (batch 1026: the plain text link
+            under it read as clutter). The menu opens above the button. */}
+        <div ref={newProjectMenuRef} className="relative">
+          {onImportProjects && importMenuOpen && (
+            <div
+              role="menu"
+              aria-label={t('sidebar.newProjectMore')}
+              data-testid="new-project-menu"
+              className="absolute inset-x-0 bottom-full z-20 mb-1.5 rounded-[10px] border border-border bg-elevated p-1.5 shadow-lg"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="sidebar-import-projects"
+                onClick={() => {
+                  setImportMenuOpen(false);
+                  onImportProjects();
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-primary transition-colors duration-150 hover:bg-surface max-md:min-h-[44px]"
+              >
+                <FolderInput className="h-4 w-4 shrink-0 text-secondary" aria-hidden="true" />
+                <span className="flex min-w-0 flex-col">
+                  <span className="leading-snug">{t('importProjects.menuItem')}</span>
+                  <span className="text-[11px] leading-snug text-secondary">{t('importProjects.menuHint')}</span>
+                </span>
+              </button>
+            </div>
+          )}
+          <div className="flex w-full overflow-hidden rounded-lg border border-border/60 bg-card/55 shadow-[0_1px_2px_rgb(0_0_0/0.05)] transition-shadow duration-100 ease-out hover:shadow-[0_2px_5px_rgb(0_0_0/0.07)] motion-reduce:transition-none">
+            <button
+              type="button"
+              onClick={onNewProject}
+              className="min-w-0 flex-1 px-3 py-2 text-sm font-medium text-primary transition-colors duration-100 ease-out hover:bg-card/80 max-md:min-h-[44px]"
+            >
+              {t('app.newProject')}
+            </button>
+            {onImportProjects && (
+              <>
+                <span className="w-px bg-border/60" aria-hidden="true" />
+                <button
+                  type="button"
+                  aria-label={t('sidebar.newProjectMore')}
+                  aria-haspopup="menu"
+                  aria-expanded={importMenuOpen}
+                  data-testid="new-project-more"
+                  onClick={() => setImportMenuOpen((open) => !open)}
+                  className={`flex w-10 shrink-0 items-center justify-center text-secondary transition-colors duration-100 ease-out hover:bg-card/80 hover:text-primary max-md:min-h-[44px] ${
+                    importMenuOpen ? 'bg-card/80 text-primary' : ''
+                  }`}
+                >
+                  <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
 
         <button
           onClick={onSettings}

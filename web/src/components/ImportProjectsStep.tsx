@@ -55,6 +55,9 @@ interface ImportProjectsStepProps {
   /** Leave without importing. The wizard labels it Skip, the dialog Cancel. */
   onSkip?: () => void;
   skipLabel?: string;
+  /** The dialog's layout: the list scrolls and the actions sit in a footer
+   *  below it, always in view (a long list used to hide Cancel and Import). */
+  scrollable?: boolean;
 }
 
 const basename = (p: string) => p.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? p;
@@ -88,6 +91,7 @@ export default function ImportProjectsStep({
   onBack,
   onSkip,
   skipLabel,
+  scrollable = false,
 }: ImportProjectsStepProps) {
   const t = useT();
   const [ticks, setTicks] = useState<TickOverrides>({});
@@ -257,8 +261,8 @@ export default function ImportProjectsStep({
 
   const nothing = scan.settled && !scan.error && candidates.length === 0 && groups.length === 0;
 
-  return (
-    <div data-testid="import-projects">
+  const content = (
+    <>
       {scan.error && (
         <div className="mb-4 text-sm text-error" role="alert" data-testid="import-error">
           {t('importProjects.error')}{' '}
@@ -325,42 +329,63 @@ export default function ImportProjectsStep({
         </p>
       )}
 
-      <div className="mt-6 flex items-center gap-3">
-        {onBack && (
+    </>
+  );
+
+  const actions = (
+    <div className={`flex items-center gap-3${scrollable ? '' : ' mt-6'}`} data-testid="import-actions">
+      {onBack && (
+        <button
+          type="button"
+          onClick={onBack}
+          data-testid="import-back"
+          className="text-sm font-medium text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
+        >
+          {t('global.back')}
+        </button>
+      )}
+      <div className="ml-auto flex items-center gap-3">
+        {onSkip && (
           <button
             type="button"
-            onClick={onBack}
-            data-testid="import-back"
-            className="text-sm font-medium text-secondary transition-colors duration-150 hover:text-primary max-md:min-h-[44px]"
+            onClick={onSkip}
+            data-testid="import-skip"
+            className="rounded-lg border border-border px-5 py-2.5 text-sm font-medium text-primary transition-all duration-150 hover:bg-surface"
           >
-            {t('global.back')}
+            {skipLabel ?? t('wizard.skip')}
           </button>
         )}
-        <div className="ml-auto flex items-center gap-3">
-          {onSkip && (
-            <button
-              type="button"
-              onClick={onSkip}
-              data-testid="import-skip"
-              className="rounded-lg border border-border px-5 py-2.5 text-sm font-medium text-primary transition-all duration-150 hover:bg-surface"
-            >
-              {skipLabel ?? t('wizard.skip')}
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={handleImport}
-            disabled={count === 0 || importing}
-            data-testid="import-submit"
-            className="inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-all duration-150 hover:bg-accent/90 disabled:opacity-50"
-          >
-            {importing && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
-            {importing
-              ? t('importProjects.importing')
-              : t(count === 1 ? 'importProjects.import.one' : 'importProjects.import.other', { n: count })}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={handleImport}
+          disabled={count === 0 || importing}
+          data-testid="import-submit"
+          className="inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-medium text-white transition-all duration-150 hover:bg-accent/90 disabled:opacity-50"
+        >
+          {importing && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
+          {importing
+            ? t('importProjects.importing')
+            : t(count === 1 ? 'importProjects.import.one' : 'importProjects.import.other', { n: count })}
+        </button>
       </div>
+    </div>
+  );
+
+  if (scrollable) {
+    return (
+      <div data-testid="import-projects" className="flex min-h-0 flex-1 flex-col">
+        <div data-testid="import-dialog-scroll" className="min-h-0 flex-1 overflow-y-auto px-6 pt-3 pb-4">
+          {content}
+        </div>
+        <div className="border-t border-border px-6 py-3">{actions}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="import-projects">
+      {content}
+      {actions}
     </div>
   );
 }
