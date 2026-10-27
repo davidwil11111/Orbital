@@ -418,7 +418,13 @@ class NativeWorkerAdapter:
         context_manager = ContextManager(self._session, prompt_builder, base_ctx)
 
         provider = _WorkerProviderView(deps.provider, self.first_token.set)
-        self._loop = AgentLoop(self._session, provider, registry, context_manager)
+        # No end-of-run memory record turn (spec 112 A6) in a worker: it
+        # cannot write the memory files (the orbital dir is forbidden to it)
+        # and the manager records at the join. With the turn on, the record
+        # reply ("nothing to record") became the worker's last assistant
+        # row, i.e. its result and the join summary, instead of its answer.
+        self._loop = AgentLoop(self._session, provider, registry, context_manager,
+                               memory_record_enabled=False)
 
     async def send(self, message: str) -> None:
         """Run ONE full ``AgentLoop`` turn with ``message`` as the user

@@ -539,3 +539,46 @@ async def test_send_browser_scope_cleanup_failure_does_not_break_turn(
                             forbidden_paths=None)
     await a.send("compute the answer")
     assert a._last_response == "done: 42"
+
+
+class _SequenceProvider:
+    """Provider that answers each call with the next text in ``texts`` (the
+    last one repeats). Models a worker that answers its task and would then
+    be asked the end-of-run memory record question."""
+    def __init__(self, texts: list[str]):
+        self.provider = "stub"
+        self.model = "stub-model"
+        self.sdk = "stub-sdk"
+        self._texts = list(texts)
+        self.calls = 0
+
+    async def stream(self, messages, tools=None):
+        text = self._texts[min(self.calls, len(self._texts) - 1)]
+        self.calls += 1
+        yield StreamChunk(text=text)
+        yield StreamChunk(is_final=True, usage=TokenUsage(input_tokens=10, output_tokens=5))
+
+
+@pytest.mark.asyncio
+async def test_worker_result_is_the_task_answer_not_the_memory_record_reply(tmp_path):
+    """A fan-out worker cannot write memory (the orbital dir is forbidden to
+    it) and the manager records at the join, so the loop's end-of-run
+    memory record turn (spec 112 A6) must not run in a worker. When it did,
+    every worker's last assistant row — and so its result and the join
+    summary — was the record reply ("nothing to record"), not its answer
+    (seen live on v0.18.0 + batch 1026, 2026-10-28)."""
+    provider = _SequenceProvider(["# INDEX", "nothing to record"])
+    deps = WorkerDeps(
+        provider=provider,
+        workspace=str(tmp_path),
+        project_id="proj-1",
+        parent_session_id="parent-sess-1",
+        make_tool_registry=_make_registry_factory(_StubToolRegistry()),
+    )
+    a = NativeWorkerAdapter(deps=deps, handle="worker:x-9",
+                            display_name="t9", allowed_paths=None,
+                            forbidden_paths=None)
+    assert a._loop._memory_record_enabled is False
+    await a.send("read orbital/INDEX.md and reply with its first heading")
+    assert a._last_response == "# INDEX"
+    assert provider.calls == 1
