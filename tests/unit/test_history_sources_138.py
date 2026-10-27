@@ -30,7 +30,7 @@ def home(tmp_path):
     return str(h)
 
 
-CWD = "/Users/x/proj"
+CWD = b.native("/Users/x/proj")
 
 
 # --------------------------------------------------------------------------
@@ -86,7 +86,7 @@ class TestPi:
         assert s.last_user_at == "2026-10-20T10:00:01+00:00"
         assert s.user_turns == 1 and not s.automation and not s.orbital_started
         assert s.stop is None
-        util = f"{CWD}/src/util.py"
+        util = b.norm(f"{CWD}/src/util.py")
         assert s.edits == {util: 1}
         assert s.reads[util] == 1  # relative path resolved against the cwd
         assert s.mentions == {util: 1}
@@ -172,8 +172,8 @@ class TestKimi:
         assert s.first_user_text == f"Add a test for {CWD}/app.py"
         assert s.user_turns == 1  # the injected date reminder is not a turn
         assert s.stop is None and s.resume_path is None
-        assert s.creates == {f"{CWD}/tests/test_app.py": 1}
-        assert s.reads == {f"{CWD}/app.py": 1}
+        assert s.creates == {b.norm(f"{CWD}/tests/test_app.py"): 1}
+        assert s.reads == {b.norm(f"{CWD}/app.py"): 1}
         assert s.started_at == "2026-10-20T10:00:00+00:00"  # state.json createdAt
         assert s.ended_at == "2026-10-20T10:00:03+00:00"
 
@@ -209,7 +209,7 @@ class TestKimi:
             b.kimi_turn_ended("completed"),
         ])
         s = kimi_code.SOURCE.read(path)
-        assert s.user_turns == 1 and s.edits == {f"{CWD}/a.py": 1} and s.stop is None
+        assert s.user_turns == 1 and s.edits == {b.norm(f"{CWD}/a.py"): 1} and s.stop is None
 
     def test_child_and_archived_sessions_are_skipped(self, home):
         child = b.install_kimi(home, CWD, state={
@@ -245,8 +245,8 @@ class TestMiniMax:
         # The <system-reminder>/<agent-context> wrapper is not the user's.
         assert s.first_user_text == f"Summarise {CWD}/README.md"
         assert s.user_turns == 1 and s.stop is None
-        assert s.reads == {f"{CWD}/README.md": 1}
-        assert s.creates == {f"{CWD}/SUMMARY.md": 1}
+        assert s.reads == {b.norm(f"{CWD}/README.md"): 1}
+        assert s.creates == {b.norm(f"{CWD}/SUMMARY.md"): 1}
         assert s.skills == ["summarize"]
 
     def test_canonical_text_range_wins_over_unknown_wrappers(self, home):
@@ -304,3 +304,28 @@ class TestMiniMax:
         os.remove(os.path.join(home, ".minimax", "v2", "sqlite", "runtime-state.sqlite"))
         s = minimax_code.SOURCE.read(path)
         assert s.native_id == b.MINIMAX_ID and s.cwd is None and s.user_turns == 1
+
+
+class TestWindowsPathsInText:
+    """Mentions and skill folders in Windows histories (batch 1026 rc): the
+    patterns knew only POSIX roots and forward slashes, so on Windows no
+    mention or skill-by-path was ever found. Pattern-level, so it runs on
+    every host."""
+
+    def test_drive_paths_are_mentions(self):
+        from agent_os.onboarding.sources._common import ABS_PATH_RE
+        text = r'cat C:\Users\x\notes\plan.md and D:/work/app/main.py; also /Users/y/a.md'
+        found = [posix or drive for posix, drive in ABS_PATH_RE.findall(text)]
+        assert found == [r"C:\Users\x\notes\plan.md", "D:/work/app/main.py", "/Users/y/a.md"]
+
+    def test_a_json_escaped_posix_path_still_stops_at_the_escape(self):
+        from agent_os.onboarding.sources._common import ABS_PATH_RE
+        found = [posix or drive for posix, drive in ABS_PATH_RE.findall('"/Users/x/a.md\\n"')]
+        assert found == ["/Users/x/a.md"]
+
+    def test_skill_folders_with_either_separator(self):
+        from agent_os.onboarding.sources._common import SKILL_RE
+        assert SKILL_RE.search(r"C:\Users\x\.claude\skills\pptx\SKILL.md").group(1) == "pptx"
+        assert SKILL_RE.search(r"C:\\Users\\x\\.agents\\skills\\docx\\SKILL.md").group(1) == "docx"
+        assert SKILL_RE.search("/Users/x/.codex/skills/tidy/SKILL.md").group(1) == "tidy"
+        assert SKILL_RE.search(r"C:\Users\x\.claude\skills\.hidden\x") is None

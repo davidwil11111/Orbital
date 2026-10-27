@@ -22,6 +22,7 @@ from agent_os.onboarding.history_types import (
     CAUSE_USAGE_LIMIT, HistorySession, StopInfo,
 )
 from agent_os.onboarding.sources import claude_code, codex
+from tests.unit._history_138_builders import native, norm
 
 
 def _write(path, rows):
@@ -64,14 +65,14 @@ class TestClaudeReader:
     def test_finished_session_with_question_is_not_unfinished(self, tmp_path):
         s = read_claude(tmp_path, [
             cu("add a login page"),
-            ca([tool_use("Write", file_path="/w/app/login.tsx")]),
+            ca([tool_use("Write", file_path=native("/w/app/login.tsx"))]),
             cu([tool_result()]),
             ca("Done. Want me to add tests too?"),
         ])
         assert s.stop is None
         assert s.user_turns == 1
         assert s.first_user_text == s.last_user_text == "add a login page"
-        assert s.creates == {"/w/app/login.tsx": 1}
+        assert s.creates == {norm(native("/w/app/login.tsx")): 1}
         assert s.cwd == "/w/app" and s.native_id == "c-1"
 
     def test_unanswered_last_user_text_is_no_reply(self, tmp_path):
@@ -153,16 +154,16 @@ class TestClaudeReader:
         s = read_claude(tmp_path, [
             {"type": "ai-title", "aiTitle": "Deck work", "sessionId": "c-1"},
             {**cu("make the deck"), "gitBranch": "feat/deck"},
-            ca([tool_use("Edit", file_path="/w/app/a.py", old_string="x", new_string="y"),
-                tool_use("Read", file_path="/Users/x/.claude/skills/pptx/SKILL.md"),
+            ca([tool_use("Edit", file_path=native("/w/app/a.py"), old_string="x", new_string="y"),
+                tool_use("Read", file_path=native("/Users/x/.claude/skills/pptx/SKILL.md")),
                 tool_use("Skill", skill="anthropic-skills:docx"),
-                tool_use("Bash", command="cat /Users/x/notes/plan.md")]),
+                tool_use("Bash", command="cat " + native("/Users/x/notes/plan.md"))]),
             cu([tool_result()]), ca("done"),
         ])
         assert s.title == "Deck work" and s.branch == "feat/deck"
-        assert s.edits == {"/w/app/a.py": 1}
-        assert "/Users/x/.claude/skills/pptx/SKILL.md" in s.reads
-        assert "/Users/x/notes/plan.md" in s.mentions
+        assert s.edits == {norm(native("/w/app/a.py")): 1}
+        assert norm(native("/Users/x/.claude/skills/pptx/SKILL.md")) in s.reads
+        assert norm(native("/Users/x/notes/plan.md")) in s.mentions
         assert set(s.skills) == {"pptx", "docx"}
 
     def test_empty_transcript_is_none(self, tmp_path):
@@ -247,16 +248,16 @@ class TestCodexReader:
 
     def test_file_changes_and_patches(self, tmp_path):
         s = read_codex(tmp_path, [
-            xmeta(), xu("write the report"),
+            xmeta(cwd=native("/w/app")), xu("write the report"),
             {"type": "response_item", "timestamp": "2026-10-20T10:00:03Z",
              "payload": {"type": "custom_tool_call", "name": "apply_patch",
                          "input": "*** Begin Patch\n*** Update File: src/a.py\n@@\n*** End Patch"}},
             xev("item_completed", item={"type": "FileChange", "changes": {
-                "/w/app/report.md": {"type": "add", "content": "x"}}}),
+                native("/w/app/report.md"): {"type": "add", "content": "x"}}}),
             xa("done"), xev("task_complete"),
         ])
-        assert s.edits == {"/w/app/src/a.py": 1}
-        assert s.creates == {"/w/app/report.md": 1}
+        assert s.edits == {norm(native("/w/app/src/a.py")): 1}
+        assert s.creates == {norm(native("/w/app/report.md")): 1}
 
 
 # ---- Scanner -----------------------------------------------------------------

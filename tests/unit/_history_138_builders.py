@@ -21,6 +21,18 @@ import sqlite3
 FIXTURES = os.path.abspath(os.path.join(
     os.path.dirname(__file__), os.pardir, "fixtures", "history_138"))
 
+def native(path: str) -> str:
+    """A POSIX fixture path as an absolute path on this host. Python 3.13 on
+    Windows no longer calls ``/Users/x`` absolute (no drive), so the readers
+    rightly drop it there; real Windows histories record ``C:\\…``."""
+    return "C:" + path if os.name == "nt" else path
+
+
+def norm(path: str) -> str:
+    """How the readers store a path: normalised (backslashes on Windows)."""
+    return os.path.normpath(path)
+
+
 PI_ID = "0199aaaa-1111-7222-8333-444455556666"
 KIMI_ID = "session_7a1b2c3d-0000-4000-8000-00000000abcd"
 MINIMAX_ID = "mvs_5e6f7a8b9c0d4e1f8a2b3c4d5e6f7a8b"

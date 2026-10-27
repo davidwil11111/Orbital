@@ -23,12 +23,15 @@ from agent_os.onboarding.text_clean import KIND_AUTOMATION, KIND_USER, clean_use
 
 # Absolute paths named in a tool input. Only user-space roots: a mention is a
 # hint about which project a session worked on, never a system path.
+# Windows: a drive path (``C:\Users\…`` or ``C:/…``), with either separator;
+# the POSIX form stops at a backslash, which there is a JSON escape.
 ABS_PATH_RE = re.compile(
     r"(?<![\w.~/-])(/(?:Users|home|Volumes|private|tmp|var|opt|srv|mnt|workspace|data)"
-    r"/[^\s\"'\\`)(,;:<>|*?\[\]{}]+)")
+    r"/[^\s\"'\\`)(,;:<>|*?\[\]{}]+)"
+    r"|(?<![\w.~/\\-])([A-Za-z]:[\\/][^\s\"'`)(,;:<>|*?\[\]{}]+)")
 # ~/.claude/skills/<name>/…, ~/.codex/skills/…, ~/.agents/skills/… (and the
-# same under a project); dot-dirs are not skills.
-SKILL_RE = re.compile(r"/\.(?:claude|codex|agents)/skills/([^/.\s][^/\s]*)/")
+# same under a project); dot-dirs are not skills. Either separator (Windows).
+SKILL_RE = re.compile(r"[\\/]\.(?:claude|codex|agents)[\\/]+skills[\\/]+([^\\/.\s][^\\/\s]*)[\\/]")
 # Codex apply_patch headers.
 PATCH_RE = re.compile(r"\*\*\* (Add|Update|Delete) File: ([^\\\"\n]+)")
 
@@ -55,8 +58,8 @@ def note_mentions(s: HistorySession, blob: object) -> None:
             blob = json.dumps(blob, ensure_ascii=False)
         except (TypeError, ValueError):
             return
-    for p in ABS_PATH_RE.findall(blob):
-        p = p.rstrip(".")
+    for posix, drive in ABS_PATH_RE.findall(blob):
+        p = (posix or drive).rstrip(".")
         bump(s.mentions, p)
         m = SKILL_RE.search(p + "/")
         if m:
