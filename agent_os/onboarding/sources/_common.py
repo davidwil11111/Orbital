@@ -115,11 +115,18 @@ class TurnState:
             self.s.last_user_text = text
             self.s.last_user_at = ts or self.s.last_user_at
         elif cleaned.kind == KIND_AUTOMATION:
-            self._automation_turns += 1
-            if self.s.first_user_text is None and cleaned.text:
-                self.s.first_user_text = cleaned.text[:_TEXT_CAP]
+            self.automation_text(cleaned.text, ts)
+            return
         else:
             return  # Orbital's own prompt: the turn state is untouched
+        self.state, self.stop = "pending", None
+
+    def automation_text(self, text: str | None, ts: str | None) -> None:
+        """A turn an automation started (Orbital's triggers, or one the agent
+        app itself ran): a session of only these is an automation run."""
+        self._automation_turns += 1
+        if self.s.first_user_text is None and text:
+            self.s.first_user_text = text[:_TEXT_CAP]
         self.state, self.stop = "pending", None
 
     def working(self) -> None:

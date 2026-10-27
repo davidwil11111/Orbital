@@ -38,6 +38,15 @@ _ORBITAL_ORIGINATORS = frozenset({"orbital"})
 _TAG_BLOCK_RE = re.compile(r"^</?[A-Za-z_][\w-]*(\s[^>]*)?>")
 _AGENTS_MD_PREFIX = "# AGENTS.md instructions for"
 
+# The Codex app's wrappers around the user's words. Attached files come as a
+# header listing them, then the request under its own heading; an automation
+# run opens with the automation's name and id. Unstripped, the header was
+# every such chat's "opening request" and grouped unrelated chats.
+_APP_FILES_HEADER = "# Files mentioned by the user:"
+# "## My request for Codex:" (older app builds) or "## My request:".
+_APP_REQUEST_HEADING_RE = re.compile(r"^## My request(?: for [^:\n]+)?:[ \t]*$", re.MULTILINE)
+_APP_AUTOMATION_RE = re.compile(r"^Automation: [^\n]+\nAutomation ID: ")
+
 
 class CodexSource:
     agent = AGENT
@@ -64,6 +73,19 @@ class CodexSource:
         except Exception:
             logger.warning("history: could not read Codex rollout %s", path, exc_info=True)
             return None
+
+
+def _strip_app_files_header(s: HistorySession, text: str) -> str:
+    """The request under the Codex app's attached-files header; the files it
+    lists count as mentions."""
+    if not text.startswith(_APP_FILES_HEADER):
+        return text
+    headings = list(_APP_REQUEST_HEADING_RE.finditer(text))
+    if not headings:
+        return text
+    last = headings[-1]
+    note_mentions(s, text[:last.start()])
+    return text[last.end():].strip()
 
 
 def _user_text(payload: dict) -> str:
@@ -126,11 +148,14 @@ def _read(path: str) -> HistorySession | None:
             if ptype == "message":
                 role = payload.get("role")
                 if role == "user":
-                    text = _user_text(payload)
+                    text = _strip_app_files_header(s, _user_text(payload))
                     if text:
                         any_message = True
                         touch(s, ts)
-                        turn.user_text(text, ts)
+                        if _APP_AUTOMATION_RE.match(text):
+                            turn.automation_text(text, ts)
+                        else:
+                            turn.user_text(text, ts)
                 elif role == "assistant" and _assistant_has_text(payload):
                     any_message = True
                     touch(s, ts)

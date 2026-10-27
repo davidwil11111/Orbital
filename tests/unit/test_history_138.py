@@ -488,3 +488,38 @@ class TestWindowsFolderRules:
         assert env.is_container(home.upper())
         assert env.is_container(os.path.join(home.lower(), "desktop"))
         assert env.is_private(os.path.join(home.upper(), ".CODEX", "x"))
+
+
+class TestCodexAppPreambles:
+    """The Codex app's own wrappers around the user's words (batch 1026 rc,
+    once compressed rollouts were read): the attached-files header became
+    every such chat's "opening request" and grouped unrelated chats, and
+    Codex automation runs were never marked as automation."""
+
+    def test_attached_files_header_is_not_the_request(self, tmp_path):
+        files = native("/Users/x/Downloads/cv.pdf")
+        text = (f"# Files mentioned by the user:\n\n## cv.pdf: {files}\n\n"
+                "## My request for Codex:\nsubmit this to the job posts below")
+        s = read_codex(tmp_path, [xmeta(), xu(text), xa("on it"), xev("task_complete")])
+        assert s.first_user_text == "submit this to the job posts below"
+        assert norm(files) in s.mentions
+
+    def test_the_newer_request_heading_too(self, tmp_path):
+        text = (f"# Files mentioned by the user:\n\n## a.srt: {native('/Users/x/a.srt')}\n\n"
+                "## My request:\nfix the caption")
+        s = read_codex(tmp_path, [xmeta(), xu(text), xa("done"), xev("task_complete")])
+        assert s.first_user_text == "fix the caption"
+
+    def test_codex_automation_runs_are_automation(self, tmp_path):
+        text = ("Automation: Daily brief\nAutomation ID: daily-brief\n"
+                "Automation memory: $CODEX_HOME/automations/daily-brief/memory.md\n"
+                "Last run: 2026-09-25T00:09:34.493Z (1790294974493)\n\n"
+                "Give me a morning brief.")
+        s = read_codex(tmp_path, [xmeta(), xu(text), xa("brief"), xev("task_complete")])
+        assert s.automation is True
+        assert h.is_noise(s, HistoryEnv.for_home("/nowhere", temp_roots=("/nope",)))
+
+    def test_a_request_that_merely_mentions_automation_is_not_one(self, tmp_path):
+        s = read_codex(tmp_path, [xmeta(), xu("Automation: can you set one up for me?"),
+                                  xa("sure"), xev("task_complete")])
+        assert not s.automation
