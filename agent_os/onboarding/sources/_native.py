@@ -41,12 +41,17 @@ _PATH_KEYS = ("path", "file_path", "filePath", "filename")
 
 # A skill used through its files: ~/.claude/skills/<name>/…, ~/.agents/skills/…,
 # pi's ~/.pi/agent/skills/…, ~/.codex/skills/…; dot-dirs are not skills.
+# Either separator (Windows histories record C:\\Users\\…).
 _SKILL_PATH_RE = re.compile(
-    r"/\.(?:claude|codex|agents|pi/agent|kimi-code|minimax)/skills/([^/.][^/]*)/")
+    r"[\\/]\.(?:claude|codex|agents|pi[\\/]agent|kimi-code|minimax)[\\/]skills[\\/]"
+    r"([^\\/.][^\\/]*)[\\/]")
 
-# Absolute paths the user named in their own words.
+# Absolute paths the user named in their own words: POSIX roots, or a Windows
+# drive path. The POSIX form never starts inside a drive path (after ``C:``),
+# which on Windows read ``C:/Users/x/a.py`` as a drive-less ``\Users\x\a.py``.
 _MENTION_RE = re.compile(
-    r"(?<![\w/~.])(/(?:Users|home|private|tmp|var|opt|Volumes|srv|mnt|workspace)/[^\s'\"`<>()\[\]{},;]+)")
+    r"(?<![\w/~.:])(/(?:Users|home|private|tmp|var|opt|Volumes|srv|mnt|workspace)/[^\s'\"`<>()\[\]{},;]+)"
+    r"|(?<![\w/~.\\])([A-Za-z]:[\\/][^\s'\"`<>()\[\]{},;]+)")
 
 
 @dataclass
@@ -176,8 +181,8 @@ def to_history(t: NativeTranscript, *, orbital_started: bool = False) -> History
     said = [kind for _turn, kind, _text in turns if kind is not None]
     mentions: dict[str, int] = {}
     for text, _ts in user_texts:
-        for raw in _MENTION_RE.findall(text):
-            path = os.path.normpath(raw.rstrip(".:!?"))
+        for posix, drive in _MENTION_RE.findall(text):
+            path = os.path.normpath((posix or drive).rstrip(".:!?"))
             mentions[path] = mentions.get(path, 0) + 1
     stamps = [ts for turn, _k, _x in turns for ts in (turn.user_ts, turn.reply_ts) if ts]
     return HistorySession(

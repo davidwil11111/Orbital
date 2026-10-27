@@ -27,7 +27,7 @@ from agent_os.onboarding.text_clean import KIND_AUTOMATION, KIND_USER, clean_use
 # Windows: a drive path (``C:\Users\…`` or ``C:/…``), with either separator;
 # the POSIX form stops at a backslash, which there is a JSON escape.
 ABS_PATH_RE = re.compile(
-    r"(?<![\w.~/-])(/(?:Users|home|Volumes|private|tmp|var|opt|srv|mnt|workspace|data)"
+    r"(?<![\w.~/:-])(/(?:Users|home|Volumes|private|tmp|var|opt|srv|mnt|workspace|data)"
     r"/[^\s\"'\\`)(,;:<>|*?\[\]{}]+)"
     r"|(?<![\w.~/\\-])([A-Za-z]:[\\/][^\s\"'`)(,;:<>|*?\[\]{}]+)")
 # ~/.claude/skills/<name>/…, ~/.codex/skills/…, ~/.agents/skills/… (and the

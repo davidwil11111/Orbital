@@ -329,3 +329,15 @@ class TestWindowsPathsInText:
         assert SKILL_RE.search(r"C:\\Users\\x\\.agents\\skills\\docx\\SKILL.md").group(1) == "docx"
         assert SKILL_RE.search("/Users/x/.codex/skills/tidy/SKILL.md").group(1) == "tidy"
         assert SKILL_RE.search(r"C:\Users\x\.claude\skills\.hidden\x") is None
+
+    def test_native_readers_keep_the_drive(self):
+        # windows-latest: pi read "C:/Users/x/proj/src/util.py" as \\Users\\x\\…
+        from agent_os.onboarding.sources._native import _MENTION_RE, _SKILL_PATH_RE
+        found = [p or d for p, d in _MENTION_RE.findall("Rename C:/Users/x/proj/a.py and /home/y/b.py")]
+        assert found == ["C:/Users/x/proj/a.py", "/home/y/b.py"]
+        assert _SKILL_PATH_RE.search(r"C:\Users\x\.pi\agent\skills\tidy\SKILL.md").group(1) == "tidy"
+
+    def test_a_posix_root_inside_a_drive_path_is_not_a_second_mention(self):
+        from agent_os.onboarding.sources._common import ABS_PATH_RE
+        found = [p or d for p, d in ABS_PATH_RE.findall("see C:/Users/x/a.md")]
+        assert found == ["C:/Users/x/a.md"]
