@@ -910,11 +910,15 @@ def _finish_late(name: str, mine: list[dict], before: str, task: asyncio.Task) -
     task.add_done_callback(_done)
 
 
-def start_sub_agent_status_updates(engine, ws_manager) -> None:
+def start_sub_agent_status_updates(engine, ws_manager, *, warm_after: float = 0.0) -> None:
     """Spec 136 A.2/A.3, at daemon start (on the event loop): a sweep that
     changes the agents' status is announced to every client as
-    ``sub_agents.updated``, and the first sweep starts now, in the
-    background, so the first Settings open finds a result."""
+    ``sub_agents.updated``, and the first sweep starts in the background, so
+    the first Settings open finds a result.
+
+    ``warm_after`` holds that sweep back so it does not compete with the boot
+    the window is waiting on; a Settings read before then sweeps on its own,
+    and the held-back sweep is then skipped."""
     loop = asyncio.get_running_loop()
 
     def _on_change(_results) -> None:
@@ -926,8 +930,17 @@ def start_sub_agent_status_updates(engine, ws_manager) -> None:
     if callable(set_listener):
         set_listener(_on_change)
     warm = getattr(engine, "warm", None)
-    if callable(warm):
+    if not callable(warm):
+        return
+    if warm_after <= 0:
         warm()
+        return
+
+    def _warm_unless_swept() -> None:
+        if getattr(engine, "_check_all_cache", None) is None:
+            warm()
+
+    loop.call_later(warm_after, _warm_unless_swept)
 
 
 def _refresh_agent_sync(slug: str):

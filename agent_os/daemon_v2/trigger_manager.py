@@ -74,6 +74,21 @@ def validate_trigger(trigger: dict, workspace: str | None = None) -> str | None:
     return None
 
 
+def _warm_timezones() -> None:
+    """Build pytz's zone list (one file check per zone) on the calling thread.
+
+    The first ``pytz.timezone()`` of a named zone builds it, and the first
+    tick used to do that on the event loop at daemon start. With the startup
+    sub-agent sweep's threads holding the GIL each check waited its turn, and
+    the loop stalled 5.9 s in the packaged first launch while the window
+    waited on it (batch 1026, 2026-10-27). pytz fills the list under its own
+    lock, so later callers on any thread find it built.
+    """
+    import pytz
+
+    len(pytz.all_timezones_set)
+
+
 class TriggerManager:
     """Manages scheduled triggers for all projects.
 
@@ -353,6 +368,12 @@ class TriggerManager:
         trigger missed during machine sleep or a daemon restart is caught up
         promptly instead of waiting for its next natural occurrence.
         """
+        try:
+            await asyncio.to_thread(_warm_timezones)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not pre-build the timezone list", exc_info=True)
         while self._running:
             try:
                 await self._evaluate_due_triggers()

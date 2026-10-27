@@ -156,12 +156,20 @@ def _configure_file_logging(data_dir: str) -> None:
     logger.info("Daemon file logging enabled at %s", log_path)
 
 
+#: Seconds after daemon start before the first sub-agent sweep. Its ~15 CLI
+#: probes and handshakes competed with the boot the window waits on (batch
+#: 1026 DMG: daemon start → window 2.9 s → 5.7–6.8 s); by now the window is
+#: up and the session index built.
+STARTUP_SWEEP_DELAY_S = 10.0
+
+
 def start_sub_agent_status(setup_engine, ws_manager) -> None:
-    """Spec 136 A.3: the first sub-agent sweep starts at daemon start, in
-    the background, and every later sweep that changes something is pushed
-    as ``sub_agents.updated``. A seam of its own so unit tests that enter the
-    app lifespan do not probe the developer's real CLIs."""
-    settings_routes.start_sub_agent_status_updates(setup_engine, ws_manager)
+    """Spec 136 A.3: the first sub-agent sweep starts shortly after daemon
+    start, in the background, and every later sweep that changes something is
+    pushed as ``sub_agents.updated``. A seam of its own so unit tests that
+    enter the app lifespan do not probe the developer's real CLIs."""
+    settings_routes.start_sub_agent_status_updates(
+        setup_engine, ws_manager, warm_after=STARTUP_SWEEP_DELAY_S)
 
 
 def schedule_sandbox_grant_refresh(platform_provider, workspaces: list[str]):
