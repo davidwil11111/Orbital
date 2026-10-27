@@ -28,34 +28,47 @@ def _make_context(**overrides) -> PromptContext:
     return PromptContext(**defaults)
 
 
+ENABLED = [{"handle": "claude-code", "display_name": "Claude Code", "type": "cli"}]
+
+
 class TestSubAgentAwarenessSection:
-    def test_section_included_when_sub_agents_active(self):
-        """Section appears in dynamic suffix when sub-agents are active."""
+    """Spec 139 B: the coordination rules are gated on the project's ENABLED
+    agents (fixed for the session) and never carry live state; the live state
+    is one line in the per-call tail (``truly_dynamic``)."""
+
+    def test_section_included_when_sub_agents_enabled(self):
+        """Section is in the system region as soon as an agent is enabled —
+        before anything has been dispatched."""
+        ctx = _make_context(enabled_agents=ENABLED, active_sub_agents=[])
+        _, semi_stable, _ = PromptBuilder().build(ctx)
+
+        assert "Sub-Agent Coordination" in semi_stable
+
+    def test_section_omitted_when_no_sub_agents_enabled(self):
+        """No enabled agents → no section, whatever happens to be running."""
         ctx = _make_context(active_sub_agents=[
             {"handle": "claude-code", "status": "running"},
         ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
-
-        assert "Sub-Agent Coordination" in semi_stable
-        assert "claude-code" in semi_stable
-        assert "running" in semi_stable
-
-    def test_section_omitted_when_no_sub_agents(self):
-        """Section is absent when no sub-agents are active."""
-        ctx = _make_context(active_sub_agents=[])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        _, semi_stable, _ = PromptBuilder().build(ctx)
 
         assert "Sub-Agent Coordination" not in semi_stable
 
+    def test_section_bytes_do_not_follow_live_state(self):
+        """Dispatch and report-back must not rewrite the system region."""
+        builder = PromptBuilder()
+        semis = []
+        for active in ([], [{"handle": "claude-code", "status": "running"}],
+                       [{"handle": "claude-code", "status": "idle"}]):
+            cached, semi_stable, _ = builder.build(
+                _make_context(enabled_agents=ENABLED, active_sub_agents=active))
+            semis.append((cached, semi_stable))
+        assert semis[0] == semis[1] == semis[2]
+        assert "Current Sub-Agent States" not in semis[0][1]
+
     def test_section_describes_nonblocking_model(self):
         """Section describes the non-blocking dispatch model."""
-        ctx = _make_context(active_sub_agents=[
-            {"handle": "claude-code", "status": "running"},
-        ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        ctx = _make_context(enabled_agents=ENABLED)
+        _, semi_stable, _ = PromptBuilder().build(ctx)
 
         # Wording updated by 16f9f42 (yield_turn dispatch + push-based
         # sub-agent resume): "does NOT wait" became "ENDS YOUR TURN" /
@@ -65,29 +78,35 @@ class TestSubAgentAwarenessSection:
         assert "ENDS YOUR TURN" in semi_stable
         assert "AUTOMATICALLY RESUMED" in semi_stable
 
-    def test_section_shows_multiple_agents(self):
-        """Multiple sub-agents listed with correct states."""
-        ctx = _make_context(active_sub_agents=[
+    def test_state_line_in_the_tail_shows_multiple_agents(self):
+        """Live states ride the tail as one line: handle + status."""
+        ctx = _make_context(enabled_agents=ENABLED, active_sub_agents=[
             {"handle": "claude-code", "status": "running"},
             {"handle": "aider", "status": "idle"},
         ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        _, semi_stable, dynamic = PromptBuilder().build(ctx)
 
-        assert "claude-code" in semi_stable
-        assert "running" in semi_stable
-        assert "aider" in semi_stable
-        assert "idle" in semi_stable
+        assert "Sub-agents: claude-code running, aider idle" in dynamic.split("\n")
+        assert "aider" not in semi_stable
 
-    def test_section_includes_last_activity(self):
-        """Last activity info is shown when present."""
-        ctx = _make_context(active_sub_agents=[
-            {"handle": "claude-code", "status": "running", "last_activity": "refactoring auth"},
+    def test_state_line_omitted_when_nothing_is_active(self):
+        ctx = _make_context(enabled_agents=ENABLED, active_sub_agents=[])
+        _, _, dynamic = PromptBuilder().build(ctx)
+
+        assert "Sub-agents:" not in dynamic
+
+    def test_state_line_carries_no_activity_or_timestamps(self):
+        """Only handle + status — free text and times would churn the tail."""
+        ctx = _make_context(enabled_agents=ENABLED, active_sub_agents=[
+            {"handle": "claude-code", "status": "running",
+             "last_activity": "refactoring auth", "started_at": "2026-10-27T10:00:00"},
         ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        cached, semi_stable, dynamic = PromptBuilder().build(ctx)
 
-        assert "refactoring auth" in semi_stable
+        assert "Sub-agents: claude-code running" in dynamic.split("\n")
+        for part in (cached, semi_stable, dynamic):
+            assert "refactoring auth" not in part
+            assert "2026-10-27T10:00:00" not in part
 
     def test_prompt_context_defaults_empty_list(self):
         """PromptContext.active_sub_agents defaults to empty list."""
@@ -96,20 +115,14 @@ class TestSubAgentAwarenessSection:
 
     def test_section_mentions_transcript_reading(self):
         """Section tells the agent how to read transcripts."""
-        ctx = _make_context(active_sub_agents=[
-            {"handle": "claude-code", "status": "running"},
-        ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        ctx = _make_context(enabled_agents=ENABLED)
+        _, semi_stable, _ = PromptBuilder().build(ctx)
 
         assert "transcript" in semi_stable.lower()
 
     def test_section_mentions_system_messages(self):
-        """Section mentions [Sub-agent] system message notifications."""
-        ctx = _make_context(active_sub_agents=[
-            {"handle": "claude-code", "status": "running"},
-        ])
-        builder = PromptBuilder()
-        _, semi_stable, _ = builder.build(ctx)
+        """Section mentions [Sub-agent] message notifications."""
+        ctx = _make_context(enabled_agents=ENABLED)
+        _, semi_stable, _ = PromptBuilder().build(ctx)
 
         assert "[Sub-agent]" in semi_stable

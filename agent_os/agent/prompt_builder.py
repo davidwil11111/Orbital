@@ -320,6 +320,7 @@ class PromptBuilder:
         ]))
         truly_dynamic = _SEP.join(filter(None, [
             self._runtime(context),
+            self._sub_agent_states(context),
             self._context_budget(context),
             self._state_checkpoint_status(context),
         ]))
@@ -703,9 +704,10 @@ class PromptBuilder:
     def _asks(self, context: PromptContext) -> str | None:
         """Spec 089 §3.5: when to open an ask, and how to close one.
 
-        The asks themselves (open + recently dropped) ride the per-call
-        runtime block (``context.py``); the grammar also sits in ASKS.md's
-        own format header for agents Orbital does not prompt.
+        Fixed text — it never reads ASKS.md, so its bytes do not move when the
+        file does (spec 139 A: asks are best-effort; the agent reads the file
+        itself when it needs to). The grammar also sits in ASKS.md's own
+        format header for agents Orbital does not prompt.
         """
         if context.is_scratch:
             return None
@@ -728,8 +730,11 @@ class PromptBuilder:
             "  `- done <id> \"<the user's own words>\"`; when they decline it,\n"
             "  `- dropped <id> \"<their words>\"`. Close only with the user's own words — if\n"
             "  unsure, leave it open.\n"
-            "- Never re-propose a dropped ask. Open asks and recently dropped ones are listed in\n"
-            "  the runtime note of each turn."
+            "- Never re-propose a dropped ask.\n"
+            "- Before opening an ask, read ASKS.md: don't duplicate an open one, and never re-open\n"
+            "  what the user dropped.\n"
+            "- When the user's message looks like an answer to something you raised earlier,\n"
+            "  check ASKS.md for an open ask to close."
         )
 
     def _memory(self, context: PromptContext) -> str:
@@ -892,8 +897,15 @@ class PromptBuilder:
         return "\n".join(lines)
 
     def _sub_agent_awareness(self, context: PromptContext) -> str | None:
-        """Section: Active sub-agents and interaction model (layer 5 awareness)."""
-        if not context.active_sub_agents:
+        """Section: how sub-agent coordination works (layer 5 awareness).
+
+        Gated on the ENABLED agents, like ``_sub_agents()``, and free of live
+        state (spec 139 B): it used to appear, disappear and change with each
+        dispatch / report-back — the very run boundary the manager wakes on —
+        and broke the cached system region there. Live states ride the tail
+        (``_sub_agent_states``).
+        """
+        if not context.enabled_agents:
             return None
 
         lines = ["## Sub-Agent Coordination\n"]
@@ -904,18 +916,7 @@ class PromptBuilder:
         lines.append("- Do NOT restate or re-summarize what a sub-agent did — the user already sees it, so repeating it is noise. After a sub-agent completes, ADD VALUE instead: silently verify the work (read files / run checks), then take the next action or reply only with what's NEW (a problem you found, a decision you need, or a one-line confirmation). If the sub-agent produced no final message, briefly tell the user the outcome yourself.")
         lines.append('- Do NOT call agent_message(action="status") in a loop to wait — that does nothing useful and wastes a turn. Use status only if the user explicitly asks about progress.')
         lines.append("- To see detailed output: read the transcript file path from the notification message.")
-        lines.append("- Sub-agent results appear as file changes in the workspace. Use the read tool to inspect.\n")
-
-        lines.append("### Current Sub-Agent States\n")
-        for agent_info in context.active_sub_agents:
-            handle = agent_info["handle"]
-            state = agent_info.get("status", "unknown")
-            last_activity = agent_info.get("last_activity", "")
-
-            status_line = f"- **{handle}**: {state}"
-            if last_activity:
-                status_line += f" (last activity: {last_activity})"
-            lines.append(status_line)
+        lines.append("- Sub-agent results appear as file changes in the workspace. Use the read tool to inspect.")
 
         return "\n".join(lines)
 
@@ -973,6 +974,19 @@ class PromptBuilder:
             f"Workspace: {context.workspace}\n"
             f"Current time: {context.datetime_now}"
         )
+
+    def _sub_agent_states(self, context: PromptContext) -> str | None:
+        """Tail line (spec 139 B): ``Sub-agents: claude-code running, codex idle``.
+
+        Handle + status only — no timestamps or activity text, which would
+        rewrite the line on every call. Omitted when nothing is active."""
+        if not context.active_sub_agents:
+            return None
+        states = ", ".join(
+            f"{a['handle']} {a.get('status') or 'unknown'}"
+            for a in context.active_sub_agents
+        )
+        return f"Sub-agents: {states}"
 
     def _context_budget(self, context: PromptContext) -> str:
         # Quantized to 5% steps for DISPLAY only: a per-percent figure rewrote

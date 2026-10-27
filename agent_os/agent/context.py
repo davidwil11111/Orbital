@@ -601,21 +601,11 @@ class ContextManager:
                         "content": snap.row_text,
                     })
 
-        # Asks (spec 089 §3.5): open asks plus the ones the user dropped
-        # recently ("never re-propose") ride the per-call runtime block, which
-        # _attach_runtime_block folds into the latest user turn — cache-safe,
-        # and next to what the user just said. This replaced the retraction
-        # row injected near the front of the prompt. With nothing open, a
-        # one-line "none" cue keeps the per-turn reminder (non-scratch
-        # projects with a memory dir only).
-        from agent_os.agent import asks as _asks
-        asks_block = _asks.render_runtime_block(
-            pp.orbital_dir,
-            empty_cue=not self._base_ctx.is_scratch and os.path.isdir(pp.orbital_dir),
-        )
-        if asks_block:
-            truly_dynamic = (truly_dynamic + "\n\n" if truly_dynamic else "") + asks_block
-            dynamic_tokens += self._estimate_tokens(asks_block)
+        # Asks (spec 089 §3, spec 139 A) are NOT injected: the prompt's fixed
+        # "## Asks" section tells the agent to read ASKS.md itself before
+        # opening or closing one. Pasting the open + dropped lists into the
+        # per-call tail cost ~1.5–2k never-cached tokens on every call (the
+        # tail moves off the prefix on the next call).
 
         # Layer 3: instructions/*.md
         instructions_dir = pp.instructions_dir

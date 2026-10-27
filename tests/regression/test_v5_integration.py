@@ -9,7 +9,8 @@ Verifies that the five layers work together:
 2. Non-blocking dispatch (send returns immediately)
 3. Lifecycle observer (system messages on state transitions)
 4. Chat composite (GET /chat merges session + transcripts)
-5. Prompt awareness (PromptBuilder includes active sub-agent states)
+5. Prompt awareness (PromptBuilder: coordination rules in the system region,
+   live sub-agent states as one line in the per-call tail — spec 139 B)
 """
 
 import asyncio
@@ -182,10 +183,11 @@ async def test_chat_composite_merges_session_and_transcripts():
 
 
 def test_prompt_awareness_reflects_active_agents():
-    """Integration: PromptBuilder includes active sub-agent states in system prompt.
+    """Integration: PromptBuilder reports active sub-agent states in the tail.
 
-    Verifies that when active_sub_agents is populated, the system prompt
-    contains the Sub-Agent Coordination section with correct states.
+    Spec 139 B: the Sub-Agent Coordination rules sit in the system region
+    whenever an agent is enabled; the live states are one line in the
+    per-call runtime block, never in the system region.
     """
     ctx = PromptContext(
         workspace=tempfile.gettempdir(),
@@ -206,19 +208,15 @@ def test_prompt_awareness_reflects_active_agents():
     builder = PromptBuilder()
     cached, semi_stable, dynamic = builder.build(ctx)
 
-    # Full system prompt
-    system_prompt = cached + "\n\n" + semi_stable + "\n\n" + dynamic
+    # The static sub-agents listing and the coordination rules: system region.
+    assert "Sub-Agents Available" in semi_stable
+    assert "Sub-Agent Coordination" in semi_stable
+    assert "returns IMMEDIATELY" in semi_stable
+    assert "Current Sub-Agent States" not in semi_stable
 
-    # Should have both the static sub-agents listing and the dynamic awareness section
-    assert "Sub-Agents Available" in system_prompt
-    assert "Sub-Agent Coordination" in system_prompt
-    assert "returns IMMEDIATELY" in system_prompt
-
-    # Semi-stable section should list both agents with states
-    assert "claude-code" in semi_stable
-    assert "running" in semi_stable
-    assert "aider" in semi_stable
-    assert "idle" in semi_stable
+    # The live states: one tail line, handle + status.
+    assert "Sub-agents: claude-code running, aider idle" in dynamic.split("\n")
+    assert "aider" not in cached + semi_stable
 
 
 def test_sanitize_roles_drops_agent_messages():

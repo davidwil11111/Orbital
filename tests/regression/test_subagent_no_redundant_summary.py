@@ -113,7 +113,10 @@ def _ctx(**overrides) -> PromptContext:
 def test_coordination_section_forbids_re_summarizing():
     """The Sub-Agent Coordination section tells the agent not to re-summarize a
     sub-agent's output because the user already sees it."""
-    ctx = _ctx(active_sub_agents=[{"handle": "claude-code", "status": "running"}])
+    # Spec 139 B: the section is gated on the enabled agents, not live state.
+    ctx = _ctx(enabled_agents=[
+        {"handle": "claude-code", "display_name": "Claude Code", "type": "cli"},
+    ])
     _, semi_stable, _ = PromptBuilder().build(ctx)
 
     low = semi_stable.lower()

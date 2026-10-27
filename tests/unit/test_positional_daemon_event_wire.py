@@ -43,16 +43,6 @@ from agent_os.agent.providers.openai_compat import LLMProvider
 from agent_os.agent.session import Session
 
 
-@pytest.fixture(autouse=True)
-def _no_asks_section(monkeypatch):
-    """These tests pin the runtime block's exact bytes from `_StubBuilder`.
-    Spec 089 appends an asks section inside that same block (an "Open asks:
-    none" cue even when empty); where it lands is covered by
-    tests/unit/test_asks.py::TestRuntimeInjection, so it is left out here."""
-    from agent_os.agent import asks
-    monkeypatch.setattr(asks, "render_runtime_block", lambda *a, **k: "")
-
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 _DYNAMIC = (
@@ -701,9 +691,10 @@ class TestPromptWording:
     def test_wake_is_not_described_as_a_system_message(self):
         ctx = PromptContext(
             workspace="/ws", model="m", autonomy=Autonomy.HANDS_OFF,
-            enabled_agents=[], tool_names=[], os_type="macos",
+            enabled_agents=[{"handle": "claude-code", "display_name": "Claude Code",
+                             "type": "cli"}],
+            tool_names=[], os_type="macos",
             datetime_now="2026-08-03T09:29",
-            active_sub_agents=[{"handle": "claude-code", "status": "running"}],
         )
         section = PromptBuilder()._sub_agent_awareness(ctx)
         assert "[Sub-agent] system message" not in section, (
