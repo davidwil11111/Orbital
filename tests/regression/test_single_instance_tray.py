@@ -214,6 +214,10 @@ def test_held_mutex_with_no_window_fails_open(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["Orbital"])
     monkeypatch.setattr(main_mod, "_acquire_single_instance", lambda *a, **k: False)
     monkeypatch.setattr(main_mod, "_activate_existing_window", lambda *a, **k: False)
+    # Spec 134 W6 asks whether the holder is frozen. Not frozen (here: no
+    # daemon recorded) and no window to show → fail open. Stubbed, since the
+    # real check reads the machine's ~/orbital/daemon.pid.
+    monkeypatch.setattr(main_mod, "_existing_instance_is_responsive", lambda: True)
     monkeypatch.setattr(migration, "run_migrations", _reached)
 
     with pytest.raises(_ReachedStartup):

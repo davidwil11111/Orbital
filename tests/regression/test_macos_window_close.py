@@ -37,5 +37,9 @@ def test_macos_cmd_q_exits():
     after_open_window = source[open_window_idx:]
     assert 'sys.platform == "darwin"' in after_open_window, \
         "After open_window(), main() must check sys.platform == 'darwin'"
-    assert "os._exit" in after_open_window, \
-        "macOS quit path must call os._exit(0) for clean shutdown"
+    # Spec 134 W7: the exit goes through _exit_app (flush telemetry, release
+    # the PID file, then os._exit) instead of a bare os._exit in main().
+    assert "_exit_app(port)" in after_open_window, \
+        "macOS quit path must end through _exit_app(port)"
+    assert "os._exit(0)" in inspect.getsource(main_mod._exit_app), \
+        "_exit_app must call os._exit(0) for clean shutdown"
