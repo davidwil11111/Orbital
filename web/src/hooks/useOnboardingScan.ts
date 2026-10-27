@@ -28,9 +28,12 @@ interface Options {
  * import dialog. GET /onboarding/history first — the call that starts the
  * daemon's background scan — then the importable list, whose candidates are
  * there at once while the groups arrive when the scan is ready. Polls both
- * while `status == "scanning"` (every 1.5 s, at most 20 s).
+ * while `status == "scanning"` (every 1.5 s, at most 90 s). Once the scan is
+ * ready the folder rows are rebuilt from it, so giving up early leaves the
+ * first, noisier list; reading Codex's compressed rollouts made a cold scan
+ * take 10–14 s on a dev Mac, and a heavier history takes longer.
  */
-export function useOnboardingScan({ pollMs = 1500, maxMs = 20000 }: Options = {}): OnboardingScan {
+export function useOnboardingScan({ pollMs = 1500, maxMs = 90000 }: Options = {}): OnboardingScan {
   const [history, setHistory] = useState<HistoryStatus | null>(null);
   const [importable, setImportable] = useState<ImportableResponse | null>(null);
   const [error, setError] = useState(false);
