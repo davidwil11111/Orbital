@@ -523,6 +523,8 @@ class SetupEngine:
         # this method with a one-argument callable.
         version = (self._run_check_command(cmd, env=check_env)
                    if check_env is not None else self._run_check_command(cmd))
+        if version is not None:
+            version = self._version_line(version)
         if key is not None and version is not None:
             self._version_cache[key] = version
         return version
@@ -1625,6 +1627,21 @@ class SetupEngine:
         import re
         match = re.search(r"(\d+\.\d+\.\d+)", raw)
         return match.group(1) if match else None
+
+    @staticmethod
+    def _version_line(raw: str) -> str:
+        """The line of ``--version`` output that carries the version.
+
+        CLIs print notices around it (Gemini on Windows: "Rename failed with
+        EPERM, retrying…"; Node: ExperimentalWarning), and the card shows
+        this string as-is.
+        """
+        import re
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        for ln in lines:
+            if re.search(r"\d+\.\d+", ln):
+                return ln
+        return lines[0] if lines else raw
 
     @staticmethod
     def _version_gte(detected: str, minimum: str) -> bool:
