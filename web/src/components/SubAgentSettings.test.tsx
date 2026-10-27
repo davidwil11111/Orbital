@@ -568,7 +568,9 @@ describe('SubAgentSettings — version floor / Update (spec 116)', () => {
       slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 0, verified: false,
     });
 
-    const notice = screen.getByTestId('sub-agent-update-notice-claude-code');
+    // findBy: the emitted event's re-render can land after this line on a
+    // loaded CI runner (batch 1026 rc: red once, green 8/8 locally).
+    const notice = await screen.findByTestId('sub-agent-update-notice-claude-code');
     expect(notice).toHaveTextContent(/did not complete/i);
     expect(notice).toHaveTextContent('npm install -g @anthropic-ai/claude-code@latest');
     // The login notice is a different surface and stays untouched.
@@ -590,7 +592,7 @@ describe('SubAgentSettings — version floor / Update (spec 116)', () => {
   it('an updater that failed outright shows the failed notice', async () => {
     await renderOldClaude();
     emit('login.failed', { slug: 'claude-code', job_id: 'upd1', kind: 'update', return_code: 1 });
-    expect(screen.getByTestId('sub-agent-update-notice-claude-code')).toHaveTextContent(/did not complete/i);
+    expect(await screen.findByTestId('sub-agent-update-notice-claude-code')).toHaveTextContent(/did not complete/i);
   });
 
   it('a 409 (worker running) shows the busy hint instead of an error', async () => {
