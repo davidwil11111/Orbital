@@ -5,8 +5,10 @@
 """Per-agent history readers (spec 138). Each module exposes ``SOURCE``, a
 :class:`agent_os.onboarding.history_types.HistorySource`.
 
-Modules are loaded by name and a missing one is skipped, so a reader can land
-on its own without touching the scan.
+Modules are loaded by name and a missing one is skipped with a warning.
+Loading by name hides them from PyInstaller's analysis, so both desktop specs
+collect this package's submodules (the rc DMG of 2026-10-27 shipped without
+claude_code and codex, and the scan quietly read a fraction of the history).
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ def load_sources() -> list:
             mod = importlib.import_module(f"{__name__}.{module}")
         except ModuleNotFoundError as exc:
             if exc.name == f"{__name__}.{module}":
-                continue  # not built yet
+                logger.warning("history source %s is missing from this build", module)
+                continue
             logger.exception("history source %s failed to import", module)
             continue
         except Exception:

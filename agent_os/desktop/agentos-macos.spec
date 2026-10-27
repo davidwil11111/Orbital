@@ -4,7 +4,7 @@ import importlib.util
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 project_root = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
@@ -66,7 +66,10 @@ a = Analysis(
         'multipart',
         'claude_agent_sdk',
         'claude_agent_sdk.types',
-    ] + _httptools_hiddenimports,
+    ] + _httptools_hiddenimports
+      # Spec 138 history readers are imported by name (onboarding.sources),
+      # which analysis cannot see: the rc DMG shipped without claude_code + codex.
+      + collect_submodules('agent_os.onboarding.sources'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
