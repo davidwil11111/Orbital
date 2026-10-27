@@ -147,6 +147,9 @@ async def test_a_live_handle_whose_wake_raises_is_reported_not_propagated(tmp_pa
     handle.session = session
     mgr._resolve_session_id = MagicMock(return_value="s1")
     mgr._handles = {make_session_key("proj", "s1"): handle}
+    # Spec 134 §3.5: the idle branch now checks the slot first; nobody else
+    # holds it here.
+    mgr.current_holder_session_id = MagicMock(return_value=None)
     mgr._start_loop = AsyncMock(
         side_effect=ProviderConfigError("invalid_api_key", "provider said no"),
     )

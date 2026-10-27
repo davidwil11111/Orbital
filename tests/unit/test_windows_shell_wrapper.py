@@ -58,6 +58,23 @@ def test_script_keeps_the_command_exit_semantics_and_emits_the_marker():
     assert "exit 1" in script
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="runs Windows PowerShell")
+@pytest.mark.parametrize("command,code", [
+    ('python -c "raise SystemExit(7)"', 7),
+    ("Get-Item C:\\orbital-no-such-path-x", 1),
+    ('python -c "raise SystemExit(0)"', 0),
+])
+def test_script_exits_with_the_native_programs_own_code(tmp_path, command, code):
+    # Batch 1026 Windows pass (D2): a job that ran `raise SystemExit(7)` was
+    # reported as exit 1, since the trailer collapsed every failure to 1.
+    script = tmp_path / "t.ps1"
+    script.write_text(build_windows_script(command), encoding="utf-8-sig")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script)], capture_output=True, timeout=60)
+    assert result.returncode == code
+
+
 def test_script_writes_its_output_as_utf8_before_the_command_runs():
     # Bench 2026-10-20: redirected PowerShell 5.1 output is encoded in the
     # OEM code page (437 on an en-US system locale), so CJK arrived as ``?``.
@@ -218,7 +235,7 @@ def test_safe_mode_projects_keep_the_focus_warning(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="real PowerShell")
 @pytest.mark.parametrize("command, code, expect", [
     ('Write-Output "a b"', 0, "a b"),
-    ("cmd /c exit 5", 1, None),
+    ("cmd /c exit 5", 5, None),          # the program's own code (batch 1026), not -Command's 1
     ("Get-Item C:\\definitely_not_here_x", 1, None),
     ("Get-Item C:\\definitely_not_here_x; Write-Output x", 0, "x"),
     ("exit 7", 7, None),

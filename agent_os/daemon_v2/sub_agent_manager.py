@@ -27,9 +27,11 @@ from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agents.setup_engine import StaleOkView
 from agent_os.agents.setup_types import handshake_failed
+from agent_os.daemon_v2.job_launcher import ensure_launcher, worker_instructions
 from agent_os.daemon_v2.sub_agent_visibility import resolve_visible_sub_agent_slugs
 from agent_os.daemon_v2.models import (
     SessionKey,
+    detect_os,
     make_session_key,
 )
 
@@ -941,6 +943,12 @@ class SubAgentManager:
 
         env = config_dict.get("env") or {}
         env.pop("CLAUDECODE", None)  # Prevent nested Claude Code detection
+        # Spec 134 Part B (d): Codex / Pi start background jobs with the
+        # workspace launcher; the env attributes them to this session.
+        jobs_enabled = self._prepare_worker_jobs(
+            manifest, project_id, session_id, handle, workspace, env)
+        jobs_hint = worker_instructions(detect_os()) if jobs_enabled else None
+        transport_kind = getattr(manifest.runtime, "transport", None)
 
         config = AdapterConfig(
             command=config_dict["command"],
@@ -1037,6 +1045,7 @@ class SubAgentManager:
                     agent_slug=handle,
                     enabled_sub_agents=enabled_sub_agents,
                     pinned=pinned,
+                    background_jobs=(jobs_hint if transport_kind == "pi-rpc" else None),
                 )
             except Exception:
                 logger.exception(
@@ -1137,6 +1146,10 @@ class SubAgentManager:
         # What this process was launched with — send() rebuilds it once the
         # user's settings have moved on (see _spawn_config_stale).
         adapter._spawn_fingerprint = spawn_fp
+        # Codex takes no system prompt: the launcher paragraph rides on the
+        # first dispatch of this process instead (spec 134 Part B).
+        adapter._orbital_jobs_hint = (
+            jobs_hint if transport_kind == "codex-appserver" else None)
 
         lock = self._get_lock(project_id, session_id=session_id)
         async with lock:
@@ -1197,6 +1210,30 @@ class SubAgentManager:
             f"Started {manifest.name} "
             f"({self._format_resume_clause(resume_status, resume_reason)})"
         )
+
+    # Spec 134 Part B (d): workers whose shell is their own start background
+    # jobs with the workspace launcher (claude-code keeps run_in_background).
+    _JOB_LAUNCHER_TRANSPORTS = ("codex-appserver", "pi-rpc")
+
+    def _prepare_worker_jobs(self, manifest, project_id: str, session_id: str,
+                             handle: str, workspace: str, env: dict) -> bool:
+        """Attribute the worker's launcher jobs (env), write the launcher and
+        watch the workspace's ``orbital/jobs/``. True when the worker can use
+        it."""
+        if getattr(getattr(manifest, "runtime", None), "transport", None) \
+                not in self._JOB_LAUNCHER_TRANSPORTS or not workspace:
+            return False
+        env.update({
+            "ORBITAL_PROJECT_ID": project_id,
+            "ORBITAL_SESSION_ID": session_id,
+            "ORBITAL_AGENT": handle,
+        })
+        if ensure_launcher(workspace) is None:
+            return False
+        registry = getattr(self, "_job_registry", None)
+        if registry is not None:
+            registry.watch(workspace, project_id)
+        return True
 
     def _fingerprint_of(self, handle: str, config_dict: dict) -> str | None:
         """The spawn fingerprint of ``config_dict``, or None when the setup
@@ -1434,6 +1471,10 @@ class SubAgentManager:
         # path — pinned, @mention, manager dispatch — gets the same block.
         preamble = await self._build_recap(
             adapter, project_id, session_id, handle, message=prompt.message)
+        jobs_hint = getattr(adapter, "_orbital_jobs_hint", None)
+        if isinstance(jobs_hint, str) and jobs_hint:
+            preamble = f"{jobs_hint}\n\n{preamble}"
+            adapter._orbital_jobs_hint = None
         try:
             await self._dispatch_async(
                 adapter, project_id, handle, preamble + prompt.message,

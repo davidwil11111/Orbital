@@ -293,6 +293,7 @@ def test_agent_store_misses(tmp_path, caplog):
 
 def test_agent_store_defaults_to_the_home_relative_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))          # what ~ is on Windows
     _write_store(tmp_path / ".dsh", "refs:\n  DEEPSEEK_API_KEY: sk-desktop\n")
     assert agent_store_has(_STORE, {}) is True
 
@@ -431,8 +432,10 @@ def test_a_picked_app_is_saved_as_the_launcher_inside_it(tmp_path, monkeypatch):
     with fake:
         result = settings_routes._locate_test("acpy", str(app_dir))
     assert result["ok"] is True
-    assert result["binary"] == launcher
-    assert calls[0][0][0] == launcher
+    # The macOS branch joins with "/"; on a Windows test host the tmp path
+    # itself has "\", so compare normalized.
+    assert os.path.normpath(result["binary"]) == os.path.normpath(launcher)
+    assert os.path.normpath(calls[0][0][0]) == os.path.normpath(launcher)
 
 
 # ---------------------------------------------------------------------------

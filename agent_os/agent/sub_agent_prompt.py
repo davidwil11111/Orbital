@@ -88,6 +88,7 @@ def render_sub_agent_prompt(
     enabled_sub_agents: list[str],
     *,
     pinned: bool = False,
+    background_jobs: str | None = None,
 ) -> str:
     """Render the sub-agent inheritance system prompt.
 
@@ -103,6 +104,8 @@ def render_sub_agent_prompt(
             to this worker (no management agent mediates). The Layer-1 ban is
             REPLACED by the narrow append/targeted-edit write contract plus
             the user's recently dropped asks.
+        background_jobs: Spec 134 Part B — the launcher paragraph for a
+            worker whose shell is its own (Pi), appended as its own block.
 
     Returns:
         The full rendered system prompt string. Callers must not cache it.
@@ -254,6 +257,9 @@ def render_sub_agent_prompt(
         "place them in appropriate paths within the workspace based on the"
     )
     lines.append("artifact's nature. Use your judgment.")
+    if background_jobs:
+        lines.append("")
+        lines.append(background_jobs)
 
     # Suppress lint about unused arg without changing the public signature;
     # `namespace` is reserved for future per-namespace overrides.

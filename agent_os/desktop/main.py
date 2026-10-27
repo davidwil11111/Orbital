@@ -921,6 +921,119 @@ def _close_requests_quit() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Spec 134 Part B, decision (a): background jobs do not survive quitting.
+# Quitting while one runs asks first; quitting ends every job tree.
+# ---------------------------------------------------------------------------
+
+# AppleEvent quit reasons (``kAEQuitReason``) that mean the session is ending.
+_AE_QUIT_REASON = 0x77687920        # 'why?'
+_AE_SESSION_ENDING = {
+    0x6C6F676F,  # 'logo' kAELogOut
+    0x726C6763,  # 'rlgc' kAEReallyLogOut
+    0x72657374,  # 'rest' kAERestart
+    0x72727374,  # 'rrst' kAEShowRestartDialog / really restart
+    0x73687574,  # 'shut' kAEShutDown
+    0x7273646E,  # 'rsdn' kAEReallyShutDown
+}
+
+
+def _quit_jobs_prompt(n: int) -> tuple[str, str, str, str]:
+    """(title, message, quit label, cancel label) in the OS language."""
+    if _os_localization() is not None:
+        return ("退出 Orbital？", f"还有 {n} 个后台任务正在运行。退出会结束它们。",
+                "退出", "取消")
+    return ("Quit Orbital?",
+            f"{n} background job(s) are still running. Quitting stops them.",
+            "Quit", "Cancel")
+
+
+def _system_is_ending_session() -> bool:
+    """True when this quit comes from a logout, restart or shutdown, which a
+    confirmation must never block. Only macOS routes those through the same
+    quit path; Windows' tray Quit is always the user's own click."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import Foundation
+
+        event = Foundation.NSAppleEventManager.sharedAppleEventManager().currentAppleEvent()
+        if event is None:
+            return False
+        reason = event.attributeDescriptorForKeyword_(_AE_QUIT_REASON)
+        return reason is not None and reason.enumCodeValue() in _AE_SESSION_ENDING
+    except Exception:
+        return False
+
+
+def _ask_quit_with_jobs(n: int) -> bool:
+    """Native Quit / Cancel. True = quit. Any failure to ask quits (a broken
+    dialog must never trap the user in the app)."""
+    title, message, quit_label, cancel_label = _quit_jobs_prompt(n)
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            MB_OKCANCEL, MB_ICONWARNING, MB_SETFOREGROUND, IDOK = 0x1, 0x30, 0x10000, 1
+            answer = ctypes.windll.user32.MessageBoxW(
+                0, message, title, MB_OKCANCEL | MB_ICONWARNING | MB_SETFOREGROUND)
+            return answer == IDOK
+        if sys.platform == "darwin":
+            if threading.current_thread() is threading.main_thread():
+                import AppKit
+
+                alert = AppKit.NSAlert.alloc().init()
+                alert.setMessageText_(title)
+                alert.setInformativeText_(message)
+                alert.addButtonWithTitle_(quit_label)
+                alert.addButtonWithTitle_(cancel_label)
+                return alert.runModal() == AppKit.NSAlertFirstButtonReturn
+            import subprocess
+
+            from agent_os.utils.subprocess_flags import win_no_window_flags
+
+            script = (
+                f"display dialog {_applescript_str(message)} "
+                f"with title {_applescript_str(title)} "
+                f"buttons {{{_applescript_str(cancel_label)}, {_applescript_str(quit_label)}}} "
+                f"default button 2 cancel button 1 with icon caution"
+            )
+            result = subprocess.run(["osascript", "-e", script], capture_output=True,
+                                    encoding="utf-8", errors="replace", timeout=600,
+                                    creationflags=win_no_window_flags())
+            return result.returncode == 0 and quit_label in (result.stdout or "")
+    except Exception:
+        _boot_logger().exception("Could not show the quit-with-jobs dialog")
+    return True
+
+
+def confirm_quit() -> bool:
+    """True when Orbital may quit now: no background job is running, the OS
+    is ending the session, or the user chose Quit."""
+    from agent_os.daemon_v2 import jobs
+
+    n = jobs.running_job_count()
+    if n <= 0 or _system_is_ending_session():
+        return True
+    return _ask_quit_with_jobs(n)
+
+
+def _exit_app(port: int) -> None:
+    """The desktop's one way out: end every background job tree, flush
+    telemetry, release the PID file, exit (``os._exit`` skips the app's
+    shutdown hooks, so the jobs are ended here)."""
+    from agent_os.daemon_v2 import jobs
+    from agent_os.utils import pid_file
+
+    try:
+        jobs.stop_all_jobs()
+    except Exception:
+        _boot_logger().exception("Could not stop background jobs on quit")
+    flush_telemetry_before_exit(port)
+    pid_file.release_pid_file()  # os._exit skips atexit (spec 134 W7)
+    os._exit(0)
+
+
 def _handle_window_close(window) -> bool:
     """pywebview ``closing`` handler: False keeps the window (hidden), True
     lets it close.
@@ -933,7 +1046,8 @@ def _handle_window_close(window) -> bool:
     not torn down while hidden, so the WebSocket state is live on reshow.
     """
     if sys.platform == "darwin" and _close_requests_quit():
-        return True
+        # Cmd+Q / menu Quit / Dock Quit: False cancels the termination.
+        return confirm_quit()
     try:
         window.hide()
         _close_state["hidden"] = True
@@ -1768,12 +1882,8 @@ def main():
     from agent_os.desktop.migration import provision_browsers_background
     provision_browsers_background()
 
-    from agent_os.utils.pid_file import release_pid_file
-
     def shutdown():
-        flush_telemetry_before_exit(port)
-        release_pid_file()  # os._exit skips atexit (spec 134 W7)
-        os._exit(0)
+        _exit_app(port)
 
     # On macOS, pystray's Cocoa backend must run on the main thread, but
     # pywebview also requires it.  Initialising pystray from a background
@@ -1786,6 +1896,7 @@ def main():
         tray_thread = threading.Thread(
             target=start_tray,
             args=(port, lambda: open_window(port), shutdown),
+            kwargs={"confirm_quit_fn": confirm_quit},
             daemon=True,
         )
         tray_thread.start()
@@ -1795,12 +1906,10 @@ def main():
     if sys.platform == "darwin":
         # macOS: no system tray, so window close = app close.
         # This is standard macOS behavior for non-document-based apps.
-        flush_telemetry_before_exit(port)
-        release_pid_file()  # os._exit skips atexit (spec 134 W7)
-        os._exit(0)
+        _exit_app(port)
     else:
         # Windows/Linux: system tray keeps app alive after window close.
-        # User quits via tray menu → shutdown() → os._exit(0).
+        # User quits via tray menu → shutdown() → _exit_app().
         try:
             while True:
                 time.sleep(1)

@@ -714,8 +714,11 @@ def test_route_is_mounted_on_the_app(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "acquire_pid_file", lambda *a, **k: None)
 
     app = create_app(data_dir=str(tmp_path))
-    paths = {getattr(r, "path", None) for r in app.routes}
-    assert "/api/v2/agents/{project_id}/browser/live" in paths
+    # Resolve by name: FastAPI >= 0.16x keeps an included router as one
+    # wrapper entry in ``app.routes`` (no ``.path``), so scanning the list
+    # missed every API route on CI.
+    assert (app.url_path_for("browser_live", project_id="p1")
+            == "/api/v2/agents/p1/browser/live")
 
 
 def test_configure_injects_dependencies():

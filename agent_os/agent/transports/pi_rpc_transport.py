@@ -117,6 +117,15 @@ async def iter_records(reader: asyncio.StreamReader, *,
         yield record
 
 
+def _secrets_from_env(env: dict | None) -> list[str]:
+    """The env values to redact from pi's output: the provider key Orbital
+    injects, never Orbital's own ``ORBITAL_*`` job attribution (spec 134 Part
+    B), which is not secret and would blank session ids and agent names."""
+    return [value for key, value in (env or {}).items()
+            if isinstance(value, str) and len(value) >= 8
+            and not str(key).startswith("ORBITAL_")]
+
+
 def _redact(text: str, secrets: list[str]) -> str:
     """Keep the first 4 characters of every known secret and key-like token."""
     for secret in secrets:
@@ -493,8 +502,7 @@ class PiRPCTransport(AgentTransport):
         if env:
             merged_env.update(env)
         # The injected env holds the one provider key Orbital hands pi.
-        self._secrets = [value for value in (env or {}).values()
-                         if isinstance(value, str) and len(value) >= 8]
+        self._secrets = _secrets_from_env(env)
         argv = [command, *args]
         if self._session_dir:
             argv += ["--session-dir", self._session_dir]

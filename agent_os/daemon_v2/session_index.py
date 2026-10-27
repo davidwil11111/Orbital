@@ -48,7 +48,9 @@ INDEX_VERSION = "3"
 # question (``interaction_required`` — the user has to act). The dispatch ack
 # ("Message sent to …") and "… started" rows carry no ``event`` and are not
 # replies. Keep in step with ``lifecycle_observer.py``.
-REPLY_META_EVENTS = frozenset({"sub_agent_terminal", "interaction_required"})
+# Spec 134 Part B: a background job group's join (``job_terminal``) too.
+REPLY_META_EVENTS = frozenset({"sub_agent_terminal", "interaction_required",
+                               "job_terminal"})
 
 
 def index_path(sessions_dir: str) -> str:

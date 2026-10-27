@@ -233,6 +233,9 @@ def _model_env(monkeypatch, tmp_path, delay):
                                          "..", "..", "agents", "manifests"))
     engine = SetupEngine(registry, data_dir=str(tmp_path / "data"))
     engine.check_agent = lambda slug: _status(slug)
+    # The real ACP binary lookups (`which` + a check command each) cost
+    # ~0.4 s on a cold Windows sweep and are not what these tests time.
+    engine._start_handshakes = lambda: None
     store = SubAgentConfigStore(str(tmp_path / "cfg.json"))
     engine.set_sub_agent_config_store(store)
     ws = _Ws()

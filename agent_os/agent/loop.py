@@ -81,6 +81,18 @@ def tool_executor() -> ThreadPoolExecutor:
         return _tool_pool
 
 
+# Spec 134 Part B: one id per tool batch (one assistant message's calls), so
+# every ``shell(background=true)`` call of that message joins one job group.
+# Sync tools see it through ``run_sync_tool``'s copied context.
+_tool_batch: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "orbital_tool_batch", default=None)
+
+
+def current_tool_batch() -> str | None:
+    """The id of the tool batch the calling tool runs in, or None."""
+    return _tool_batch.get()
+
+
 async def run_sync_tool(func, /, *args):
     """``asyncio.to_thread`` on the tool pool (context vars carried along)."""
     loop = asyncio.get_running_loop()
@@ -1611,6 +1623,11 @@ class AgentLoop:
 
                 exit_outer = False
                 intercepted_tc_id = None
+                # Spec 134 Part B: a call asking to end the turn AFTER its
+                # batch (``yield_after_batch``, background jobs) lets its
+                # siblings run first, unlike ``yield_turn``.
+                yield_after_batch = False
+                _batch_token = _tool_batch.set(uuid4().hex[:12])
 
                 for tc in tool_calls:
                     # Cancellation check: if cancel_turn() fired between or
@@ -1800,6 +1817,8 @@ class AgentLoop:
                             self._note_exit("yield_turn", iteration)
                             exit_outer = True
                             break
+                        if result.meta and result.meta.get("yield_after_batch"):
+                            yield_after_batch = True
 
                         # Pause if credential was requested (wait for user input)
                         if result.meta and result.meta.get("credential_request"):
@@ -1904,6 +1923,8 @@ class AgentLoop:
                         # error tracking for this tool.
                         error_tracker.pop(tc["name"], None)
 
+                _tool_batch.reset(_batch_token)
+
                 # Drain deferred messages (lifecycle notifications)
                 for msg in self._session.pop_deferred_messages():
                     self._session.append(msg)
@@ -2005,6 +2026,12 @@ class AgentLoop:
                             "payload": {"reason": reason},
                         })
                         self._note_exit("task_blocked", iteration)
+                    break
+
+                if yield_after_batch:
+                    logger.info("yield_after_batch: background job(s) started; "
+                                "the turn ends after its tool batch")
+                    self._note_exit("yield_after_batch", iteration)
                     break
 
                 # Check stopped

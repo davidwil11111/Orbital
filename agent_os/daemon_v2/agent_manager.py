@@ -66,7 +66,10 @@ from agent_os.daemon_v2.models import (
 # Spec 117 — terminal rows that must wake an idle-after-turn management loop,
 # alongside the sub-agent terminals of spec 091 §4: the result of a command
 # the user let run outside the sandbox is an answer the agent is waiting on.
-_WAKE_EVENTS = frozenset({"sub_agent_terminal", "unsandboxed_run"})
+# Spec 134 Part B: a background job group ending (``job_terminal``) or its
+# 15-minute check-in (``job_checkin``) wakes the session the same way.
+_WAKE_EVENTS = frozenset({"sub_agent_terminal", "unsandboxed_run",
+                          "job_terminal", "job_checkin"})
 
 # Spec 112 A6 (pinned workers): transports whose event stream reports tool
 # names AND paths, so the daemon can list what the turn changed. Pipe / PTY
@@ -332,6 +335,15 @@ class AgentManager:
         # set can't be matched that way. Cleared per-entry in ``_fire``'s
         # finally.
         self._pending_inflight: dict[str, list[PendingInject]] = {}
+        # Spec 134 Part B §3.5 (B5): sessions owed a wake that was refused
+        # because another session held the slot, per project, in arrival
+        # order (dict as an ordered set). Drained one at a time where the
+        # FIFO above drains, after it. In memory: nothing it covers (jobs,
+        # sub-agents) survives a restart.
+        self._owed_wakes: dict[str, dict[str, None]] = {}
+        self._owed_inflight: set[str] = set()
+        # Spec 134 Part B: the daemon's JobRegistry (wired in _assemble_app).
+        self._job_registry = None
         # ── Cross-project read scope (Spec 12 §2a/§2c) ─────────────────────
         # Per-session scope record, keyed by SessionKey:
         #   {"mode": "all"|"selected"|"off", "selected_project_ids": [str]}.
@@ -1773,6 +1785,11 @@ class AgentManager:
                 project_id=project_id,
                 safe_mode_cb=safe_mode_cb,
                 unsandboxed_cb=unsandboxed_cb,
+                # Spec 134 Part B: ``background: true`` for the manager only.
+                # A fanout worker is one-shot and reaped at its join, so a job
+                # outliving it would wake a session that never started it.
+                jobs=getattr(self, "_job_registry", None),
+                session_id=session_id,
             ))
         except ImportError:
             pass
@@ -2490,6 +2507,8 @@ class AgentManager:
                 )
                 return "delivered"
             except Exception as exc:
+                if self._maybe_owe_wake(project_id, session_id, exc, meta):
+                    return "persisted"
                 logger.warning(
                     "inject_system_message(%s/%s): wake failed; event is "
                     "persisted on disk", project_id, session_id,
@@ -2515,6 +2534,14 @@ class AgentManager:
                 # Pinned dispatch (spec 074): append only, never start a
                 # management turn.
                 return "suppressed"
+            # ``_start_loop`` does not check the slot itself: a wake for an
+            # idle session while another holds it is owed (spec 134 §3.5).
+            holder = self.current_holder_session_id(project_id)
+            if holder is not None and holder != session_id:
+                self._maybe_owe_wake(
+                    project_id, session_id,
+                    ValueError(f"Slot held by session {holder}"), meta)
+                return "persisted"
             try:
                 await self._start_loop(project_id, session_id=session_id)
             except Exception as exc:
@@ -3068,6 +3095,10 @@ class AgentManager:
         # before any case branch so it applies uniformly to Case 1 (queue),
         # Case 1b (approval-dismiss), Case 2 (hot-resume), Case 3 (start).
         self._clear_last_terminal_event(project_id, session_id)
+        # Spec 134 Part B: a user message counts as attention for the
+        # background-job check-in guard and resets its wake-loop guards.
+        if queue_state == "chat" and getattr(self, "_job_registry", None) is not None:
+            self._job_registry.note_user_message(project_id, session_id)
         handle = self._handles.get(sk)
         if handle is None:
             # Both the config build and the hydrate run off the event loop
@@ -3608,6 +3639,95 @@ class AgentManager:
         )
         return {"id": entry.id, "nonce": nonce, "position": len(queue)}
 
+    # ── Owed wakes (spec 134 Part B §3.5, B5) ───────────────────────────
+
+    @staticmethod
+    def _is_slot_held_error(exc: BaseException) -> bool:
+        return isinstance(exc, ValueError) and str(exc).startswith("Slot held by session")
+
+    def _maybe_owe_wake(self, project_id: str, session_id: str,
+                        exc: BaseException, meta: dict | None) -> bool:
+        """Record an owed wake when *exc* is the slot guard refusing a
+        wake-eligible event. True when recorded."""
+        if not self._is_slot_held_error(exc):
+            return False
+        if not meta or meta.get("event") not in _WAKE_EVENTS or meta.get("suppress_wake"):
+            return False
+        owed = getattr(self, "_owed_wakes", None)
+        if owed is None:
+            owed = self._owed_wakes = {}
+        owed.setdefault(project_id, {}).setdefault(session_id, None)
+        logger.info("owed wake recorded for %s/%s (%s)", project_id, session_id, exc)
+        return True
+
+    def _maybe_deliver_owed_wake(self, project_id: str) -> None:
+        owed = getattr(self, "_owed_wakes", {}).get(project_id)
+        inflight = getattr(self, "_owed_inflight", None)
+        if inflight is None:
+            inflight = self._owed_inflight = set()
+        if not owed or project_id in inflight:
+            return
+        session_id = next(iter(owed))
+        del owed[session_id]
+        if not owed:
+            self._owed_wakes.pop(project_id, None)
+        inflight.add(project_id)
+        asyncio.ensure_future(self._deliver_owed_wake(project_id, session_id))
+
+    async def _deliver_owed_wake(self, project_id: str, session_id: str) -> None:
+        """Start the owed session's turn if its wake row is still unread."""
+        try:
+            sk = make_session_key(project_id, session_id)
+            handle = self._handles.get(sk)
+            if handle is not None:
+                if handle.task is not None and not handle.task.done():
+                    return              # running: it reads the row itself
+                if not self._terminal_unread(handle.session):
+                    return
+                await self._start_loop(project_id, session_id=session_id)
+                return
+            loaded = await self._hydrate_session(project_id, session_id)
+            if self._handles.get(sk) is not None:
+                handle = self._handles[sk]
+                if (handle.task is None or handle.task.done()) and \
+                        self._terminal_unread(handle.session):
+                    await self._start_loop(project_id, session_id=session_id)
+                return
+            if loaded is None or not self._terminal_unread(loaded):
+                return
+            config = await self._abuild_agent_config_from_project(project_id)
+            await self.start_agent(project_id, config, initial_message=None,
+                                   session_id=loaded.session_uuid, session=loaded)
+        except Exception as exc:
+            if self._is_slot_held_error(exc):
+                # Lost the race for the slot: back to the head of the line.
+                owed = self._owed_wakes.setdefault(project_id, {})
+                self._owed_wakes[project_id] = {session_id: None, **owed}
+            else:
+                logger.warning("owed wake for %s/%s failed", project_id, session_id,
+                               exc_info=True)
+                self._note_wake_failed(project_id, session_id, exc)
+        finally:
+            self._owed_inflight.discard(project_id)
+            self._maybe_dispatch_pending(project_id)
+
+    async def deliver_job_message_to_worker(self, project_id: str, session_id: str,
+                                            handle: str, content: str) -> str:
+        """Spec 134 Part B (d): a Codex/Pi worker's background job ended or
+        checked in — send it to that worker as a normal dispatch. A worker the
+        user is chatting with directly (pinned) stays pinned: its reply must
+        not wake the management agent either."""
+        observer = getattr(self._sub_agent_manager, "_lifecycle_observer", None)
+        pinned = False
+        try:
+            pinned = bool(observer is not None and observer._is_pinned_dispatch(
+                project_id, handle, session_id))
+        except Exception:
+            pinned = False
+        return await self._sub_agent_manager.send(
+            project_id, handle, content, session_id=session_id,
+            initiator="user_pinned" if pinned else "management_agent")
+
     def has_pending_inject(self, project_id: str) -> bool:
         """True if interactive pending input is queued for this project.
 
@@ -3769,18 +3889,21 @@ class AgentManager:
 
     def _maybe_dispatch_pending(self, project_id: str) -> None:
         """If the slot is free and a pending inject exists, dispatch its FIFO
-        head session's batch (spec 006 §3c)."""
+        head session's batch (spec 006 §3c). With no user message waiting,
+        deliver the oldest owed wake instead (spec 134 §3.5)."""
         if self.current_holder_session_id(project_id) is not None:
             return                          # still held; a later free retries
         if self._pending_inflight.get(project_id):
             return                          # a batch is already mid-dispatch
         pend = self._pending_inject.get(project_id)
         if not pend:
+            self._maybe_deliver_owed_wake(project_id)
             return
         item = next(
             (p for p in pend if p.id not in self._pending_tombstoned), None,
         )
         if item is None:
+            self._maybe_deliver_owed_wake(project_id)
             return
         sid = item.session_id
         # In-order, this session's not-yet-tombstoned entries form one batch.

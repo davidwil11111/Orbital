@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import plistlib
+import posixpath
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -145,11 +146,14 @@ def _default_is_executable(path: str) -> bool:
     return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+# macOS paths are POSIX whatever the host, so they are joined with posixpath
+# (the tests run this branch on Windows too).
+
 def _macos_rank(path: str, home: str) -> int:
     """Installed copies first; a mounted DMG or the Trash last."""
     if path.startswith("/Applications/"):
         return 0
-    if home and path.startswith(os.path.join(home, "Applications") + os.sep):
+    if home and path.startswith(posixpath.join(home, "Applications") + "/"):
         return 1
     if path.startswith("/Volumes/") or "/.Trash/" in path:
         return 9
@@ -165,9 +169,9 @@ def find_macos(spec: DesktopAppPlatform, label: str, *, home: str,
     for bundle_id in spec.bundle_ids:
         candidates.extend(p for p in mdfind(bundle_id) if p.endswith(".app"))
     for name in spec.app_names:
-        candidates.append(os.path.join("/Applications", name))
+        candidates.append(posixpath.join("/Applications", name))
         if home:
-            candidates.append(os.path.join(home, "Applications", name))
+            candidates.append(posixpath.join(home, "Applications", name))
     seen: set[str] = set()
     ordered = []
     for path in candidates:
@@ -183,7 +187,7 @@ def find_macos(spec: DesktopAppPlatform, label: str, *, home: str,
             continue
         if spec.bundle_ids and info.get("CFBundleIdentifier") not in spec.bundle_ids:
             continue
-        executable = os.path.join(app_path, spec.executable)
+        executable = posixpath.join(app_path, spec.executable)
         if not is_executable(executable):
             continue
         version = info.get("CFBundleShortVersionString")
@@ -343,7 +347,7 @@ def launcher_inside(apps: list[DesktopApp], os_name: str, path: str, *,
                 info = read_plist(path) or {}
                 if info.get("CFBundleIdentifier") not in spec.bundle_ids:
                     continue
-            candidate = os.path.join(path, spec.executable)
+            candidate = posixpath.join(path, spec.executable)
             if is_executable(candidate):
                 return candidate
         elif os_name == "windows":

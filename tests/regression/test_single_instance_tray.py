@@ -227,9 +227,10 @@ def test_guard_precedes_tray_and_daemon_in_source():
     guard_idx = source.find("_acquire_single_instance")
     assert guard_idx > 0, "main() must call the single-instance guard"
 
-    # The daemon boots through boot_daemon_with_retry (bug #75), which owns the
-    # start_daemon calls; main() itself no longer names start_daemon.
-    for later in ("run_migrations", "boot_daemon_with_retry", "open_window", "start_tray"):
+    # The daemon boots through _boot_or_report (spec 134 W6), which wraps
+    # boot_daemon_with_retry (bug #75); main() names neither start_daemon nor
+    # boot_daemon_with_retry itself.
+    for later in ("run_migrations", "_boot_or_report", "open_window", "start_tray"):
         assert source.find(later) > guard_idx, \
             f"{later} must come after the single-instance guard in main()"
 

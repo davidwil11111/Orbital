@@ -232,6 +232,20 @@ def test_forget_versions_asks_again(tmp_path):
     assert len(versions) == 2
 
 
+def test_the_version_is_the_line_that_carries_it(tmp_path):
+    """Gemini CLI on Windows printed a retry notice after its version, and the
+    Settings card showed it: ``v0.65.0 Rename failed with EPERM, retrying in
+    50ms (attempt 1/5)...`` (batch 1026 Windows pass)."""
+    engine, _binary, _ = _installed_engine(tmp_path)
+    engine._run_check_command = lambda cmd: (
+        "0.65.0\nRename failed with EPERM, retrying in 50ms (attempt 1/5)...")
+    assert engine.check_agent("a").version == "0.65.0"
+    engine.forget_versions()
+    engine._run_check_command = lambda cmd: (
+        "(node:1) ExperimentalWarning: fetch\nclaude 2.1.3 (Claude Code)")
+    assert engine.check_agent("a").version == "claude 2.1.3 (Claude Code)"
+
+
 def test_a_failed_version_check_is_not_cached(tmp_path):
     engine, _binary, _ = _installed_engine(tmp_path)
     calls = []
