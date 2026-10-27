@@ -2,20 +2,24 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import ProjectDetail from './ProjectDetail';
-import type { Project } from '../types';
+import type { Project, Trigger } from '../types';
 import type { Route } from '../route';
+import { __resetPanelState, usePanelState } from '../hooks/usePanelState';
+import { renderHook } from '@testing-library/react';
 
 // ProjectDetail now calls useSessions and useQueue (both need WebSocketProvider).
 // Mock them to avoid the provider requirement in these unit tests.
 vi.mock('../hooks/useSessions', () => ({
   useSessions: () => ({ sessions: [], loading: false, error: null, refresh: vi.fn() }),
 }));
+// A mutable queue snapshot, so the status-line tests can put work in it.
+const queueMock = vi.hoisted(() => ({ snapshot: null as null | { items: Array<{ state: string }> } }));
 vi.mock('../hooks/useQueue', () => ({
   useQueue: () => ({
-    snapshot: null,
+    snapshot: queueMock.snapshot,
     loading: false,
     error: null,
     refresh: vi.fn(),
@@ -60,10 +64,29 @@ const mockProject: Project = {
 const baseRoute: Extract<Route, { name: 'project' }> = {
   name: 'project',
   projectId: 'proj-42',
-  tab: 'chat',
   sessionId: 'sess-xyz',
-  settings: false,
 };
+
+function makeTrigger(over: Partial<Trigger> = {}): Trigger {
+  return {
+    id: 'trg-1',
+    name: 'Daily build',
+    enabled: true,
+    type: 'schedule',
+    schedule: { cron: '0 9 * * *', human: 'Every day at 09:00', timezone: 'UTC' },
+    task: 'Build',
+    autonomy: null,
+    last_triggered: null,
+    trigger_count: 0,
+    created_at: '2026-01-01T00:00:00Z',
+    ...over,
+  } as Trigger;
+}
+
+afterEach(() => {
+  queueMock.snapshot = null;
+  __resetPanelState();
+});
 
 function renderProjectDetail(
   routeOverride?: Partial<Extract<Route, { name: 'project' }>>,
@@ -122,7 +145,7 @@ describe('ProjectDetail — gear icon in header', () => {
     expect(screen.getByRole('button', { name: /project settings/i })).toBeInTheDocument();
   });
 
-  it('clicking the gear icon calls setRoute with settings:true, preserving projectId, tab, and sessionId', () => {
+  it('clicking the gear icon opens the settings page, preserving projectId and sessionId', () => {
     const setRoute = vi.fn();
     renderProjectDetail({}, setRoute);
     fireEvent.click(screen.getByRole('button', { name: /project settings/i }));
@@ -130,72 +153,127 @@ describe('ProjectDetail — gear icon in header', () => {
     expect(setRoute).toHaveBeenCalledWith({
       name: 'project',
       projectId: 'proj-42',
-      tab: 'chat',
       sessionId: 'sess-xyz',
-      settings: true,
+      page: 'settings',
+      previewPath: undefined,
     });
-  });
-
-  it('still renders queue/chat/files tab buttons (not a Settings tab)', () => {
-    renderProjectDetail();
-    // The queue tab is labelled "Tasks" (it parents the Queue and Automations
-    // panes); its route key is still 'queue'.
-    expect(screen.getByRole('button', { name: /^Tasks$/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Chat$/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Files$/i })).toBeInTheDocument();
-    // Must NOT have a standalone "Settings" tab button
-    expect(screen.queryByRole('button', { name: /^Settings$/i })).toBeNull();
-  });
-
-  it('tab click calls setRoute with settings:false to clear settings overlay', () => {
-    const setRoute = vi.fn();
-    renderProjectDetail({ tab: 'chat', settings: false }, setRoute);
-    fireEvent.click(screen.getByRole('button', { name: /^Tasks$/i }));
-    expect(setRoute).toHaveBeenCalledWith(
-      expect.objectContaining({ tab: 'queue', settings: false }),
-    );
   });
 });
 
-describe('ProjectDetail — Tasks tab panes', () => {
-  it('shows the Queue│Automations switch only on the Tasks tab', () => {
-    const { unmount } = renderProjectDetail({ tab: 'chat' });
-    expect(screen.queryByTestId('queue-pane-automations')).toBeNull();
-    unmount();
-
-    renderProjectDetail({ tab: 'queue' });
-    expect(screen.getByTestId('queue-pane-queue')).toBeInTheDocument();
-    expect(screen.getByTestId('queue-pane-automations')).toBeInTheDocument();
+// Spec 137: the Chat / Tasks / Files tab bar is gone. Chat is the only home;
+// Tasks and Settings are pages under the shared toolbar.
+describe('ProjectDetail — no tab bar, one page at a time', () => {
+  it('renders no tab bar: no Chat, Tasks or Files buttons', () => {
+    renderProjectDetail();
+    expect(screen.queryByRole('button', { name: /^Chat$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Files$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Tasks/i })).toBeNull();
+    expect(document.querySelector('[data-tour^="tab-"]')).toBeNull();
   });
 
-  it('defaults to the queue pane and renders the tab children there', () => {
-    const route = { ...baseRoute, tab: 'queue' as const };
+  it('home (no page) renders the header and the chat children', () => {
+    render(
+      <ProjectDetail project={mockProject} agentStatus="idle" route={baseRoute} setRoute={vi.fn()}>
+        <div data-testid="chat-children" />
+      </ProjectDetail>,
+    );
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
+    expect(screen.getByTestId('chat-children')).toBeInTheDocument();
+  });
+
+  it('a page swaps the header for the toolbar and renders the page, not the chat children', () => {
     render(
       <ProjectDetail
         project={mockProject}
         agentStatus="idle"
-        route={route}
+        route={{ ...baseRoute, page: 'settings' }}
         setRoute={vi.fn()}
+        pageContent={{ settings: <div data-testid="settings-body" /> }}
       >
-        <div data-testid="queue-children" />
+        <div data-testid="chat-children" />
       </ProjectDetail>,
+    );
+    expect(screen.getByTestId('settings-body')).toBeInTheDocument();
+    expect(screen.queryByTestId('chat-children')).toBeNull();
+    expect(screen.queryByRole('button', { name: /project settings/i })).toBeNull();
+    const crumbs = screen.getByRole('navigation', { name: 'Location' });
+    expect(crumbs.textContent).toBe('Alpha Project/Settings');
+    expect(screen.getByTestId('settings-modal-title').textContent).toBe('Settings');
+  });
+
+  it('Back from Settings returns to chat with the session kept', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'settings', settingsAnchor: 'budget' }, setRoute);
+    fireEvent.click(screen.getByTestId('settings-back-button'));
+    expect(setRoute).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'project', projectId: 'proj-42', sessionId: 'sess-xyz', page: undefined }),
+    );
+  });
+
+  it('the project crumb is a link home', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'tasks' }, setRoute);
+    fireEvent.click(screen.getByRole('button', { name: 'Alpha Project' }));
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: undefined }));
+  });
+
+  it('Pricing nests under Settings: crumb Project / Settings / Pricing, Back goes up one level to Budget', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'pricing' }, setRoute);
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe(
+      'Alpha Project/Settings/Pricing table',
+    );
+    fireEvent.click(screen.getByTestId('pricing-back-button'));
+    expect(setRoute).toHaveBeenCalledWith(
+      expect.objectContaining({ page: 'settings', settingsAnchor: 'budget' }),
+    );
+    setRoute.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'settings' }));
+  });
+});
+
+describe('ProjectDetail — Tasks page', () => {
+  it('is a page with its own crumb: Project / Tasks', () => {
+    renderProjectDetail({ page: 'tasks' });
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Alpha Project/Tasks');
+    expect(screen.getByTestId('tasks-title').textContent).toBe('Tasks');
+  });
+
+  it('shows the Queue│Automations switch only on the Tasks page', () => {
+    const { unmount } = renderProjectDetail();
+    expect(screen.queryByTestId('queue-pane-automations')).toBeNull();
+    unmount();
+
+    renderProjectDetail({ page: 'tasks' });
+    expect(screen.getByTestId('queue-pane-queue')).toBeInTheDocument();
+    expect(screen.getByTestId('queue-pane-automations')).toBeInTheDocument();
+  });
+
+  it('defaults to the queue pane and renders the queue content there', () => {
+    render(
+      <ProjectDetail
+        project={mockProject}
+        agentStatus="idle"
+        route={{ ...baseRoute, page: 'tasks' }}
+        setRoute={vi.fn()}
+        pageContent={{ tasks: <div data-testid="queue-children" /> }}
+      />,
     );
     expect(screen.getByTestId('queue-children')).toBeInTheDocument();
     expect(screen.getByTestId('queue-pane-queue')).toHaveAttribute('aria-selected', 'true');
     expect(screen.queryByTestId('automations-pane')).toBeNull();
   });
 
-  it('renders the automations pane (not the queue children) when queuePane=automations', () => {
-    const route = { ...baseRoute, tab: 'queue' as const, queuePane: 'automations' as const };
+  it('renders the automations pane (not the queue content) when queuePane=automations', () => {
     render(
       <ProjectDetail
         project={mockProject}
         agentStatus="idle"
-        route={route}
+        route={{ ...baseRoute, page: 'tasks', queuePane: 'automations' }}
         setRoute={vi.fn()}
-      >
-        <div data-testid="queue-children" />
-      </ProjectDetail>,
+        pageContent={{ tasks: <div data-testid="queue-children" /> }}
+      />,
     );
     expect(screen.getByTestId('automations-pane')).toBeInTheDocument();
     expect(screen.queryByTestId('queue-children')).toBeNull();
@@ -203,14 +281,64 @@ describe('ProjectDetail — Tasks tab panes', () => {
 
   it('clicking the Automations pane sets route.queuePane', () => {
     const setRoute = vi.fn();
-    renderProjectDetail({ tab: 'queue' }, setRoute);
+    renderProjectDetail({ page: 'tasks' }, setRoute);
     fireEvent.click(screen.getByTestId('queue-pane-automations'));
     expect(setRoute).toHaveBeenCalledWith(
-      expect.objectContaining({ tab: 'queue', queuePane: 'automations' }),
+      expect.objectContaining({ page: 'tasks', queuePane: 'automations' }),
     );
   });
 
-  it('the trigger strip is a status line that deep-links into the automations pane', () => {
+  it('"New automation" goes back to chat with /automate picked and the schedule example as the draft', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'tasks', queuePane: 'automations' }, setRoute);
+    fireEvent.click(screen.getByTestId('automations-new'));
+    expect(setRoute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        page: undefined,
+        draftSkill: 'automate',
+        draft: 'Every weekday at 9am, summarize new GitHub issues',
+      }),
+    );
+  });
+
+  it('the empty state\'s examples go back to chat with /automate picked', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'tasks', queuePane: 'automations' }, setRoute);
+    fireEvent.click(screen.getByText('When a new spreadsheet lands in this folder, write up a data analysis report'));
+    expect(setRoute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        page: undefined,
+        draftSkill: 'automate',
+        draft: 'When a new spreadsheet lands in this folder, write up a data analysis report',
+      }),
+    );
+  });
+});
+
+// Spec 137 gap 4 + decision 6: the status line under the title is the only
+// way into Tasks, so it renders always — with queued work and no
+// automations too, and as a teaching line when there is nothing at all.
+describe('ProjectDetail — the status line', () => {
+  it('renders with something queued and zero automations, and opens the Queue pane', () => {
+    queueMock.snapshot = { items: [{ state: 'queued' }] };
+    const setRoute = vi.fn();
+    renderProjectDetail({}, setRoute);
+    const line = screen.getByTestId('trigger-summary');
+    expect(line.textContent).toContain('1 queued');
+    expect(line.textContent).not.toContain('automation');
+    fireEvent.click(line);
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'tasks', queuePane: 'queue' }));
+  });
+
+  it('counts running and queued items separately', () => {
+    queueMock.snapshot = { items: [{ state: 'running' }, { state: 'queued' }, { state: 'queued' }, { state: 'completed' }] };
+    renderProjectDetail();
+    const line = screen.getByTestId('trigger-summary');
+    expect(line.textContent).toContain('1 running');
+    expect(line.textContent).toContain('2 queued');
+  });
+
+  it('with automations only, shows the count and the off-count and opens the Automations pane', () => {
     const setRoute = vi.fn();
     render(
       <ProjectDetail
@@ -218,32 +346,33 @@ describe('ProjectDetail — Tasks tab panes', () => {
         agentStatus="idle"
         route={baseRoute}
         setRoute={setRoute}
-        triggers={[
-          {
-            id: 'trg-1',
-            name: 'Daily build',
-            enabled: false,
-            type: 'schedule',
-            schedule: { cron: '0 9 * * *', human: 'Every day at 09:00', timezone: 'UTC' },
-            task: 'Build',
-            autonomy: null,
-            last_triggered: null,
-            trigger_count: 0,
-            created_at: '2026-01-01T00:00:00Z',
-          },
-        ]}
+        triggers={[makeTrigger(), makeTrigger({ id: 'trg-2', enabled: false })]}
       />,
     );
-    const summary = screen.getByTestId('trigger-summary');
-    // The off-count stays glanceable from every tab.
-    expect(summary.textContent).toContain('1 off');
-    // No management controls left on the strip — one home for that.
+    const line = screen.getByTestId('trigger-summary');
+    expect(line.textContent).toContain('2 automations');
+    expect(line.textContent).toContain('1 off');
+    // No management controls on the line — one home for that.
     expect(screen.queryByRole('switch')).toBeNull();
+    fireEvent.click(line);
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'tasks', queuePane: 'automations' }));
+  });
 
-    fireEvent.click(summary);
-    expect(setRoute).toHaveBeenCalledWith(
-      expect.objectContaining({ tab: 'queue', queuePane: 'automations' }),
+  it('with nothing scheduled or queued, still renders: the teaching line, opening Automations', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({}, setRoute);
+    const line = screen.getByTestId('trigger-summary');
+    expect(screen.getByTestId('status-line-teach').textContent).toBe(
+      'Nothing scheduled · type /automate in the composer to add one',
     );
+    expect(line).toHaveAttribute('data-tour', 'status-line');
+    fireEvent.click(line);
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'tasks', queuePane: 'automations' }));
+  });
+
+  it('is not on a page — the toolbar replaces the whole header', () => {
+    renderProjectDetail({ page: 'tasks' });
+    expect(screen.queryByTestId('trigger-summary')).toBeNull();
   });
 });
 
@@ -289,7 +418,10 @@ describe('ProjectDetail — model header label', () => {
     );
     expect(screen.queryByText(/Research Bot/)).not.toBeInTheDocument();
     expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/·/)).not.toBeInTheDocument();
+    // No "model · cost" separator in the header. (The status line's teaching
+    // copy below it has its own "·"; that is not a label.)
+    const dots = screen.queryAllByText(/·/).filter((el) => !el.closest('[data-testid="trigger-summary"]'));
+    expect(dots).toEqual([]);
   });
 
   it('prefers the project-pinned model over the global default', () => {
@@ -353,35 +485,67 @@ describe('ProjectDetail — overlay drawer vs. the docked panel', () => {
     return el as HTMLElement;
   }
 
-  it('keeps the overlay closed on a wide Chat tab — the panel has the preview', () => {
+  it('keeps the overlay closed on a wide chat home — the panel has the preview', () => {
     setViewportWidth(1440);
-    const { container } = renderProjectDetail({ tab: 'chat', previewPath: 'docs/plan.md' });
+    const { container } = renderProjectDetail({ previewPath: 'docs/plan.md' });
     expect(drawer(container)).toHaveAttribute('inert');
   });
 
-  it('still opens the overlay on the Chat tab below the push threshold', () => {
+  it('still opens the overlay on the chat home below the push threshold', () => {
     setViewportWidth(1024);
-    const { container } = renderProjectDetail({ tab: 'chat', previewPath: 'docs/plan.md' });
+    const { container } = renderProjectDetail({ previewPath: 'docs/plan.md' });
     expect(drawer(container)).not.toHaveAttribute('inert');
   });
 
-  it('still opens the overlay on the Queue and Files tabs at any width', () => {
+  it('still opens the overlay on the Tasks and Settings pages at any width', () => {
     setViewportWidth(1440);
-    const queue = renderProjectDetail({ tab: 'queue', previewPath: 'docs/plan.md' });
-    expect(drawer(queue.container)).not.toHaveAttribute('inert');
-    queue.unmount();
+    const tasks = renderProjectDetail({ page: 'tasks', previewPath: 'docs/plan.md' });
+    expect(drawer(tasks.container)).not.toHaveAttribute('inert');
+    tasks.unmount();
 
-    const files = renderProjectDetail({ tab: 'files', previewPath: 'docs/plan.md' });
-    expect(drawer(files.container)).not.toHaveAttribute('inert');
+    const settings = renderProjectDetail({ page: 'settings', previewPath: 'docs/plan.md' });
+    expect(drawer(settings.container)).not.toHaveAttribute('inert');
+  });
+});
+
+// Spec 137 gap 3: below the dock threshold the panel has no handle, so the
+// header gets a button for it — rendered only there.
+describe('ProjectDetail — the narrow-window panel button', () => {
+  afterEach(() => setViewportWidth(1024));
+
+  it('is not rendered at or above the dock threshold', () => {
+    setViewportWidth(1440);
+    renderProjectDetail();
+    expect(screen.queryByTestId('panel-open-button')).toBeNull();
   });
 
-  it('still opens the overlay over the settings surface', () => {
+  it('is rendered below the dock threshold and on phones, and opens the panel overlay', () => {
+    setViewportWidth(1000);
+    const { unmount } = renderProjectDetail();
+    const button = screen.getByTestId('panel-open-button');
+    expect(button).toHaveAttribute('data-tour', 'panel-button');
+    const panel = renderHook(() => usePanelState('proj-42', 'sess-xyz'));
+    expect(panel.result.current.overlayOpen).toBe(false);
+    act(() => fireEvent.click(button));
+    expect(panel.result.current.overlayOpen).toBe(true);
+    unmount();
+
+    setViewportWidth(390);
+    renderProjectDetail();
+    expect(screen.getByTestId('panel-open-button')).toBeInTheDocument();
+  });
+
+  it('the docked panel maximized hides the project header (the main area is the panel)', () => {
     setViewportWidth(1440);
-    const { container } = renderProjectDetail({
-      tab: 'chat',
-      settings: true,
-      previewPath: 'docs/plan.md',
+    const panel = renderHook(() => usePanelState('proj-42', 'sess-xyz'));
+    act(() => {
+      panel.result.current.expand();
+      panel.result.current.maximize();
     });
-    expect(drawer(container)).not.toHaveAttribute('inert');
+    renderProjectDetail();
+    expect(screen.queryByRole('button', { name: /project settings/i })).toBeNull();
+    expect(screen.queryByTestId('trigger-summary')).toBeNull();
+    act(() => panel.result.current.restore());
+    expect(screen.getByRole('button', { name: /project settings/i })).toBeInTheDocument();
   });
 });

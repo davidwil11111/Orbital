@@ -64,13 +64,15 @@ export interface FilePreviewProps {
   /**
    * Spec 088 — opt-in compact header for the docked workspace panel: ONE row
    * of icon Back · filename · `headerExtras` · the file's mode actions (Edit,
-   * or Write|Preview · Cancel · Save) · More (Copy / Download, Open in Files).
+   * or Write|Preview · Cancel · Save) · More (Copy / Download, Open full width).
    * Loading and error states keep the row, so Back is never lost. Omit it (the
    * Files tab) and every header renders exactly as before.
    */
   panelHeader?: {
     onBack: () => void;
-    onOpenInFiles: () => void;
+    /** Spec 137: "Open full width" — maximize the panel on this file.
+     *  Absent where the panel cannot maximize (the phone's bottom sheet). */
+    onOpenInFiles?: () => void;
   };
   /**
    * Spec 088/090 extension point: navigation a document renderer places in the
@@ -470,12 +472,16 @@ export default function FilePreview({
         menuItems={menuItems}
       />
     );
-  const openInFilesItem: PanelMenuItem = {
-    id: 'open-in-files',
-    label: t('panel.openInFiles'),
-    icon: <FolderOpen size={14} aria-hidden />,
-    onSelect: () => panelHeader?.onOpenInFiles(),
-  };
+  const openInFilesItems: PanelMenuItem[] = panelHeader?.onOpenInFiles
+    ? [
+        {
+          id: 'open-in-files',
+          label: t('panel.openInFiles'),
+          icon: <FolderOpen size={14} aria-hidden />,
+          onSelect: () => panelHeader?.onOpenInFiles?.(),
+        },
+      ]
+    : [];
 
   if (!selectedPath) {
     return (
@@ -504,7 +510,7 @@ export default function FilePreview({
     if (!panelHeader) return skeleton;
     return (
       <div className="flex flex-col h-full">
-        {renderPanelHeader(requestedName, null, [openInFilesItem])}
+        {renderPanelHeader(requestedName, null, openInFilesItems)}
         {skeleton}
       </div>
     );
@@ -519,7 +525,7 @@ export default function FilePreview({
     if (!panelHeader) return unableToLoad;
     return (
       <div className="flex flex-col h-full">
-        {renderPanelHeader(requestedName, null, [openInFilesItem])}
+        {renderPanelHeader(requestedName, null, openInFilesItems)}
         <div className="flex-1 min-h-0">{unableToLoad}</div>
       </div>
     );
@@ -585,7 +591,7 @@ export default function FilePreview({
             <span className="text-xs text-secondary shrink-0 @max-[24rem]:hidden">
               {formatSize(fileContent.size)}
             </span>,
-            [openInFilesItem, ...revealItems],
+            [...openInFilesItems, ...revealItems],
           )
         ) : (
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">
@@ -627,7 +633,7 @@ export default function FilePreview({
     return (
       <div className="flex flex-col h-full">
         {panelHeader ? (
-          renderPanelHeader(fileName, null, [openInFilesItem, ...revealItems])
+          renderPanelHeader(fileName, null, [...openInFilesItems, ...revealItems])
         ) : (
           <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-2">
             <h3 className="font-semibold text-sm text-primary truncate">{fileName}</h3>
@@ -698,7 +704,7 @@ export default function FilePreview({
     if (quoteFile) {
       documentMenuItems.push({ id: 'quote-file', label: t('panel.files.quoteFile'), onSelect: quoteFile });
     }
-    documentMenuItems.push(openInFilesItem, ...revealItems);
+    documentMenuItems.push(...openInFilesItems, ...revealItems);
     return (
       <div className="flex flex-col h-full">
         {panelHeader ? (
@@ -784,7 +790,7 @@ export default function FilePreview({
                 icon: <Download size={14} aria-hidden />,
                 onSelect: () => handleDownloadRaw(fileContent.content, 'text/html', fileName),
               },
-              openInFilesItem,
+              ...openInFilesItems,
               ...revealItems,
             ],
           )
@@ -990,7 +996,7 @@ export default function FilePreview({
   return (
     <div className="flex flex-col h-full">
       {panelHeader ? (
-        renderPanelHeader(fileName, panelActions, editing ? [] : [copyItem, openInFilesItem, ...revealItems])
+        renderPanelHeader(fileName, panelActions, editing ? [] : [copyItem, ...openInFilesItems, ...revealItems])
       ) : (
         <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-2">
           <h3 className="font-semibold text-sm text-primary truncate">{fileName}</h3>

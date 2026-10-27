@@ -72,8 +72,21 @@ interface FilePreviewDrawerProps {
    * when it is wider; clamped to the same 80% cap as the drag.
    */
   minWidth?: number;
-  /** Docked only: chrome rendered in the header row, left of the collapse button. */
+  /**
+   * Chrome rendered in the header row, left of the collapse (docked) or close
+   * (overlay) button. In the overlay it replaces the "File preview" label —
+   * spec 137's narrow-window workspace panel puts its Files|Browser bar here.
+   */
   header?: ReactNode;
+  /**
+   * Spec 137 — maximized: docked, the column takes the whole row (the session
+   * column and chat hide beside it); as an overlay it spans the content area
+   * edge to edge, i.e. everything right of the strip/list. No resize handle
+   * either way; the remembered width is untouched for the restore.
+   */
+  maximized?: boolean;
+  /** Overlay only: what Escape does. Default: `onClose`. */
+  onEscape?: () => void;
   /** Rendered in the content pane INSTEAD of `FilePreview` (the workspace panel). */
   children?: ReactNode;
 }
@@ -98,6 +111,8 @@ export default function FilePreviewDrawer({
   docked = false,
   minWidth,
   header,
+  maximized = false,
+  onEscape,
   children,
 }: FilePreviewDrawerProps) {
   const t = useT();
@@ -204,14 +219,15 @@ export default function FilePreviewDrawer({
 
   // Esc-to-close while open. Overlay only: docked, the panel is a persistent
   // region and Esc belongs to whatever is inside it (the Annotate mode).
+  const escapeAction = onEscape ?? onClose;
   useEffect(() => {
     if (!open || docked) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') escapeAction();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, onClose, docked]);
+  }, [open, escapeAction, docked]);
 
   // Focus management (a11y for the aria-modal dialog): move focus into the
   // drawer when it opens; restore it to the opener (the clicked chip/card) when
@@ -313,11 +329,16 @@ export default function FilePreviewDrawer({
       <section
         ref={panelRef}
         data-testid="workspace-panel-column"
+        data-maximized={maximized}
         aria-label={t('panel.handle')}
         style={{ '--file-preview-drawer-width': `${dockedWidth}px` } as CSSProperties}
-        className="relative z-0 hidden md:flex h-full min-h-0 shrink-0 flex-col border-l border-border bg-background w-[var(--file-preview-drawer-width)] max-w-[80%]"
+        className={`relative z-0 hidden md:flex h-full min-h-0 flex-col bg-background ${
+          maximized
+            ? 'flex-1 min-w-0'
+            : 'shrink-0 border-l border-border w-[var(--file-preview-drawer-width)] max-w-[80%]'
+        }`}
       >
-        {resizeHandle}
+        {!maximized && resizeHandle}
         {header ? (
           <div
             data-testid="workspace-panel-header"
@@ -359,26 +380,38 @@ export default function FilePreviewDrawer({
         aria-hidden={!open}
         inert={!open}
         onKeyDown={handleTrapTab}
+        data-maximized={maximized}
         style={{ '--file-preview-drawer-width': `${drawerWidth}px` } as CSSProperties}
         className={`absolute z-40 flex flex-col bg-background shadow-xl transition-transform duration-200 ease-out
           inset-x-0 bottom-0 h-[75%] rounded-t-xl border-t border-border
-          md:inset-y-0 md:right-0 md:left-auto md:h-full md:w-[var(--file-preview-drawer-width)] md:max-w-[80%] md:rounded-none md:border-t-0 md:border-l
+          md:inset-y-0 md:right-0 md:h-full md:rounded-none md:border-t-0 md:border-l
+          ${maximized ? 'md:left-0 md:w-auto md:max-w-none' : 'md:left-auto md:w-[var(--file-preview-drawer-width)] md:max-w-[80%]'}
           ${open ? 'translate-y-0 md:translate-x-0' : 'translate-y-full md:translate-y-0 md:translate-x-full pointer-events-none'}`}
       >
-        {resizeHandle}
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border shrink-0">
-          <span className="text-xs font-medium text-secondary">{t('filePreview.heading')}</span>
+        {!maximized && resizeHandle}
+        <div
+          className={`flex items-center justify-between gap-2 border-b border-border shrink-0 min-w-0 ${
+            header ? 'pl-3 pr-2 py-1.5' : 'px-4 py-2.5'
+          }`}
+        >
+          {header ? (
+            <div className="min-w-0 flex-1">{header}</div>
+          ) : (
+            <span className="text-xs font-medium text-secondary">{t('filePreview.heading')}</span>
+          )}
           <button
             ref={closeBtnRef}
             type="button"
             onClick={onClose}
             aria-label={t('filePreview.close')}
-            className="flex items-center justify-center w-7 h-7 -mr-1 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+            className={`flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
+              header ? '' : '-mr-1'
+            }`}
           >
             <X size={16} />
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto min-h-0">{body}</div>
+        <div className={`flex-1 min-h-0 ${children ? 'overflow-hidden flex flex-col' : 'overflow-y-auto'}`}>{body}</div>
       </div>
     </>
   );

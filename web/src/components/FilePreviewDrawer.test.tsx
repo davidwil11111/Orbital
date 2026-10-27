@@ -281,3 +281,75 @@ describe('FilePreviewDrawer — docked mode', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 });
+
+// Spec 137 gap 1: maximize. Docked, the panel takes the whole main area;
+// as an overlay (narrow windows) it grows to the full width right of the
+// strip/list. Restoring keeps the remembered width.
+describe('FilePreviewDrawer — maximized (spec 137)', () => {
+  it('docked + maximized fills the row: no fixed width, no resize handle', () => {
+    localStorage.setItem('orbital:workspacePanelWidth', '500');
+    const { rerender } = render(
+      <FilePreviewDrawer docked maximized open selectedPath={null} fileContent={null} loading={false} onClose={vi.fn()}>
+        <div data-testid="body" />
+      </FilePreviewDrawer>,
+    );
+    const column = screen.getByTestId('workspace-panel-column');
+    expect(column).toHaveAttribute('data-maximized', 'true');
+    expect(column.className).toContain('flex-1');
+    expect(column.className).not.toContain('w-[var(--file-preview-drawer-width)]');
+    expect(screen.queryByRole('separator')).toBeNull();
+
+    // Restore: the remembered width comes back untouched.
+    rerender(
+      <FilePreviewDrawer docked open selectedPath={null} fileContent={null} loading={false} onClose={vi.fn()}>
+        <div data-testid="body" />
+      </FilePreviewDrawer>,
+    );
+    const restored = screen.getByTestId('workspace-panel-column');
+    expect(restored).toHaveAttribute('data-maximized', 'false');
+    expect(restored.style.getPropertyValue('--file-preview-drawer-width')).toBe('500px');
+    expect(screen.getByRole('separator')).toBeInTheDocument();
+    expect(localStorage.getItem('orbital:workspacePanelWidth')).toBe('500');
+  });
+
+  it('as an overlay with a header slot, shows that header in place of the "File preview" label', () => {
+    render(
+      <FilePreviewDrawer
+        open
+        selectedPath={null}
+        fileContent={null}
+        loading={false}
+        onClose={vi.fn()}
+        header={<div data-testid="panel-bar" />}
+      >
+        <div data-testid="body" />
+      </FilePreviewDrawer>,
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByTestId('panel-bar')).toBeInTheDocument();
+    expect(within(dialog).queryByText('File preview')).toBeNull();
+    expect(within(dialog).getByTestId('body')).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: 'Close preview' })).toBeInTheDocument();
+  });
+
+  it('overlay + maximized spans the content area (left edge to right edge)', () => {
+    render(
+      <FilePreviewDrawer open maximized selectedPath={null} fileContent={null} loading={false} onClose={vi.fn()} />,
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveAttribute('data-maximized', 'true');
+    expect(dialog.className).toContain('md:left-0');
+    expect(dialog.className).not.toContain('md:max-w-[80%]');
+  });
+
+  it('Escape calls onEscape when given (a maximized overlay restores before it closes)', () => {
+    const onClose = vi.fn();
+    const onEscape = vi.fn();
+    render(
+      <FilePreviewDrawer open selectedPath={null} fileContent={null} loading={false} onClose={onClose} onEscape={onEscape} />,
+    );
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onEscape).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

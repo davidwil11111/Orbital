@@ -23,6 +23,9 @@ export interface ParseSkillResult {
 
 const POINTER_LINE =
   'The user chose this skill for this message. Read the file at `path` before acting and follow it.';
+const INLINE_LINE =
+  'The user chose this skill for this message. Its SKILL.md is below ' +
+  '(the path is outside what you can read); follow it.';
 
 // The opening tag's attributes are escaped, so neither `"` nor `>` occurs
 // inside them; the inline body's own `</use_skill>` is escaped by the backend.
@@ -50,6 +53,22 @@ export function buildSkillBlock(skill: PickedSkill | null | undefined): string {
   return (
     `<use_skill name="${escapeAttr(skill.name)}" path="${escapeAttr(skill.path)}">\n` +
     `${POINTER_LINE}\n</use_skill>\n\n`
+  );
+}
+
+/**
+ * The inline form of the block (the backend's `format_skill_prefix` with an
+ * `inline_body`): the skill's text travels inside the message. Spec 137's
+ * built-in skills (`/automate`) have no SKILL.md on disk for the backend to
+ * resolve, so the composer sends this block as part of the message text —
+ * the same shape a safe-mode manager receives, so the agent, the title strip
+ * and the bubble's chip all read it the way they already do.
+ */
+export function buildInlineSkillBlock(name: string, path: string, body: string): string {
+  const safeBody = body.split('</use_skill>').join('&lt;/use_skill&gt;').replace(/\n+$/, '');
+  return (
+    `<use_skill name="${escapeAttr(name)}" path="${escapeAttr(path)}" inline="true">\n` +
+    `${INLINE_LINE}\n<skill_content>\n${safeBody}\n</skill_content>\n</use_skill>\n\n`
   );
 }
 

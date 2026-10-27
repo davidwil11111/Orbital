@@ -22,7 +22,7 @@ import type {
   WebSocketEvent,
   SetupGateSettings,
 } from './types';
-import type { Route } from './route';
+import { routeKey, type Route } from './route';
 import SetupGate from './components/SetupGate';
 import SetupWizard from './components/SetupWizard';
 import Sidebar from './components/Sidebar';
@@ -43,7 +43,6 @@ import SettingsModalPage from './components/SettingsModalPage';
 import PricingEditorPage from './components/PricingEditorPage';
 import ChatTab from './components/ChatTab';
 import ErrorBoundary from './components/ErrorBoundary';
-import FileExplorer from './components/FileExplorer';
 import GlobalSettings, { requestedSettingsSection } from './components/GlobalSettings';
 import CalendarPage from './components/CalendarPage';
 import WorkbenchPage from './components/WorkbenchPage';
@@ -498,7 +497,7 @@ export default function App() {
 
     function handleMessage(event: MessageEvent) {
       if (event.data?.type === 'navigate' && event.data.projectId) {
-        setRoute({ name: 'project', projectId: event.data.projectId, tab: 'chat', sessionId: undefined });
+        setRoute({ name: 'project', projectId: event.data.projectId, sessionId: undefined });
         setMobileView('content');
       }
     }
@@ -515,7 +514,7 @@ export default function App() {
   }
 
   function handleSelectProject(id: string) {
-    setRoute({ name: 'project', projectId: id, tab: 'chat', sessionId: undefined });
+    setRoute({ name: 'project', projectId: id, sessionId: undefined });
     setMobileView('content');
   }
 
@@ -543,7 +542,7 @@ export default function App() {
     // A project on an empty folder opens with the agent speaking first. A
     // folder with files gets the scan card instead, whose Skip does the same.
     if (created.is_empty_workspace) requestOnboardingKickoff(created.project_id);
-    setRoute({ name: 'project', projectId: created.project_id, tab: 'chat', sessionId: undefined });
+    setRoute({ name: 'project', projectId: created.project_id, sessionId: undefined });
   }
 
   async function handleDeleteProject() {
@@ -568,7 +567,7 @@ export default function App() {
     } catch {
       // Still open the project; ChatTab picks its most recent session.
     }
-    setRoute({ name: 'project', projectId, tab: 'chat', sessionId });
+    setRoute({ name: 'project', projectId, sessionId });
     setMobileView('content');
   }
 
@@ -601,7 +600,7 @@ export default function App() {
           if (imported && loaded.some((p) => p.project_id === imported)) {
             await openProjectOnNewSession(imported);
           } else if (landing) {
-            setRoute({ name: 'project', projectId: landing, tab: 'chat', sessionId: undefined });
+            setRoute({ name: 'project', projectId: landing, sessionId: undefined });
           } else {
             setRoute({ name: 'create' });
           }
@@ -639,7 +638,7 @@ export default function App() {
   // the chat tab of a project they created and the tour is still pending (or
   // was asked for). Finishing or skipping flips `tourState` to done, which
   // turns this off — no "start" effect to keep in sync with the route.
-  const onProjectChat = route.name === 'project' && route.tab === 'chat' && !route.settings;
+  const onProjectChat = route.name === 'project' && route.page === undefined;
   // Held until the installed-agents probe has answered (`null` = still
   // loading; it shells out to find CLI binaries, so it is slow). The tour
   // freezes its list of stops when it starts, and the pin mark — the agents
@@ -653,7 +652,7 @@ export default function App() {
     // The tour walks through a project, so open the user's most recent one.
     const projectId = wizardLandingProjectId(projects);
     if (!projectId) return;
-    setRoute({ name: 'project', projectId, tab: 'chat', sessionId: undefined });
+    setRoute({ name: 'project', projectId, sessionId: undefined });
     setMobileView('content');
     setTourReplay(true);
   }
@@ -721,7 +720,7 @@ export default function App() {
           The band's fill is route-dependent so it matches the pane beneath it:
           the chat pane is white "paper" while the card-list surfaces keep the
           grey canvas so their cards still lift off it. Global settings opens
-          with the card-coloured SettingsToolbar, so it takes the card band
+          with the card-coloured PageToolbar, so it takes the card band
           too. Both classes are inert off macOS, so the non-mac render is
           unchanged. */}
       <main className={`flex-1 overflow-hidden flex flex-col shadow-panel pt-titlebar ${route.name === 'project' || route.name === 'settings' ? 'titlebar-band-card' : 'titlebar-band-canvas'} ${contentHidden ? 'hidden' : ''}`}>
@@ -780,77 +779,67 @@ export default function App() {
           // Scoped to the project view: a render crash here shows a recoverable
           // fallback instead of unmounting the whole app (the app shell/sidebar
           // stays alive). resetKey clears a prior crash when the user navigates.
-          <ErrorBoundary
-            resetKey={`${selectedProject.project_id}:${route.tab}:${route.sessionId ?? ''}:${route.pricing ? 'pricing' : route.settings ? 'settings' : ''}`}
-          >
-            {route.pricing ? (
-              // Pricing-table editor overlay (P3-I). Back returns to the
-              // settings surface; onSaved bumps the module-level pricing
-              // version so EVERY mounted useCost (settings meter, header
-              // budget corner, queue banner) recomputes against the new rates.
-              <PricingEditorPage
-                onBack={() =>
-                  setRoute({ ...route, pricing: false, settings: true, settingsAnchor: 'budget' })
-                }
-                onSaved={bumpPricingVersion}
-              />
-            ) : route.settings ? (
-              <SettingsModalPage
-                project={selectedProject}
-                route={route}
-                setRoute={setRoute}
-                // Bound to THIS project, not "whatever is selected when the
-                // request fires": settings autosave, and a pause-then-save can
-                // outlive a switch to another project.
-                onSave={(data) => updateProject(selectedProject.project_id, data)}
-                onDelete={handleDeleteProject}
-                onEditPricing={() =>
-                  setRoute({ ...route, settings: false, pricing: true })
-                }
-              />
-            ) : (
-              <ProjectDetail
-                project={selectedProject}
-                agentStatus={agentStatuses[selectedProject.project_id] ?? 'idle'}
-                subAgentsRunning={subAgentsRunning[selectedProject.project_id] ?? false}
-                statusSummary={statusSummaries[selectedProject.project_id]}
-                route={route}
-                setRoute={setRoute}
-                triggers={triggers}
-                onTriggerToggle={toggleTrigger}
-                onTriggerDelete={deleteTrigger}
-                globalDefaultModel={defaultModel}
-                agentsAvailable={agentsAvailable ?? []}
-              >
-                {route.tab === 'queue' && (
+          <ErrorBoundary resetKey={routeKey(route)}>
+            {/* Spec 137: one ProjectDetail for every page. Chat (no page) is
+                the home and its body is the children; Tasks, Settings and
+                Pricing are pages whose bodies are handed over in
+                `pageContent` — ProjectDetail draws the shared toolbar and the
+                page registry decides the rest. Only the open page's element
+                is ever mounted. */}
+            <ProjectDetail
+              project={selectedProject}
+              agentStatus={agentStatuses[selectedProject.project_id] ?? 'idle'}
+              subAgentsRunning={subAgentsRunning[selectedProject.project_id] ?? false}
+              statusSummary={statusSummaries[selectedProject.project_id]}
+              route={route}
+              setRoute={setRoute}
+              triggers={triggers}
+              onTriggerToggle={toggleTrigger}
+              onTriggerDelete={deleteTrigger}
+              globalDefaultModel={defaultModel}
+              agentsAvailable={agentsAvailable ?? []}
+              pageContent={{
+                tasks: (
                   <QueueTab
                     key={`queue-${selectedProject.project_id}`}
                     projectId={selectedProject.project_id}
                     project={selectedProject}
                     agents={agentsAvailable ?? []}
                   />
-                )}
-                {route.tab === 'chat' && (
-                  <ChatTab
-                    key={selectedProject.project_id}
+                ),
+                settings: (
+                  <SettingsModalPage
                     project={selectedProject}
-                    projects={projects}
-                    agentStatus={agentStatuses[selectedProject.project_id] ?? 'idle'}
-                    statusTick={statusTicks[selectedProject.project_id] ?? 0}
-                    agents={agentsAvailable ?? []}
-                    route={route}
-                    setRoute={setRoute}
-                    onRefreshProject={refreshProject}
+                    // Bound to THIS project, not "whatever is selected when the
+                    // request fires": settings autosave, and a pause-then-save can
+                    // outlive a switch to another project.
+                    onSave={(data) => updateProject(selectedProject.project_id, data)}
+                    onDelete={handleDeleteProject}
+                    onEditPricing={() => setRoute({ ...route, page: 'pricing' })}
+                    scrollToSection={route.settingsAnchor}
                   />
-                )}
-                {route.tab === 'files' && (
-                  <FileExplorer
-                    projectId={selectedProject.project_id}
-                    initialPath={route.name === 'project' ? route.filesPath : undefined}
-                  />
-                )}
-              </ProjectDetail>
-            )}
+                ),
+                // Pricing-table editor (P3-I), a page under Settings. onSaved
+                // bumps the module-level pricing version so EVERY mounted
+                // useCost (settings meter, header budget corner, queue banner)
+                // recomputes against the new rates.
+                pricing: <PricingEditorPage onSaved={bumpPricingVersion} />,
+              }}
+            >
+              {route.page === undefined && (
+                <ChatTab
+                  key={selectedProject.project_id}
+                  project={selectedProject}
+                  projects={projects}
+                  agentStatus={agentStatuses[selectedProject.project_id] ?? 'idle'}
+                  statusTick={statusTicks[selectedProject.project_id] ?? 0}
+                  agents={agentsAvailable ?? []}
+                  route={route}
+                  setRoute={setRoute}
+                  onRefreshProject={refreshProject}
+                />
+              )}
+            </ProjectDetail>
           </ErrorBoundary>
         )}
 

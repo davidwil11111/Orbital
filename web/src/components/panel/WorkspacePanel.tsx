@@ -9,8 +9,13 @@
  * Spec 088 splits the bar from the body: `WorkspacePanelBar` is handed to the
  * docked drawer's header slot, so the switch shares one row with collapse
  * instead of stacking a second bar under an empty one.
+ *
+ * Spec 137 adds two icon controls on the right: Upload (Files view) and
+ * Full width / Restore. Maximize is what replaced the Files tab: maximized
+ * Files is the tab's old layout, tree on the left and the file on the right.
  */
 import type { ReactNode } from 'react';
+import { Maximize2, Minimize2, Upload } from 'lucide-react';
 import type { PanelView } from '../../utils/panelSelectors';
 import { useT } from '../../i18n/useT';
 
@@ -19,13 +24,26 @@ export interface WorkspacePanelBarProps {
   onViewChange: (v: PanelView) => void;
   annotating: boolean;
   onToggleAnnotate: () => void;
+  /** Files view: pick a file to upload to the workspace. Absent = no button. */
+  onUpload?: () => void;
+  uploading?: boolean;
+  /** Full width ⇄ restore. Absent = no control (the phone's bottom sheet). */
+  onToggleMaximize?: () => void;
+  maximized?: boolean;
 }
+
+const ICON_BUTTON =
+  'flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50';
 
 export function WorkspacePanelBar({
   view,
   onViewChange,
   annotating,
   onToggleAnnotate,
+  onUpload,
+  uploading = false,
+  onToggleMaximize,
+  maximized = false,
 }: WorkspacePanelBarProps) {
   const t = useT();
 
@@ -60,6 +78,7 @@ export function WorkspacePanelBar({
         {tab('files', t('panel.view.files'))}
         {tab('browser', t('panel.view.browser'))}
       </div>
+      <div className="flex items-center gap-1 shrink-0">
       {/* Annotate is a Browser-only mode: on the live page a drag would
           otherwise be forwarded, so a mode is needed to draw a box. Files
           needs none — selecting text shows Quote, like any document. */}
@@ -78,6 +97,49 @@ export function WorkspacePanelBar({
           {annotating ? t('panel.annotate.done') : t('panel.annotate')}
         </button>
       )}
+      {view === 'files' && onUpload && (
+        <button
+          type="button"
+          onClick={onUpload}
+          disabled={uploading}
+          aria-label={uploading ? t('panel.uploading') : t('panel.upload')}
+          title={uploading ? t('panel.uploading') : t('panel.upload')}
+          data-testid="panel-upload"
+          className={ICON_BUTTON}
+        >
+          {uploading ? (
+            <span className="w-3.5 h-3.5 border-2 border-secondary border-t-transparent rounded-full animate-spin" aria-hidden />
+          ) : (
+            <Upload size={14} aria-hidden />
+          )}
+        </button>
+      )}
+      {onToggleMaximize &&
+        (maximized ? (
+          <button
+            type="button"
+            onClick={onToggleMaximize}
+            aria-label={t('panel.restore')}
+            title={t('panel.restore')}
+            data-testid="panel-restore"
+            className={ICON_BUTTON}
+          >
+            <Minimize2 size={14} aria-hidden />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onToggleMaximize}
+            aria-label={t('panel.maximize')}
+            title={t('panel.maximize')}
+            data-testid="panel-maximize"
+            data-tour="panel-maximize"
+            className={ICON_BUTTON}
+          >
+            <Maximize2 size={14} aria-hidden />
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -90,7 +152,7 @@ export interface WorkspacePanelProps {
 
 export default function WorkspacePanel({ view, browser, files }: WorkspacePanelProps) {
   return (
-    <div className="flex flex-col h-full min-h-0 overflow-hidden" data-testid="workspace-panel" data-tour="workspace-panel">
+    <div className="flex flex-col flex-1 h-full min-h-0 overflow-hidden" data-testid="workspace-panel" data-tour="workspace-panel">
       {view === 'browser' ? browser : files}
     </div>
   );

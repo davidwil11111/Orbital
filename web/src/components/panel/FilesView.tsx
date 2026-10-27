@@ -6,7 +6,8 @@
  * Spec 078 §5.3 (D10) — Files view: tree state (workspace tree, touched files
  * badged + "Touched this session" group) ⇄ preview state (FilePreview in
  * place; since spec 088 its one header row carries Back and a More menu with
- * "Open in Files"). Never both at once.
+ * "Open full width" — spec 137's maximize, which replaced the Files tab).
+ * Never both at once.
  * CONTRACT FILE: props are final.
  *
  * The tree is a flat `Map<dirPath, entries>` + an expanded set rather than the
@@ -36,9 +37,13 @@ export interface FilesViewProps {
   /** Current file in preview state, or null for the tree state. */
   file: string | null;
   onSelectFile: (path: string | null) => void;
-  onOpenInFiles: (path: string) => void;
+  /** Spec 137: "Open full width" — maximize the panel on this file. Absent
+   *  where the panel cannot maximize (the phone's bottom sheet). */
+  onOpenInFiles?: (path: string) => void;
   onAddAnnotation: (draft: AnnotationDraft) => void;
   onSave?: (path: string, content: string) => Promise<boolean>;
+  /** Spec 137: bumped by the parent after an upload — re-list what is on screen. */
+  refreshKey?: number;
 }
 
 const OP_LABEL: Record<TouchedOp, StringKey> = {
@@ -108,6 +113,7 @@ export default function FilesView({
   onOpenInFiles,
   onAddAnnotation,
   onSave,
+  refreshKey = 0,
 }: FilesViewProps) {
   const t = useT();
   const { listDirectory, getFileContent, resolvePath, revealPath } = useFiles();
@@ -187,6 +193,11 @@ export default function FilesView({
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [projectId, on, off]);
+
+  // An upload from the panel bar: the same refresh, at once.
+  useEffect(() => {
+    if (refreshKey !== 0) setRefreshTick((n) => n + 1);
+  }, [refreshKey]);
 
   // Re-list what is on screen: the root and the folders currently expanded
   // (spec 103 R3 — not every folder ever listed, and nothing at all in preview
@@ -391,7 +402,7 @@ export default function FilesView({
             onQuote={handleQuote}
             panelHeader={{
               onBack: () => onSelectFile(null),
-              onOpenInFiles: () => onOpenInFiles(content?.path ?? file),
+              onOpenInFiles: onOpenInFiles && (() => onOpenInFiles(content?.path ?? file)),
             }}
             onReveal={
               canRevealInFileManager()

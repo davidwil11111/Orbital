@@ -623,6 +623,7 @@ function renderChat(props: {
   agentStatus?: string;
   sessionId?: string;
   initialDraft?: string;
+  initialSkill?: 'automate';
   onDraftConsumed?: () => void;
   agents?: Array<{ slug: string; name: string }>;
   project?: Project;
@@ -638,6 +639,7 @@ function renderChat(props: {
         agents={props.agents ?? []}
         sessionId={props.sessionId}
         initialDraft={props.initialDraft}
+        initialSkill={props.initialSkill}
         onDraftConsumed={props.onDraftConsumed}
       />,
     );
@@ -5035,14 +5037,91 @@ describe('ChatView: the / skill picker (spec 132)', () => {
     expect(menu()).toBeNull();
   });
 
-  it('no skills installed: / shows a hint and Enter still sends', async () => {
+  // Spec 137: `/automate` is a built-in, so the list is never empty — the
+  // old "no skills installed" hint can no longer show.
+  it('no skills installed: / still lists the built-in /automate', async () => {
     skillCatalogResponse = [];
     await renderChat({ sessionId: 's1' });
     await flushEffects();
     await type('/');
-    expect(container.querySelector('[data-testid="skill-menu-empty"]')).not.toBeNull();
+    expect(optionNames()).toEqual(['automate']);
+    expect(container.querySelector('[data-testid="skill-menu-empty"]')).toBeNull();
+  });
+
+  it('/automate sits in the same flat list as installed skills, first, with no badge', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/');
+    expect(optionNames()[0]).toBe('automate');
+    expect(optionNames()).toContain('Task Planning');
+    await type('/aut');
+    expect(optionNames()).toEqual(['automate']);
+  });
+
+  it('picking /automate chips it and prefills the schedule phrasing, selected; nothing is sent', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/aut');
+    await press('Enter');
+    await act(async () => { await new Promise((r) => requestAnimationFrame(() => r(null))); });
+    expect(injectCalls).toHaveLength(0);
+    expect(composerChip()?.textContent).toContain('automate');
+    expect(textarea().value).toBe('Every weekday at 9am, summarize new GitHub issues');
+    expect(textarea().selectionStart).toBe(0);
+    expect(textarea().selectionEnd).toBe(textarea().value.length);
+  });
+
+  it('sending /automate inlines its instructions in the message, with no catalog payload', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    await type('/aut');
+    await press('Enter');
+    await type('Every Monday at 8am, write the weekly plan');
     await press('Enter');
     expect(injectCalls).toHaveLength(1);
+    // injectMessage(projectId, content, target, nonce, attachments, sessionId, pinned, skill)
+    const content = injectCalls[0][1] as string;
+    expect(content.startsWith('<use_skill name="automate" path="orbital:builtin/automate" inline="true">\n')).toBe(true);
+    expect(content).toContain('create_trigger');
+    expect(content.endsWith('Every Monday at 8am, write the weekly plan')).toBe(true);
+    expect(injectCalls[0][2]).toBeUndefined(); // the manager
+    expect(injectCalls[0][7]).toBeUndefined();
+    // The bubble shows the chip, not the block.
+    const bubble = container.querySelector('[data-testid="user-message"]');
+    expect(bubble?.querySelector('[data-testid="message-skill-chip"]')?.textContent).toContain('automate');
+    expect(bubble?.textContent).not.toContain('use_skill');
+    expect(bubble?.textContent).not.toContain('create_trigger');
+  });
+
+  it('/automate goes to the manager even with a worker pinned (only it has the trigger tools)', async () => {
+    const agents = [{ slug: 'codex', name: 'Codex' }];
+    await renderChat({
+      sessionId: 's_new',
+      agents,
+      project: { ...project, manager_ready: true, effective_pinned_target: 'codex' },
+    });
+    await flushEffects();
+    await type('/aut');
+    await press('Enter');
+    await type('Every Monday at 8am, write the weekly plan');
+    await press('Enter');
+    expect(injectCalls).toHaveLength(1);
+    expect(injectCalls[0][2]).toBeUndefined();
+    expect(injectCalls[0][6]).toBe(false);
+  });
+
+  it('initialSkill + initialDraft (Tasks → New automation) arrive picked and filled', async () => {
+    const onDraftConsumed = vi.fn();
+    await renderChat({
+      sessionId: 's1',
+      initialDraft: 'When a new spreadsheet lands in this folder, write up a data analysis report',
+      initialSkill: 'automate',
+      onDraftConsumed,
+    });
+    await flushEffects();
+    expect(composerChip()?.textContent).toContain('automate');
+    expect(textarea().value).toBe('When a new spreadsheet lands in this folder, write up a data analysis report');
+    expect(onDraftConsumed).toHaveBeenCalledTimes(1);
   });
 
   it('the catalog is fetched once per project, on the first /', async () => {

@@ -13,7 +13,9 @@
  * round-trip does not reset the panel. `view` — and only `view` — is mirrored
  * to `localStorage['orbital:panel:<projectId>:<sessionId>']`; expansion is
  * runtime state and deliberately does NOT survive a reload (D8: at rest the
- * panel is collapsed).
+ * panel is collapsed). Spec 137's `maximized` and `overlayOpen` are runtime
+ * state too: reopening a project lands in chat with the panel docked
+ * (decision 7), its width kept by `orbital:workspacePanelWidth` as before.
  */
 import { useCallback, useSyncExternalStore } from 'react';
 import type { PanelView } from '../utils/panelSelectors';
@@ -23,10 +25,26 @@ export interface PanelState {
   userCollapsedThisRun: boolean;
   view: PanelView;
   file: string | null;
+  /**
+   * Spec 137 — the panel fills the main area (docked: the session column and
+   * chat hide; overlay: the full width right of the strip/list). Maximized
+   * Files is the old Files tab: tree on the left, the file on the right.
+   */
+  maximized: boolean;
+  /** Spec 137 — below the dock threshold the panel opens as an overlay / bottom sheet. */
+  overlayOpen: boolean;
 }
 export interface PanelStateApi extends PanelState {
   expand: () => void;
-  collapse: () => void; // user intent: stays collapsed for this run
+  collapse: () => void; // user intent: stays collapsed for this run; also restores a maximized panel
+  /** Grow the panel to the main area (docked) or the full overlay width. */
+  maximize: () => void;
+  /** Back to the previous width (docked) or the side overlay. */
+  restore: () => void;
+  /** Narrow windows and phones: open the panel overlay (header button). */
+  openOverlay: () => void;
+  /** Close the overlay; a maximized overlay closes to its normal width next time. */
+  closeOverlay: () => void;
   setView: (v: PanelView) => void;
   setFile: (path: string | null) => void;
   /** A run touched the browser / a file: expand and switch, unless the user collapsed this run. */
@@ -47,6 +65,8 @@ const DEFAULT_STATE: PanelState = {
   userCollapsedThisRun: false,
   view: 'files',
   file: null,
+  maximized: false,
+  overlayOpen: false,
 };
 
 const store = new Map<string, PanelState>();
@@ -117,7 +137,23 @@ export function usePanelState(
   }, [update]);
 
   const collapse = useCallback(() => {
-    update({ expanded: false, userCollapsedThisRun: true });
+    update({ expanded: false, userCollapsedThisRun: true, maximized: false });
+  }, [update]);
+
+  const maximize = useCallback(() => {
+    update({ maximized: true });
+  }, [update]);
+
+  const restore = useCallback(() => {
+    update({ maximized: false });
+  }, [update]);
+
+  const openOverlay = useCallback(() => {
+    update({ overlayOpen: true });
+  }, [update]);
+
+  const closeOverlay = useCallback(() => {
+    update({ overlayOpen: false, maximized: false });
   }, [update]);
 
   const setView = useCallback(
@@ -156,12 +192,28 @@ export function usePanelState(
     ...state,
     expand,
     collapse,
+    maximize,
+    restore,
+    openOverlay,
+    closeOverlay,
     setView,
     setFile,
     expandForEvent,
     onRunStart,
     onRunEnd,
   };
+}
+
+function readMobile(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth <= PANEL_MOBILE_MAX_WIDTH;
+}
+
+/**
+ * Phone width (the App's mobile split): the panel opens as the drawer's
+ * bottom sheet there, and has no maximize.
+ */
+export function usePanelMobile(): boolean {
+  return useSyncExternalStore(subscribeToWindowWidth, readMobile, readNotDockable);
 }
 
 function readDockable(): boolean {

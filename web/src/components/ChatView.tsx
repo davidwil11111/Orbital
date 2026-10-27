@@ -45,8 +45,11 @@ import {
 import { uploadFile } from '../lib/attachment-upload';
 import { BASE_URL, isRelayMode } from '../config';
 import { buildAttachmentsBlock, parseAttachmentsBlock } from '../lib/attachment-parsing';
-import { buildSkillBlock, parseSkillBlock, skillAwarePreview } from '../lib/skill-parsing';
+import { buildInlineSkillBlock, buildSkillBlock, parseSkillBlock, skillAwarePreview } from '../lib/skill-parsing';
 import {
+  builtinSkills,
+  skillSendParts,
+  withBuiltinSkills,
   cachedSkillCatalog,
   loadSkillCatalog,
   matchSkills,
@@ -62,6 +65,7 @@ import { useContextUsage } from '../hooks/useContextUsage';
 import { useT, translate } from '../i18n/useT';
 import { useLocale } from '../i18n/LocaleContext';
 import type { StringKey } from '../i18n/strings';
+import type { BuiltinSkillKey } from '../route';
 import { publishSessionMessages, sessionMessagesKey } from '../utils/sessionMessagesStore';
 import { budgetTimelineText } from '../budget/timelineText';
 
@@ -765,6 +769,12 @@ interface ChatViewProps {
    * on a later remount (e.g. tab switch away and back).
    */
   initialDraft?: string;
+  /**
+   * Spec 137: a built-in skill to have picked along with `initialDraft`
+   * (Tasks → "New automation" opens chat with `/automate` chipped). Same
+   * one-shot lifetime; `onDraftConsumed` clears both.
+   */
+  initialSkill?: BuiltinSkillKey;
   onDraftConsumed?: () => void;
   /**
    * Re-fetch this project's runtime fields and merge
@@ -818,7 +828,7 @@ interface PendingApproval {
   reason?: string;
 }
 
-export default function ChatView({ projectId, project, agentStatus, statusTick, agents, sessionId, initialDraft, onDraftConsumed, onRefreshProject, onOpenSession }: ChatViewProps) {
+export default function ChatView({ projectId, project, agentStatus, statusTick, agents, sessionId, initialDraft, initialSkill, onDraftConsumed, onRefreshProject, onOpenSession }: ChatViewProps) {
   const t = useT();
   const { locale } = useLocale();
   // Chrome-only translator for the annotation chip's fallback label (the
@@ -980,14 +990,39 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // The catalog lives in the per-project module cache (skill-catalog.ts);
   // this counter re-renders when a fetch lands.
   const [, setSkillCatalogVersion] = useState(0);
-  const skillCatalog = cachedSkillCatalog(projectId);
+  const installedSkills = cachedSkillCatalog(projectId);
+  // Spec 137: built-in entries (`/automate`) sit in the same flat list.
+  // Bound to `locale` (their description and prefill are translated), not
+  // to the unstable `t`.
+  const builtins = useMemo(
+    () =>
+      builtinSkills(
+        {
+          description: translate(locale, 'chat.skill.automate.description'),
+          prefill: translate(locale, 'automations.example.schedule'),
+        },
+        (() => {
+          try {
+            return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+          } catch {
+            return 'UTC';
+          }
+        })(),
+      ),
+    [locale],
+  );
+  const skillCatalog = withBuiltinSkills(installedSkills, builtins);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
   // One skill per message, scoped to the session it was picked in (a chip
-  // must not follow the user into another conversation).
+  // must not follow the user into another conversation). Seeded from
+  // `initialSkill` (the Tasks page's "New automation" doorway).
   const [pickedSkillState, setPickedSkillState] = useState<
     { sessionId: string | undefined; skill: SkillCatalogEntry } | null
-  >(null);
+  >(() => {
+    const seeded = initialSkill ? builtins.find((b) => b.name === initialSkill) : undefined;
+    return seeded ? { sessionId, skill: seeded } : null;
+  });
   const pickedSkill =
     pickedSkillState && pickedSkillState.sessionId === sessionId ? pickedSkillState.skill : null;
   // Keep the highlighted row visible inside the menu. Only the menu's own
@@ -1953,6 +1988,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     if (sessionId !== undefined && pendingPrefillRef.current !== undefined) {
       pendingPrefillRef.current = undefined; // consumed — never re-applied
       prevSessionForDraftRef.current = sessionId;
+      // A chip seeded with the prefill (spec 137 `initialSkill`) was picked
+      // before the session resolved; it belongs to this one.
+      setPickedSkillState((prev) => (prev && prev.sessionId === undefined ? { ...prev, sessionId } : prev));
       return;
     }
     // Load the incoming session's draft (default to empty).
@@ -3052,15 +3090,29 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   const filteredSkills =
     currentSlashQuery !== null && skillCatalog ? matchSkills(skillCatalog, currentSlashQuery) : [];
   const skillMenuOpen = filteredSkills.length > 0;
-  // A bare `/` with nothing installed shows a hint instead (not interactive).
-  const skillMenuEmptyHint =
-    currentSlashQuery === '' && skillCatalog !== null && skillCatalog.length === 0;
+  // Spec 137: the built-ins keep the list from ever being empty, so the old
+  // "no skills installed" hint is gone — a bare `/` always lists `/automate`.
+
 
   /** Pick a skill: the `/query` text goes, the chip replaces any earlier pick. */
   function pickSkill(entry: SkillCatalogEntry) {
     setPickedSkillState({ sessionId, skill: entry });
-    setInputText('');
     setSelectedSkillIndex(0);
+    if (entry.builtin) {
+      // Spec 137: a built-in prefills its phrasing, selected, so typing
+      // replaces the example and Enter sends it as is.
+      const prefill = entry.builtin.prefill;
+      setInputText(prefill);
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        adjustTextareaHeight();
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(0, prefill.length);
+      });
+      return;
+    }
+    setInputText('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
   }
 
@@ -3177,7 +3229,14 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     // Spec 091: the sticky "Talking to" pin is the only direct-to-worker send;
     // otherwise the management agent. Text goes out verbatim — a leading
     // `@codex` is part of the message, never a target.
-    const resolved = resolveSendTarget(text, pinnedTarget);
+    const resolvedPin = resolveSendTarget(text, pinnedTarget);
+    // Spec 137: `/automate` goes to the manager whatever the pin — only it
+    // has the trigger tools. Not on a keyless project (no manager to run
+    // it): there the pin stands, as for any other message.
+    const resolved =
+      skill?.builtin?.managerOnly && project?.manager_ready !== false
+        ? { target: undefined, content: resolvedPin.content, pinned: false }
+        : resolvedPin;
     const target = resolved.target;
     let content = resolved.content;
 
@@ -3211,11 +3270,13 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     // The skill block follows the attachments block, as on the backend. (A
     // safe-mode manager gets the body inlined server-side; the echo then
     // differs from this bubble, which the nonce dedup tolerates.)
-    const skillPayload = skill ? { key: skill.key, path: skill.path } : undefined;
+    // A built-in skill (spec 137) is not in the backend catalog: its text
+    // rides inside `content` as an inline block, with no skill payload.
+    const skillParts = skillSendParts(skill, buildSkillBlock, buildInlineSkillBlock);
+    const skillPayload = skillParts.payload;
+    content = skillParts.contentPrefix + content;
     const wireContent =
-      buildAttachmentsBlock(attachmentsPayload) +
-      buildSkillBlock(skill ? { name: skill.name, path: skill.path } : null) +
-      content;
+      buildAttachmentsBlock(attachmentsPayload) + skillParts.pointerBlock + content;
 
     setInputText('');
     if (skill) setPickedSkillState(null);
@@ -3470,7 +3531,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         return;
       }
     }
-    if ((skillMenuOpen || skillMenuEmptyHint) && e.key === 'Escape') {
+    if (skillMenuOpen && e.key === 'Escape') {
       setSlashDismissed(true);
       return;
     }
@@ -4218,9 +4279,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               setInputText('');
               setPickedSkillState(null);
               const pendingSkill = pending.pendingSkill;
-              const wireContent =
-                buildSkillBlock(pendingSkill ? { name: pendingSkill.name, path: pendingSkill.path } : null) +
-                pending.pendingContent;
+              // pendingContent already carries a built-in's inline block.
+              const pendingParts = skillSendParts(pendingSkill, buildSkillBlock, buildInlineSkillBlock);
+              const wireContent = pendingParts.pointerBlock + pending.pendingContent;
               setItems((prev) => [
                 ...prev,
                 {
@@ -4238,7 +4299,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                 pending.pendingAttachments,
                 sessionId,
                 undefined,
-                pendingSkill ? { key: pendingSkill.key, path: pendingSkill.path } : undefined,
+                pendingParts.payload,
               );
             }}
           />
@@ -4332,14 +4393,6 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
                   </span>
                 </button>
               ))}
-            </div>
-          )}
-          {skillMenuEmptyHint && (
-            <div
-              data-testid="skill-menu-empty"
-              className="absolute bottom-full left-0 mb-1 w-[min(28rem,calc(100vw-2rem))] bg-elevated border border-border rounded-[10px] shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)] z-50 px-3 py-2 text-xs text-secondary"
-            >
-              {t('chat.skill.empty')}
             </div>
           )}
           {annotationStrip}

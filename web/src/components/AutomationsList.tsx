@@ -26,6 +26,12 @@ interface AutomationsListProps {
    * state's example prompts clickable; without it they are plain cards.
    */
   onTryInChat?: (text: string) => void;
+  /**
+   * Spec 137 decision 2: "New automation" goes back to the chat with the
+   * `/automate` skill picked — creating an automation is the agent's job.
+   * Without it (older callers) the button opens the inline form.
+   */
+  onNewInChat?: () => void;
 }
 
 function formatLastFired(last: string | null): string {
@@ -270,7 +276,7 @@ function AutomationRow({
  * `trigger.deleted` and the row disappeared until the next refetch, which is
  * why this surface shipped read-only.
  */
-export default function AutomationsList({ projectId, agents = [], onTryInChat }: AutomationsListProps) {
+export default function AutomationsList({ projectId, agents = [], onTryInChat, onNewInChat }: AutomationsListProps) {
   const t = useT();
   const { locale } = useLocale();
   const {
@@ -348,7 +354,7 @@ export default function AutomationsList({ projectId, agents = [], onTryInChat }:
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs text-secondary">
           {triggers.length > 0
-            ? t(triggers.length === 1 ? 'trigger.summary.one' : 'trigger.summary.other', {
+            ? t(triggers.length === 1 ? 'statusLine.automations.one' : 'statusLine.automations.other', {
                 n: triggers.length,
               })
             : ''}
@@ -356,6 +362,10 @@ export default function AutomationsList({ projectId, agents = [], onTryInChat }:
         <button
           type="button"
           onClick={() => {
+            if (onNewInChat) {
+              onNewInChat();
+              return;
+            }
             setEditingId(null);
             setCreating(true);
           }}
