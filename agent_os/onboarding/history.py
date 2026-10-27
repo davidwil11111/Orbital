@@ -32,7 +32,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from agent_os.onboarding.history_paths import HistoryEnv, history_home
+from agent_os.onboarding.history_paths import HistoryEnv, has_project_instructions, history_home
 from agent_os.onboarding.history_types import HistorySession, StopInfo
 from agent_os.utils.subprocess_flags import win_no_window_flags
 
@@ -45,7 +45,6 @@ CACHE_FILENAME = "sessions-cache.json"
 # Pass 1: a folder with this many sessions is a project even without git or
 # an AGENTS.md / CLAUDE.md.
 MIN_FOLDER_SESSIONS = 3
-_AGENT_MD_NAMES = ("AGENTS.md", "CLAUDE.md")
 
 # Pass 2 weights and thresholds (spec "Grouping" 2).
 _WEIGHT_EDIT, _WEIGHT_READ, _WEIGHT_MENTION = 3, 2, 1
@@ -470,7 +469,9 @@ def analyze(sessions: list[HistorySession], env: HistoryEnv, *, isdir=os.path.is
         if env.is_container(folder) or env.is_temp(folder) or not isdir(folder):
             continue
         is_git = git_main_root(folder) is not None
-        has_md = any(os.path.isfile(os.path.join(folder, n)) for n in _AGENT_MD_NAMES)
+        if env.is_chat_folder(folder) and not is_git:
+            continue  # a Codex app chat: its sessions go on to passes 2-3
+        has_md = has_project_instructions(folder)
         minor = not (is_git or has_md or len(members) >= MIN_FOLDER_SESSIONS)
         result.projects[folder] = FolderProject(folder, is_git, has_md, minor, list(members))
         for s in members:

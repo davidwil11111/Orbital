@@ -43,6 +43,7 @@ import logging
 import os
 import sqlite3
 import sys
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -554,17 +555,19 @@ def _fold_to_repo(cand: ImportCandidate, env: HistoryEnv) -> ImportCandidate | N
             path = root
     if env.is_container(path) or env.is_temp(path):
         return None
+    if env.is_chat_folder(path) and git_main_root(path) is None:
+        return None  # a Codex app chat folder, not a project
     return cand
 
 
 def _annotate(cand: ImportCandidate, env: HistoryEnv) -> None:
     from agent_os.onboarding.history import MIN_FOLDER_SESSIONS, git_main_root
+    from agent_os.onboarding.history_paths import has_project_instructions
 
     root = git_main_root(os.path.normpath(cand.path))
     # A repo rooted at a container (a dotfiles repo in ~) says nothing.
     cand.is_git = root is not None and not env.is_container(root)
-    cand.has_agent_md = any(os.path.isfile(os.path.join(cand.path, n))
-                            for n in ("AGENTS.md", "CLAUDE.md"))
+    cand.has_agent_md = has_project_instructions(cand.path)
     cand.minor = (cand.source in _AGENT_SOURCES and not cand.is_git
                   and not cand.has_agent_md and cand.session_count < MIN_FOLDER_SESSIONS)
 
@@ -590,12 +593,49 @@ def _rank(candidates: list[ImportCandidate]) -> list[ImportCandidate]:
     """Agent projects above Obsidian vaults; within a tier newest-first."""
 
     def sort_key(c: ImportCandidate):
-        tier = 0 if c.source in _AGENT_SOURCES else 1
+        tier = 1 if c.source == SOURCE_OBSIDIAN else 0
         # tier ascending; activity + session_count descending; name as a stable,
         # deterministic final tiebreak.
         return (tier, -_activity_epoch(c.last_activity), -c.session_count, c.name.lower())
 
     return sorted(candidates, key=sort_key)
+
+
+def candidates_from_analysis(analysis, *, vaults: Iterable[ImportCandidate] = (),
+                             existing_workspaces: Iterable[str] = ()) -> list[ImportCandidate]:
+    """Spec 138 step 2 rows once the history scan is done: one per pass-1
+    folder of ``analysis``, plus the Obsidian ``vaults`` (which have no
+    history). Unlike the folder scan above, the analysis has dropped the
+    sessions Orbital itself ran as a worker, automation runs and probes, and
+    counts the sessions it attached to a folder by the files they touched, so
+    the rows agree with the groups."""
+    out: list[ImportCandidate] = []
+    for root, project in analysis.projects.items():
+        by_agent = Counter(s.agent for s in project.sessions)
+        if not by_agent:
+            continue
+        ended = [s.ended_at for s in project.sessions if s.ended_at]
+        out.append(ImportCandidate(
+            source=by_agent.most_common(1)[0][0],
+            name=os.path.basename(root.rstrip("/\\")) or root,
+            path=root,
+            session_count=len(project.sessions),
+            last_activity=max(ended) if ended else None,
+            sources=sorted(by_agent),
+            by_agent=dict(by_agent),
+            is_git=project.is_git,
+            has_agent_md=project.has_agent_md,
+            minor=project.minor,
+        ))
+    # Folder roots are unique already; a vault that is also a folder row
+    # stays the folder row.
+    seen = {_path_key(c.path) for c in out}
+    out.extend(v for v in vaults
+               if v.source == SOURCE_OBSIDIAN and _path_key(v.path) not in seen)
+    imported_keys = {_path_key(w) for w in existing_workspaces if w}
+    for cand in out:
+        cand.already_imported = _path_key(cand.path) in imported_keys
+    return _rank(out)
 
 
 # --------------------------------------------------------------------------

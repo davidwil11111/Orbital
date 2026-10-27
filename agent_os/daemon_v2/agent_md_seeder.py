@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 AGENT_MD_FILENAME = "AGENTS.md"
 
+#: A sentence every template Orbital has seeded carries. Onboarding's
+#: project detection (spec 138) uses it to tell Orbital's own signpost from an
+#: AGENTS.md the user wrote; keep it in any new template.
+SEED_MARKER = "Orbital generated this file when the project was created"
+
 # Substitution is `str.format`, so the template must contain **no literal
 # braces** beyond the named fields below.
 AGENT_MD_TEMPLATE = """# AGENTS.md — read this first

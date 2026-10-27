@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 from agent_os.onboarding import scan_importable_projects
+from agent_os.onboarding.import_scanner import candidates_from_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,17 @@ async def importable_projects():
     except Exception:
         logger.exception("importable-projects scan failed")
         candidates = []
+    # Once the history scan is done the folder rows come from its analysis:
+    # the folder scan above counts the sessions Orbital itself ran as a
+    # worker (rc DMG: 42 rows on a dev Mac, 35 of them smoke workspaces) and
+    # is only the instant first answer while the history is read.
+    analysis = scanner.analysis() if scanner.status()["status"] == "ready" else None
+    if analysis is not None:
+        try:
+            candidates = candidates_from_analysis(
+                analysis, vaults=candidates, existing_workspaces=_existing_workspaces())
+        except Exception:
+            logger.exception("importable-projects: rows from the history scan failed")
     try:
         groups = _groups_payload(scanner)
     except Exception:

@@ -61,6 +61,32 @@ def _key(path: str) -> str:
     return _normcase(os.path.normpath(path))
 
 
+_AGENT_MD_NAMES = ("AGENTS.md", "CLAUDE.md")
+
+
+def has_project_instructions(folder: str) -> bool:
+    """A CLAUDE.md, or an AGENTS.md the user wrote, in ``folder`` (spec 138
+    pass 1). Orbital seeds AGENTS.md into every project it creates, so with
+    the seed counted every folder Orbital was ever pointed at qualified (rc
+    DMG: 35 smoke-test workspaces offered as projects)."""
+    from agent_os.daemon_v2.agent_md_seeder import SEED_MARKER
+
+    for name in _AGENT_MD_NAMES:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if name != "AGENTS.md":
+            return True
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return True
+        if SEED_MARKER not in head:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class HistoryEnv:
     """The folders the grouping rules treat specially, resolved for one home.
@@ -73,6 +99,10 @@ class HistoryEnv:
     containers: frozenset[str] = field(default_factory=frozenset)
     # Written files under these never link two sessions (pass 3).
     private_roots: tuple[str, ...] = ()
+    # Where the Codex app puts a chat started without a project:
+    # <root>/<YYYY-MM-DD>/<slug>, one folder per chat. The root and its day
+    # folders are containers; a chat folder is a project only as a git repo.
+    chat_roots: tuple[str, ...] = ()
 
     @classmethod
     def for_home(cls, home: str | None = None, *,
@@ -101,8 +131,9 @@ class HistoryEnv:
             *((drive + os.sep,) if drive else ())))
         private = tuple(_key(os.path.join(home, d)) for d in (
             ".claude", ".codex", ".codebuddy", ".pi", ".kimi-code", ".minimax", ".agents"))
+        chats = (_key(os.path.join(home, "Documents", "Codex")),)
         return cls(home=home, temp_roots=tuple(_key(r) for r in temp_roots),
-                   containers=containers, private_roots=private)
+                   containers=containers, private_roots=private, chat_roots=chats)
 
     def is_temp(self, path: str | None) -> bool:
         if not path:
@@ -111,7 +142,24 @@ class HistoryEnv:
         return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in self.temp_roots)
 
     def is_container(self, path: str | None) -> bool:
-        return bool(path) and _key(path) in self.containers
+        if not path:
+            return False
+        p = _key(path)
+        return p in self.containers or self._chat_depth(p) in (0, 1)
+
+    def is_chat_folder(self, path: str | None) -> bool:
+        """Inside a Codex app chat folder (below a chat root's day folders)."""
+        return bool(path) and (self._chat_depth(_key(path)) or 0) >= 2
+
+    def _chat_depth(self, p: str) -> int | None:
+        """Levels below a chat root (0 = the root itself), or None."""
+        for root in self.chat_roots:
+            if p == root:
+                return 0
+            prefix = root.rstrip(os.sep) + os.sep
+            if p.startswith(prefix):
+                return len([part for part in p[len(prefix):].split(os.sep) if part])
+        return None
 
     def is_private(self, path: str) -> bool:
         p = _key(path)
