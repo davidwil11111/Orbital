@@ -212,6 +212,45 @@ class _ActivityTrackingRegistry:
         return self._inner.tool_names()
 
 
+class _WorkerProviderView:
+    """A worker's view of the batch's shared provider (spec 140 R3).
+
+    Every worker in a fanout reuses the PARENT session's provider object
+    (``build_worker_deps``), and when no utility model is configured that is
+    the manager's own main provider. ``AgentLoop.__init__`` binds its
+    provider's session-header getter to the loop's session, so each worker
+    used to re-point the shared object at itself: every worker, and the
+    manager after the fanout, sent the LAST worker's id as OpenCode Go's
+    ``x-opencode-session``, a routing key, so the manager's next call landed
+    on another upstream and lost its whole cached prefix (measured: 45k
+    prompt, cached 0). ``bind_session_id`` is therefore a no-op here: workers
+    ride the parent's conversation id, which also keeps the batch on one
+    route so the stagger below can hit worker 1's prefix.
+
+    ``stream`` also reports the first chunk carrying output, the moment the
+    provider has processed (and cached) the prompt, to ``on_first_token``.
+    Everything else delegates to the shared provider unchanged.
+    """
+
+    def __init__(self, inner, on_first_token: Callable[[], None]) -> None:
+        self._inner = inner
+        self._on_first_token = on_first_token
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def bind_session_id(self, getter) -> None:  # noqa: ARG002 — see class docstring
+        return None
+
+    async def stream(self, messages, tools=None):
+        async for chunk in self._inner.stream(messages, tools=tools):
+            if (getattr(chunk, "text", "") or getattr(chunk, "reasoning_content", "")
+                    or getattr(chunk, "tool_calls_delta", None)
+                    or getattr(chunk, "is_final", False)):
+                self._on_first_token()
+            yield chunk
+
+
 class NativeWorkerAdapter:
     """In-process ``AgentLoop`` wrapped in the sub-agent adapter duck-type.
 
@@ -262,6 +301,11 @@ class NativeWorkerAdapter:
         # CLIAdapter's field of the same name (sub_agent_manager.py owns the
         # actual task; this adapter never assigns it itself).
         self._background_send_task: asyncio.Task | None = None
+        # Spec 140 R3: set once this worker's first LLM call has returned its
+        # first token (its prompt prefix is now in the provider's cache), or
+        # once its turn ended / it was stopped without one, so a fanout
+        # waiting on it to start the remaining workers is never left hanging.
+        self.first_token = asyncio.Event()
 
         registry = deps.make_tool_registry(allowed_paths, forbidden_paths, handle)
         if self._on_activity is not None:
@@ -356,6 +400,11 @@ class NativeWorkerAdapter:
         # stall watchdog (spec 009 §0.5-5) is a separate activity-timeout
         # applied externally by the spawner/join layer, not this loop's cap.
         prompt_builder = PromptBuilder(workspace=deps.workspace)
+        # No agent_name: the task label used to become the identity line
+        # ("You are <label>, ...") at the very top of the system prompt, so
+        # sibling workers' prompts differed from ~token 9 and none could reuse
+        # another's cached prefix (spec 140 I2). The label still names the
+        # task in the UI and the join summary; the brief carries the task.
         base_ctx = PromptContext(
             workspace=deps.workspace,
             model=getattr(deps.provider, "model", "unknown"),
@@ -365,11 +414,11 @@ class NativeWorkerAdapter:
             os_type=detect_os(),
             datetime_now=datetime.now().isoformat(),
             project_id=deps.project_id,
-            agent_name=display_name,
         )
         context_manager = ContextManager(self._session, prompt_builder, base_ctx)
 
-        self._loop = AgentLoop(self._session, deps.provider, registry, context_manager)
+        provider = _WorkerProviderView(deps.provider, self.first_token.set)
+        self._loop = AgentLoop(self._session, provider, registry, context_manager)
 
     async def send(self, message: str) -> None:
         """Run ONE full ``AgentLoop`` turn with ``message`` as the user
@@ -416,6 +465,7 @@ class NativeWorkerAdapter:
         finally:
             self._running = False
             self._idle = True
+            self.first_token.set()
             self._fire_activity()  # turn end
             await self._cleanup_browser_scope()
 
@@ -456,6 +506,7 @@ class NativeWorkerAdapter:
         ``cancel_turn()``'s effects propagate.
         """
         self._stop_requested = True
+        self.first_token.set()
         await self._loop.cancel_turn()
         self._running = False
         self._idle = True

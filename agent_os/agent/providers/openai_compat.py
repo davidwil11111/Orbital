@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 import re
+from datetime import datetime, timezone
 from typing import AsyncIterator
 
 import openai
@@ -504,6 +506,76 @@ def _extra_headers_kw(headers: dict | None) -> dict:
     return {"extra_headers": headers} if headers else {}
 
 
+# ---------------------------------------------------------------------------
+# Spec 140 I1: request-body dump (diagnostic only, off by default, no UI).
+# ``AGENT_OS_DUMP_LLM_REQUESTS=<dir>`` writes every OpenAI-compatible request
+# body, exactly as handed to the SDK, to ``<dir>/<session>_<n>.json`` so a
+# byte-level diff (scripts/diag/first_divergence.py) can find where two
+# sessions' prompts first differ. The scrub masks only credentials: the
+# provider's own key and key/bearer shapes. Session ids, paths and hashes are
+# deliberately kept, since they are exactly the bytes such a diff looks for.
+# ---------------------------------------------------------------------------
+
+DUMP_ENV = "AGENT_OS_DUMP_LLM_REQUESTS"
+_DUMP_REDACTED = "<redacted>"
+_DUMP_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_DUMP_PREFIXED_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})"
+)
+_DUMP_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_dump_counters: dict[str, int] = {}
+
+
+def _scrub_dump_text(text: str, secrets: list[str]) -> str:
+    for secret in sorted((s for s in secrets if s and len(s) >= 6), key=len, reverse=True):
+        text = text.replace(secret, _DUMP_REDACTED)
+    text = _DUMP_BEARER_RE.sub(f"Bearer {_DUMP_REDACTED}", text)
+    return _DUMP_PREFIXED_KEY_RE.sub(_DUMP_REDACTED, text)
+
+
+def _dump_llm_request(provider: "LLMProvider", body: dict, *, path: str,
+                      headers: dict | None) -> None:
+    """Write one request body when ``AGENT_OS_DUMP_LLM_REQUESTS`` is set.
+    Never raises: a diagnostic must not break a turn."""
+    out_dir = os.environ.get(DUMP_ENV)
+    if not out_dir:
+        return
+    try:
+        session = provider.request_session_id()
+        stem = _DUMP_NAME_RE.sub("_", session).strip("._") or "nosession"
+        os.makedirs(out_dir, exist_ok=True)
+        doc = {
+            "meta": {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "path": path,
+                "provider": provider.provider,
+                "model": provider.model,
+                "base_url": provider.base_url,
+                "session_id": session,
+                "caller": provider.cache_audit_caller,
+                "headers": dict(headers or {}),
+            },
+            "body": body,
+        }
+        text = _scrub_dump_text(
+            json.dumps(doc, ensure_ascii=False, indent=1, default=str),
+            [provider.api_key or ""])
+        n = _dump_counters.get(stem, 0)
+        while True:
+            n += 1
+            target = os.path.join(out_dir, f"{stem}_{n}.json")
+            try:
+                with open(target, "x", encoding="utf-8") as fh:
+                    fh.write(text)
+                break
+            except FileExistsError:
+                continue
+        _dump_counters[stem] = n
+    except Exception:
+        logging.getLogger(__name__).debug("LLM request dump failed", exc_info=True)
+
+
 class LLMProvider:
     """Dual-SDK LLM client: OpenAI or Anthropic."""
 
@@ -667,19 +739,24 @@ class LLMProvider:
     async def _stream_openai(self, messages, tools=None) -> AsyncIterator[StreamChunk]:
         """OpenAI SDK streaming path."""
         messages = self._prepare_messages_openai(messages)
+        body = dict(
+            model=self.model,
+            messages=messages,
+            # OMIT `tools` when empty. `tools=None` serializes to
+            # "tools": null, which strict gateways reject outright:
+            # GLM-5.2 via OpenCode Go answers 400 "Input should be a
+            # valid list, field: 'tools', value: None". The Anthropic
+            # path already only sets the key when it has one.
+            **({"tools": tools} if tools else {}),
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        headers = self._request_headers()
+        _dump_llm_request(self, body, path="stream", headers=headers)
         try:
             response_iter = await self._openai_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                # OMIT `tools` when empty. `tools=None` serializes to
-                # "tools": null, which strict gateways reject outright:
-                # GLM-5.2 via OpenCode Go answers 400 "Input should be a
-                # valid list, field: 'tools', value: None". The Anthropic
-                # path already only sets the key when it has one.
-                **({"tools": tools} if tools else {}),
-                stream=True,
-                stream_options={"include_usage": True},
-                **_extra_headers_kw(self._request_headers()),
+                **body,
+                **_extra_headers_kw(headers),
             )
         except (ContextOverflowError, LLMError):
             raise
@@ -701,14 +778,13 @@ class LLMProvider:
                         msg = dict(msg)
                         msg["content"] = _flatten_multimodal_content(msg["content"])
                     flat_messages.append(msg)
+                retry_body = {**body, "messages": flat_messages}
+                _dump_llm_request(self, retry_body, path="stream_flat_retry",
+                                  headers=headers)
                 try:
                     response_iter = await self._openai_client.chat.completions.create(
-                        model=self.model,
-                        messages=flat_messages,
-                        **({"tools": tools} if tools else {}),
-                        stream=True,
-                        stream_options={"include_usage": True},
-                        **_extra_headers_kw(self._request_headers()),
+                        **retry_body,
+                        **_extra_headers_kw(headers),
                     )
                 except (ContextOverflowError, LLMError):
                     raise
@@ -879,14 +955,19 @@ class LLMProvider:
             off_switch = _build_reasoning_off_switch(self.model, self.reasoning)
             if off_switch is not None:
                 extra_kwargs["extra_body"] = off_switch
+        body = dict(
+            model=self.model,
+            messages=messages,
+            **({"tools": tools} if tools else {}),
+            stream=False,
+            **extra_kwargs,
+        )
+        headers = self._request_headers()
+        _dump_llm_request(self, body, path="complete", headers=headers)
         try:
             response = await self._openai_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                **({"tools": tools} if tools else {}),
-                stream=False,
-                **extra_kwargs,
-                **_extra_headers_kw(self._request_headers()),
+                **body,
+                **_extra_headers_kw(headers),
             )
         except (ContextOverflowError, LLMError):
             raise

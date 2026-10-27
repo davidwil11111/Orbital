@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 MAX_CONCURRENT_SUBAGENTS = 5  # Max active sub-agents per project
+# Spec 140 R3: a fanout starts worker 1 alone and starts the others once its
+# first LLM call has returned a first token (its prompt prefix is then in the
+# provider's cache, so the others hit it), or after this many seconds anyway.
+FANOUT_STAGGER_TIMEOUT_S = 20.0
 
 
 @dataclass
@@ -139,6 +143,9 @@ class SubAgentManager:
         # ``dispatch_fanout`` cannot run yet — it fails closed with an
         # "unavailable" error rather than raising.
         self._fanout_registry = None
+        # Spec 140 R3: strong refs to the "start the rest of the fanout"
+        # tasks (asyncio keeps only weak refs to bare create_task results).
+        self._fanout_stagger_tasks: set[asyncio.Task] = set()
         self._worker_deps_factory = None
         # Prompt execution is serialized independently for every owning
         # management session and sub-agent handle.  The existing
@@ -2024,11 +2031,30 @@ class SubAgentManager:
 
             await self._fanout_registry.start_watchdog(group)
 
-            for task, fanout_task in zip(tasks, fanout_tasks):
+            # Spec 140 R3: concurrent first calls all miss the provider's
+            # prefix cache (it is written only once a request is processed),
+            # so workers 2..N start after worker 1's first token instead of
+            # in the same instant. They share one model (one provider per
+            # batch), which is what makes worker 1's prefix theirs too.
+            briefs = [(fanout_task.handle, task["brief"])
+                      for task, fanout_task in zip(tasks, fanout_tasks)]
+            stagger = len(briefs) >= 2 and _same_model(adapters.values())
+            first = briefs[:1] if stagger else briefs
+            for handle, brief in first:
                 await self._dispatch_async(
-                    adapters[fanout_task.handle], project_id,
-                    fanout_task.handle, task["brief"], session_id=session_id,
+                    adapters[handle], project_id, handle, brief,
+                    session_id=session_id,
                 )
+            if stagger:
+                t = asyncio.create_task(
+                    self._dispatch_fanout_rest(
+                        project_id, session_id, group, adapters[briefs[0][0]],
+                        [(adapters[h], h, b) for h, b in briefs[1:]],
+                    ),
+                    name=f"fanout-stagger-{fanout_id}",
+                )
+                self._fanout_stagger_tasks.add(t)
+                t.add_done_callback(self._fanout_stagger_tasks.discard)
 
         ws = self._ws()
         if ws is not None:
@@ -2058,6 +2084,66 @@ class SubAgentManager:
             f"Fanout {fanout_id} dispatched: {len(fanout_tasks)} tasks — "
             f"{labels}. Results will arrive together when all tasks finish."
         )
+
+    async def _dispatch_fanout_rest(self, project_id: str, session_id: str,
+                                    group, lead, rest: list) -> None:
+        """Start fanout workers 2..N once worker 1 (``lead``) has returned its
+        first token, or its turn ended or it was stopped (both set the same
+        event), or ``FANOUT_STAGGER_TIMEOUT_S`` passed. Never raises.
+
+        A worker torn down while it waited (project stop, user stop) is not
+        started: it is reported interrupted, exactly like a running worker
+        that was stopped, so the join still resolves."""
+        try:
+            await asyncio.wait_for(lead.first_token.wait(),
+                                   timeout=FANOUT_STAGGER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.info(
+                "fanout %s: worker 1 gave no first token within %.0fs; "
+                "starting the rest", group.fanout_id, FANOUT_STAGGER_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("fanout %s: stagger wait failed", group.fanout_id)
+        sk = make_session_key(project_id, session_id)
+        lock = self._get_lock(project_id, session_id=session_id)
+        skipped: list[str] = []
+        async with lock:
+            for adapter, handle, brief in rest:
+                registered = self._adapters.get(sk, {}).get(handle) is adapter
+                # ``_stopping``: a stop_all is tearing this session down
+                # (it stops adapters one by one, and stopping worker 1 is
+                # what woke us), so the not-yet-stopped rest stay unstarted.
+                if (group.resolved or not registered or sk in self._stopping
+                        or getattr(adapter, "_stop_requested", False)):
+                    skipped.append(handle)
+                    continue
+                try:
+                    await self._dispatch_async(
+                        adapter, project_id, handle, brief,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "fanout %s: dispatch of %s failed", group.fanout_id, handle)
+                    skipped.append(handle)
+        for handle in skipped:
+            await self._report_unstarted_worker(project_id, session_id, handle)
+
+    async def _report_unstarted_worker(self, project_id: str, session_id: str,
+                                       handle: str) -> None:
+        transcript = self._transcripts.get((project_id, session_id, handle))
+        path = transcript.filepath if transcript is not None else ""
+        try:
+            if self._lifecycle_observer is not None:
+                await self._lifecycle_observer.on_turn_interrupted(
+                    project_id, handle, path, session_id=session_id)
+            elif self._fanout_registry is not None:
+                self._fanout_registry.absorb_terminal(
+                    project_id, handle, session_id, kind="interrupted",
+                    summary="", transcript_path=path)
+        except Exception:
+            logger.exception("fanout: reporting unstarted worker %s failed", handle)
 
     def _make_activity_callback(self, project_id: str, handle: str,
                                 session_id: str):
@@ -3059,3 +3145,13 @@ class SubAgentManager:
             return SubAgentTranscript.read(filepath)
         except (OSError, json.JSONDecodeError):
             return None
+
+
+def _same_model(adapters) -> bool:
+    """True when every fanout worker runs the same model (spec 140 R3: only
+    then can workers 2..N reuse worker 1's cached prefix)."""
+    models = {
+        (getattr(getattr(getattr(a, "_deps", None), "provider", None), "model", None))
+        for a in adapters
+    }
+    return len(models) == 1
