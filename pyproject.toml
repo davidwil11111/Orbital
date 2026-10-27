@@ -34,6 +34,9 @@ dependencies = [
     # shipped inside the packaged app. Lift the cap only together with
     # a 2.x migration of the client.
     "mcp>=1.2,<2",
+    # Codex compresses older rollouts to .jsonl.zst; the spec 138 history
+    # readers decompress them. Python 3.14 has compression.zstd; 3.13 does not.
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]

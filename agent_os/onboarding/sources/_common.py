@@ -10,6 +10,7 @@ Not a reader itself (``load_sources`` only imports the modules it names).
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -162,8 +163,25 @@ def touch(s: HistorySession, ts: str | None) -> None:
         s.ended_at = ts
 
 
+def open_text(path: str):
+    """A history file as text. Codex compresses older rollouts to
+    ``rollout-*.jsonl.zst`` (418 of 487 on a dev Mac), so a reader that only
+    opened ``.jsonl`` missed most of a long-time user's Codex history."""
+    if path.endswith(".zst"):
+        import zstandard
+
+        raw = open(path, "rb")
+        try:
+            stream = zstandard.ZstdDecompressor().stream_reader(raw, closefd=True)
+        except Exception:
+            raw.close()
+            raise
+        return io.TextIOWrapper(stream, encoding="utf-8", errors="ignore")
+    return open(path, "r", encoding="utf-8", errors="ignore")
+
+
 def iter_json_lines(path: str):
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open_text(path) as fh:
         for line in fh:
             line = line.strip()
             if not line:

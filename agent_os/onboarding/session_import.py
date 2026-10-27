@@ -625,6 +625,8 @@ def _codex_native_from_row(row: dict) -> NativeSession | None:
     rollout = row.get("rollout_path")
     if not isinstance(rollout, str) or not rollout:
         return None
+    if not os.path.exists(rollout) and os.path.exists(rollout + ".zst"):
+        rollout += ".zst"  # Codex compressed it; the index keeps the old name
     try:
         size = os.path.getsize(rollout)
     except OSError:
@@ -1021,7 +1023,9 @@ def convert_transcript(agent: str, path: str, *, handle: str | None = None,
 
 
 def _iter_file_rows(path: str):
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    from agent_os.onboarding.sources._common import open_text
+
+    with open_text(path) as fh:
         yield from _json_rows(fh)
 
 

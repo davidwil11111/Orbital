@@ -66,6 +66,10 @@ a = Analysis(
         'multipart',
         'claude_agent_sdk',
         'claude_agent_sdk.types',
+        # Codex .jsonl.zst rollouts (spec 138 readers); its C backend is
+        # imported by name inside the package.
+        'zstandard',
+        'zstandard.backend_c',
     ] + _httptools_hiddenimports
       # Spec 138 history readers are imported by name (onboarding.sources),
       # which analysis cannot see: the rc DMG shipped without claude_code + codex.

@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Codex history: ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl``.
+"""Codex history: ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`` (or ``.jsonl.zst``).
 
 One rollout per thread. ``session_meta`` carries the thread id, cwd, git
 branch and ``originator`` ("orbital" = Orbital's own app-server worker);
@@ -46,8 +46,15 @@ class CodexSource:
         root = os.path.join(codex_dir(home), "sessions")
         out: list[str] = []
         for dirpath, _dirs, files in os.walk(root):
+            names = set(files)
             for name in files:
-                if name.startswith("rollout-") and name.endswith(".jsonl"):
+                if not name.startswith("rollout-"):
+                    continue
+                if name.endswith(".jsonl"):
+                    out.append(os.path.join(dirpath, name))
+                elif name.endswith(".jsonl.zst") and name[:-len(".zst")] not in names:
+                    # Older rollouts are compressed; mid-compression both
+                    # exist and the plain one is read.
                     out.append(os.path.join(dirpath, name))
         return out
 

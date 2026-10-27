@@ -243,8 +243,11 @@ def iso_text(value) -> str | None:
 
 
 def json_lines(path: str):
-    """Each JSON object of a JSONL file; torn or non-object lines skipped."""
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    """Each JSON object of a JSONL file (``.zst``-compressed too); torn or
+    non-object lines skipped."""
+    from agent_os.onboarding.sources._common import open_text
+
+    with open_text(path) as fh:
         for line in fh:
             line = line.strip()
             if not line:
