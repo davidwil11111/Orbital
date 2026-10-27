@@ -43,8 +43,16 @@ const STEPS: TourStep[] = [
   { id: 'project', anchors: ['project-header'], titleKey: 'tour.project.title', bodyKey: 'tour.project.body' },
   { id: 'agents', anchors: ['pin-select'], titleKey: 'tour.agents.title', bodyKey: 'tour.agents.body' },
   { id: 'panel', anchors: ['workspace-panel', 'panel-handle'], titleKey: 'tour.panel.title', bodyKey: 'tour.panel.body' },
-  { id: 'files', anchors: ['tab-files'], titleKey: 'tour.files.title', bodyKey: 'tour.files.body' },
-  { id: 'tasks', anchors: ['tab-queue'], titleKey: 'tour.tasks.title', bodyKey: 'tour.tasks.body' },
+  // Spec 137: no Files tab any more. The project's files are the panel at
+  // full width — its maximize control when the panel is open, the panel
+  // handle when it is collapsed, the header button below the dock threshold.
+  // When that lands on the same control as the panel stop, the stop is
+  // dropped rather than shown twice (see `distinctAnchors`).
+  { id: 'files', anchors: ['panel-maximize', 'panel-handle', 'panel-button'], titleKey: 'tour.files.title', bodyKey: 'tour.files.body' },
+  // The status line under the title is the only way into Tasks; it always
+  // renders (a teaching line when nothing is scheduled), so the stop is
+  // always there.
+  { id: 'tasks', anchors: ['status-line'], titleKey: 'tour.tasks.title', bodyKey: 'tour.tasks.body' },
   { id: 'settings', anchors: ['project-settings'], titleKey: 'tour.settings.title', bodyKey: 'tour.settings.body' },
   // Inside a project the project list is collapsed to the edge strip, so the
   // Quick Tasks row itself is usually not on screen — the strip is where it lives.
@@ -78,6 +86,21 @@ function findAnchor(step: TourStep): HTMLElement | null {
     }
   }
   return null;
+}
+
+/** The stops whose anchor is on screen, minus any that would spotlight the
+ * same element as an earlier stop (a collapsed panel: the panel stop and the
+ * files stop both resolve to the handle — one coachmark is enough). */
+function distinctAnchors(steps: TourStep[]): TourStep[] {
+  const seen = new Set<HTMLElement>();
+  const out: TourStep[] = [];
+  for (const step of steps) {
+    const el = findAnchor(step);
+    if (!el || seen.has(el)) continue;
+    seen.add(el);
+    out.push(step);
+  }
+  return out;
 }
 
 export interface FirstJourneyTourProps {
@@ -114,7 +137,7 @@ export default function FirstJourneyTour({ folderName, agentNames, onClose }: Fi
       const answered = !!document.querySelector('[data-tour="left-off"], [data-left-off-state="none"]');
       const loading = !!document.querySelector('[data-left-off-state="loading"]');
       if (findAnchor(header) && (answered || tries > 15) && (!loading || tries > 20)) {
-        setSteps(orderTourStops(STEPS.filter((s) => findAnchor(s))));
+        setSteps(orderTourStops(distinctAnchors(STEPS)));
         return;
       }
       tries += 1;

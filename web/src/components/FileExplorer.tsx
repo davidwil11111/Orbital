@@ -14,14 +14,13 @@ import {
   FolderOpen,
   SquareArrowOutUpRight,
 } from 'lucide-react';
-import { api, BASE_URL, isRelayMode } from '../config';
+import { api } from '../config';
 import type { FileEntry, DirectoryListing, FileContent } from '../types';
 import FilePreview from './FilePreview';
 import { revealPath } from '../hooks/useFiles';
 import { canRevealInFileManager, revealLabelKey } from '../utils/clientPlatform';
 import { useT } from '../i18n/useT';
-
-const MAX_UPLOAD_SIZE = 10 * 1024 * 1024; // 10MB
+import { useWorkspaceUpload } from '../hooks/useWorkspaceUpload';
 
 interface FileExplorerProps {
   projectId: string;
@@ -29,8 +28,15 @@ interface FileExplorerProps {
    * Spec 078 D15: a workspace-relative file to reveal and select on open
    * ("Open in Files" from the workspace panel). Ancestors are expanded,
    * fetching their listings; then the file is selected. One-shot per value.
+   * Spec 137: the maximized workspace panel passes the file it was showing.
    */
   initialPath?: string;
+  /**
+   * Spec 137: told when the user opens a file here, so the panel's docked
+   * view shows the same file after a restore. Not re-revealed: the explorer
+   * already has it selected.
+   */
+  onSelectFile?: (path: string) => void;
 }
 
 interface TreeNode {
@@ -41,7 +47,7 @@ interface TreeNode {
   loading: boolean;
 }
 
-export default function FileExplorer({ projectId, initialPath }: FileExplorerProps) {
+export default function FileExplorer({ projectId, initialPath, onSelectFile }: FileExplorerProps) {
   const t = useT();
   const [rootNodes, setRootNodes] = useState<TreeNode[]>([]);
   const [rootLoading, setRootLoading] = useState(true);
@@ -50,9 +56,8 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
   const [contentLoading, setContentLoading] = useState(false);
   const [mobileShowPreview, setMobileShowPreview] = useState(false);
 
-  // Upload state
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  // Upload state (shared with the workspace panel's Files view)
+  const { upload, uploading, error: uploadError, clearError: clearUploadError } = useWorkspaceUpload(projectId);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Spec 093: Reveal in Finder / Show in File Explorer — tree rows, the
@@ -138,7 +143,7 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
     setSelectedPath(null);
     setFileContent(null);
     setMobileShowPreview(false);
-    setUploadError(null);
+    clearUploadError();
     setRevealFailed(false);
 
     fetchDirectory('').then((entries) => {
@@ -150,7 +155,7 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
     });
 
     return () => { cancelled = true; };
-  }, [projectId, fetchDirectory]);
+  }, [projectId, fetchDirectory, clearUploadError]);
 
   const toggleDirectory = useCallback(
     async (path: string) => {
@@ -193,13 +198,19 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
     [fetchDirectory],
   );
 
+  // Mirrors the reveal below: the parent echoes a reported selection back
+  // as `initialPath`, which must not trigger a second reveal of the same file.
+  const revealedPathRef = useRef<string | null>(null);
+
   const handleFileClick = useCallback(
     (path: string) => {
       setSelectedPath(path);
       setMobileShowPreview(true);
       fetchFileContent(path);
+      revealedPathRef.current = path;
+      onSelectFile?.(path);
     },
-    [fetchFileContent],
+    [fetchFileContent, onSelectFile],
   );
 
   // Spec 078 D15: reveal `initialPath` once the root has loaded. Each ancestor
@@ -207,7 +218,6 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
   // nodes happen to be loaded already), then the file is selected. Runs once
   // per path value; the component unmounts on a tab switch, so re-opening the
   // same path from the panel later reveals it again.
-  const revealedPathRef = useRef<string | null>(null);
   useEffect(() => {
     if (!initialPath || rootLoading) return;
     if (revealedPathRef.current === initialPath) return;
@@ -244,66 +254,19 @@ export default function FileExplorer({ projectId, initialPath }: FileExplorerPro
   }, []);
 
   const handleUploadClick = useCallback(() => {
-    setUploadError(null);
+    clearUploadError();
     fileInputRef.current?.click();
-  }, []);
+  }, [clearUploadError]);
 
   const handleFileSelected = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
-
       // Reset input so the same file can be selected again
       e.target.value = '';
-
-      if (file.size > MAX_UPLOAD_SIZE) {
-        setUploadError(t('fileExplorer.tooLarge', { size: formatSize(file.size) }));
-        return;
-      }
-
-      setUploading(true);
-      setUploadError(null);
-
-      try {
-        const formData = new FormData();
-        formData.append('file', file);
-
-        const baseUrl = isRelayMode ? window.location.origin : BASE_URL;
-        const url = `${baseUrl}/api/v2/projects/${encodeURIComponent(projectId)}/files/upload`;
-        const headers: Record<string, string> = {};
-
-        if (isRelayMode) {
-          try {
-            const token = localStorage.getItem('relay_jwt');
-            if (token) {
-              headers['Authorization'] = `Bearer ${token}`;
-            }
-          } catch {
-            // ignore
-          }
-        }
-
-        const response = await fetch(url, { method: 'POST', body: formData, headers });
-        if (!response.ok) {
-          const body = await response.text();
-          let detail: string;
-          try {
-            const parsed = JSON.parse(body);
-            detail = parsed.detail ?? body;
-          } catch {
-            detail = body;
-          }
-          throw new Error(detail || t('fileExplorer.uploadFailed'));
-        }
-
-        refreshRoot();
-      } catch (err) {
-        setUploadError(err instanceof Error ? err.message : t('fileExplorer.uploadFailed'));
-      } finally {
-        setUploading(false);
-      }
+      if (await upload(file)) refreshRoot();
     },
-    [projectId, refreshRoot, t],
+    [upload, refreshRoot],
   );
 
   return (
@@ -559,12 +522,6 @@ function TreeSkeleton() {
       ))}
     </div>
   );
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function toTreeNode(entry: FileEntry, parentPath: string): TreeNode {

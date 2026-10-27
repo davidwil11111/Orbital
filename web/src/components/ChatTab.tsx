@@ -49,7 +49,8 @@ import { useSessionMessages } from '../utils/sessionMessagesStore';
 import { markFreshSession } from '../utils/freshSession';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAnnotations } from '../hooks/useAnnotations';
-import { usePanelDockable, usePanelState } from '../hooks/usePanelState';
+import { usePanelDockable, usePanelMobile, usePanelState } from '../hooks/usePanelState';
+import { useWorkspaceUpload } from '../hooks/useWorkspaceUpload';
 import {
   eventAsMessage,
   latestScreenshot,
@@ -65,6 +66,7 @@ import WorkspacePanel, { WorkspacePanelBar } from './panel/WorkspacePanel';
 import FilesView from './panel/FilesView';
 import BrowserView from './panel/BrowserView';
 import PanelHandle from './panel/PanelHandle';
+import FileExplorer from './FileExplorer';
 
 /**
  * Statuses that mean "a turn is in flight". `pending_approval` counts: the
@@ -151,21 +153,39 @@ export default function ChatTab({
   const routeSessionId = route.sessionId;
 
   // ── Spec 078: the workspace panel (Files · Browser) ─────────────────────
-  // Docked only above the push threshold and never on mobile; below it the
-  // FilePreviewDrawer stays the overlay ProjectDetail owns.
+  // Docked only above the push threshold and never on mobile. Below it a
+  // chat path click keeps the FilePreviewDrawer overlay ProjectDetail owns,
+  // and (spec 137) the header button opens the whole panel as an overlay —
+  // a bottom sheet on a phone.
   const docked = usePanelDockable();
+  const mobile = usePanelMobile();
   const {
     expanded: panelExpanded,
     view: panelView,
     file: panelFile,
+    maximized: panelMaximized,
+    overlayOpen,
     expand: expandPanel,
     collapse: collapsePanel,
+    maximize: maximizePanel,
+    restore: restorePanel,
+    closeOverlay,
     setView: setPanelView,
     setFile: setPanelFile,
     expandForEvent,
     onRunStart,
     onRunEnd,
   } = usePanelState(projectId, routeSessionId);
+  // Where the panel is showing right now, if anywhere.
+  const panelOpen = docked ? panelExpanded : overlayOpen;
+  // Spec 137: maximize exists docked and in the narrow overlay; the phone's
+  // bottom sheet is already the whole screen.
+  const canMaximize = docked || !mobile;
+  const maximized = panelOpen && canMaximize && panelMaximized;
+  // The docked panel maximized takes the whole row: the session column and
+  // the conversation hide (CSS only — the chat stays mounted, composer
+  // draft and stream intact).
+  const panelFillsRow = docked && maximized;
   const { annotating, setAnnotating, annotations, add: addAnnotation } =
     useAnnotations(routeSessionId);
   // Spec 078 §11.5: ChatView owns the session transcript and publishes it by
@@ -205,13 +225,13 @@ export default function ChatTab({
   }, [sessionKey, clearMessages]);
 
   useEffect(() => {
-    if (!docked || !panelExpanded || !routeSessionId) return;
+    if (!panelOpen || !routeSessionId) return;
     if (sharedMessages !== null) return; // ChatView already holds the transcript
     if (loadedKeyRef.current === sessionKey && !historyStaleRef.current) return;
     loadedKeyRef.current = sessionKey;
     historyStaleRef.current = false;
     void loadHistory(projectId);
-  }, [docked, panelExpanded, projectId, routeSessionId, sessionKey, loadHistory, sharedMessages]);
+  }, [panelOpen, projectId, routeSessionId, sessionKey, loadHistory, sharedMessages]);
 
   // Lifecycle (D8) driven by the live activity stream. Handled synchronously
   // in the socket callback rather than from a rendered `lastEvent`, so a burst
@@ -297,16 +317,65 @@ export default function ChatTab({
     [setPanelFile, clearPreviewPath],
   );
 
+  // Spec 137: "Open full width" (was "Open in Files", which routed to the
+  // Files tab) maximizes the panel on this file — the tree on the left, the
+  // file on the right, as the tab had it.
   const handleOpenInFiles = useCallback(
     (path: string) => {
-      setRoute((prev) =>
-        prev.name === 'project' && prev.projectId === projectId
-          ? { ...prev, tab: 'files', settings: false, previewPath: undefined, filesPath: path }
-          : prev,
-      );
+      setPanelView('files');
+      setPanelFile(path);
+      clearPreviewPath();
+      maximizePanel();
     },
-    [projectId, setRoute],
+    [setPanelView, setPanelFile, clearPreviewPath, maximizePanel],
   );
+
+  const toggleMaximize = useCallback(() => {
+    if (panelMaximized) restorePanel();
+    else maximizePanel();
+  }, [panelMaximized, restorePanel, maximizePanel]);
+
+  // Esc restores a maximized docked panel. The overlay handles its own Esc
+  // (restore first, then close); Annotate owns Esc while it is on.
+  useEffect(() => {
+    if (!docked || !maximized || annotating) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) restorePanel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [docked, maximized, annotating, restorePanel]);
+
+  // Spec 137 gap 2: upload from the Files view, the old Files tab's
+  // affordance. A landed file bumps `filesRefresh`, which FilesView re-lists on.
+  const { upload, uploading, error: uploadError, clearError: clearUploadError } =
+    useWorkspaceUpload(projectId);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [filesRefresh, setFilesRefresh] = useState(0);
+  const handleUploadClick = useCallback(() => {
+    clearUploadError();
+    uploadInputRef.current?.click();
+  }, [clearUploadError]);
+  const handleUploadPicked = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      e.target.value = ''; // the same file can be picked again
+      if (await upload(file)) setFilesRefresh((n) => n + 1);
+    },
+    [upload],
+  );
+  useEffect(() => {
+    if (!uploadError) return;
+    const id = setTimeout(clearUploadError, 4000);
+    return () => clearTimeout(id);
+  }, [uploadError, clearUploadError]);
+
+  // The overlay is always mounted (it slides), but its views are only built
+  // once it has been opened: a narrow window that never opens it must not
+  // list the workspace or connect the browser view.
+  const [overlayUsed, setOverlayUsed] = useState(false);
+  if (overlayOpen && !overlayUsed) setOverlayUsed(true);
 
   const panelMessages = useMemo(() => {
     const synthetic = liveEvents
@@ -375,7 +444,7 @@ export default function ChatTab({
   function handleDraftConsumed() {
     setRoute((prev) =>
       prev.name === 'project' && prev.projectId === projectId
-        ? { ...prev, draft: undefined }
+        ? { ...prev, draft: undefined, draftSkill: undefined }
         : prev,
     );
   }
@@ -419,9 +488,75 @@ export default function ChatTab({
       });
   }
 
+  // The panel's chrome and body, shared by the docked column and the
+  // narrow overlay / phone sheet.
+  const panelBar = (
+    <WorkspacePanelBar
+      view={panelView}
+      onViewChange={setPanelView}
+      annotating={annotating}
+      onToggleAnnotate={() => setAnnotating(!annotating)}
+      onUpload={maximized ? undefined : handleUploadClick}
+      uploading={uploading}
+      onToggleMaximize={canMaximize ? toggleMaximize : undefined}
+      maximized={maximized}
+    />
+  );
+  const panelBody = (
+    <>
+      {uploadError && (
+        <p role="status" className="shrink-0 mx-3 mt-2 px-3 py-2 text-xs text-error bg-error/10 border border-error/30 rounded-md">
+          {uploadError}
+        </p>
+      )}
+      <input
+        ref={uploadInputRef}
+        type="file"
+        className="hidden"
+        data-testid="panel-upload-input"
+        onChange={handleUploadPicked}
+      />
+      <WorkspacePanel
+        view={panelView}
+        browser={
+          <BrowserView
+            projectId={projectId}
+            active={panelOpen && panelView === 'browser'}
+            fallback={screenshot ? { path: screenshot.path, title: screenshot.title } : null}
+            annotating={annotating}
+            annotations={annotations}
+            onAddAnnotation={addAnnotation}
+          />
+        }
+        files={
+          maximized ? (
+            // Maximized Files = the old Files tab: tree left, file right.
+            // The explorer is moved, not rebuilt (upload + reveal included).
+            <FileExplorer
+              projectId={projectId}
+              initialPath={panelFile ?? undefined}
+              onSelectFile={setPanelFile}
+            />
+          ) : (
+            <FilesView
+              projectId={projectId}
+              touched={touched}
+              file={panelFile}
+              onSelectFile={handlePanelSelectFile}
+              onOpenInFiles={canMaximize ? handleOpenInFiles : undefined}
+              onAddAnnotation={addAnnotation}
+              onSave={handleSave}
+              refreshKey={filesRefresh}
+            />
+          )
+        }
+      />
+    </>
+  );
+
   return (
     <div className="flex h-full min-h-0" data-testid="chat-tab">
-      <div className="shrink-0 max-md:hidden">
+      <div className={`shrink-0 max-md:hidden ${panelFillsRow ? 'hidden' : ''}`} data-testid="chat-tab-sessions">
         <SessionSidebar
           projectId={projectId}
           selectedSessionId={routeSessionId}
@@ -431,9 +566,10 @@ export default function ChatTab({
         />
       </div>
       <div
+        data-testid="chat-tab-conversation"
         className={`flex-1 min-w-0 min-h-0 flex flex-col bg-card ${
           docked ? 'md:min-w-[520px]' : ''
-        }`}
+        } ${panelFillsRow ? 'hidden' : ''}`}
       >
         {/* Quick Tasks scope chip (Spec 012 §2c) — chat-header area, scratch
             project only. ScopeChip also self-gates on is_scratch. */}
@@ -456,6 +592,7 @@ export default function ChatTab({
             agents={agents}
             sessionId={routeSessionId}
             initialDraft={route.draft}
+            initialSkill={route.draftSkill}
             onDraftConsumed={handleDraftConsumed}
             onRefreshProject={onRefreshProject}
             onOpenSession={handleSessionSelect}
@@ -463,55 +600,44 @@ export default function ChatTab({
         </div>
       </div>
       {/* Spec 078 §5.1 — the third column: the panel when expanded, the 20px
-          edge handle when collapsed. Only above the push threshold. */}
+          edge handle when collapsed. Only above the push threshold. Spec
+          137: maximized, it takes the whole row. */}
       {docked &&
         (panelExpanded ? (
           <FilePreviewDrawer
             docked
             open
+            maximized={maximized}
             selectedPath={null}
             fileContent={null}
             loading={false}
             onClose={collapsePanel}
-            header={
-              <WorkspacePanelBar
-                view={panelView}
-                onViewChange={setPanelView}
-                annotating={annotating}
-                onToggleAnnotate={() => setAnnotating(!annotating)}
-              />
-            }
+            header={panelBar}
           >
-            <WorkspacePanel
-              view={panelView}
-              browser={
-                <BrowserView
-                  projectId={projectId}
-                  active={panelExpanded && panelView === 'browser'}
-                  fallback={
-                    screenshot ? { path: screenshot.path, title: screenshot.title } : null
-                  }
-                  annotating={annotating}
-                  annotations={annotations}
-                  onAddAnnotation={addAnnotation}
-                />
-              }
-              files={
-                <FilesView
-                  projectId={projectId}
-                  touched={touched}
-                  file={panelFile}
-                  onSelectFile={handlePanelSelectFile}
-                  onOpenInFiles={handleOpenInFiles}
-                  onAddAnnotation={addAnnotation}
-                  onSave={handleSave}
-                />
-              }
-            />
+            {panelBody}
           </FilePreviewDrawer>
         ) : (
           <PanelHandle working={agentStatus === 'running'} onExpand={expandPanel} />
         ))}
+      {/* Spec 137 gap 3 — below the dock threshold: the same panel as an
+          overlay over the chat (maximize grows it to the full width right of
+          the strip/list), and on a phone the drawer's bottom sheet. Opened
+          from the header button; Esc restores a maximized overlay, then
+          closes it. */}
+      {!docked && (
+        <FilePreviewDrawer
+          open={overlayOpen}
+          maximized={maximized}
+          selectedPath={null}
+          fileContent={null}
+          loading={false}
+          onClose={closeOverlay}
+          onEscape={maximized ? restorePanel : closeOverlay}
+          header={panelBar}
+        >
+          {overlayUsed ? panelBody : <div />}
+        </FilePreviewDrawer>
+      )}
     </div>
   );
 }

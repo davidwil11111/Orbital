@@ -167,7 +167,7 @@ export default function WorkbenchPage({ projectId, setRoute }: WorkbenchPageProp
   );
 
   function navigateToChat(pid: string, sessionId?: string) {
-    setRoute({ name: 'project', projectId: pid, tab: 'chat', sessionId });
+    setRoute({ name: 'project', projectId: pid, sessionId });
   }
 
   // Card tap doorway (spec 2026-07-24, round 3 final revision): mint a
@@ -190,7 +190,6 @@ export default function WorkbenchPage({ projectId, setRoute }: WorkbenchPageProp
       setRoute({
         name: 'project',
         projectId: entry.project_id,
-        tab: 'chat',
         sessionId: minted.session_id,
         draft: buildPrefillDraft(entry),
       });

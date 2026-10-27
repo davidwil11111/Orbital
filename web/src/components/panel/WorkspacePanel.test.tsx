@@ -72,6 +72,47 @@ describe('WorkspacePanelBar — the Annotate toggle', () => {
   });
 });
 
+// Spec 137 gaps 1 + 2: maximize (the Files tab's replacement) and upload
+// live in the panel bar.
+describe('WorkspacePanelBar — maximize and upload', () => {
+  it('offers Full width when docked and Restore when maximized', () => {
+    const onToggleMaximize = vi.fn();
+    const { rerender, props } = renderBar({ onToggleMaximize, maximized: false });
+    fireEvent.click(screen.getByTestId('panel-maximize'));
+    expect(onToggleMaximize).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('panel-maximize')).toHaveAttribute('aria-label', 'Full width');
+    expect(screen.getByTestId('panel-maximize')).toHaveAttribute('data-tour', 'panel-maximize');
+
+    rerender(<WorkspacePanelBar {...props} onToggleMaximize={onToggleMaximize} maximized />);
+    expect(screen.queryByTestId('panel-maximize')).toBeNull();
+    fireEvent.click(screen.getByTestId('panel-restore'));
+    expect(onToggleMaximize).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('panel-restore')).toHaveAttribute('aria-label', 'Restore panel width');
+  });
+
+  it('has no maximize control without a handler (the phone sheet has none)', () => {
+    renderBar();
+    expect(screen.queryByTestId('panel-maximize')).toBeNull();
+    expect(screen.queryByTestId('panel-restore')).toBeNull();
+  });
+
+  it('shows Upload on the Files view only, and reports a click', () => {
+    const onUpload = vi.fn();
+    const { rerender, props } = renderBar({ view: 'files', onUpload });
+    fireEvent.click(screen.getByTestId('panel-upload'));
+    expect(onUpload).toHaveBeenCalledTimes(1);
+
+    rerender(<WorkspacePanelBar {...props} view="browser" onUpload={onUpload} />);
+    expect(screen.queryByTestId('panel-upload')).toBeNull();
+  });
+
+  it('disables Upload while an upload is in flight', () => {
+    renderBar({ view: 'files', onUpload: vi.fn(), uploading: true });
+    expect(screen.getByTestId('panel-upload')).toBeDisabled();
+    expect(screen.getByTestId('panel-upload')).toHaveAttribute('aria-label', 'Uploading…');
+  });
+});
+
 describe('WorkspacePanel — the body', () => {
   it('shows only the selected view, never both', () => {
     const { rerender } = render(

@@ -30,7 +30,9 @@ function mountAnchors(ids: string[], leftOffAnswered = true) {
   document.body.appendChild(host);
 }
 
-const ALL = ['project-header', 'pin-select', 'workspace-panel', 'tab-files', 'tab-queue', 'project-settings', 'edge-strip'];
+// Spec 137: no tab bar. Files anchors on the panel's maximize control (panel
+// open), Tasks on the status line under the title.
+const ALL = ['project-header', 'pin-select', 'workspace-panel', 'panel-maximize', 'status-line', 'project-settings', 'edge-strip'];
 
 beforeEach(() => {
   Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true });
@@ -79,7 +81,9 @@ describe('FirstJourneyTour', () => {
   });
 
   it('skips stops whose anchor is not on screen — no sub-agents, panel not docked — and counts only the rest', async () => {
-    mountAnchors(ALL.filter((id) => id !== 'pin-select' && id !== 'workspace-panel'));
+    // A narrow window: no docked panel and no handle; the header's panel
+    // button is where the files are.
+    mountAnchors(['project-header', 'panel-button', 'status-line', 'project-settings', 'edge-strip']);
     render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
@@ -90,6 +94,32 @@ describe('FirstJourneyTour', () => {
       seen.push(stepId());
     }
     expect(seen).toEqual(['project', 'files', 'tasks', 'settings', 'quickTasks']);
+  });
+
+  it('never anchors on the retired tab bar', async () => {
+    mountAnchors(['project-header', 'tab-files', 'tab-queue']);
+    render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
+    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 1');
+  });
+
+  it('the Tasks stop spotlights the status line', async () => {
+    mountAnchors(['project-header', 'status-line']);
+    render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('tour-next'));
+    expect(stepId()).toBe('tasks');
+  });
+
+  it('a collapsed panel gets one stop, not two: the files stop does not repeat the handle', async () => {
+    mountAnchors(['project-header', 'panel-handle', 'status-line']);
+    render(<FirstJourneyTour folderName="x" agentNames={[]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('tour-card')).toBeTruthy());
+    expect(screen.getByTestId('tour-counter').textContent).toBe('1 of 3');
+    fireEvent.click(screen.getByTestId('tour-next'));
+    expect(stepId()).toBe('panel');
+    fireEvent.click(screen.getByTestId('tour-next'));
+    expect(stepId()).toBe('tasks');
   });
 
   it('with left-off cards showing, opens on them and goes to the agents stop next', async () => {

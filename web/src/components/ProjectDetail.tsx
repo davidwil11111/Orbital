@@ -3,26 +3,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Dispatch, SetStateAction } from 'react';
+import type { Dispatch, ReactNode, SetStateAction } from 'react';
+import { PanelRight } from 'lucide-react';
 import type { AgentRunStatus, FileContent, Project, Trigger } from '../types';
-import type { Route } from '../route';
-import AutomationsList from './AutomationsList';
+import type { ProjectPage, ProjectRoute, Route } from '../route';
+import { pageTrail, routeUp } from '../route';
 import StatusBadge from './StatusBadge';
-import TriggerStrip from './TriggerStrip';
+import TasksStatusLine, { type TasksPane } from './TasksStatusLine';
 import SettingsIcon from './SettingsIcon';
+import PageToolbar from './PageToolbar';
+import { PROJECT_PAGES } from './projectPages';
 import { withViewTransition } from '../utils/viewTransition';
 import BudgetCorner from './BudgetCorner';
 import FilePreviewDrawer from './FilePreviewDrawer';
 import { OpenPathContext } from './filePreviewContext';
 import { useQueue } from '../hooks/useQueue';
 import { useFiles } from '../hooks/useFiles';
-import { usePanelDockable } from '../hooks/usePanelState';
+import { usePanelDockable, usePanelState } from '../hooks/usePanelState';
 import { fetchPathWithFallback } from '../utils/openPathWithFallback';
 import { useT } from '../i18n/useT';
 import { projectDisplayName } from '../utils/projectDisplayName';
 import { displayRunStatus } from '../utils/projectStatus';
 import { useCredentialCards, resolveCard } from '../hooks/useCredentialCards';
-import type { StringKey } from '../i18n/strings';
 
 interface ProjectDetailProps {
   project: Project;
@@ -58,28 +60,20 @@ interface ProjectDetailProps {
    * re-hits the daemon's cache).
    */
   agentsAvailable?: Array<{ slug: string; name: string }>;
-  children?: React.ReactNode;
+  /** The chat home's body (ChatTab). Rendered only when no page is open. */
+  children?: ReactNode;
+  /**
+   * Spec 137 — what App supplies for each page's body: the queue for Tasks,
+   * the settings form, the pricing table. The page registry decides what to
+   * do with it (`PROJECT_PAGES[page].render`).
+   */
+  pageContent?: Partial<Record<ProjectPage, ReactNode>>;
 }
 
 // Workbench and Calendar are GLOBAL workspace surfaces — they aggregate
-// across projects and deliberately have no per-project tab (user decision,
-// 2026-07-24).
-type TabKey = 'queue' | 'chat' | 'files';
-
-const BASE_TABS: { key: TabKey; labelKey: StringKey }[] = [
-  { key: 'chat', labelKey: 'projectDetail.tab.chat' },
-  { key: 'queue', labelKey: 'projectDetail.tab.queue' },
-  { key: 'files', labelKey: 'projectDetail.tab.files' },
-];
-
-// The two panes inside the Tasks tab. A parent tab should not carry the name
-// of one of its children — hence "Tasks" above, "Queue" here.
-type QueuePaneKey = 'queue' | 'automations';
-
-const QUEUE_PANES: { key: QueuePaneKey; labelKey: StringKey }[] = [
-  { key: 'queue', labelKey: 'queue.pane.queue' },
-  { key: 'automations', labelKey: 'queue.section.automations' },
-];
+// across projects and deliberately have no per-project page (user decision,
+// 2026-07-24). Spec 137 retired the Chat / Tasks / Files tab bar: chat is the
+// home, Tasks and Settings are pages, Files is the workspace panel maximized.
 
 export default function ProjectDetail({
   project,
@@ -92,23 +86,21 @@ export default function ProjectDetail({
   globalDefaultModel,
   agentsAvailable = [],
   children,
+  pageContent = {},
 }: ProjectDetailProps) {
   const t = useT();
   // Names the credential the header chip shows; the same flat list the
   // settings picker offers.
   const { cards, defaultCardId } = useCredentialCards();
 
-  // The active tab indicator: when settings overlay is showing, no tab is highlighted
-  const activeTab = route.settings ? null : route.tab;
-  const queuePane: QueuePaneKey = route.queuePane ?? 'queue';
+  const page = route.page;
+  const pageDef = page ? PROJECT_PAGES[page] : undefined;
 
-  const tabs = BASE_TABS;
-
-  // Tab count badges (queue only — Chat's session count lives in the sidebar).
+  // The status line's queue half (spec 137 gap 4): without it a project with
+  // queued work and no automations has no way to reach its queue.
   const { snapshot } = useQueue(project.project_id);
-  const queueCount = snapshot?.items.filter(
-    (item) => item.state === 'queued' || item.state === 'running',
-  ).length ?? 0;
+  const runningCount = snapshot?.items.filter((item) => item.state === 'running').length ?? 0;
+  const queuedCount = snapshot?.items.filter((item) => item.state === 'queued').length ?? 0;
 
   // File preview drawer (spec 002). The open/close state lives on the route
   // (`previewPath`); the fetched content + lazy 404 probe live here. Opening is
@@ -124,14 +116,21 @@ export default function ProjectDetail({
   const latestPreviewReqRef = useRef<string | null>(null);
   const previewPath = route.previewPath ?? null;
 
-  // Spec 078 §5.1/§9.10 — on the Chat tab, above the push threshold, the
+  // Spec 078 §5.1/§9.10 — on the chat home, above the push threshold, the
   // docked workspace panel in ChatTab shows the preview instead. Suppressing
   // the overlay here is what keeps a chat path click from opening BOTH. The
   // probe-first fetch above still runs: it is what resolves an abbreviated
   // path to a real one (and toasts a miss) before the panel is told about it.
-  // Queue and Files tabs, mobile, and narrow windows keep today's overlay.
+  // Pages (Tasks, Settings), mobile, and narrow windows keep the overlay.
   const dockable = usePanelDockable();
-  const chatPanelOwnsPreview = dockable && !route.settings && route.tab === 'chat';
+  const chatPanelOwnsPreview = dockable && page === undefined;
+
+  // Spec 137 — the workspace panel's shared state (ChatTab renders it). The
+  // header reads it for two things: a docked panel maximized takes the whole
+  // main area, header included; below the dock threshold the header carries
+  // the button that opens the panel as an overlay / bottom sheet.
+  const panel = usePanelState(project.project_id, route.sessionId);
+  const panelFillsMain = dockable && page === undefined && panel.expanded && panel.maximized;
 
   const handleOpenPath = useCallback(
     async (path: string) => {
@@ -195,52 +194,68 @@ export default function ProjectDetail({
     return () => clearTimeout(id);
   }, [previewToast]);
 
-  // Navigating to another tab/surface closes the preview drawer — it is a
-  // chat overlay, not a persistent panel (clearing `previewPath` so it can't
-  // linger over the Files tab or strand open after a settings round-trip).
-  function handleTabChange(tab: TabKey) {
-    setRoute({ ...route, tab, settings: false, previewPath: undefined });
+  // Every page change goes through here: the one-shot preview path never
+  // survives navigation (it is a chat overlay, not a persistent panel), and
+  // the View Transition folds the header into the toolbar and back.
+  function navigate(next: ProjectRoute) {
+    withViewTransition(() => setRoute({ ...next, previewPath: undefined }));
   }
 
   function handleSettingsClick() {
-    withViewTransition(() => setRoute({ ...route, settings: true, previewPath: undefined }));
+    navigate({ ...route, page: 'settings' });
   }
 
   // Budget corner → open settings scrolled to the Budget section.
   function handleOpenBudgetSettings() {
-    withViewTransition(() =>
-      setRoute({ ...route, settings: true, settingsAnchor: 'budget', previewPath: undefined }),
-    );
+    navigate({ ...route, page: 'settings', settingsAnchor: 'budget' });
   }
 
-  // Trigger strip → the Automations pane of the Tasks tab (one management home).
-  function handleOpenAutomations() {
-    setRoute({
-      ...route,
-      tab: 'queue',
-      queuePane: 'automations',
-      settings: false,
-      previewPath: undefined,
-    });
+  // Status line → the Tasks page, on the pane that has something to show.
+  function handleOpenTasks(pane: TasksPane) {
+    navigate({ ...route, page: 'tasks', queuePane: pane });
   }
 
-  // Automations empty state → "try this in chat": rides the existing one-shot
+  // Automations "try this in chat" and "New automation" (spec 137 decision
+  // 2): back to chat with `/automate` picked. Rides the existing one-shot
   // composer prefill (route.draft, the Workbench doorway) — filled, never sent.
   function handleTryInChat(text: string) {
-    setRoute({
-      ...route,
-      tab: 'chat',
-      settings: false,
-      previewPath: undefined,
-      draft: text,
-    });
+    navigate({ ...route, page: undefined, draft: text, draftSkill: 'automate' });
   }
+
+  function handleNewAutomation() {
+    handleTryInChat(t('automations.example.schedule'));
+  }
+
+  // Back: up one level (a page's parent, else the chat home), carrying the
+  // page's own landing patch (Pricing → Settings lands on Budget).
+  function handleBack() {
+    if (!page) return;
+    navigate({ ...routeUp(route), ...(PROJECT_PAGES[page].backPatch ?? {}) });
+  }
+
+  const trail = pageTrail(page);
+  const projectName = projectDisplayName(project, t);
 
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-card">
-      {/* Everything above the tab content, as one unit: opening settings folds
-          it into the SettingsToolbar (both carry `vt-project-header`, so the
-          View Transition morphs one into the other — see index.css). */}
+      {pageDef ? (
+        // A page: the header folds into the toolbar (both carry
+        // `vt-project-header`, so the View Transition morphs one into the
+        // other — see index.css). The crumb walks the registry's parent chain.
+        <PageToolbar
+          parent={projectName}
+          onParent={() => navigate({ ...route, page: undefined })}
+          crumbs={trail.slice(0, -1).map((p) => ({
+            label: t(PROJECT_PAGES[p].titleKey),
+            onClick: () => navigate({ ...route, page: p }),
+          }))}
+          title={t(pageDef.titleKey)}
+          onBack={handleBack}
+          backTestId={pageDef.backTestId}
+          titleTestId={pageDef.titleTestId}
+        />
+      ) : panelFillsMain ? null : (
+      // Everything above the conversation, as one unit (see above).
       <div className="vt-project-header shrink-0 bg-card">
       {/* Header */}
       <div className="flex items-center justify-between gap-2 px-6 pt-5 pb-4 max-md:px-4">
@@ -251,7 +266,7 @@ export default function ProjectDetail({
               tour spotlights it, and a half-screen-wide box around a short
               name points at nothing. */}
           <div data-tour="project-header" className="flex items-center gap-3 min-w-0">
-          <h1 className="vt-project-title text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">{projectDisplayName(project, t)}</h1>
+          <h1 className="vt-project-title text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">{projectName}</h1>
           {/* Spec 102: Active while a pinned worker runs with the manager idle;
               a manager error/approval/waiting state is shown as-is. */}
           <StatusBadge status={displayRunStatus(agentStatus, subAgentsRunning)} />
@@ -283,17 +298,34 @@ export default function ProjectDetail({
             return (
               <span
                 data-testid="project-credential-chip"
-                className="font-mono text-[11px] text-secondary truncate max-w-[220px]"
+                className="font-mono text-[11px] text-secondary truncate max-w-[220px] max-md:hidden"
               >
                 {label}
               </span>
             );
           })()}
+          {/* Spec 137 gap 3: below the dock threshold there is no panel
+              handle, so the panel gets a header button — an overlay on a
+              narrow desktop window, the bottom sheet on a phone. */}
+          {!dockable && (
+            <button
+              type="button"
+              onClick={panel.openOverlay}
+              aria-label={t('projectDetail.openPanel')}
+              title={t('projectDetail.openPanel')}
+              data-testid="panel-open-button"
+              data-tour="panel-button"
+              className="inline-flex shrink-0 items-center justify-center w-7 h-7 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 max-md:w-10 max-md:h-10"
+            >
+              <PanelRight size={16} aria-hidden="true" />
+            </button>
+          )}
           <span data-tour="project-settings" className="inline-flex">
             <SettingsIcon onClick={handleSettingsClick} />
           </span>
         </div>
       </div>
+
 
       {/* Status summary line */}
       {statusSummary && (
@@ -302,112 +334,37 @@ export default function ProjectDetail({
         </div>
       )}
 
-      {/* Trigger strip — between header and tab bar. A status line only: the
-          glanceable off-count stays visible from every tab, and clicking it
-          goes to the one place automations are managed. */}
-      {triggers.length > 0 && (
-        <TriggerStrip triggers={triggers} onOpen={handleOpenAutomations} />
+      {/* The status line — the only way into Tasks (spec 137). Always
+          rendered: a teaching line when nothing is scheduled or queued. */}
+      <TasksStatusLine
+        running={runningCount}
+        queued={queuedCount}
+        triggers={triggers}
+        onOpen={handleOpenTasks}
+      />
+      </div>
       )}
 
-      {/* Tab bar */}
-      <div className="flex gap-1 px-6 border-b border-border max-md:px-4">
-        {tabs.map((tab) => {
-          // Chat shows no count badge — the session count lives in the
-          // sidebar header. Only the queue badge (pending/running items) shows.
-          const count = tab.key === 'queue' ? queueCount : 0;
-          return (
-            <button
-              key={tab.key}
-              data-tour={`tab-${tab.key}`}
-              onClick={() => handleTabChange(tab.key)}
-              className={`text-xs font-medium px-3 py-2 -mb-px transition-all duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center gap-1.5 ${
-                activeTab === tab.key
-                  ? 'text-primary border-b-2 border-tab-active'
-                  : 'text-secondary hover:text-primary'
-              }`}
-            >
-              {t(tab.labelKey)}
-              {count > 0 && (
-                <span className="text-2xs font-mono text-secondary">
-                  {count}
-                </span>
-              )}
-            </button>
-          );
-        })}
-      </div>
-      </div>
-
-      {/* Tab content. `relative` so the file-preview drawer (absolute) overlays
-          only this content area, not the header/tab bar. The OpenPathContext
-          hands the drawer-open handler down to the chat's MarkdownContent. */}
+      {/* Page body. `relative` so the file-preview drawer (absolute) overlays
+          only this area, not the header/toolbar. The OpenPathContext hands
+          the drawer-open handler down to the chat's MarkdownContent. */}
       <div
         className={`vt-project-body flex-1 overflow-hidden min-h-0 relative ${
-          activeTab === 'queue' ? 'bg-background' : ''
+          pageDef ? 'bg-background' : ''
         }`}
       >
         <OpenPathContext.Provider value={handleOpenPath}>
-          {activeTab === 'queue' ? (
-            // Two panes behind one tab. The queue is a live stream and an
-            // automation is a standing definition with a create/edit form —
-            // sibling views, not sections of one scroll.
-            <div className="flex flex-col h-full min-h-0">
-              {/* A segmented control, on a track.
-                  These two panes used to be bare pills: the active one carried
-                  its own border and the inactive one an invisible one, with
-                  nothing enclosing the pair. That reads as one card floating
-                  beside a line of plain text — the inactive pane did not look
-                  clickable, and neither looked related to the other. A track
-                  around both is what says "one control, two positions".
-                  text-[11px] against the parent tab bar's text-xs: two tab
-                  rows at the same size gave no clue which level you were on. */}
-              <div className="px-6 pt-3 max-md:px-4">
-                <div
-                  className="inline-flex gap-0.5 rounded-lg border border-border bg-nav p-0.5"
-                  role="tablist"
-                  aria-label={t('projectDetail.tab.queue')}
-                >
-                  {QUEUE_PANES.map((pane) => {
-                    const active = queuePane === pane.key;
-                    return (
-                      <button
-                        key={pane.key}
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        data-testid={`queue-pane-${pane.key}`}
-                        onClick={() =>
-                          setRoute({ ...route, tab: 'queue', queuePane: pane.key })
-                        }
-                        className={`text-[11px] font-medium px-3 py-1 rounded-md transition-colors duration-150 max-md:min-h-[40px] ${
-                          active
-                            ? 'bg-segment-on text-segment-on-text shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
-                            : 'text-secondary hover:text-primary'
-                        }`}
-                      >
-                        {t(pane.labelKey)}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="flex-1 min-h-0 overflow-hidden">
-                {queuePane === 'automations' ? (
-                  <div className="h-full overflow-y-auto px-6 py-4 max-md:px-4">
-                    <AutomationsList
-                      projectId={project.project_id}
-                      agents={agentsAvailable}
-                      onTryInChat={handleTryInChat}
-                    />
-                  </div>
-                ) : (
-                  children
-                )}
-              </div>
-            </div>
-          ) : (
-            children
-          )}
+          {pageDef
+            ? pageDef.render({
+                project,
+                route,
+                setRoute,
+                content: pageContent[pageDef.key],
+                agentsAvailable,
+                onTryInChat: handleTryInChat,
+                onNewAutomation: handleNewAutomation,
+              })
+            : children}
         </OpenPathContext.Provider>
         <FilePreviewDrawer
           open={previewPath !== null && !chatPanelOwnsPreview}

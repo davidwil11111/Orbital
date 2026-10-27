@@ -262,7 +262,6 @@ describe('WorkbenchPage — prefill doorway (spec 2026-07-24, round 3 final revi
     expect(routeArg).toMatchObject({
       name: 'project',
       projectId: 'proj-a',
-      tab: 'chat',
       sessionId: 'sess-tap-minted',
     });
     // composeNewSession (an earlier, reverted design) must not reappear.
@@ -492,7 +491,6 @@ describe('WorkbenchPage — empty state', () => {
       expect(setRoute).toHaveBeenCalledWith({
         name: 'project',
         projectId: 'proj-a',
-        tab: 'chat',
         sessionId: 'sess-migrate',
       }),
     );
@@ -532,7 +530,6 @@ describe('WorkbenchPage — empty state', () => {
       expect(setRoute).toHaveBeenCalledWith({
         name: 'project',
         projectId: 'proj-b',
-        tab: 'chat',
         sessionId: 'sess-migrate',
       }),
     );

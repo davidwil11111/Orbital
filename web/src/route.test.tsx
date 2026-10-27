@@ -6,18 +6,19 @@
  * Tests for the Route type and Sidebar + ProjectDetail routing integration.
  *
  * Requirements verified:
- *   1. Selecting a project produces a project route with tab 'chat' and the right projectId.
- *   2. Switching tabs updates route.tab and preserves projectId (and sessionId if set).
- *   3. Setting route.sessionId and then switching tabs preserves sessionId.
- *   4. The settings flag (route.settings) toggles the settings surface without losing
- *      the project/tab context, and "back" (re-clicking a tab) returns to the project route.
- *   5. Sidebar produces the correct project route when a project is clicked.
+ *   1. Selecting a project produces a project route on the chat home (no page).
+ *   2. Spec 137: `page` replaces the old tab + settings + pricing trio. Opening
+ *      a page (status line → Tasks, gear → Settings) keeps projectId and
+ *      sessionId; Back goes up one level; the crumb walks the parent chain.
+ *   3. The pure helpers: parseProjectPage, pageTrail, routeUp, routeKey.
+ *   4. Sidebar produces the correct project route when a project is clicked.
  */
 
 import { render, screen, fireEvent } from '@testing-library/react';
 import { useState, type SetStateAction } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { Route } from './route';
+import { PROJECT_PAGE_PARENT, pageTrail, parseProjectPage, routeKey, routeUp } from './route';
 
 // Sidebar renders <BlockedBadge> which calls useBlockedCount → useWebSocket.
 // These tests render Sidebar without a WebSocketProvider, so mock the hook to
@@ -108,7 +109,7 @@ describe('Sidebar routing', () => {
         agentStatuses={{}}
         statusSummaries={{}}
         pendingApprovals={{}}
-        route={{ name: 'project', projectId: 'alpha', tab: 'chat' }}
+        route={{ name: 'project', projectId: 'alpha' }}
         connectionState="connected"
         onSelectProject={onSelectProject}
         onSelectCalendar={vi.fn()}
@@ -133,7 +134,7 @@ describe('Sidebar routing', () => {
         agentStatuses={{}}
         statusSummaries={{}}
         pendingApprovals={{}}
-        route={{ name: 'project', projectId: 'active', tab: 'chat' }}
+        route={{ name: 'project', projectId: 'active' }}
         connectionState="connected"
         onSelectProject={vi.fn()}
         onSelectCalendar={vi.fn()}
@@ -170,7 +171,7 @@ describe('Sidebar mobile select-project regression', () => {
 
     // Mirrors App.handleSelectProject: set the route AND transition mobile view.
     function handleSelectProject(id: string) {
-      setRoute({ name: 'project', projectId: id, tab: 'chat', sessionId: undefined });
+      setRoute({ name: 'project', projectId: id, sessionId: undefined });
       setMobileView('content');
       onMobileView('content');
     }
@@ -205,143 +206,65 @@ describe('Sidebar mobile select-project regression', () => {
 
 // ─── ProjectDetail routing tests ─────────────────────────────────────────────
 
-describe('ProjectDetail routing', () => {
+describe('ProjectDetail routing (spec 137: pages, no tabs)', () => {
   const project = makeProject('proj-42');
   const baseRoute: Extract<Route, { name: 'project' }> = {
     name: 'project',
     projectId: 'proj-42',
-    tab: 'chat',
   };
 
-  it('switching tabs updates route.tab and preserves projectId', () => {
+  function renderAt(route: Extract<Route, { name: 'project' }>) {
     const setRoute = vi.fn<(value: SetStateAction<Route>) => void>();
-
     render(
       <ProjectDetail
         project={project}
         agentStatus={'idle' as AgentRunStatus}
-        route={baseRoute}
+        route={route}
         setRoute={setRoute}
-
       />,
     );
+    return setRoute;
+  }
 
-    // The tab is labelled "Tasks" — it parents two panes, Queue and
-    // Automations. The route key stays 'queue'.
-    fireEvent.click(screen.getByText('Tasks'));
-    expect(setRoute).toHaveBeenCalledWith(
-      expect.objectContaining({ name: 'project', projectId: 'proj-42', tab: 'queue' }),
-    );
-  });
-
-  it('switching tabs preserves sessionId when set', () => {
-    const setRoute = vi.fn<(value: SetStateAction<Route>) => void>();
-    const routeWithSession: Extract<Route, { name: 'project' }> = {
-      ...baseRoute,
-      tab: 'chat',
-      sessionId: 'sess-abc',
-    };
-
-    render(
-      <ProjectDetail
-        project={project}
-        agentStatus={'idle' as AgentRunStatus}
-        route={routeWithSession}
-        setRoute={setRoute}
-
-      />,
-    );
-
-    fireEvent.click(screen.getByText('Files'));
-    const produced = setRoute.mock.calls[0][0];
-    expect(produced).toMatchObject({
+  it('the status line opens the Tasks page, preserving projectId and sessionId', () => {
+    const setRoute = renderAt({ ...baseRoute, sessionId: 'sess-abc' });
+    fireEvent.click(screen.getByTestId('trigger-summary'));
+    expect(setRoute.mock.calls[0][0]).toMatchObject({
       name: 'project',
       projectId: 'proj-42',
-      tab: 'files',
       sessionId: 'sess-abc',
+      page: 'tasks',
     });
   });
 
-  it('clicking the gear icon sets route.settings=true, preserving project/tab', () => {
-    const setRoute = vi.fn<(value: SetStateAction<Route>) => void>();
-
-    render(
-      <ProjectDetail
-        project={project}
-        agentStatus={'idle' as AgentRunStatus}
-        route={baseRoute}
-        setRoute={setRoute}
-
-      />,
-    );
-
+  it('the gear opens the Settings page, preserving the session', () => {
+    const setRoute = renderAt({ ...baseRoute, sessionId: 'sess-abc' });
     fireEvent.click(screen.getByRole('button', { name: /project settings/i }));
-    const produced = setRoute.mock.calls[0][0];
-    expect(produced).toMatchObject({
+    expect(setRoute.mock.calls[0][0]).toMatchObject({
       name: 'project',
       projectId: 'proj-42',
-      tab: 'chat',
-      settings: true,
+      sessionId: 'sess-abc',
+      page: 'settings',
     });
   });
 
-  it('clicking a tab from settings clears route.settings (back to project)', () => {
-    const setRoute = vi.fn<(value: SetStateAction<Route>) => void>();
-    const settingsRoute: Extract<Route, { name: 'project' }> = {
-      ...baseRoute,
-      tab: 'queue',
-      settings: true,
-    };
-
-    render(
-      <ProjectDetail
-        project={project}
-        agentStatus={'idle' as AgentRunStatus}
-        route={settingsRoute}
-        setRoute={setRoute}
-
-      />,
-    );
-
-    fireEvent.click(screen.getByText('Chat'));
-    const produced = setRoute.mock.calls[0][0];
-    expect(produced).toMatchObject({
-      name: 'project',
-      projectId: 'proj-42',
-      tab: 'chat',
-      settings: false,
-    });
+  it('Back from Tasks returns to the chat home', () => {
+    const setRoute = renderAt({ ...baseRoute, page: 'tasks', sessionId: 'sess-abc' });
+    fireEvent.click(screen.getByTestId('tasks-back-button'));
+    const produced = setRoute.mock.calls[0][0] as Extract<Route, { name: 'project' }>;
+    expect(produced).toMatchObject({ name: 'project', projectId: 'proj-42', sessionId: 'sess-abc' });
+    expect(produced.page).toBeUndefined();
   });
 
-  it('gear icon is present in the header regardless of route.settings value', () => {
-    render(
-      <ProjectDetail
-        project={project}
-        agentStatus={'idle' as AgentRunStatus}
-        route={{ ...baseRoute, settings: true }}
-        setRoute={vi.fn()}
-
-      />,
-    );
-
-    // The gear button lives in the header — it must always be accessible
-    expect(screen.getByRole('button', { name: /project settings/i })).toBeInTheDocument();
-  });
-
-  it('no tab is highlighted when settings is active', () => {
-    render(
-      <ProjectDetail
-        project={project}
-        agentStatus={'idle' as AgentRunStatus}
-        route={{ ...baseRoute, tab: 'chat', settings: true }}
-        setRoute={vi.fn()}
-
-      />,
-    );
-
-    // Chat tab should NOT be highlighted
-    const chatBtn = screen.getByText('Chat');
-    expect(chatBtn.className).not.toContain('border-b-2');
+  it('renders no tab bar on any page', () => {
+    for (const page of [undefined, 'tasks', 'settings'] as const) {
+      const { unmount } = render(
+        <ProjectDetail project={project} agentStatus="idle" route={{ ...baseRoute, page }} setRoute={vi.fn()} />,
+      );
+      expect(screen.queryByRole('button', { name: /^Chat$/ })).toBeNull();
+      expect(screen.queryByRole('button', { name: /^Files$/ })).toBeNull();
+      unmount();
+    }
   });
 });
 
@@ -366,7 +289,7 @@ describe('Global settings nav (settings in Route union)', () => {
     // Mirrors App.handleSelectProject / handleNewProject / onSettings / onBack —
     // all of which drive `route` alone (no separate overlay boolean).
     function handleSelectProject(id: string) {
-      setRoute({ name: 'project', projectId: id, tab: 'chat', sessionId: undefined });
+      setRoute({ name: 'project', projectId: id, sessionId: undefined });
     }
     function handleNewProject() {
       setRoute({ name: 'create' });
@@ -425,26 +348,67 @@ describe('Global settings nav (settings in Route union)', () => {
   });
 });
 
-// ─── Route type shape tests ───────────────────────────────────────────────────
+// ─── Route type shape + page helpers ─────────────────────────────────────────
 
 describe('Route type', () => {
-  it('project route carries sessionId that survives tab changes when spread', () => {
-    const route: Route = { name: 'project', projectId: 'p1', tab: 'chat', sessionId: 'sess-99' };
-    // Simulate what ProjectDetail.handleTabChange does
-    const after: Route = { ...(route as Extract<Route, { name: 'project' }>), tab: 'files', settings: false };
-    expect(after).toMatchObject({ name: 'project', projectId: 'p1', tab: 'files', sessionId: 'sess-99' });
+  it('project route carries sessionId that survives a page change when spread', () => {
+    const route: Route = { name: 'project', projectId: 'p1', sessionId: 'sess-99' };
+    const after: Route = { ...(route as Extract<Route, { name: 'project' }>), page: 'tasks' };
+    expect(after).toMatchObject({ name: 'project', projectId: 'p1', page: 'tasks', sessionId: 'sess-99' });
   });
 
-  it('project route sessionId defaults to undefined when not provided', () => {
-    const route: Route = { name: 'project', projectId: 'p1', tab: 'queue' };
+  it('project route sessionId and page default to undefined (the chat home)', () => {
+    const route: Route = { name: 'project', projectId: 'p1' };
     expect((route as Extract<Route, { name: 'project' }>).sessionId).toBeUndefined();
+    expect((route as Extract<Route, { name: 'project' }>).page).toBeUndefined();
   });
 
   it('project route accepts an optional draft (Workbench prefill doorway) and defaults to undefined', () => {
-    const withDraft: Route = { name: 'project', projectId: 'p1', tab: 'chat', draft: 'hello' };
+    const withDraft: Route = { name: 'project', projectId: 'p1', draft: 'hello', draftSkill: 'automate' };
     expect((withDraft as Extract<Route, { name: 'project' }>).draft).toBe('hello');
+    expect((withDraft as Extract<Route, { name: 'project' }>).draftSkill).toBe('automate');
 
-    const withoutDraft: Route = { name: 'project', projectId: 'p1', tab: 'chat' };
+    const withoutDraft: Route = { name: 'project', projectId: 'p1' };
     expect((withoutDraft as Extract<Route, { name: 'project' }>).draft).toBeUndefined();
+  });
+});
+
+describe('page helpers (spec 137)', () => {
+  it('parseProjectPage accepts the registry keys and nothing else', () => {
+    expect(parseProjectPage('tasks')).toBe('tasks');
+    expect(parseProjectPage('settings')).toBe('settings');
+    expect(parseProjectPage('pricing')).toBe('pricing');
+    // The retired tab keys are not pages.
+    expect(parseProjectPage('queue')).toBeUndefined();
+    expect(parseProjectPage('files')).toBeUndefined();
+    expect(parseProjectPage('chat')).toBeUndefined();
+    expect(parseProjectPage(undefined)).toBeUndefined();
+    expect(parseProjectPage(3)).toBeUndefined();
+  });
+
+  it('pageTrail walks the parent chain from the top down', () => {
+    expect(pageTrail(undefined)).toEqual([]);
+    expect(pageTrail('tasks')).toEqual(['tasks']);
+    expect(pageTrail('settings')).toEqual(['settings']);
+    expect(pageTrail('pricing')).toEqual(['settings', 'pricing']);
+    expect(PROJECT_PAGE_PARENT.pricing).toBe('settings');
+  });
+
+  it('routeUp goes one level up and drops the one-shot preview path', () => {
+    const base = { name: 'project' as const, projectId: 'p', sessionId: 's', previewPath: 'a.md' };
+    expect(routeUp({ ...base, page: 'pricing' })).toMatchObject({ page: 'settings', sessionId: 's', previewPath: undefined });
+    expect(routeUp({ ...base, page: 'settings' }).page).toBeUndefined();
+    expect(routeUp({ ...base, page: 'tasks' }).page).toBeUndefined();
+    expect(routeUp(base).page).toBeUndefined();
+  });
+
+  it('routeKey serialises which screen is showing, and only that', () => {
+    expect(routeKey({ name: 'list' })).toBe('list');
+    expect(routeKey({ name: 'project', projectId: 'p', sessionId: 's' })).toBe('project:p:chat:s');
+    expect(routeKey({ name: 'project', projectId: 'p', page: 'tasks' })).toBe('project:p:tasks:');
+    // A pane switch or a draft is not a different screen.
+    expect(routeKey({ name: 'project', projectId: 'p', page: 'tasks', queuePane: 'automations', draft: 'x' })).toBe(
+      'project:p:tasks:',
+    );
   });
 });

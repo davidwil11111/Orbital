@@ -66,7 +66,7 @@ describe('FilePreview — documents and the panel header (spec 088 × 090)', () 
     expect(onQuote).toHaveBeenCalledWith({ path: 'docs/report.pdf' });
 
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Open in Files' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Open full width' }));
     expect(onOpenInFiles).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole('button', { name: 'Back to files' }));
@@ -98,7 +98,7 @@ describe('FilePreview — documents offer the reveal (spec 093)', () => {
       );
       fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
       const items = screen.getAllByRole('menuitem').map((i) => i.textContent);
-      expect(items.slice(-2)).toEqual(['Open in Files', 'Reveal in Finder']);
+      expect(items.slice(-2)).toEqual(['Open full width', 'Reveal in Finder']);
       fireEvent.click(screen.getByRole('menuitem', { name: 'Reveal in Finder' }));
       expect(onRevealPanel).toHaveBeenCalledWith('docs/report.pdf');
     } finally {

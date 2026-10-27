@@ -611,7 +611,7 @@ describe('FilePreview — panel header (spec 088)', () => {
     expect(header.onBack).toHaveBeenCalledTimes(1);
   });
 
-  it('More holds Copy and Open in Files', async () => {
+  it('More holds Copy and Open full width', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
     const header = panelHeaderProps();
@@ -625,13 +625,13 @@ describe('FilePreview — panel header (spec 088)', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Copy', 'Open in Files']);
+    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Copy', 'Open full width']);
     fireEvent.click(screen.getByRole('menuitem', { name: 'Copy' }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(MD_BODY));
     await screen.findByText('Copied');
 
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Open in Files' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Open full width' }));
     expect(header.onOpenInFiles).toHaveBeenCalledTimes(1);
   });
 
@@ -708,7 +708,7 @@ describe('FilePreview — panel header (spec 088)', () => {
     expect(screen.getByRole('button', { name: 'Source' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Download' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Download', 'Open in Files']);
+    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Download', 'Open full width']);
   });
 
   it('image and binary previews get the same one-row header', () => {
@@ -734,7 +734,7 @@ describe('FilePreview — panel header (spec 088)', () => {
     );
     expect(screen.getAllByTestId('file-preview-panel-header')).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Open in Files' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Open full width' }));
     expect(header.onOpenInFiles).toHaveBeenCalledTimes(1);
   });
 
@@ -880,7 +880,7 @@ describe('FilePreview — reveal in the file manager (spec 093)', () => {
     expect(screen.queryByRole('button', { name: 'Reveal in Finder' })).toBeNull();
   });
 
-  it('panel: a More-menu item after Open in Files, never a header button', () => {
+  it('panel: a More-menu item after Open full width, never a header button', () => {
     setPlatform('MacIntel');
     const onReveal = vi.fn();
     render(
@@ -897,7 +897,7 @@ describe('FilePreview — reveal in the file manager (spec 093)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
     expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual([
       'Copy',
-      'Open in Files',
+      'Open full width',
       'Reveal in Finder',
     ]);
     fireEvent.click(screen.getByRole('menuitem', { name: 'Reveal in Finder' }));
@@ -940,7 +940,7 @@ describe('FilePreview — reveal in the file manager (spec 093)', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
-    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Open in Files']);
+    expect(screen.getAllByRole('menuitem').map((i) => i.textContent)).toEqual(['Open full width']);
   });
 });
 

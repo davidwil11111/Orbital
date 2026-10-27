@@ -286,7 +286,7 @@ describe('FilesView — preview state', () => {
     expect(props.onSelectFile).toHaveBeenCalledWith(null);
   });
 
-  it('the header’s "Open in Files" hands the resolved path to the parent', async () => {
+  it('the header’s "Open full width" hands the resolved path to the parent', async () => {
     getFileContent.mockImplementation(async (_projectId, path) =>
       path === 'src/app.ts'
         ? { path, content: 'x', size: 1, truncated: false, type: 'text' }
@@ -617,5 +617,30 @@ describe('FilesView — refresh scope (spec 103)', () => {
 
     expect(screen.getByText('README.md')).toBeInTheDocument();
     expect(screen.getByText('src')).toBeInTheDocument();
+  });
+
+  // Spec 137 gap 2: the bar's Upload lands a file; the parent bumps
+  // refreshKey and the tree shows it without waiting for a daemon event.
+  it('re-lists the tree when refreshKey changes', async () => {
+    const { rerender, props } = renderView();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    listDirectory.mockImplementation(async (_projectId, path) =>
+      (path ?? '') === ''
+        ? { path: '', entries: [...TREE[''].entries, { name: 'upload.csv', type: 'file', size: 3 }] }
+        : TREE[path ?? ''] ?? null,
+    );
+    rerender(<FilesView {...props} refreshKey={1} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(screen.getByText('upload.csv')).toBeInTheDocument();
+  });
+});
+
+describe('FilesView — no full-width target (phone sheet)', () => {
+  it('omits "Open full width" when the parent gives no onOpenInFiles', async () => {
+    renderView({ file: 'README.md', onOpenInFiles: undefined });
+    await settle();
+    const header = lastFilePreviewProps.panelHeader as { onOpenInFiles?: () => void };
+    expect(header).toBeDefined();
+    expect(header.onOpenInFiles).toBeUndefined();
   });
 });

@@ -129,6 +129,15 @@ vi.mock('./panel/FilesView', () => ({
   },
 }));
 
+// Maximized Files renders the old Files tab's explorer (spec 137 gap 1).
+let lastFileExplorerProps: Record<string, unknown> | null = null;
+vi.mock('./FileExplorer', () => ({
+  default: (props: Record<string, unknown>) => {
+    lastFileExplorerProps = props;
+    return <div data-testid="file-explorer" />;
+  },
+}));
+
 vi.mock('./panel/BrowserView', () => ({
   default: (props: Record<string, unknown>) => {
     lastBrowserViewProps = props;
@@ -197,7 +206,6 @@ function makeRoute(
   return {
     name: 'project',
     projectId: 'proj-1',
-    tab: 'chat',
     sessionId: undefined,
     ...overrides,
   };
@@ -213,6 +221,7 @@ function resetMocks() {
   lastChatViewProps = {};
   lastFilesViewProps = {};
   lastBrowserViewProps = {};
+  lastFileExplorerProps = null;
   mockMessages = [];
   mockLoadHistory.mockClear();
   mockOn.mockClear();
@@ -553,7 +562,6 @@ describe('ChatTab — composer prefill (route.draft → ChatView, spec 2026-07-2
     expect(updated).toMatchObject({
       name: 'project',
       projectId: 'proj-1',
-      tab: 'chat',
       sessionId: 'sess-x',
     });
     expect((updated as Extract<Route, { name: 'project' }>).draft).toBeUndefined();
@@ -1088,8 +1096,8 @@ describe('ChatTab — route.previewPath opens the panel, not the overlay (§9.10
     expect(lastFilesViewProps.file).toBeNull();
   });
 
-  it('"Open in Files" navigates to the full-width Files tab', async () => {
-    const { setRoute, route } = await act(async () =>
+  it('"Open full width" maximizes the panel on that file — no route change, no Files tab', async () => {
+    const { setRoute } = await act(async () =>
       renderChatTab({ previewPath: 'docs/plan.md' }),
     );
     setRoute.mockClear();
@@ -1098,10 +1106,15 @@ describe('ChatTab — route.previewPath opens the panel, not the overlay (§9.10
       (lastFilesViewProps.onOpenInFiles as (path: string) => void)('docs/plan.md');
     });
 
-    const updater = setRoute.mock.calls[setRoute.mock.calls.length - 1][0] as (prev: Route) => Route;
-    const updated = updater(route) as Extract<Route, { name: 'project' }>;
-    expect(updated.tab).toBe('files');
-    expect(updated.previewPath).toBeUndefined();
+    // Every setRoute is an updater; none of them reintroduces a tab.
+    for (const call of setRoute.mock.calls) {
+      const arg = call[0] as Route | ((prev: Route) => Route);
+      const next = typeof arg === 'function' ? arg(makeRoute({ sessionId: 'sess-x' })) : arg;
+      expect(next).not.toHaveProperty('tab');
+    }
+    expect(screen.getByTestId('workspace-panel-column')).toHaveAttribute('data-maximized', 'true');
+    expect(screen.getByTestId('file-explorer')).toBeInTheDocument();
+    expect(lastFileExplorerProps?.initialPath).toBe('docs/plan.md');
   });
 
   // Spec 110 — route.previewPath is a request, consumed once by the docked
@@ -1276,5 +1289,215 @@ describe('ChatTab — default resolution skips unmaterialized imports', () => {
       makeSession({ session_id: 'sess-chat', last_activity_at: '2026-10-01T00:00:00Z' }),
     ];
     expect(await resolvedFor()).toBe('imp_codex_done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 137 — maximize replaces the Files tab; the panel reaches narrow
+// windows (overlay) and phones (bottom sheet) through a header button.
+// ---------------------------------------------------------------------------
+
+describe('ChatTab — maximize (docked)', () => {
+  beforeEach(() => {
+    resetMocks();
+    setViewportWidth(1440);
+    mockSessions = [makeSession({ session_id: 'sess-x' })];
+  });
+
+  async function openDocked() {
+    const view = await act(async () => renderChatTab());
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-handle'));
+    });
+    return view;
+  }
+
+  it('docked → maximized hides the session column and the chat; Restore brings back the docked width', async () => {
+    const view = await openDocked();
+    const sessions = view.container.querySelector('[data-testid="chat-tab-sessions"]') as HTMLElement;
+    const chat = view.container.querySelector('[data-testid="chat-tab-conversation"]') as HTMLElement;
+    expect(sessions.className).not.toMatch(/(^|\s)hidden(\s|$)/);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-maximize'));
+    });
+    expect(screen.getByTestId('workspace-panel-column')).toHaveAttribute('data-maximized', 'true');
+    expect(sessions.className).toMatch(/(^|\s)hidden(\s|$)/);
+    expect(chat.className).toMatch(/(^|\s)hidden(\s|$)/);
+    // Maximized Files is the old Files tab: the tree + preview explorer.
+    expect(screen.getByTestId('file-explorer')).toBeInTheDocument();
+    expect(screen.queryByTestId('files-view')).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-restore'));
+    });
+    expect(screen.getByTestId('workspace-panel-column')).toHaveAttribute('data-maximized', 'false');
+    expect(chat.className).not.toMatch(/(^|\s)hidden(\s|$)/);
+    expect(screen.getByTestId('files-view')).toBeInTheDocument();
+  });
+
+  it('Esc restores a maximized panel', async () => {
+    await openDocked();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-maximize'));
+    });
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'Escape' });
+    });
+    expect(screen.getByTestId('workspace-panel-column')).toHaveAttribute('data-maximized', 'false');
+  });
+
+  it('the chat stays mounted while maximized (the composer keeps its draft)', async () => {
+    await openDocked();
+    const before = lastChatViewProps;
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-maximize'));
+    });
+    // ChatView was re-rendered with the same session, not torn down.
+    expect(lastChatViewProps.sessionId).toBe(before.sessionId);
+    expect(lastChatViewProps.projectId).toBe('proj-1');
+  });
+
+  it('is not persisted: nothing about maximize is written to storage', async () => {
+    await openDocked();
+    const keysBefore = Object.keys(localStorage).sort();
+    const valuesBefore = keysBefore.map((k) => localStorage.getItem(k));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-maximize'));
+    });
+    const keysAfter = Object.keys(localStorage).sort();
+    expect(keysAfter).toEqual(keysBefore);
+    expect(keysAfter.map((k) => localStorage.getItem(k))).toEqual(valuesBefore);
+    // A fresh load (the in-memory store reset) lands docked.
+    __resetPanelState();
+    cleanup();
+    await act(async () => renderChatTab());
+    expect(screen.queryByTestId('workspace-panel-column')).toBeNull();
+    expect(screen.getByTestId('panel-handle')).toBeInTheDocument();
+  });
+
+  it('maximized Files reports the explorer\'s selection back, so Restore shows the same file', async () => {
+    await openDocked();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-maximize'));
+    });
+    act(() => {
+      (lastFileExplorerProps?.onSelectFile as (p: string) => void)('src/app.ts');
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-restore'));
+    });
+    expect(lastFilesViewProps.file).toBe('src/app.ts');
+  });
+});
+
+describe('ChatTab — upload from the docked Files view (gap 2)', () => {
+  beforeEach(() => {
+    resetMocks();
+    setViewportWidth(1440);
+    mockSessions = [makeSession({ session_id: 'sess-x' })];
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('Upload picks a file, posts it, and refreshes the tree', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const view = await act(async () => renderChatTab());
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('panel-handle'));
+    });
+    const input = view.container.querySelector('input[type="file"][data-testid="panel-upload-input"]') as HTMLInputElement;
+    expect(input).not.toBeNull();
+    const clickSpy = vi.spyOn(input, 'click');
+    fireEvent.click(screen.getByTestId('panel-upload'));
+    expect(clickSpy).toHaveBeenCalled();
+
+    const before = (lastFilesViewProps.refreshKey as number | undefined) ?? 0;
+    const file = new File(['a,b'], 'data.csv', { type: 'text/csv' });
+    await act(async () => {
+      fireEvent.change(input, { target: { files: [file] } });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toContain('/files/upload');
+    expect(lastFilesViewProps.refreshKey).toBe(before + 1);
+  });
+});
+
+describe('ChatTab — narrow windows and phones (gap 3)', () => {
+  beforeEach(() => {
+    resetMocks();
+    mockSessions = [makeSession({ session_id: 'sess-x' })];
+  });
+
+  async function openOverlay() {
+    const { usePanelState } = await import('../hooks/usePanelState');
+    function Opener() {
+      const p = usePanelState('proj-1', 'sess-x');
+      return <button data-testid="opener" onClick={p.openOverlay} />;
+    }
+    const view = await act(async () => renderChatTab());
+    render(<Opener />);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('opener'));
+    });
+    return view;
+  }
+
+  it('below the dock threshold the header button opens the panel as an overlay, with maximize', async () => {
+    setViewportWidth(1000);
+    await openOverlay();
+    expect(screen.queryByTestId('workspace-panel-column')).toBeNull();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).not.toHaveAttribute('inert');
+    expect(within(dialog).getByRole('tab', { name: 'Files' })).toBeInTheDocument();
+    expect(within(dialog).getByTestId('files-view')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByTestId('panel-maximize'));
+    });
+    expect(dialog).toHaveAttribute('data-maximized', 'true');
+
+    // Esc first restores the overlay's width, then closes it.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'Escape' });
+    });
+    expect(dialog).toHaveAttribute('data-maximized', 'false');
+    expect(dialog).not.toHaveAttribute('inert');
+    await act(async () => {
+      fireEvent.keyDown(window, { key: 'Escape' });
+    });
+    expect(dialog).toHaveAttribute('inert');
+  });
+
+  it('on a phone it is the bottom sheet, with no maximize and no "Open full width"', async () => {
+    setViewportWidth(390);
+    await openOverlay();
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).not.toHaveAttribute('inert');
+    expect(within(dialog).queryByTestId('panel-maximize')).toBeNull();
+    expect(lastFilesViewProps.onOpenInFiles).toBeUndefined();
+  });
+});
+
+describe('ChatTab — /automate hand-off from Tasks (decision 2)', () => {
+  beforeEach(() => resetMocks());
+
+  it('passes route.draftSkill to ChatView with the draft, and clears both once consumed', async () => {
+    const { setRoute } = await act(async () =>
+      renderChatTab({ draft: 'Every weekday at 9am, summarize new GitHub issues', draftSkill: 'automate' }),
+    );
+    expect(lastChatViewProps.initialDraft).toBe('Every weekday at 9am, summarize new GitHub issues');
+    expect(lastChatViewProps.initialSkill).toBe('automate');
+    setRoute.mockClear();
+    act(() => {
+      (lastChatViewProps.onDraftConsumed as () => void)();
+    });
+    const updater = setRoute.mock.calls[0][0] as (prev: Route) => Route;
+    const next = updater(makeRoute({ sessionId: 'sess-x', draft: 'x', draftSkill: 'automate' })) as Extract<
+      Route,
+      { name: 'project' }
+    >;
+    expect(next.draft).toBeUndefined();
+    expect(next.draftSkill).toBeUndefined();
   });
 });

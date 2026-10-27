@@ -9,7 +9,7 @@ import { useAutosave } from '../hooks/useAutosave';
 import { api } from '../config';
 import BetaBadge from './BetaBadge';
 import SettingsSection, { SettingsGroup, LabelWithHint } from './SettingsSection';
-import SettingsToolbar from './SettingsToolbar';
+import PageToolbar from './PageToolbar';
 import AppearanceSection from './AppearanceSection';
 import AutosaveStatusPill from './AutosaveStatusPill';
 import CredentialCards from './CredentialCards';
@@ -158,7 +158,7 @@ export default function GlobalSettings({ onBack, onTakeTour, canTakeTour, scroll
     <div className="flex flex-col flex-1 min-h-0 bg-background">
       {/* Same toolbar as project settings — the two settings surfaces are one
           design. No parent crumb: global settings belongs to no project. */}
-      <SettingsToolbar
+      <PageToolbar
         title={t('global.title')}
         onBack={onBack}
         backTestId="global-settings-back-button"
