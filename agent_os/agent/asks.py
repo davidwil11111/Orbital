@@ -50,7 +50,6 @@ Public API
 - ``extract_legacy_flags(state_content)`` — pure ``[user]`` → ask conversion.
 - ``convert_legacy_on_write(orbital_dir, state_content)`` — the PROJECT_STATE
   write-path hook built on it.
-- ``render_runtime_block(orbital_dir)`` — the per-call "Open asks" block.
 - ``migrate_project(workspace)`` / ``migrate_all(project_store)`` — upgrade.
 """
 
@@ -84,17 +83,12 @@ CLOSE_KINDS = ("done", "dropped")
 EVENT_KINDS = ("open", "reopen") + CLOSE_KINDS
 WRITERS = ("user", "agent", "editor")
 
-# Runtime block bounds (spec §3.5).
-OPEN_LIMIT = 10
+# "Recently dropped" bounds (spec §3.5) — the never-re-propose list handed to
+# writers that get it once (pinned workers, the memory editor).
 DROPPED_DAYS = 60
 DROPPED_LIMIT = 15
 # Workbench "Recently closed" window (spec §3.6).
 RECENTLY_CLOSED_DAYS = 7
-# One ask can be a paragraph; the per-call block must stay bounded.
-_RUNTIME_LINE_CHARS = 240
-# The per-turn cue when nothing is open (live test (b): with no asks the block
-# was omitted, so a project got no per-turn reminder before its first ask).
-EMPTY_CUE = "Open asks: none (orbital/ASKS.md)"
 
 # The file's contract, on line 1 like every other Layer-1 file — so any agent
 # that opens it, including external ones, learns the grammar from the file.
@@ -862,7 +856,7 @@ def convert_legacy_on_write(
 
 
 # ---------------------------------------------------------------------------
-# What the agent sees each call
+# Dropped / closed lists (pinned workers, memory editor, Workbench)
 # ---------------------------------------------------------------------------
 
 def _as_date(value: str | None) -> date | None:
@@ -870,18 +864,6 @@ def _as_date(value: str | None) -> date | None:
         return date.fromisoformat((value or "")[:10])
     except ValueError:
         return None
-
-
-def sort_open(asks_list: list[Ask]) -> list[Ask]:
-    """Open asks: dated ones first, due-soonest (so overdue) first; then
-    undated ones, newest first."""
-    live = [a for a in asks_list if a.is_open]
-    dated = sorted((a for a in live if a.due), key=lambda a: (a.due, a.seq))
-    undated = sorted(
-        (a for a in live if not a.due),
-        key=lambda a: (a.opened or "", a.seq), reverse=True,
-    )
-    return dated + undated
 
 
 def recently_dropped(
@@ -919,55 +901,13 @@ def recently_closed(
     return rows
 
 
-def _clip(text: str, limit: int = _RUNTIME_LINE_CHARS) -> str:
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def render_runtime_block(
-    orbital_dir: str, *, today: str | None = None, empty_cue: bool = False,
-) -> str:
-    """The per-call runtime section: open asks, then recently dropped ones.
-
-    With nothing open, ``empty_cue`` puts ``EMPTY_CUE`` where the list would
-    be (the dropped section is still omitted when empty). ``""`` when there
-    is nothing to show or the file can't be read — never raises, because it
-    runs on every LLM call.
-    """
-    try:
-        today = today or _today()
-        folded = read_asks(orbital_dir)
-        parts: list[str] = []
-        live = sort_open(folded)
-        if not live and empty_cue:
-            parts.append(EMPTY_CUE)
-        if live:
-            lines = [f"Open asks ({len(live)}):"]
-            for a in live[:OPEN_LIMIT]:
-                suffix = ""
-                if a.due:
-                    late = ", overdue" if a.due[:10] < today else ""
-                    suffix = f" (due {a.due}{late})"
-                lines.append(f"[{a.id}] {_clip(a.text)}{suffix}")
-            if len(live) > OPEN_LIMIT:
-                lines.append(f"…and {len(live) - OPEN_LIMIT} more in orbital/ASKS.md")
-            parts.append("\n".join(lines))
-        dropped = recently_dropped(folded, today)
-        if dropped:
-            lines = ["Dropped by the user — never re-propose:"]
-            lines.extend(f"- {_clip(a.text)}" for a in dropped)
-            parts.append("\n".join(lines))
-        return "\n\n".join(parts)
-    except Exception:
-        logger.warning("asks: runtime block failed for %s", orbital_dir, exc_info=True)
-        return ""
-
-
 def dropped_texts(
     orbital_dir: str, *, recent: bool = True, today: str | None = None,
 ) -> list[str]:
     """Texts of dropped asks — the "never re-propose" list for writers that
-    don't get the runtime block. ``recent`` limits it to the runtime block's
-    selection; ``False`` returns every dropped ask (the old retractions list)."""
+    get it once (pinned workers, the memory editor). ``recent`` limits it to
+    ``recently_dropped``; ``False`` returns every dropped ask (the old
+    retractions list)."""
     try:
         folded = read_asks(orbital_dir)
         if not recent:

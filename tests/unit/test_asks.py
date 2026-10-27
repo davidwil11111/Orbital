@@ -6,8 +6,9 @@
 
 Covers the grammar + fold, the append-only write path, the append API the
 Workbench (and later the editor) closes asks through, the legacy ``[user]``
-conversion, the per-call runtime block, and the one-time migration with its
-backup / marker / resume / never-delete guarantees.
+conversion, that the asks never ride the prompt (spec 139: the agent reads
+ASKS.md itself), and the one-time migration with its backup / marker / resume /
+never-delete guarantees.
 """
 
 from __future__ import annotations
@@ -345,79 +346,6 @@ class TestExtractLegacyFlags:
 
 
 # ---------------------------------------------------------------------------
-# Runtime block
-# ---------------------------------------------------------------------------
-
-class TestRuntimeBlock:
-    def _write(self, orbital, lines):
-        (orbital / "ASKS.md").write_text(
-            asks.FORMAT_HEADER + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
-
-    def test_empty_when_nothing(self, tmp_path):
-        orbital = _orbital(tmp_path)
-        assert asks.render_runtime_block(str(orbital), today=TODAY) == ""
-        self._write(orbital, ["- open a1b2c3 2026-09-01 x", "- done a1b2c3 2026-09-02 by:user"])
-        assert asks.render_runtime_block(str(orbital), today=TODAY) == ""
-
-    def test_none_cue_when_asked_for_and_nothing_is_open(self, tmp_path):
-        orbital = _orbital(tmp_path)
-        cue = "Open asks: none (orbital/ASKS.md)"
-        assert asks.render_runtime_block(str(orbital), today=TODAY, empty_cue=True) == cue
-        self._write(orbital, [
-            "- open a1b2c3 2026-09-01 x", "- dropped a1b2c3 2026-09-02 by:user",
-        ])
-        block = asks.render_runtime_block(str(orbital), today=TODAY, empty_cue=True)
-        assert block == cue + "\n\nDropped by the user — never re-propose:\n- x"
-        self._write(orbital, ["- open a1b2c3 2026-09-01 x"])
-        block = asks.render_runtime_block(str(orbital), today=TODAY, empty_cue=True)
-        assert block == "Open asks (1):\n[a1b2c3] x"
-
-    def test_order_overdue_and_due_soonest_first_then_newest(self, tmp_path):
-        orbital = _orbital(tmp_path)
-        self._write(orbital, [
-            "- open 000001 2026-09-01 old undated",
-            "- open 000002 2026-09-10 new undated",
-            "- open 000003 2026-09-05 due:2026-09-25 due later",
-            "- open 000004 2026-09-06 due:2026-09-15 overdue one",
-        ])
-        block = asks.render_runtime_block(str(orbital), today=TODAY)
-        lines = block.split("\n")
-        assert lines[0] == "Open asks (4):"
-        assert lines[1] == "[000004] overdue one (due 2026-09-15, overdue)"
-        assert lines[2] == "[000003] due later (due 2026-09-25)"
-        assert lines[3] == "[000002] new undated"
-        assert lines[4] == "[000001] old undated"
-
-    def test_open_list_is_capped_at_ten(self, tmp_path):
-        orbital = _orbital(tmp_path)
-        self._write(orbital, [f"- open {i:06x} 2026-09-01 ask {i}" for i in range(13)])
-        block = asks.render_runtime_block(str(orbital), today=TODAY)
-        assert block.startswith("Open asks (13):")
-        assert sum(1 for ln in block.split("\n") if ln.startswith("[")) == 10
-        assert "…and 3 more in orbital/ASKS.md" in block
-
-    def test_dropped_last_60_days_newest_first_capped_at_15(self, tmp_path):
-        orbital = _orbital(tmp_path)
-        lines = []
-        for i in range(17):
-            lines.append(f"- open {i:06x} 2026-08-01 dropped thing {i}")
-            lines.append(f"- dropped {i:06x} 2026-09-{i + 1:02d} by:user")
-        lines.append("- open 0000ff 2026-06-01 ancient")
-        lines.append("- dropped 0000ff 2026-07-01 by:user")      # > 60 days ago
-        self._write(orbital, lines)
-        block = asks.render_runtime_block(str(orbital), today=TODAY)
-        assert "Open asks" not in block
-        dropped = block.split("\n")
-        assert dropped[0] == "Dropped by the user — never re-propose:"
-        assert dropped[1] == "- dropped thing 16"
-        assert len(dropped) == 16
-        assert "ancient" not in block
-
-    def test_never_raises_on_unreadable_dir(self, tmp_path):
-        assert asks.render_runtime_block(str(tmp_path / "nope"), today=TODAY) == ""
-
-
-# ---------------------------------------------------------------------------
 # One-time migration
 # ---------------------------------------------------------------------------
 
@@ -657,10 +585,15 @@ class TestToolWiring:
 
 
 # ---------------------------------------------------------------------------
-# What the agent sees: asks ride the per-call runtime block
+# What the agent sees: nothing from ASKS.md (spec 139 A — best-effort asks)
 # ---------------------------------------------------------------------------
 
 class TestRuntimeInjection:
+    """Spec 139 A: the open / dropped lists used to ride the per-call runtime
+    block, which moves off the cached prefix on the next call — ~1.5–2k
+    never-cached tokens per manager call. The prompt now only says how to use
+    ASKS.md; the agent reads it when it needs to."""
+
     def _prepare(self, tmp_path, user_text="hello", is_scratch=False):
         from agent_os.agent.context import ContextManager
         from agent_os.agent.prompt_builder import Autonomy, PromptContext
@@ -683,7 +616,7 @@ class TestRuntimeInjection:
         session.append({"role": "user", "content": user_text, "source": "user"})
         return ContextManager(session, Builder(), ctx, workspace_files=wfm).prepare()
 
-    def test_open_and_dropped_asks_ride_the_last_user_turn(self, tmp_path):
+    def test_open_and_dropped_asks_never_reach_the_wire(self, tmp_path):
         orbital = _orbital(tmp_path)
         (orbital / "ASKS.md").write_text("\n".join([
             asks.FORMAT_HEADER,
@@ -693,13 +626,14 @@ class TestRuntimeInjection:
             "",
         ]), encoding="utf-8")
         prepared = self._prepare(tmp_path)
-        tail = prepared[-1]
-        assert tail["role"] == "user"
-        assert "[a1b2c3] Choose the venue" in tail["content"]
-        assert "Dropped by the user — never re-propose:" in tail["content"]
-        assert "Sponsor the GOAI booth" in tail["content"]
-        for m in prepared[:-1]:
-            assert "Choose the venue" not in str(m.get("content"))
+        assert prepared[-1]["role"] == "user"
+        assert prepared[-1]["content"].endswith("dynamic-runtime")
+        for m in prepared:
+            content = str(m.get("content"))
+            assert "Choose the venue" not in content
+            assert "Sponsor the GOAI booth" not in content
+            assert "Dropped by the user" not in content
+            assert "Open asks" not in content
 
     def test_retractions_file_is_no_longer_injected(self, tmp_path):
         orbital = _orbital(tmp_path)
@@ -709,12 +643,11 @@ class TestRuntimeInjection:
         assert not any("Retracted by user" in str(m.get("content")) for m in prepared)
         assert not any("Send DM drafts" in str(m.get("content")) for m in prepared)
 
-    def test_no_open_asks_still_carries_the_none_cue(self, tmp_path):
+    def test_no_none_cue_with_nothing_open(self, tmp_path):
+        _orbital(tmp_path)
         prepared = self._prepare(tmp_path)
-        assert prepared[-1]["role"] == "user"
-        assert prepared[-1]["content"].endswith("Open asks: none (orbital/ASKS.md)")
-        for m in prepared[:-1]:
-            assert "Open asks" not in str(m.get("content"))
+        assert prepared[-1]["content"].endswith("dynamic-runtime")
+        assert not any("Open asks" in str(m.get("content")) for m in prepared)
 
     def test_scratch_projects_get_no_cue(self, tmp_path):
         prepared = self._prepare(tmp_path, is_scratch=True)
@@ -760,6 +693,12 @@ class TestPromptRules:
         assert TRIGGER in semi
         assert "you are parking" not in semi
         assert "Never re-propose a dropped ask" in semi
+        # Spec 139 A: the agent reads ASKS.md itself; nothing is listed per turn.
+        assert ("Before opening an ask, read ASKS.md: don't duplicate an open one, "
+                "and never re-open what the user dropped.") in semi
+        assert ("When the user's message looks like an answer to something you "
+                "raised earlier, check ASKS.md for an open ask to close.") in semi
+        assert "runtime note" not in semi
         assert "[user]" not in semi
 
     def test_rules_follow_the_memory_section(self):

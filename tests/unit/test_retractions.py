@@ -192,7 +192,8 @@ class TestNormalizedTitleMatch:
 
 
 # Injection into session context: retired by spec 089. Dropped asks replaced
-# the front-of-prompt retraction row; see tests/unit/test_asks.py
+# the front-of-prompt retraction row, and spec 139 took those off the per-call
+# tail too (the agent reads ASKS.md itself); see tests/unit/test_asks.py
 # (TestRuntimeInjection), which also proves retractions.md is no longer
 # injected.
 # ---------------------------------------------------------------------------
