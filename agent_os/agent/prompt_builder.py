@@ -45,6 +45,11 @@ class PromptContext:
     # the file exists with content.
     user_memory_path: str = ""
     agent_name: str = ""
+    # Spec 140 R2: carried for callers only. They must NOT reach the system
+    # prompt — a triggered run's prompt is byte-identical to a chat
+    # session's so both share the provider's cached prefix. The trigger
+    # context travels in the first user message (trigger_manager
+    # TRIGGER_RUN_NOTE).
     trigger_source: str | None = None   # "schedule" | "file_watch" | None
     trigger_name: str | None = None     # human-readable trigger name
     vision_enabled: bool = False        # model supports vision (image input)
@@ -303,7 +308,6 @@ class PromptBuilder:
             self._queue_signals(),
         ]))
         semi_stable = _SEP.join(filter(None, [
-            self._trigger_context(context),
             self._global_preferences(context),
             self._user_memory(context),
             self._cross_project_scope(context),
@@ -603,22 +607,6 @@ class PromptBuilder:
         )
 
     # -- Semi-stable sections (placed before history for caching) --
-
-    def _trigger_context(self, context: PromptContext) -> str | None:
-        """If this run was started by a trigger, tell the agent."""
-        if not context.trigger_source:
-            return None
-        name = context.trigger_name or "unknown"
-        source = context.trigger_source
-        return (
-            f"## Trigger Context\n\n"
-            f"This run was triggered by a {source} trigger: '{name}'.\n"
-            "The initial message contains the task to perform. Execute it according to "
-            "your project goals and autonomy settings.\n\n"
-            "You also have trigger management tools available (create_trigger, list_triggers, "
-            "update_trigger, delete_trigger) which you can use if the user asks you to set up, "
-            "modify, or remove scheduled tasks."
-        )
 
     def _global_preferences(self, context: PromptContext) -> str | None:
         if not context.global_preferences_path:
