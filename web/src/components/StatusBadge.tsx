@@ -32,12 +32,27 @@ export default function StatusBadge({ status, size = 'md' }: StatusBadgeProps) {
   const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.idle;
   const dotSize = size === 'sm' ? 'w-2 h-2' : 'w-2.5 h-2.5';
 
+  if (size === 'sm') {
+    // Dot only (spec 137 round 3: the state dot sits before the project name
+    // in the column, like the dot before a session). The colour says it; the
+    // word is the tooltip and what a screen reader announces.
+    const label = t(config.labelKey);
+    return (
+      <span
+        role="img"
+        aria-label={label}
+        title={label}
+        data-testid="status-dot"
+        data-status={status}
+        className={`${dotSize} rounded-full ${config.color} shrink-0`}
+      />
+    );
+  }
+
   return (
     <span className="inline-flex items-center gap-1.5">
       <span className={`${dotSize} rounded-full ${config.color} shrink-0`} />
-      {size === 'md' && (
-        <span className="text-xs text-secondary">{t(config.labelKey)}</span>
-      )}
+      <span className="text-xs text-secondary">{t(config.labelKey)}</span>
     </span>
   );
 }

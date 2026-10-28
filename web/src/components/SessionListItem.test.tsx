@@ -302,7 +302,9 @@ describe('SessionListItem — active highlight', () => {
     expect(row.className).not.toContain('font-medium');
   });
 
-  it('applies the card surface (white in light mode) when selected', () => {
+  // Spec 137 round 3: the list sits on a white surface, so the selected row
+  // is the selection tint with no shadow (not a raised card).
+  it('applies the selection tint, with no shadow, when selected', () => {
     render(
       <SessionListItem
         session={makeSession({ session_id: 'sess-bg' })}
@@ -311,7 +313,8 @@ describe('SessionListItem — active highlight', () => {
       />,
     );
     const row = screen.getByTestId('session-list-item-sess-bg');
-    expect(row.style.background).toBe('var(--color-session-selected)');
+    expect(row.style.background).toBe('var(--color-selected)');
+    expect(row.style.boxShadow).toBe('');
   });
 });
 

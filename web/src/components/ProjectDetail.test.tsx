@@ -154,26 +154,36 @@ describe('ProjectDetail — header badge while a worker runs (spec 102)', () => 
     );
   }
 
+  // In the column (desktop, narrow) the state is a dot whose label is the
+  // word; on the phone the header still reads the word.
+  const dotLabel = () => screen.getByTestId('status-dot').getAttribute('aria-label');
+
   it('reads Active with the manager idle and a worker running', () => {
     renderBadge('idle', true);
-    expect(screen.getByText('Active')).toBeInTheDocument();
-    expect(screen.queryByText('Idle')).toBeNull();
+    expect(dotLabel()).toBe('Active');
   });
 
   it('reads Idle with the manager idle and no worker running', () => {
     renderBadge('idle', false);
-    expect(screen.getByText('Idle')).toBeInTheDocument();
+    expect(dotLabel()).toBe('Idle');
   });
 
   it('reads Idle when the prop is omitted (older callers)', () => {
     renderBadge('idle');
-    expect(screen.getByText('Idle')).toBeInTheDocument();
+    expect(dotLabel()).toBe('Idle');
   });
 
   it('keeps a manager error over a running worker', () => {
     renderBadge('error', true);
-    expect(screen.getByText('Error')).toBeInTheDocument();
-    expect(screen.queryByText('Active')).toBeNull();
+    expect(dotLabel()).toBe('Error');
+    expect(screen.getByTestId('status-dot').className).toContain('bg-error');
+  });
+
+  it('phone: the header still reads the word', () => {
+    setViewportWidth(390);
+    renderBadge('idle', true);
+    expect(screen.getByText('Active')).toBeInTheDocument();
+    expect(screen.queryByTestId('status-dot')).toBeNull();
   });
 });
 
@@ -240,17 +250,41 @@ describe('ProjectDetail — no tab bar, one page at a time', () => {
     expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();
     expect(within(column).getByTestId('trigger-summary')).toBeInTheDocument();
     expect(within(column).getByTestId('session-sidebar')).toBeInTheDocument();
-    // The page carries only its title: no project crumb (the column names it).
-    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Settings');
+    // The page opens with its own heading — no bar, no crumb (the column
+    // names the project, and Settings sits directly under it).
+    expect(within(main).getByTestId('page-heading')).toBeInTheDocument();
+    expect(within(main).queryByRole('navigation', { name: 'Location' })).toBeNull();
     expect(screen.getByTestId('settings-modal-title').textContent).toBe('Settings');
   });
 
-  it('Pricing nests under Settings: crumb Settings / Pricing, the parent a link', () => {
+  it('Pricing nests under Settings: the parent is a link line above the title', () => {
     const setRoute = vi.fn();
     renderProjectDetail({ page: 'pricing' }, setRoute);
-    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Settings/Pricing table');
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Location' })).getByRole('button', { name: 'Settings' }));
+    const heading = screen.getByTestId('page-heading');
+    const parent = within(heading).getByRole('navigation', { name: 'Location' });
+    expect(parent.textContent).toBe('Settings');
+    expect(within(heading).getByTestId('pricing-title').textContent).toBe('Pricing table');
+    fireEvent.click(within(parent).getByRole('button', { name: 'Settings' }));
     expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'settings' }));
+  });
+
+  // Spec 137 round 3: no toolbar beside the column — a heading on the page.
+  it('a desktop page renders a heading and no toolbar; the phone keeps the toolbar with Back', () => {
+    for (const w of [1440, 1000]) {
+      setViewportWidth(w);
+      const { container, unmount } = renderProjectDetail({ page: 'tasks' });
+      expect(container.querySelector('header')).toBeNull();
+      const h1 = within(screen.getByTestId('page-heading')).getByRole('heading', { level: 1 });
+      expect(h1.textContent).toBe('Tasks');
+      expect(h1.className).toContain('text-lg');
+      expect(screen.queryByTestId('tasks-back-button')).toBeNull();
+      unmount();
+    }
+    setViewportWidth(390);
+    const { container } = renderProjectDetail({ page: 'tasks' });
+    expect(screen.queryByTestId('page-heading')).toBeNull();
+    expect(container.querySelector('header')).not.toBeNull();
+    expect(screen.getByTestId('tasks-back-button')).toBeInTheDocument();
   });
 });
 
@@ -331,7 +365,7 @@ describe('ProjectDetail — Back exists on the phone only', () => {
 describe('ProjectDetail — Tasks page', () => {
   it('is a page titled Tasks (Project / Tasks on the phone)', () => {
     const { unmount } = renderProjectDetail({ page: 'tasks' });
-    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Tasks');
+    expect(screen.queryByRole('navigation', { name: 'Location' })).toBeNull();
     expect(screen.getByTestId('tasks-title').textContent).toBe('Tasks');
     unmount();
 
@@ -498,7 +532,7 @@ describe('ProjectDetail — the status line', () => {
     );
   });
 
-  it('in the column it is ONE line: no wrapping, truncation with the facts as the tooltip; no fill at rest', () => {
+  it('in the column it is ONE line, truncating with the facts as the tooltip, on a white surface at rest', () => {
     render(
       <ProjectDetail
         project={mockProject}
@@ -511,9 +545,21 @@ describe('ProjectDetail — the status line', () => {
     const line = screen.getByTestId('trigger-summary');
     expect(line.className).toContain('whitespace-nowrap');
     expect(line.className).not.toMatch(/flex-wrap/);
-    expect(line.className).not.toMatch(/(^|\s)bg-card(\s|$)/);
+    // A soft surface: white + the standard shadow at rest, tinted on hover.
+    expect(line.className).toMatch(/(^|\s)bg-card(\s|$)/);
+    expect(line.className).toContain('shadow-[');
     expect(line.className).toContain('hover:bg-card-hover');
+    expect(line.className).not.toMatch(/border/);
     expect(line).toHaveAttribute('title', '2 automations 1 off');
+  });
+
+  it('selected on Tasks: keeps the surface and adds the accent ring (no hover tint)', () => {
+    renderProjectDetail({ page: 'tasks' });
+    const line = screen.getByTestId('trigger-summary');
+    expect(line).toHaveAttribute('aria-current', 'page');
+    expect(line.className).toMatch(/(^|\s)bg-card(\s|$)/);
+    expect(line.className).toContain('ring-accent');
+    expect(line.className).not.toContain('hover:bg-card-hover');
   });
 
   it('phone: not on a page — the toolbar replaces the whole header', () => {
@@ -697,7 +743,15 @@ describe('ProjectDetail — the project column (desktop, narrow)', () => {
     );
     const column = screen.getByTestId('project-column');
     expect(within(column).getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
-    expect(within(column).getByText('Idle')).toBeInTheDocument();
+    // No state word in the column: a dot before the name, the word its label.
+    expect(within(column).queryByText('Idle')).toBeNull();
+    const dot = within(column).getByTestId('status-dot');
+    expect(dot).toHaveAttribute('title', 'Idle');
+    expect(dot).toHaveAttribute('aria-label', 'Idle');
+    const name = within(column).getByRole('heading', { level: 1 });
+    expect(dot.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(dot.parentElement).toBe(name.parentElement);
+    expect(name).toHaveAttribute('data-tour', 'project-header');
     expect(within(column).getByTestId('project-credential-chip').textContent).toBe('claude-3-5-sonnet');
     expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();
     expect(within(column).getByTestId('trigger-summary')).toBeInTheDocument();
@@ -727,6 +781,31 @@ describe('ProjectDetail — the project column (desktop, narrow)', () => {
     renderProjectDetail();
     const column = screen.getByTestId('project-column');
     expect(column.querySelector('.font-mono')).toBeNull();
+  });
+
+  it('the meta line is ONE line: model, then the spend — the model gives way first', () => {
+    setViewportWidth(1000);
+    render(
+      <ProjectDetail
+        project={{ ...mockProject, model: 'OpenCode Go · deepseek-v4.1-flash' }}
+        agentStatus="idle"
+        route={baseRoute}
+        setRoute={vi.fn()}
+      />,
+    );
+    const meta = within(screen.getByTestId('project-column')).getByTestId('project-state-row');
+    expect(meta.className).toContain('whitespace-nowrap');
+    expect(meta.className).toContain('text-[11px]');
+    expect(meta.className).not.toMatch(/flex-col|flex-wrap/);
+    const model = within(meta).getByTestId('project-credential-chip');
+    expect(model.className).toMatch(/min-w-0.*truncate|truncate.*min-w-0/);
+    const spend = within(meta).getByTestId('project-spend');
+    expect(spend.className).toContain('shrink-0');
+    // The separator rides on the spend: with no spend (useCost mocked empty)
+    // the wrapper is empty and hidden — no dangling " · ".
+    expect(spend.className).toContain('empty:hidden');
+    expect(spend.className).toContain("before:content-['·']");
+    expect(spend.textContent).toBe('');
   });
 
   it('shows only the model of a "Provider · model" card, one line, the full card name as the tooltip', () => {
