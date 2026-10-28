@@ -655,10 +655,52 @@ describe('SessionSidebar — filter and automation groups', () => {
   it('an empty filter says so instead of showing a blank list', async () => {
     const user = userEvent.setup();
     resetMocks();
-    mockSessions = [makeSession({ session_id: 'a', session_uuid: 'ua', name: 'Chat' })];
+    // Only automation runs: Chats is the filter that can come up empty.
+    mockSessions = [daily('run-1', '2026-09-10T00:00:00Z')];
     render(<SessionSidebar projectId="p1" />);
-    await user.click(screen.getByTestId('session-filter-automations'));
-    expect(screen.getByTestId('session-empty')).toHaveTextContent('No automation runs yet');
+    await user.click(screen.getByTestId('session-filter-chats'));
+    expect(screen.getByTestId('session-empty')).toHaveTextContent('No chats yet');
+  });
+
+  // Spec 137 polish: nothing to tell apart → no filter (the prototype's column).
+  it('a project with no automation session shows no filter, and lists everything', () => {
+    resetMocks();
+    localStorage.setItem('orbital:sessionSidebar.filter', 'automations'); // remembered from another project
+    mockSessions = [
+      makeSession({ session_id: 'a', session_uuid: 'ua', name: 'Chat A' }),
+      makeSession({ session_id: 'b', session_uuid: 'ub', name: 'Chat B' }),
+    ];
+    render(<SessionSidebar projectId="p1" />);
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.queryByTestId('session-filter-all')).toBeNull();
+    expect(ids()).toEqual(['session-list-item-a', 'session-list-item-b']);
+    expect(screen.getByTestId('session-active-count').textContent).toBe('2');
+  });
+
+  it('with automation sessions the filter is plain text tabs: no boxed track, the chosen one primary + medium', async () => {
+    const user = userEvent.setup();
+    resetMocks();
+    mockSessions = mixed();
+    render(<SessionSidebar projectId="p1" />);
+    const tablist = screen.getByRole('tablist', { name: 'Filter sessions' });
+    expect(tablist.className).not.toMatch(/\bborder\b|bg-nav|rounded-lg/);
+    const all = screen.getByTestId('session-filter-all');
+    expect(all).toHaveAttribute('aria-selected', 'true');
+    expect(all.className).toContain('text-primary');
+    expect(all.className).toContain('font-medium');
+    expect(all.className).not.toMatch(/bg-/);
+    await user.click(screen.getByTestId('session-filter-chats'));
+    expect(screen.getByTestId('session-filter-chats').className).toContain('font-medium');
+    expect(screen.getByTestId('session-filter-all').className).toContain('text-secondary');
+  });
+
+  it('the header reads "Sessions 6": sentence case, the count without parentheses', () => {
+    resetMocks();
+    mockSessions = mixed();
+    render(<SessionSidebar projectId="p1" />);
+    const header = screen.getByTestId('session-sidebar-header');
+    expect(header.textContent).toBe('Sessions6');
+    expect(header.innerHTML).not.toMatch(/uppercase|font-mono/);
   });
 
   it('remembers the chosen filter across remounts', async () => {
@@ -878,7 +920,7 @@ describe('SessionSidebar — imported rows and the 50-row cap', () => {
     expect(ids[49]).toBe('s49');
     expect(screen.getByTestId('session-show-older').textContent).toBe('Show older (3)');
     // The header still counts every session.
-    expect(screen.getByTestId('session-active-count').textContent).toBe('(53)');
+    expect(screen.getByTestId('session-active-count').textContent).toBe('53');
   });
 
   it('Show older reveals the rest', async () => {

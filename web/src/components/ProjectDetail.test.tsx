@@ -462,9 +462,16 @@ describe('ProjectDetail — the status line', () => {
     const setRoute = vi.fn();
     renderProjectDetail({}, setRoute);
     const line = screen.getByTestId('trigger-summary');
-    expect(screen.getByTestId('status-line-teach').textContent).toBe(
-      'Nothing scheduled · type /automate in the composer to add one',
-    );
+    // The column: two deliberate lines — a title, then the /automate hint —
+    // neither of which wraps.
+    expect(screen.getByTestId('status-line-teach-title').textContent).toBe('Nothing scheduled');
+    expect(screen.getByTestId('status-line-teach-hint').textContent).toBe('Type /automate to add one');
+    expect(screen.getByTestId('status-line-teach-hint').querySelector('kbd')?.textContent).toBe('/automate');
+    // <kbd> defaults to monospace; the column has none.
+    expect(screen.getByTestId('status-line-teach-hint').querySelector('kbd')?.className).toContain('font-sans');
+    expect(line.className).toContain('whitespace-nowrap');
+    expect(screen.getByTestId('status-line-teach').innerHTML).not.toMatch(/truncate/);
+    expect(line).toHaveAttribute('title', 'Nothing scheduled · Type /automate to add one');
     expect(line).toHaveAttribute('data-tour', 'status-line');
     fireEvent.click(line);
     expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'tasks', queuePane: 'automations' }));
@@ -481,6 +488,32 @@ describe('ProjectDetail — the status line', () => {
 
     renderProjectDetail({ page: 'settings' });
     expect(screen.getByTestId('trigger-summary')).not.toHaveAttribute('aria-current');
+  });
+
+  it('phone keeps the full teaching sentence in its full-width band', () => {
+    setViewportWidth(390);
+    renderProjectDetail();
+    expect(screen.getByTestId('status-line-teach').textContent).toBe(
+      'Nothing scheduled · type /automate in the composer to add one',
+    );
+  });
+
+  it('in the column it is ONE line: no wrapping, truncation with the facts as the tooltip; no fill at rest', () => {
+    render(
+      <ProjectDetail
+        project={mockProject}
+        agentStatus="idle"
+        route={baseRoute}
+        setRoute={vi.fn()}
+        triggers={[makeTrigger(), makeTrigger({ id: 'trg-2', enabled: false })]}
+      />,
+    );
+    const line = screen.getByTestId('trigger-summary');
+    expect(line.className).toContain('whitespace-nowrap');
+    expect(line.className).not.toMatch(/flex-wrap/);
+    expect(line.className).not.toMatch(/(^|\s)bg-card(\s|$)/);
+    expect(line.className).toContain('hover:bg-card-hover');
+    expect(line).toHaveAttribute('title', '2 automations 1 off');
   });
 
   it('phone: not on a page — the toolbar replaces the whole header', () => {
@@ -686,6 +719,30 @@ describe('ProjectDetail — the project column (desktop, narrow)', () => {
     expect(within(main).queryByRole('heading')).toBeNull();
     expect(within(main).queryByTestId('trigger-summary')).toBeNull();
     expect(within(main).queryByRole('button', { name: /project settings/i })).toBeNull();
+  });
+
+  it('reads as words: no monospace anywhere in the column', () => {
+    setViewportWidth(1440);
+    sessionsMock.sessions = [session('sess-xyz')];
+    renderProjectDetail();
+    const column = screen.getByTestId('project-column');
+    expect(column.querySelector('.font-mono')).toBeNull();
+  });
+
+  it('shows only the model of a "Provider · model" card, one line, the full card name as the tooltip', () => {
+    setViewportWidth(1000);
+    render(
+      <ProjectDetail
+        project={{ ...mockProject, model: 'OpenCode Go · deepseek-v4.1-flash' }}
+        agentStatus="idle"
+        route={baseRoute}
+        setRoute={vi.fn()}
+      />,
+    );
+    const chip = within(screen.getByTestId('project-column')).getByTestId('project-credential-chip');
+    expect(chip.textContent).toBe('deepseek-v4.1-flash');
+    expect(chip).toHaveAttribute('title', 'OpenCode Go · deepseek-v4.1-flash');
+    expect(chip.className).toContain('truncate');
   });
 
   it('keeps the tour anchors on the column (spec 138)', () => {

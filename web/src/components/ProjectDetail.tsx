@@ -296,11 +296,12 @@ export default function ProjectDetail({
   // Budget corner (P3-G): converted window spend / warn / exhausted pill.
   // Reads the same GET /cost as the settings meter; event-driven (no
   // polling). Click → Budget settings.
-  const budget = (
+  const budget = (plain: boolean) => (
     <BudgetCorner
       project={project}
       pauseReason={snapshot?.pause_reason}
       onOpenBudgetSettings={handleOpenBudgetSettings}
+      plain={plain}
     />
   );
 
@@ -324,6 +325,12 @@ export default function ProjectDetail({
         {credentialLabel}
       </span>
     ) : null;
+  // The column has room for the model alone: a card name reads
+  // "Provider · model", so the column shows what follows the last " · " and
+  // keeps the whole card name as the tooltip.
+  const columnModelLabel = credentialLabel.includes(' · ')
+    ? credentialLabel.slice(credentialLabel.lastIndexOf(' · ') + 3)
+    : credentialLabel;
 
   // Spec 137 gap 3: below the dock threshold there is no panel handle, so the
   // panel gets a button — an overlay on a narrow desktop window, the bottom
@@ -423,7 +430,7 @@ export default function ProjectDetail({
                 </div>
               </div>
               <div className="flex items-center gap-3 min-w-0 shrink">
-                {budget}
+                {budget(false)}
                 {credentialChip('max-w-[220px] max-md:hidden')}
                 {panelButton}
                 <span data-tour="project-settings" className="inline-flex">
@@ -477,10 +484,25 @@ export default function ProjectDetail({
               </span>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0" data-testid="project-state-row">
-            {badge}
-            {budget}
-            {credentialChip('max-w-full')}
+          {/* The state reads as words, not code: status and spend on one
+              line, the model on the next — sans, one line each, ellipsis. */}
+          <div className="flex flex-col gap-0.5 min-w-0">
+            <div
+              className="flex items-center gap-2 min-w-0 overflow-hidden whitespace-nowrap"
+              data-testid="project-state-row"
+            >
+              {badge}
+              {budget(true)}
+            </div>
+            {credentialLabel && (
+              <p
+                data-testid="project-credential-chip"
+                title={credentialLabel}
+                className="text-[11px] text-secondary truncate"
+              >
+                {columnModelLabel}
+              </p>
+            )}
           </div>
           {statusSummaryLine}
         </div>

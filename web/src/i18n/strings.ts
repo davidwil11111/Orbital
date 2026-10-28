@@ -1078,6 +1078,8 @@ export const STRINGS = {
   "statusLine.queued": { en: "{n} queued", zh: "{n} 个排队中" },
   "statusLine.running": { en: "{n} running", zh: "{n} 个运行中" },
   "statusLine.teach": { en: "Nothing scheduled · type {command} in the composer to add one", zh: "还没有自动任务 · 在输入框输入 {command} 即可添加" },
+  "statusLine.teach.hint": { en: "Type {command} to add one", zh: "输入 {command} 添加" },
+  "statusLine.teach.title": { en: "Nothing scheduled", zh: "还没有自动任务" },
   // --- settingsRail: settings index rail (spec 011 §0.8, Task D1). Section
   // labels reuse each group's existing heading key; only rail-specific
   // strings and labels for groups WITHOUT a stable heading key live here. ---

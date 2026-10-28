@@ -40,12 +40,19 @@ interface BudgetCornerProps {
   pauseReason?: 'user' | 'budget' | null;
   /** Navigate to the settings Budget section (anchored when supported). */
   onOpenBudgetSettings: () => void;
+  /**
+   * Spec 137 polish: in the project column the spend reads as words beside
+   * the status ("Idle  ≈ $0.00 today"), so it uses the 12px sans of the row
+   * instead of the header's 11px monospace.
+   */
+  plain?: boolean;
 }
 
 export default function BudgetCorner({
   project,
   pauseReason,
   onOpenBudgetSettings,
+  plain = false,
 }: BudgetCornerProps) {
   const t = useT();
   const { locale } = useLocale();
@@ -71,6 +78,7 @@ export default function BudgetCorner({
   if (cost == null && corner.state !== 'exhausted') return null;
   if (!hasSignal) return null;
 
+  const font = plain ? 'text-xs' : 'font-mono text-[11px]';
   const windowWord = t(WINDOW_WORD[window]);
   const spentStr = formatMoney(corner.spent, corner.currency, locale);
   const limitStr =
@@ -84,13 +92,21 @@ export default function BudgetCorner({
         data-testid="budget-corner"
         data-state="exhausted"
         aria-label={t('budget.corner.aria')}
-        className="shrink-0 max-md:max-w-[55%] font-mono text-[11px] font-medium leading-none px-2 py-1 rounded-full text-error bg-error/10 hover:bg-error/15 transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center whitespace-nowrap"
+        className={`shrink-0 max-md:max-w-[55%] ${font} font-medium leading-none px-2 py-1 rounded-full text-error bg-error/10 hover:bg-error/15 transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center whitespace-nowrap`}
       >
         {/* Full label on >=md; a compact label below it so the long string can't
             crush the project title to 0 width on a 375px viewport (P3-J header
             collision). Both keys are i18n; only the visible one renders text. */}
-        <span className="hidden md:inline">{t('budget.corner.exhausted')}</span>
-        <span className="md:hidden">{t('budget.corner.exhausted.short')}</span>
+        {plain ? (
+          // The project column is 220–260px: the short label, the long one
+          // as the tooltip.
+          <span title={t('budget.corner.exhausted')}>{t('budget.corner.exhausted.short')}</span>
+        ) : (
+          <>
+            <span className="hidden md:inline">{t('budget.corner.exhausted')}</span>
+            <span className="md:hidden">{t('budget.corner.exhausted.short')}</span>
+          </>
+        )}
       </button>
     );
   }
@@ -103,7 +119,7 @@ export default function BudgetCorner({
         data-testid="budget-corner"
         data-state="warn"
         aria-label={t('budget.corner.aria')}
-        className="font-mono text-[11px] text-warning hover:underline transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center"
+        className={`${font} text-warning hover:underline transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center`}
       >
         {t('budget.corner.warn', { spent: spentStr, limit: limitStr, window: windowWord })}
       </button>
@@ -118,7 +134,7 @@ export default function BudgetCorner({
       data-testid="budget-corner"
       data-state="normal"
       aria-label={t('budget.corner.aria')}
-      className="font-mono text-[11px] text-secondary hover:text-primary transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center"
+      className={`${font} text-secondary hover:text-primary whitespace-nowrap transition-colors duration-150 max-md:min-h-[44px] max-md:flex max-md:items-center`}
     >
       {t('budget.corner.normal', { spent: spentStr, window: windowWord })}
     </button>
