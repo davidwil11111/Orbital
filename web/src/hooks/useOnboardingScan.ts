@@ -28,7 +28,7 @@ interface Options {
  * import dialog. GET /onboarding/history first — the call that starts the
  * daemon's background scan — then the importable list, whose candidates are
  * there at once while the groups arrive when the scan is ready. Polls both
- * while `status == "scanning"` (every 1.5 s, at most 90 s). Once the scan is
+ * while either says `status == "scanning"` (every 1.5 s, at most 90 s). Once the scan is
  * ready the folder rows are rebuilt from it, so giving up early leaves the
  * first, noisier list; reading Codex's compressed rollouts made a cold scan
  * take 10–14 s on a dev Mac, and a heavier history takes longer.
@@ -50,7 +50,12 @@ export function useOnboardingScan({ pollMs = 1500, maxMs = 90000 }: Options = {}
     const tick = async () => {
       const h = await api<HistoryStatus>('/api/v2/onboarding/history').catch(() => null);
       if (cancelled) return;
-      if (h && typeof h === 'object' && 'by_agent' in h) setHistory(h);
+      const historyOk = !!h && typeof h === 'object' && 'by_agent' in h;
+      if (historyOk) setHistory(h);
+      // The folder list can be "ready" from its first pass while the history
+      // scan behind the conversation count is still running; stopping on the
+      // list alone froze the step at "Found in 0 conversations".
+      const historyScanning = historyOk && (h as { status?: string }).status === 'scanning';
       let data: ImportableResponse | null = null;
       try {
         data = await api<ImportableResponse>('/api/v2/onboarding/importable-projects');
@@ -67,7 +72,7 @@ export function useOnboardingScan({ pollMs = 1500, maxMs = 90000 }: Options = {}
         groups: Array.isArray(data?.groups) ? data.groups : [],
       };
       setImportable(body);
-      if (body.status === 'scanning' && Date.now() - started < limit) {
+      if ((body.status === 'scanning' || historyScanning) && Date.now() - started < limit) {
         timer = setTimeout(() => { void tick(); }, every);
       } else {
         setSettled(true);

@@ -212,7 +212,10 @@ export function importIntro(
   total: number | undefined,
   data: { candidates: Array<{ session_count: number }> } | null,
 ): string {
-  const n = total ?? (data?.candidates ?? []).reduce((sum, c) => sum + (c.session_count || 0), 0);
+  // While the history scan is still counting, its total lags the rows that
+  // are already on screen; never say "0 conversations" above a list of them.
+  const fromRows = (data?.candidates ?? []).reduce((sum, c) => sum + (c.session_count || 0), 0);
+  const n = Math.max(total ?? 0, fromRows);
   return t(n === 1 ? 'importProjects.intro.one' : 'importProjects.intro.other', { n });
 }
 

@@ -12,7 +12,8 @@ vi.mock('../config', () => ({ api: apiMock }));
 
 import { useOnboardingScan } from './useOnboardingScan';
 
-const HISTORY = { status: 'scanning', sessions_total: 10, by_agent: { codex: 10 } };
+// A finished history scan: the folder list alone decides when polling stops.
+const HISTORY = { status: 'ready', sessions_total: 10, by_agent: { codex: 10 } };
 const CAND = { source: 'codex', name: 'a', path: '/a', session_count: 3, last_activity: null };
 
 beforeEach(() => apiMock.mockReset());
@@ -51,6 +52,23 @@ describe('useOnboardingScan', () => {
     expect(result.current.importable?.groups).toHaveLength(1);
     await new Promise((r) => setTimeout(r, 40));
     expect(calls('/api/v2/onboarding/importable-projects')).toBe(3);
+  });
+
+  it('keeps polling while the history scan runs, even when the folder list is already ready', async () => {
+    let n = 0;
+    apiMock.mockImplementation(async (path: string) => {
+      if (path === '/api/v2/onboarding/history') {
+        n += 1;
+        return n < 3
+          ? { status: 'scanning', sessions_total: 0, by_agent: {} }
+          : { status: 'ready', sessions_total: 29, by_agent: { codex: 29 } };
+      }
+      return { status: 'ready', candidates: [CAND], groups: [] };
+    });
+    const { result } = renderHook(() => useOnboardingScan({ pollMs: 10 }));
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current.history?.sessions_total).toBe(29);
+    expect(calls('/api/v2/onboarding/history')).toBe(3);
   });
 
   it('gives up polling after maxMs and settles with what it has', async () => {
