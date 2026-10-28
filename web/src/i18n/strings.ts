@@ -909,6 +909,7 @@ export const STRINGS = {
   "session.status.queued": { en: "Queued", zh: "排队中" },
   "sessionGlyph.errored": { en: "Session errored", zh: "会话错误" },
   "sessionGlyph.errored.withDetails": { en: "Session errored: {details}", zh: "会话错误：{details}" },
+  "sessionHeading.new": { en: "New session", zh: "新会话" },
   "sessionItem.aria": { en: "Session {label}", zh: "会话 {label}" },
   "sessionItem.ariaUnread": { zh: "会话 {label}，有新回复", en: "Session {label}, new reply" },
   "sessionItem.delete": { en: "Delete", zh: "删除" },

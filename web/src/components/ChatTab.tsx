@@ -50,6 +50,7 @@ import { useSessionMessages } from '../utils/sessionMessagesStore';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAnnotations } from '../hooks/useAnnotations';
 import { usePanelDockable, usePanelMobile, usePanelState } from '../hooks/usePanelState';
+import SessionHeading from './SessionHeading';
 import { useWorkspaceUpload } from '../hooks/useWorkspaceUpload';
 import {
   eventAsMessage,
@@ -494,6 +495,9 @@ export default function ChatTab({
           docked ? 'md:min-w-[520px]' : ''
         } ${panelFillsRow ? 'hidden' : ''}`}
       >
+        {/* Spec 137 follow-up: the chat's heading, aligned with the project
+            name at the top of the column. The phone keeps its own header. */}
+        {!mobile && <SessionHeading session={sessions.find((s) => s.session_id === routeSessionId)} />}
         {/* Quick Tasks scope chip (Spec 012 §2c) — chat-header area, scratch
             project only. ScopeChip also self-gates on is_scratch. */}
         {project.is_scratch && (

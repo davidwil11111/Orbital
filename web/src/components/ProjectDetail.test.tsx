@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ProjectDetail from './ProjectDetail';
 import type { Project, SessionListEntry, Trigger } from '../types';
 import type { Route } from '../route';
@@ -154,36 +154,37 @@ describe('ProjectDetail — header badge while a worker runs (spec 102)', () => 
     );
   }
 
-  // In the column (desktop, narrow) the state is a dot whose label is the
-  // word; on the phone the header still reads the word.
-  const dotLabel = () => screen.getByTestId('status-dot').getAttribute('aria-label');
+  // The column (desktop, narrow) shows no project state at all — the agents'
+  // rows do, and the project list's dot tells the active project apart. The
+  // phone header still reads the word, so that is where the rule shows.
+  beforeEach(() => setViewportWidth(390));
 
   it('reads Active with the manager idle and a worker running', () => {
     renderBadge('idle', true);
-    expect(dotLabel()).toBe('Active');
+    expect(screen.getByText('Active')).toBeInTheDocument();
   });
 
   it('reads Idle with the manager idle and no worker running', () => {
     renderBadge('idle', false);
-    expect(dotLabel()).toBe('Idle');
+    expect(screen.getByText('Idle')).toBeInTheDocument();
   });
 
   it('reads Idle when the prop is omitted (older callers)', () => {
     renderBadge('idle');
-    expect(dotLabel()).toBe('Idle');
+    expect(screen.getByText('Idle')).toBeInTheDocument();
   });
 
   it('keeps a manager error over a running worker', () => {
     renderBadge('error', true);
-    expect(dotLabel()).toBe('Error');
-    expect(screen.getByTestId('status-dot').className).toContain('bg-error');
+    expect(screen.getByText('Error')).toBeInTheDocument();
   });
 
-  it('phone: the header still reads the word', () => {
-    setViewportWidth(390);
+  it('desktop: the column shows neither the word nor a dot', () => {
+    setViewportWidth(1440);
     renderBadge('idle', true);
-    expect(screen.getByText('Active')).toBeInTheDocument();
-    expect(screen.queryByTestId('status-dot')).toBeNull();
+    const column = screen.getByTestId('project-column');
+    expect(within(column).queryByText('Active')).toBeNull();
+    expect(within(column).queryByTestId('status-dot')).toBeNull();
   });
 });
 
@@ -743,14 +744,11 @@ describe('ProjectDetail — the project column (desktop, narrow)', () => {
     );
     const column = screen.getByTestId('project-column');
     expect(within(column).getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
-    // No state word in the column: a dot before the name, the word its label.
+    // No state in the column at all — no word, no dot: inside the project the
+    // agents' rows show what runs; the dot lives in the project list.
     expect(within(column).queryByText('Idle')).toBeNull();
-    const dot = within(column).getByTestId('status-dot');
-    expect(dot).toHaveAttribute('title', 'Idle');
-    expect(dot).toHaveAttribute('aria-label', 'Idle');
+    expect(within(column).queryByTestId('status-dot')).toBeNull();
     const name = within(column).getByRole('heading', { level: 1 });
-    expect(dot.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(dot.parentElement).toBe(name.parentElement);
     expect(name).toHaveAttribute('data-tour', 'project-header');
     expect(within(column).getByTestId('project-credential-chip').textContent).toBe('claude-3-5-sonnet');
     expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();

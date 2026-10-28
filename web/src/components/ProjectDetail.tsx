@@ -471,9 +471,9 @@ export default function ProjectDetail({
       >
         <div className="flex flex-col gap-1.5 px-4 pt-[18px] pb-1.5 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
-            {/* The state is a dot before the name, like the dot before a
-                session: the colour says it, the word is its tooltip / label. */}
-            <StatusBadge status={runStatus} size="sm" />
+            {/* No state dot by the name: inside the project the agents' own
+                rows show what is running. The dot stays in the project list,
+                where it tells the active project apart. */}
             {/* The tour's "your project" stop spotlights the name itself (not
                 the whole row: the gear is a stop of its own). */}
             <h1
