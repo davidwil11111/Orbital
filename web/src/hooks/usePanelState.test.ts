@@ -15,6 +15,7 @@ import { act, renderHook } from '@testing-library/react';
 import {
   PANEL_DOCK_MIN_WIDTH,
   __resetPanelState,
+  restoreMaximized,
   usePanelDockable,
   usePanelState,
 } from './usePanelState';
@@ -192,6 +193,35 @@ describe('usePanelState — localStorage mirror', () => {
     expect(result.current.view).toBe('browser');
     expect(getItem).toHaveBeenCalled();
     expect(setItem).toHaveBeenCalled();
+  });
+});
+
+// Spec 137 item 12: opening anything from the project column (a session, the
+// status line, the gear) needs the right area back.
+describe('restoreMaximized', () => {
+  it('returns every maximized panel of the project to its docked width, and only that', () => {
+    const a = mount('proj-1', 'sess-1');
+    const b = mount('proj-1', 'sess-2');
+    const other = mount('proj-2', 'sess-1');
+    act(() => {
+      a.result.current.expand();
+      a.result.current.maximize();
+      b.result.current.maximize();
+      other.result.current.maximize();
+    });
+    act(() => restoreMaximized('proj-1'));
+    expect(a.result.current.maximized).toBe(false);
+    expect(a.result.current.expanded).toBe(true); // docked, not collapsed
+    expect(b.result.current.maximized).toBe(false);
+    expect(other.result.current.maximized).toBe(true);
+  });
+
+  it('writes nothing to storage (maximize is never persisted)', () => {
+    const a = mount();
+    act(() => a.result.current.maximize());
+    const before = JSON.stringify({ ...localStorage });
+    act(() => restoreMaximized('proj-1'));
+    expect(JSON.stringify({ ...localStorage })).toBe(before);
   });
 });
 

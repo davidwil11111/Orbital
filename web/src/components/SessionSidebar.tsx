@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * SessionSidebar — 260px left column of the Chat tab (V1 layout).
+ * SessionSidebar — the session half of the project column (spec 137, the
+ * folder shell: name, state, status line, then this). It fills whatever room
+ * the column gives it; the column owns the width, the tint and the absence of
+ * any border.
  *
  * Header: "SESSIONS" uppercase + the count for the active filter, then an
  *   All | Chats | Automations filter (remembered per device).
@@ -117,6 +120,12 @@ export interface SessionSidebarProps {
    * pruned), so the caller can navigate to the most-recent remaining session.
    */
   onSessionDeleted?: (deletedId: string, remaining: SessionListEntry[]) => void;
+  /**
+   * Spec 137: a page (Tasks, Settings) fills the right area. The selected
+   * session is then only where the user came from, so its row drops to the
+   * faint "was here" mark instead of the selected fill.
+   */
+  pageOpen?: boolean;
 }
 
 export function SessionSidebar({
@@ -125,6 +134,7 @@ export function SessionSidebar({
   onNewSession,
   onSessionSelect,
   onSessionDeleted,
+  pageOpen = false,
 }: SessionSidebarProps) {
   const { sessions, loading, renameSession, pinSession, deleteSession } =
     useSessions(projectId);
@@ -264,17 +274,19 @@ export function SessionSidebar({
   );
 
   function renderRow(session: SessionListEntry, inGroup = false) {
-    const selected = selectedSessionId === session.session_id;
+    const current = selectedSessionId === session.session_id;
+    const selected = current && !pageOpen;
     return (
       <SessionListItem
         key={session.session_uuid ?? session.session_id}
         session={session}
         hideKindChip={inGroup}
         selected={selected}
+        wasHere={current && pageOpen}
         // The viewed row is never unread (its marker is written by the
         // effect above, one commit later — this keeps the dot from flashing
         // in between).
-        unread={!selected && hasUnseenReply(session, seenAt(seenKey(session)))}
+        unread={!current && hasUnseenReply(session, seenAt(seenKey(session)))}
         onSelect={handleSelect}
         onRename={handleRename}
         onPin={handlePin}
@@ -354,14 +366,14 @@ export function SessionSidebar({
         : 'sessionSidebar.empty';
 
   return (
-    <aside
+    <section
       data-testid="session-sidebar"
-      style={{ width: 260, minWidth: 260, maxWidth: 260 }}
-      className="flex flex-col h-full bg-sidebar border-r border-border/60 shadow-well"
+      aria-label={t('sessionSidebar.header')}
+      className="flex flex-col flex-1 min-h-0"
     >
       {/* Header */}
       <div
-        className="flex items-center justify-between px-3 pt-3 pb-1.5 shrink-0"
+        className="flex items-center justify-between px-4 pt-3 pb-1.5 shrink-0"
         data-testid="session-sidebar-header"
       >
         <span
@@ -385,7 +397,7 @@ export function SessionSidebar({
 
       {/* All | Chats | Automations — a segmented control on a track, the same
           pattern as the Tasks tab's Queue | Automations switch. */}
-      <div className="px-3 pb-1.5 shrink-0">
+      <div className="px-4 pb-1.5 shrink-0">
         <div
           role="tablist"
           aria-label={t('sessionSidebar.filter.label')}
@@ -458,7 +470,7 @@ export function SessionSidebar({
       </div>
 
       {/* New session button */}
-      <div className="shrink-0 px-3 pb-3 pt-2">
+      <div className="shrink-0 px-4 pb-3.5 pt-2">
         <button
           type="button"
           data-testid="session-new-button"
@@ -469,6 +481,6 @@ export function SessionSidebar({
           {t('sessionSidebar.newSession')}
         </button>
       </div>
-    </aside>
+    </section>
   );
 }

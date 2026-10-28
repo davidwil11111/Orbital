@@ -19,7 +19,15 @@ import FilePreviewDrawer from './FilePreviewDrawer';
 import { OpenPathContext } from './filePreviewContext';
 import { useQueue } from '../hooks/useQueue';
 import { useFiles } from '../hooks/useFiles';
-import { usePanelDockable, usePanelState } from '../hooks/usePanelState';
+import {
+  restoreMaximized,
+  usePanelDockable,
+  usePanelMobile,
+  usePanelState,
+} from '../hooks/usePanelState';
+import { useSessionNav } from '../hooks/useSessionNav';
+import { SessionSidebar } from './SessionSidebar';
+import type { SessionListEntry } from '../types';
 import { fetchPathWithFallback } from '../utils/openPathWithFallback';
 import { useT } from '../i18n/useT';
 import { projectDisplayName } from '../utils/projectDisplayName';
@@ -74,6 +82,18 @@ interface ProjectDetailProps {
 // across projects and deliberately have no per-project page (user decision,
 // 2026-07-24). Spec 137 retired the Chat / Tasks / Files tab bar: chat is the
 // home, Tasks and Settings are pages, Files is the workspace panel maximized.
+//
+// The folder shell (spec 137 items 8–13). On desktop and narrow windows the
+// project IS the left column — name (gear on its right), the state row, ONE
+// status line, the sessions — and the right area is whatever was opened from
+// it: the chat (messages + composer, the panel beside it) or a page. The
+// column never grows past those four things, carries no border, and stays on
+// screen for every page, so it is the navigation: pages have no Back, the
+// status line / gear show as chosen while their page is open, and the
+// session you came from keeps a faint mark. A phone has no room for a
+// column: there the chat keeps a compact header + status line and pages are
+// full-screen with Back, a `Project / Page` crumb and the header-folding
+// View Transition (the 1027-C build, unchanged).
 
 export default function ProjectDetail({
   project,
@@ -125,12 +145,12 @@ export default function ProjectDetail({
   const dockable = usePanelDockable();
   const chatPanelOwnsPreview = dockable && page === undefined;
 
-  // Spec 137 — the workspace panel's shared state (ChatTab renders it). The
-  // header reads it for two things: a docked panel maximized takes the whole
-  // main area, header included; below the dock threshold the header carries
-  // the button that opens the panel as an overlay / bottom sheet.
+  // Spec 137 — the workspace panel's shared state (ChatTab renders it). Below
+  // the dock threshold the column (the header, on a phone) carries the button
+  // that opens the panel as an overlay / bottom sheet.
   const panel = usePanelState(project.project_id, route.sessionId);
-  const panelFillsMain = dockable && page === undefined && panel.expanded && panel.maximized;
+  const phone = usePanelMobile();
+  const sessionNav = useSessionNav(project.project_id, setRoute);
 
   const handleOpenPath = useCallback(
     async (path: string) => {
@@ -195,24 +215,50 @@ export default function ProjectDetail({
   }, [previewToast]);
 
   // Every page change goes through here: the one-shot preview path never
-  // survives navigation (it is a chat overlay, not a persistent panel), and
-  // the View Transition folds the header into the toolbar and back.
+  // survives navigation (it is a chat overlay, not a persistent panel). The
+  // View Transition swaps the right area beside the column (and, on a phone,
+  // folds the header into the toolbar and back).
   function navigate(next: ProjectRoute) {
     withViewTransition(() => setRoute({ ...next, previewPath: undefined }));
   }
 
+  // Opening anything from the column needs the right area, so a maximized
+  // panel returns to its docked width first (spec 137 item 12).
+  function openFromColumn(next: ProjectRoute) {
+    restoreMaximized(project.project_id);
+    navigate(next);
+  }
+
   function handleSettingsClick() {
-    navigate({ ...route, page: 'settings' });
+    openFromColumn({ ...route, page: 'settings' });
   }
 
   // Budget corner → open settings scrolled to the Budget section.
   function handleOpenBudgetSettings() {
-    navigate({ ...route, page: 'settings', settingsAnchor: 'budget' });
+    openFromColumn({ ...route, page: 'settings', settingsAnchor: 'budget' });
   }
 
   // Status line → the Tasks page, on the pane that has something to show.
   function handleOpenTasks(pane: TasksPane) {
-    navigate({ ...route, page: 'tasks', queuePane: pane });
+    openFromColumn({ ...route, page: 'tasks', queuePane: pane });
+  }
+
+  // A session row: that session in the chat. From a page this is the way
+  // back (there is no Back on desktop), so it swaps the right area like any
+  // other move between chat and a page.
+  function handleSelectSession(sessionId: string) {
+    restoreMaximized(project.project_id);
+    if (page) withViewTransition(() => sessionNav.selectSession(sessionId));
+    else sessionNav.selectSession(sessionId);
+  }
+
+  function handleNewSession() {
+    restoreMaximized(project.project_id);
+    void sessionNav.newSession();
+  }
+
+  function handleSessionDeleted(deletedId: string, remaining: SessionListEntry[]) {
+    sessionNav.sessionDeleted(deletedId, remaining, route.sessionId);
   }
 
   // Automations "try this in chat" and "New automation" (spec 137 decision
@@ -226,8 +272,8 @@ export default function ProjectDetail({
     handleTryInChat(t('automations.example.schedule'));
   }
 
-  // Back: up one level (a page's parent, else the chat home), carrying the
-  // page's own landing patch (Pricing → Settings lands on Budget).
+  // Back (phone only): up one level (a page's parent, else the chat home),
+  // carrying the page's own landing patch (Pricing → Settings lands on Budget).
   function handleBack() {
     if (!page) return;
     navigate({ ...routeUp(route), ...(PROJECT_PAGES[page].backPatch ?? {}) });
@@ -235,154 +281,235 @@ export default function ProjectDetail({
 
   const trail = pageTrail(page);
   const projectName = projectDisplayName(project, t);
+  // The pages above this one, as crumb links (`Settings` above `Pricing`).
+  const crumbs = trail.slice(0, -1).map((p) => ({
+    label: t(PROJECT_PAGES[p].titleKey),
+    onClick: () => navigate({ ...route, page: p }),
+  }));
 
-  return (
-    <div className="flex flex-col flex-1 min-h-0 bg-card">
-      {pageDef ? (
-        // A page: the header folds into the toolbar (both carry
-        // `vt-project-header`, so the View Transition morphs one into the
-        // other — see index.css). The crumb walks the registry's parent chain.
-        <PageToolbar
-          parent={projectName}
-          onParent={() => navigate({ ...route, page: undefined })}
-          crumbs={trail.slice(0, -1).map((p) => ({
-            label: t(PROJECT_PAGES[p].titleKey),
-            onClick: () => navigate({ ...route, page: p }),
-          }))}
-          title={t(pageDef.titleKey)}
-          onBack={handleBack}
-          backTestId={pageDef.backTestId}
-          titleTestId={pageDef.titleTestId}
-        />
-      ) : panelFillsMain ? null : (
-      // Everything above the conversation, as one unit (see above).
-      <div className="vt-project-header shrink-0 bg-card">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-2 px-6 pt-5 pb-4 max-md:px-4">
-        {/* Left cluster keeps a readable minimum so a long budget pill on the
-            right can never crush the title to 0 width (P3-J header collision). */}
-        <div className="flex items-center gap-3 min-w-[40%] flex-1">
-          {/* data-tour on the title + badge, not the whole flex-1 cluster: the
-              tour spotlights it, and a half-screen-wide box around a short
-              name points at nothing. */}
-          <div data-tour="project-header" className="flex items-center gap-3 min-w-0">
-          <h1 className="vt-project-title text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">{projectName}</h1>
-          {/* Spec 102: Active while a pinned worker runs with the manager idle;
-              a manager error/approval/waiting state is shown as-is. */}
-          <StatusBadge status={displayRunStatus(agentStatus, subAgentsRunning)} />
-          </div>
-        </div>
-        <div className="flex items-center gap-3 min-w-0 shrink">
-          {/* Budget corner (P3-G): converted window spend / warn / exhausted
-              pill, next to the model name. Reads the same GET /cost as the
-              settings meter; event-driven (no polling). Click → Budget settings.
-              Replaces the dead P3-F $0.00 segment properly. */}
-          <BudgetCorner
-            project={project}
-            pauseReason={snapshot?.pause_reason}
-            onOpenBudgetSettings={handleOpenBudgetSettings}
-          />
-          {(() => {
-            // Credential label (spec 082 D13): the card this project runs on —
-            // its own pinned card, else the global default. A card name
-            // already carries the model ("DeepSeek · deepseek-v4-flash"), so
-            // the default case reads as it always did. Falls back to the raw
-            // model id against a pre-082 daemon, which serves no cards.
-            // NEVER agent_name (an identity, not a model).
-            const label =
-              resolveCard(cards, project.card_id, defaultCardId)?.name ||
-              project.model ||
-              globalDefaultModel ||
-              '';
-            if (!label) return null;
-            return (
-              <span
-                data-testid="project-credential-chip"
-                className="font-mono text-[11px] text-secondary truncate max-w-[220px] max-md:hidden"
-              >
-                {label}
-              </span>
-            );
-          })()}
-          {/* Spec 137 gap 3: below the dock threshold there is no panel
-              handle, so the panel gets a header button — an overlay on a
-              narrow desktop window, the bottom sheet on a phone. */}
-          {!dockable && (
-            <button
-              type="button"
-              onClick={panel.openOverlay}
-              aria-label={t('projectDetail.openPanel')}
-              title={t('projectDetail.openPanel')}
-              data-testid="panel-open-button"
-              data-tour="panel-button"
-              className="inline-flex shrink-0 items-center justify-center w-7 h-7 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 max-md:w-10 max-md:h-10"
-            >
-              <PanelRight size={16} aria-hidden="true" />
-            </button>
-          )}
-          <span data-tour="project-settings" className="inline-flex">
-            <SettingsIcon onClick={handleSettingsClick} />
-          </span>
-        </div>
-      </div>
+  // ── Pieces the column (desktop, narrow) and the phone header share ───────
 
+  // Spec 102: Active while a pinned worker runs with the manager idle; a
+  // manager error/approval/waiting state is shown as-is.
+  const badge = <StatusBadge status={displayRunStatus(agentStatus, subAgentsRunning)} />;
 
-      {/* Status summary line */}
-      {statusSummary && (
-        <div className="px-6 pb-2 max-md:px-4">
-          <p className="text-xs text-secondary truncate">{statusSummary}</p>
-        </div>
-      )}
+  // Budget corner (P3-G): converted window spend / warn / exhausted pill.
+  // Reads the same GET /cost as the settings meter; event-driven (no
+  // polling). Click → Budget settings.
+  const budget = (
+    <BudgetCorner
+      project={project}
+      pauseReason={snapshot?.pause_reason}
+      onOpenBudgetSettings={handleOpenBudgetSettings}
+    />
+  );
 
-      {/* The status line — the only way into Tasks (spec 137). Always
-          rendered: a teaching line when nothing is scheduled or queued. */}
-      <TasksStatusLine
-        running={runningCount}
-        queued={queuedCount}
-        triggers={triggers}
-        onOpen={handleOpenTasks}
-      />
-      </div>
-      )}
-
-      {/* Page body. `relative` so the file-preview drawer (absolute) overlays
-          only this area, not the header/toolbar. The OpenPathContext hands
-          the drawer-open handler down to the chat's MarkdownContent. */}
-      <div
-        className={`vt-project-body flex-1 overflow-hidden min-h-0 relative ${
-          pageDef ? 'bg-background' : ''
-        }`}
+  // Credential label (spec 082 D13): the card this project runs on — its own
+  // pinned card, else the global default. A card name already carries the
+  // model ("DeepSeek · deepseek-v4-flash"). Falls back to the raw model id
+  // against a pre-082 daemon, which serves no cards. NEVER agent_name (an
+  // identity, not a model).
+  const credentialLabel =
+    resolveCard(cards, project.card_id, defaultCardId)?.name ||
+    project.model ||
+    globalDefaultModel ||
+    '';
+  const credentialChip = (extra: string) =>
+    credentialLabel ? (
+      <span
+        data-testid="project-credential-chip"
+        title={credentialLabel}
+        className={`font-mono text-[11px] text-secondary truncate ${extra}`}
       >
-        <OpenPathContext.Provider value={handleOpenPath}>
-          {pageDef
-            ? pageDef.render({
-                project,
-                route,
-                setRoute,
-                content: pageContent[pageDef.key],
-                agentsAvailable,
-                onTryInChat: handleTryInChat,
-                onNewAutomation: handleNewAutomation,
-              })
-            : children}
-        </OpenPathContext.Provider>
-        <FilePreviewDrawer
-          open={previewPath !== null && !chatPanelOwnsPreview}
-          // Content-driven (NOT previewPath): the drawer renders its content
-          // while still off-screen so the slide-in reveals an already-painted
-          // layer. Also keeps content during the close slide-out (no empty
-          // "select a file" flash on close either).
-          selectedPath={previewContent?.path ?? null}
-          fileContent={previewContent}
-          loading={previewLoading}
-          onClose={handleClosePreview}
-          onSave={(path, content) => saveFileContent(project.project_id, path, content)}
-        />
-        {previewToast && (
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-primary text-background text-[13px] shadow-lg max-w-[90%] text-center pointer-events-none">
-            {previewToast}
+        {credentialLabel}
+      </span>
+    ) : null;
+
+  // Spec 137 gap 3: below the dock threshold there is no panel handle, so the
+  // panel gets a button — an overlay on a narrow desktop window, the bottom
+  // sheet on a phone.
+  const panelButton = !dockable && (
+    <button
+      type="button"
+      onClick={panel.openOverlay}
+      aria-label={t('projectDetail.openPanel')}
+      title={t('projectDetail.openPanel')}
+      data-testid="panel-open-button"
+      data-tour="panel-button"
+      className="inline-flex shrink-0 items-center justify-center w-7 h-7 rounded-md text-secondary hover:text-primary hover:bg-card-hover transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 max-md:w-10 max-md:h-10"
+    >
+      <PanelRight size={16} aria-hidden="true" />
+    </button>
+  );
+
+  const statusSummaryLine = statusSummary ? (
+    <p className="text-xs text-secondary truncate">{statusSummary}</p>
+  ) : null;
+
+  // The page (or the chat) itself. `relative` so the file-preview drawer
+  // (absolute) overlays only this area. The OpenPathContext hands the
+  // drawer-open handler down to the chat's MarkdownContent.
+  const body = (
+    <div
+      className={`flex-1 overflow-hidden min-h-0 relative ${phone ? 'vt-project-body' : ''} ${
+        pageDef ? 'bg-background' : ''
+      }`}
+    >
+      <OpenPathContext.Provider value={handleOpenPath}>
+        {pageDef
+          ? pageDef.render({
+              project,
+              route,
+              setRoute,
+              content: pageContent[pageDef.key],
+              agentsAvailable,
+              onTryInChat: handleTryInChat,
+              onNewAutomation: handleNewAutomation,
+            })
+          : children}
+      </OpenPathContext.Provider>
+      <FilePreviewDrawer
+        open={previewPath !== null && !chatPanelOwnsPreview}
+        // Content-driven (NOT previewPath): the drawer renders its content
+        // while still off-screen so the slide-in reveals an already-painted
+        // layer. Also keeps content during the close slide-out (no empty
+        // "select a file" flash on close either).
+        selectedPath={previewContent?.path ?? null}
+        fileContent={previewContent}
+        loading={previewLoading}
+        onClose={handleClosePreview}
+        onSave={(path, content) => saveFileContent(project.project_id, path, content)}
+      />
+      {previewToast && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-primary text-background text-[13px] shadow-lg max-w-[90%] text-center pointer-events-none">
+          {previewToast}
+        </div>
+      )}
+    </div>
+  );
+
+  // ── Phone: no column (the 1027-C layout, unchanged) ──────────────────────
+  if (phone) {
+    return (
+      <div className="flex flex-col flex-1 min-h-0 bg-card">
+        {pageDef ? (
+          // A page: the header folds into the toolbar (both carry
+          // `vt-project-header`, so the View Transition morphs one into the
+          // other — see index.css). The crumb walks the registry's parent chain.
+          <PageToolbar
+            parent={projectName}
+            onParent={() => navigate({ ...route, page: undefined })}
+            crumbs={crumbs}
+            title={t(pageDef.titleKey)}
+            onBack={handleBack}
+            backTestId={pageDef.backTestId}
+            titleTestId={pageDef.titleTestId}
+          />
+        ) : (
+          // Everything above the conversation, as one unit (see above).
+          <div className="vt-project-header shrink-0 bg-card">
+            <div className="flex items-center justify-between gap-2 px-6 pt-5 pb-4 max-md:px-4">
+              {/* Left cluster keeps a readable minimum so a long budget pill
+                  on the right can never crush the title to 0 width (P3-J). */}
+              <div className="flex items-center gap-3 min-w-[40%] flex-1">
+                {/* data-tour on the title + badge, not the whole flex-1
+                    cluster: a half-screen-wide box around a short name points
+                    at nothing. */}
+                <div data-tour="project-header" className="flex items-center gap-3 min-w-0">
+                  <h1 className="vt-project-title text-lg font-semibold tracking-[-0.01em] text-primary truncate min-w-0">
+                    {projectName}
+                  </h1>
+                  {badge}
+                </div>
+              </div>
+              <div className="flex items-center gap-3 min-w-0 shrink">
+                {budget}
+                {credentialChip('max-w-[220px] max-md:hidden')}
+                {panelButton}
+                <span data-tour="project-settings" className="inline-flex">
+                  <SettingsIcon onClick={handleSettingsClick} />
+                </span>
+              </div>
+            </div>
+            {statusSummaryLine && <div className="px-6 pb-2 max-md:px-4">{statusSummaryLine}</div>}
+            {/* The status line — the only way into Tasks (spec 137). Always
+                rendered: a teaching line when nothing is scheduled or queued. */}
+            <TasksStatusLine
+              variant="band"
+              running={runningCount}
+              queued={queuedCount}
+              triggers={triggers}
+              onOpen={handleOpenTasks}
+            />
           </div>
         )}
+        {body}
+      </div>
+    );
+  }
+
+  // ── Desktop and narrow: the project column + the right area ──────────────
+  const settingsOpen = trail[0] === 'settings';
+  return (
+    <div className="flex flex-1 min-h-0 bg-card" data-testid="project-shell">
+      <aside
+        data-testid="project-column"
+        aria-label={projectName}
+        // 260 beside a docked panel, 220 on a narrow window (the column the
+        // session list had, now holding the whole project).
+        style={{ width: dockable ? 260 : 220 }}
+        className="project-column flex flex-col shrink-0 min-h-0 bg-sidebar"
+      >
+        <div className="flex flex-col gap-2 px-4 pt-[18px] pb-1.5 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            {/* The tour's "your project" stop spotlights the name itself (not
+                the whole row: the gear is a stop of its own). */}
+            <h1
+              data-tour="project-header"
+              className="text-[17px] font-semibold tracking-[-0.01em] text-primary truncate min-w-0"
+            >
+              {projectName}
+            </h1>
+            <div className="ml-auto flex items-center gap-0.5 shrink-0">
+              {panelButton}
+              <span data-tour="project-settings" className="inline-flex">
+                <SettingsIcon size="column" selected={settingsOpen} onClick={handleSettingsClick} />
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0" data-testid="project-state-row">
+            {badge}
+            {budget}
+            {credentialChip('max-w-full')}
+          </div>
+          {statusSummaryLine}
+        </div>
+        {/* The status line — the only way into Tasks (spec 137). Always
+            rendered: a teaching line when nothing is scheduled or queued. */}
+        <TasksStatusLine
+          running={runningCount}
+          queued={queuedCount}
+          triggers={triggers}
+          onOpen={handleOpenTasks}
+          selected={page === 'tasks'}
+        />
+        <SessionSidebar
+          projectId={project.project_id}
+          selectedSessionId={route.sessionId}
+          pageOpen={page !== undefined}
+          onSessionSelect={handleSelectSession}
+          onNewSession={handleNewSession}
+          onSessionDeleted={handleSessionDeleted}
+        />
+      </aside>
+      {/* The right area: the chat, or the page opened from the column. One
+          `vt-project-body`, so a move between them swaps it as a whole while
+          the column stays put. */}
+      <div className="vt-project-body flex flex-col flex-1 min-w-0 min-h-0 bg-card" data-testid="project-main">
+        {pageDef && (
+          <PageToolbar crumbs={crumbs} title={t(pageDef.titleKey)} titleTestId={pageDef.titleTestId} />
+        )}
+        {body}
       </div>
     </div>
   );

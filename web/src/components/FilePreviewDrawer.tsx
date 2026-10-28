@@ -335,7 +335,11 @@ export default function FilePreviewDrawer({
         className={`relative z-0 hidden md:flex h-full min-h-0 flex-col bg-background ${
           maximized
             ? 'flex-1 min-w-0'
-            : 'shrink-0 border-l border-border w-[var(--file-preview-drawer-width)] max-w-[80%]'
+            : // Shrinks (to the 320px floor) rather than overflowing when
+              // the row narrows without a window resize — pinning the project
+              // list takes 240px from the right area and re-measures nothing
+              // (spec 137: strip + list + column + right area must coexist).
+              'shrink min-w-[320px] border-l border-border w-[var(--file-preview-drawer-width)] max-w-[80%]'
         }`}
       >
         {!maximized && resizeHandle}

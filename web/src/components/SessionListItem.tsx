@@ -48,6 +48,14 @@ import MessageAvatar from './MessageAvatar';
 export interface SessionListItemProps {
   session: SessionListEntry;
   selected: boolean;
+  /**
+   * Spec 137 (the folder shell): a page fills the right area and this is the
+   * session the user came from. A faint mark — secondary text, regular
+   * weight, no fill — so the column still says where the chat is, without
+   * claiming the row is what the right area shows. Clicking it returns to
+   * the chat like any row.
+   */
+  wasHere?: boolean;
   /** Select this session. Receives the sessionId (stable-callback friendly). */
   onSelect: (sessionId: string) => void;
   /** Persist a renamed display label. Receives (sessionId, newName). */
@@ -87,6 +95,7 @@ function SessionListItemBase({
   onDelete,
   hideKindChip = false,
   unread = false,
+  wasHere = false,
 }: SessionListItemProps) {
   const [hovered, setHovered] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -182,6 +191,7 @@ function SessionListItemBase({
       aria-selected={selected}
       aria-label={t(unread ? 'sessionItem.ariaUnread' : 'sessionItem.aria', { label: ariaLabel })}
       data-testid={`session-list-item-${session.session_id}`}
+      data-was-here={wasHere || undefined}
       onClick={() => {
         if (editing) return;
         onSelect(session.session_id);
@@ -297,7 +307,7 @@ function SessionListItemBase({
           <>
             <span
               data-testid="session-name"
-              className={`text-xs text-primary truncate${unread ? ' font-medium' : ''}`}
+              className={`text-xs truncate${wasHere ? ' text-secondary font-normal' : ' text-primary'}${unread ? ' font-medium' : ''}`}
               style={{ fontSize: '11.5px' }}
               onDoubleClick={(e) => {
                 e.stopPropagation();

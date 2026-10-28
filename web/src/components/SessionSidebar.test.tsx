@@ -945,3 +945,51 @@ describe('SessionSidebar — imported rows and the 50-row cap', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Spec 137 (the folder shell): the list lives in the project column, which
+// stays while a page fills the right area.
+// ---------------------------------------------------------------------------
+
+describe('SessionSidebar — in the project column', () => {
+  afterEach(() => cleanup());
+
+  it('with a page open, the viewed session is only "was here": no selected fill, secondary text', () => {
+    resetMocks();
+    mockSessions = [
+      makeSession({ session_id: 'sess-a', session_uuid: 'ua' }),
+      makeSession({ session_id: 'sess-b', session_uuid: 'ub' }),
+    ];
+    const { rerender } = render(<SessionSidebar projectId="proj-1" selectedSessionId="sess-a" />);
+    const row = () => screen.getByTestId('session-list-item-sess-a');
+    expect(row()).toHaveAttribute('aria-selected', 'true');
+    expect(row()).not.toHaveAttribute('data-was-here');
+    expect(within(row()).getByTestId('session-name').className).toContain('text-primary');
+
+    rerender(<SessionSidebar projectId="proj-1" selectedSessionId="sess-a" pageOpen />);
+    expect(row()).toHaveAttribute('aria-selected', 'false');
+    expect(row()).toHaveAttribute('data-was-here', 'true');
+    expect(row().getAttribute('style') ?? '').not.toContain('session-selected');
+    const name = within(row()).getByTestId('session-name');
+    expect(name.className).toContain('text-secondary');
+    expect(name.className).toContain('font-normal');
+    expect(screen.getByTestId('session-list-item-sess-b')).not.toHaveAttribute('data-was-here');
+  });
+
+  it('clicking the "was here" row still selects it (that is the way back to the chat)', async () => {
+    resetMocks();
+    mockSessions = [makeSession({ session_id: 'sess-a', session_uuid: 'ua' })];
+    const onSelect = vi.fn();
+    render(<SessionSidebar projectId="proj-1" selectedSessionId="sess-a" pageOpen onSessionSelect={onSelect} />);
+    await userEvent.click(screen.getByTestId('session-list-item-sess-a'));
+    expect(onSelect).toHaveBeenCalledWith('sess-a');
+  });
+
+  it('owns no width, border or inset shadow — the column does', () => {
+    resetMocks();
+    render(<SessionSidebar projectId="proj-1" />);
+    const el = screen.getByTestId('session-sidebar');
+    expect(el.getAttribute('style')).toBeNull();
+    expect(el.className).not.toMatch(/\bborder|shadow-well|bg-sidebar/);
+  });
+});

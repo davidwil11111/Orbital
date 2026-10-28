@@ -16,13 +16,24 @@ interface TasksStatusLineProps {
   triggers: Trigger[];
   /** Open the Tasks page on this pane. */
   onOpen: (pane: TasksPane) => void;
+  /**
+   * Where it sits (spec 137, the folder shell):
+   * - `row` (default): one rounded row in the project column, between the
+   *   state row and the sessions. No lines; it fills like a chosen row while
+   *   the Tasks page is open (`selected`).
+   * - `band`: the phone, which has no column: a full-width line under the
+   *   compact header, as the 1027-C build drew it everywhere.
+   */
+  variant?: 'row' | 'band';
+  /** The Tasks page is open (row variant): the line shows as the chosen row. */
+  selected?: boolean;
 }
 
 /** Stand-in for the `/automate` chip inside the translated teaching line. */
 const COMMAND_SLOT = '\u0001';
 
 /**
- * The status line under the project title — spec 137: the ONLY way into the
+ * The project's status line — spec 137: the ONLY way into the
  * Tasks page now that the tab bar is gone (the user rejected a Tasks row in
  * the session column and a header icon). It always renders:
  *
@@ -36,7 +47,15 @@ const COMMAND_SLOT = '\u0001';
  * queued, otherwise Automations. Without the queue half of this gate a
  * project with queued work and no automations had no way to reach its queue.
  */
-export default function TasksStatusLine({ running, queued, triggers, onOpen }: TasksStatusLineProps) {
+export default function TasksStatusLine({
+  running,
+  queued,
+  triggers,
+  onOpen,
+  variant = 'row',
+  selected = false,
+}: TasksStatusLineProps) {
+  const row = variant === 'row';
   const t = useT();
   const offCount = triggers.filter((tr) => !tr.enabled).length;
   const busy = running + queued > 0;
@@ -51,14 +70,25 @@ export default function TasksStatusLine({ running, queued, triggers, onOpen }: T
   let content: React.ReactNode;
   if (empty) {
     const [before, after = ''] = t('statusLine.teach', { command: COMMAND_SLOT }).split(COMMAND_SLOT);
-    content = (
+    const teach = (
+      <span className={`min-w-0 text-muted ${row ? '' : 'truncate'}`} data-testid="status-line-teach">
+        {before}
+        <kbd className="mx-0.5 rounded border border-border px-1 font-mono text-[11px] text-secondary">/automate</kbd>
+        {after}
+      </span>
+    );
+    // In the column the sentence wraps onto a second line (zh runs longer
+    // than 260px); icon and text stay one unit so the clock heads the first
+    // line instead of sitting on a line of its own.
+    content = row ? (
+      <span className="flex flex-1 min-w-0 items-start gap-2">
+        <Clock size={13} aria-hidden="true" className="mt-px shrink-0 text-muted" />
+        {teach}
+      </span>
+    ) : (
       <>
         <Clock size={13} aria-hidden="true" className="shrink-0 text-muted" />
-        <span className="min-w-0 truncate text-muted" data-testid="status-line-teach">
-          {before}
-          <kbd className="mx-0.5 rounded border border-border px-1 font-mono text-[11px] text-secondary">/automate</kbd>
-          {after}
-        </span>
+        {teach}
       </>
     );
   } else {
@@ -94,14 +124,42 @@ export default function TasksStatusLine({ running, queued, triggers, onOpen }: T
     content = parts.flatMap((part, i) => (i === 0 ? [part] : [<span key={`dot-${i}`}>{dot}</span>, part]));
   }
 
+  const pane: TasksPane = busy ? 'queue' : 'automations';
+  const state = empty ? 'empty' : busy ? 'busy' : 'automations';
+
+  if (row) {
+    // The column is 260px (220 narrow): the facts wrap rather than truncate,
+    // and the trailing "Tasks" word gives way to the chevron alone — the row
+    // is a row in a list of places, like the sessions under it.
+    return (
+      <button
+        type="button"
+        onClick={() => onOpen(pane)}
+        aria-current={selected ? 'page' : undefined}
+        title={t('projectDetail.tab.queue')}
+        data-testid="trigger-summary"
+        data-tour="status-line"
+        data-state={state}
+        className={`mx-2 mt-1.5 mb-1 flex min-w-0 items-center gap-2 rounded-lg px-2 py-[7px] text-left text-xs text-secondary transition-[background-color,box-shadow] duration-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
+          selected
+            ? 'bg-card shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
+            : 'hover:bg-card hover:shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
+        }`}
+      >
+        <span className="flex flex-1 min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">{content}</span>
+        <ChevronRight size={13} aria-hidden="true" className="shrink-0 text-muted" />
+      </button>
+    );
+  }
+
   return (
     <div className="border-y border-border">
       <button
         type="button"
-        onClick={() => onOpen(busy ? 'queue' : 'automations')}
+        onClick={() => onOpen(pane)}
         data-testid="trigger-summary"
         data-tour="status-line"
-        data-state={empty ? 'empty' : busy ? 'busy' : 'automations'}
+        data-state={state}
         className="flex w-full min-w-0 items-center gap-2 px-6 py-1.5 text-left text-xs text-secondary transition-colors duration-100 hover:bg-sidebar/50 max-md:min-h-[44px] max-md:px-4"
       >
         {content}
