@@ -615,6 +615,21 @@ body {
 .vt-settings-back { view-transition-name: settings-back; }
 .vt-project-body { view-transition-name: project-body; }
 
+/* The chat's session heading (spec 137 follow-up): the messages scroll under
+   a 16px fade below it. Written as a plain gradient on purpose — Tailwind v4's
+   `bg-linear-to-b … to-transparent` interpolates in oklab, and WebKit (the
+   packaged app's WKWebView, Safari) renders that as a dark grey band. */
+.session-heading::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 16px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--color-card), rgb(from var(--color-card) r g b / 0));
+}
+
 ::view-transition-group(*) {
   animation-duration: 280ms;
   animation-timing-function: cubic-bezier(0.2, 0, 0, 1);

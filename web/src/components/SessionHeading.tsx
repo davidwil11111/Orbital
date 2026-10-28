@@ -34,7 +34,10 @@ interface SessionHeadingProps {
  * as SessionListItem). Above it, small, the things a row carries as a chip:
  * an automation's kind, or "Imported · codex". A session with no name yet
  * reads as "New session". No bar, no line: the messages scroll under a short
- * fade below the heading, so the boundary is the heading itself.
+ * fade below the heading (`.session-heading` in index.css — a plain sRGB
+ * gradient; Tailwind's oklab gradient to `transparent` paints a dark band in
+ * WebKit, which is what the packaged app renders in), so the boundary is the
+ * heading itself.
  *
  * The phone keeps its project header and never mounts this.
  */
@@ -70,7 +73,7 @@ export default function SessionHeading({ session }: SessionHeadingProps) {
 
   return (
     <div
-      className="relative z-10 shrink-0 px-7 pt-[20px] pb-1 bg-card after:pointer-events-none after:absolute after:inset-x-0 after:top-full after:h-4 after:bg-linear-to-b after:from-card after:to-transparent"
+      className="session-heading relative z-10 shrink-0 px-7 pt-[20px] pb-1 bg-card"
       data-testid="session-heading"
     >
       {eyebrow && (
