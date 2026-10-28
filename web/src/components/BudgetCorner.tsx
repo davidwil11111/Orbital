@@ -41,9 +41,9 @@ interface BudgetCornerProps {
   /** Navigate to the settings Budget section (anchored when supported). */
   onOpenBudgetSettings: () => void;
   /**
-   * Spec 137 polish: in the project column the spend reads as words beside
-   * the status ("Idle  ≈ $0.00 today"), so it uses the 12px sans of the row
-   * instead of the header's 11px monospace.
+   * Spec 137: in the project column the spend reads as words on the meta
+   * line beside the model ("deepseek-v4.1-flash · ≈ $0.06 today"), so it uses
+   * the line's 11px sans instead of the header's 11px monospace.
    */
   plain?: boolean;
 }
@@ -78,7 +78,7 @@ export default function BudgetCorner({
   if (cost == null && corner.state !== 'exhausted') return null;
   if (!hasSignal) return null;
 
-  const font = plain ? 'text-xs' : 'font-mono text-[11px]';
+  const font = plain ? 'text-[11px]' : 'font-mono text-[11px]';
   const windowWord = t(WINDOW_WORD[window]);
   const spentStr = formatMoney(corner.spent, corner.currency, locale);
   const limitStr =

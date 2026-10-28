@@ -22,15 +22,8 @@ interface PageToolbarProps {
   crumbs?: PageToolbarCrumb[];
   /** Already translated. The page itself — rendered as the h1. */
   title: string;
-  /**
-   * Back goes up one level. Omitted on desktop and narrow windows (spec 137
-   * item 10, the folder shell): the project column is the navigation there,
-   * so a page carries only its title — or `Parent / Page` for a page under
-   * another page — with no Back, no divider and no line under it. The phone
-   * has no column and always passes it.
-   */
-  onBack?: () => void;
-  backTestId?: string;
+  onBack: () => void;
+  backTestId: string;
   titleTestId: string;
 }
 
@@ -57,8 +50,8 @@ interface PageToolbarProps {
  * the project title glides into the parent crumb, so the toolbar reads as the
  * same header in a compact state rather than a bar that exists nowhere else.
  * That fold exists only where there is a header to fold — the phone and
- * global settings. The Back-less column form carries no `vt-*` names: there
- * the right area swaps as one (`vt-project-body`) beside a column that stays.
+ * global settings. Beside the project column (desktop, narrow) a page has no
+ * bar at all: it opens with a PageHeading.
  */
 export default function PageToolbar({
   parent,
@@ -77,19 +70,16 @@ export default function PageToolbar({
       /
     </span>
   );
-  // The project title glides into the parent crumb only where the header
-  // folds (the Back form); the column form has nothing to fold from.
-  const titleVt = onBack ? 'vt-project-title ' : '';
   const nav = (
     <nav aria-label={t('settingsToolbar.breadcrumb')} className="flex items-center gap-2 min-w-0 text-[13px]">
       {parent && (
         <>
           {onParent ? (
-            <button type="button" onClick={onParent} className={`${titleVt}${linkClass}`}>
+            <button type="button" onClick={onParent} className={`vt-project-title ${linkClass}`}>
               {parent}
             </button>
           ) : (
-            <span className={`${titleVt}truncate text-secondary`}>{parent}</span>
+            <span className="vt-project-title truncate text-secondary">{parent}</span>
           )}
           {slash}
         </>
@@ -107,10 +97,6 @@ export default function PageToolbar({
       </h1>
     </nav>
   );
-
-  if (!onBack) {
-    return <header className="flex items-center h-[52px] shrink-0 px-6 bg-card">{nav}</header>;
-  }
 
   return (
     <header className="vt-project-header flex items-center gap-3 h-[52px] shrink-0 px-4 bg-card border-b border-border max-md:h-14">

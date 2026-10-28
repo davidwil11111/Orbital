@@ -50,26 +50,4 @@ describe('PageToolbar', () => {
     expect(screen.queryByRole('button', { name: 'Proj' })).toBeNull();
     expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Proj/Settings');
   });
-
-  // Spec 137 item 10: desktop and narrow pages sit beside the project column,
-  // which is the navigation — so no Back, no divider, no fold names, no line.
-  it('without onBack renders the title alone: no Back, no divider, no View Transition names', () => {
-    const { container } = render(<PageToolbar title="Tasks" titleTestId="title" />);
-    expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
-    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Tasks');
-    const header = container.querySelector('header') as HTMLElement;
-    expect(header.className).not.toMatch(/border|vt-/);
-    expect(container.querySelector('[class*="vt-"]')).toBeNull();
-    expect(container.querySelector('.w-px')).toBeNull();
-  });
-
-  it('without onBack a nested page reads `Parent / Page`, the parent a link', () => {
-    const onSettings = vi.fn();
-    render(
-      <PageToolbar crumbs={[{ label: 'Settings', onClick: onSettings }]} title="Pricing" titleTestId="title" />,
-    );
-    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Settings/Pricing');
-    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-    expect(onSettings).toHaveBeenCalledTimes(1);
-  });
 });

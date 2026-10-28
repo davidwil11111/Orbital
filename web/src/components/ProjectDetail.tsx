@@ -12,6 +12,7 @@ import StatusBadge from './StatusBadge';
 import TasksStatusLine, { type TasksPane } from './TasksStatusLine';
 import SettingsIcon from './SettingsIcon';
 import PageToolbar from './PageToolbar';
+import PageHeading from './PageHeading';
 import { PROJECT_PAGES } from './projectPages';
 import { withViewTransition } from '../utils/viewTransition';
 import BudgetCorner from './BudgetCorner';
@@ -291,7 +292,8 @@ export default function ProjectDetail({
 
   // Spec 102: Active while a pinned worker runs with the manager idle; a
   // manager error/approval/waiting state is shown as-is.
-  const badge = <StatusBadge status={displayRunStatus(agentStatus, subAgentsRunning)} />;
+  const runStatus = displayRunStatus(agentStatus, subAgentsRunning);
+  const badge = <StatusBadge status={runStatus} />;
 
   // Budget corner (P3-G): converted window spend / warn / exhausted pill.
   // Reads the same GET /cost as the settings meter; event-driven (no
@@ -467,8 +469,11 @@ export default function ProjectDetail({
         style={{ width: dockable ? 260 : 220 }}
         className="project-column flex flex-col shrink-0 min-h-0 bg-sidebar"
       >
-        <div className="flex flex-col gap-2 px-4 pt-[18px] pb-1.5 shrink-0">
+        <div className="flex flex-col gap-1.5 px-4 pt-[18px] pb-1.5 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
+            {/* The state is a dot before the name, like the dot before a
+                session: the colour says it, the word is its tooltip / label. */}
+            <StatusBadge status={runStatus} size="sm" />
             {/* The tour's "your project" stop spotlights the name itself (not
                 the whole row: the gear is a stop of its own). */}
             <h1
@@ -484,25 +489,32 @@ export default function ProjectDetail({
               </span>
             </div>
           </div>
-          {/* The state reads as words, not code: status and spend on one
-              line, the model on the next — sans, one line each, ellipsis. */}
-          <div className="flex flex-col gap-0.5 min-w-0">
-            <div
-              className="flex items-center gap-2 min-w-0 overflow-hidden whitespace-nowrap"
-              data-testid="project-state-row"
-            >
-              {badge}
-              {budget(true)}
-            </div>
+          {/* ONE quiet meta line: the model, then the spend. The model gives
+              way first (ellipsis); the spend — or a paused budget's short
+              warning — stays whole. The " · " lives on the spend's wrapper, so
+              when BudgetCorner has nothing to say (no spend, no limit) the
+              wrapper is empty, hidden, and leaves no dangling separator. */}
+          <div
+            className="flex items-center min-w-0 text-[11px] text-secondary whitespace-nowrap"
+            data-testid="project-state-row"
+          >
             {credentialLabel && (
-              <p
+              <span
                 data-testid="project-credential-chip"
                 title={credentialLabel}
-                className="text-[11px] text-secondary truncate"
+                className="min-w-0 truncate"
               >
                 {columnModelLabel}
-              </p>
+              </span>
             )}
+            <span
+              data-testid="project-spend"
+              className={`flex shrink-0 items-center empty:hidden ${
+                credentialLabel ? "before:mx-1 before:text-muted before:content-['·']" : ''
+              }`}
+            >
+              {budget(true)}
+            </span>
           </div>
           {statusSummaryLine}
         </div>
@@ -527,10 +539,13 @@ export default function ProjectDetail({
       {/* The right area: the chat, or the page opened from the column. One
           `vt-project-body`, so a move between them swaps it as a whole while
           the column stays put. */}
-      <div className="vt-project-body flex flex-col flex-1 min-w-0 min-h-0 bg-card" data-testid="project-main">
-        {pageDef && (
-          <PageToolbar crumbs={crumbs} title={t(pageDef.titleKey)} titleTestId={pageDef.titleTestId} />
-        )}
+      <div
+        className={`vt-project-body flex flex-col flex-1 min-w-0 min-h-0 ${pageDef ? 'bg-background' : 'bg-card'}`}
+        data-testid="project-main"
+      >
+        {/* A page starts with its own heading (no bar): the column is the
+            navigation, so there is nothing to put beside the title. */}
+        {pageDef && <PageHeading parents={crumbs} title={t(pageDef.titleKey)} titleTestId={pageDef.titleTestId} />}
         {body}
       </div>
     </div>

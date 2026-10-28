@@ -156,13 +156,13 @@ describe('BudgetCorner', () => {
   });
 
   // Spec 137 polish: in the project column the spend reads as words.
-  it('plain (the project column): sans 12px, no monospace; header form unchanged', () => {
+  it('plain (the project column): sans 11px, no monospace; header form unchanged', () => {
     mockUseCost.mockReturnValue({ cost: costOf(0.84), loading: false, error: null, refresh: vi.fn() });
     const { unmount } = render(
       <BudgetCorner project={project()} pauseReason={null} onOpenBudgetSettings={vi.fn()} plain />,
     );
     const corner = screen.getByTestId('budget-corner');
-    expect(corner.className).toContain('text-xs');
+    expect(corner.className).toContain('text-[11px]');
     expect(corner.className).not.toContain('font-mono');
     unmount();
     render(<BudgetCorner project={project()} pauseReason={null} onOpenBudgetSettings={vi.fn()} />);
