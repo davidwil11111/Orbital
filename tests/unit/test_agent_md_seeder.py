@@ -203,3 +203,30 @@ def test_pre_asks_seed_is_recognised_and_refreshed(store_and_project):
     ), encoding="utf-8")
     assert reseed_project_agent_md(store, pid)["status"] == "reseeded"
     assert "orbital/ASKS.md" in (workspace / AGENT_MD_FILENAME).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Spec 141 follow-up: a user-edited AGENTS.md saved in GBK must not raise out
+# of the reseed, and is never rewritten (user-owned).
+# ---------------------------------------------------------------------------
+
+def test_gbk_agents_md_does_not_raise_out_of_reseed(store_and_project):
+    from agent_os.daemon_v2.agent_md_seeder import reseed_project_agent_md
+    store, pid, workspace = store_and_project
+    path = workspace / AGENT_MD_FILENAME
+    raw = "# 我的项目说明\n回答请用简体中文。\n".encode("gbk")
+    path.write_bytes(raw)
+
+    result = reseed_project_agent_md(store, pid)
+
+    assert result["status"] == "skipped_user_modified"
+    assert path.read_bytes() == raw
+
+
+def test_crlf_unedited_seed_still_counts_as_unedited(store_and_project):
+    from agent_os.daemon_v2.agent_md_seeder import reseed_project_agent_md
+    store, pid, workspace = store_and_project
+    seed_project_agent_md(store, pid)
+    path = workspace / AGENT_MD_FILENAME
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    assert reseed_project_agent_md(store, pid)["status"] == "unchanged"
