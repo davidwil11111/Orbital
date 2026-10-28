@@ -3696,6 +3696,72 @@ describe('Spec 078 ChatView: the annotation chip', () => {
     ).toBe(1);
   });
 
+  // 2026-10-28: in the composer the chip is an inline capsule at the start of
+  // the input, after the skill capsule; its list opens as a popover.
+  it('is an inline capsule inside the input box, after the skill capsule; the list is a popover', async () => {
+    skillCatalogResponse = [
+      { key: 'task-planning', name: 'Task Planning', description: 'Plan', path: '/s/task/SKILL.md', dir_name: 'task' },
+    ];
+    __seedAnnotations('s1', [browserAnnotation]);
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    const row = container.querySelector('[data-testid="composer-input"] [data-testid="composer-capsules"]')!;
+    expect(row.contains(chipButton())).toBe(true);
+    expect(container.querySelector('[data-testid="annotation-strip"]')).toBeNull();
+    expect((container.querySelector('textarea') as HTMLTextAreaElement).placeholder).toBe('');
+
+    await act(async () => { typeInComposer('/tas'); });
+    await flushEffects();
+    const ev = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    await act(async () => { (container.querySelector('textarea') as HTMLTextAreaElement).dispatchEvent(ev); });
+    await flushEffects();
+    const skill = row.querySelector('[data-testid="composer-skill-chip"]')!;
+    expect(skill).toBeTruthy();
+    // Skill first, then the annotation capsule, in one row.
+    expect(skill.compareDocumentPosition(chipButton()!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await act(async () => { chipButton()!.click(); });
+    const popover = container.querySelector('[data-testid="annotation-popover"]')!;
+    expect(popover).toBeTruthy();
+    expect(popover.getAttribute('role')).toBe('dialog');
+    expect(popover.querySelector('[data-testid="annotation-list"]')).toBeTruthy();
+    // Anchored to the capsule (above it), not expanding the box.
+    expect(chipButton()!.parentElement!.contains(popover)).toBe(true);
+    expect(popover.className).toContain('bottom-full');
+    // Esc closes it.
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(container.querySelector('[data-testid="annotation-popover"]')).toBeNull();
+  });
+
+  it('the popover stays inside a phone screen: it slides left by exactly its overflow', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { value: 390, configurable: true, writable: true });
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const box = (left: number, width: number) =>
+        ({ x: left, y: 0, left, top: 0, width, height: 20, right: left + width, bottom: 20, toJSON() {} }) as DOMRect;
+      if (this.getAttribute('data-testid') === 'annotation-popover') return box(200, 342);
+      if (this.querySelector(':scope > [data-testid="annotation-chip"]')) return box(200, 40);
+      return original.call(this);
+    });
+    try {
+      __seedAnnotations('s1', [browserAnnotation]);
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      await act(async () => { chipButton()!.click(); });
+      const popover = container.querySelector('[data-testid="annotation-popover"]') as HTMLElement;
+      // 200 + 342 − (390 − 12) = 164px over the edge → slides 164px left.
+      expect(popover.style.transform).toBe('translateX(-164px)');
+      // The capsule says the full count to assistive tech even when it shows only the number.
+      expect(chipButton()).toHaveAttribute('aria-label', '1 annotation');
+    } finally {
+      spy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', { value: innerWidth, configurable: true, writable: true });
+    }
+  });
+
   it('enables Send on annotations alone, with no typed text', async () => {
     __seedAnnotations('s1', [textAnnotation]);
     await renderChat({ sessionId: 's1' });
@@ -5007,6 +5073,105 @@ describe('ChatView: the / skill picker (spec 132)', () => {
     const remove = container.querySelector('[data-testid="composer-skill-chip-remove"]') as HTMLButtonElement;
     await act(async () => { remove.click(); });
     expect(composerChip()).toBeNull();
+  });
+
+  // 2026-10-28: the capsule sits INSIDE the input box, at the start of the
+  // first line, and the typed text flows after it (a plain textarea whose
+  // first line is indented by the capsule row's measured width).
+  describe('the inline capsule', () => {
+    const CAPSULE_W = 112;
+    let rectSpy: { mockRestore: () => void } | null = null;
+    beforeEach(() => {
+      const original = HTMLElement.prototype.getBoundingClientRect;
+      rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+        if (this.getAttribute('data-testid') === 'composer-capsules') {
+          return { x: 0, y: 0, left: 0, top: 0, width: CAPSULE_W, height: 21, right: CAPSULE_W, bottom: 21, toJSON() {} } as DOMRect;
+        }
+        return original.call(this);
+      });
+    });
+    afterEach(() => rectSpy?.mockRestore());
+
+    it('renders inside the input box, before the textarea — not in a strip above it', async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      await type('/tas');
+      await press('Enter');
+      const box = container.querySelector('[data-testid="composer-input"]')!;
+      const row = box.querySelector('[data-testid="composer-capsules"]')!;
+      expect(row).toBeTruthy();
+      expect(row.contains(composerChip())).toBe(true);
+      expect(row.compareDocumentPosition(textarea()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(box.contains(textarea())).toBe(true);
+      // No chip strip for a skill alone (attachments still use one).
+      expect(container.querySelector('[data-testid="chip-strip"]')).toBeNull();
+      // The textarea is still a plain textarea.
+      expect(textarea().tagName).toBe('TEXTAREA');
+    });
+
+    it("indents the textarea's first line by exactly the capsule row's width", async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      expect(textarea().style.textIndent).toBe('');
+      await type('/tas');
+      await press('Enter');
+      expect(textarea().style.textIndent).toBe(`${CAPSULE_W}px`);
+    });
+
+    it('hides the placeholder while a capsule is present, and brings it back without one', async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      const placeholder = textarea().placeholder;
+      expect(placeholder).not.toBe('');
+      await type('/tas');
+      await press('Enter');
+      expect(textarea().placeholder).toBe('');
+      const remove = container.querySelector('[data-testid="composer-skill-chip-remove"]') as HTMLButtonElement;
+      await act(async () => { remove.click(); });
+      expect(textarea().placeholder).toBe(placeholder);
+    });
+
+    it('a tap on the capsule body (not its ×) focuses the input under it', async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      await type('/tas');
+      await press('Enter');
+      textarea().blur();
+      const name = composerChip()!.querySelector('span.truncate') as HTMLElement;
+      await act(async () => {
+        name.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      });
+      expect(document.activeElement).toBe(textarea());
+    });
+
+    it('removing the capsule clears the indent', async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      await type('/tas');
+      await press('Enter');
+      expect(textarea().style.textIndent).toBe(`${CAPSULE_W}px`);
+      const remove = container.querySelector('[data-testid="composer-skill-chip-remove"]') as HTMLButtonElement;
+      await act(async () => { remove.click(); });
+      await flushEffects();
+      expect(container.querySelector('[data-testid="composer-capsules"]')).toBeNull();
+      expect(textarea().style.textIndent).toBe('');
+    });
+
+    it('typing more lines keeps the capsule in the input box and the indent on the first line only', async () => {
+      await renderChat({ sessionId: 's1' });
+      await flushEffects();
+      await type('/tas');
+      await press('Enter');
+      await type('line one\nline two\nline three');
+      expect(textarea().value).toBe('line one\nline two\nline three');
+      // text-indent is a first-line property by definition; the capsule row
+      // is still the single absolutely-placed row at the box's top-left.
+      expect(textarea().style.textIndent).toBe(`${CAPSULE_W}px`);
+      const row = container.querySelector('[data-testid="composer-capsules"]')!;
+      expect(row.className).toMatch(/\babsolute\b/);
+      expect(row.className).toMatch(/\btop-0\b/);
+      expect(row.className).toMatch(/\bleft-0\b/);
+    });
   });
 
   it('Esc keeps the text, stays closed while typing on, and reopens after clearing', async () => {

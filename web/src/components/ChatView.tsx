@@ -5,7 +5,7 @@
 import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Send, Loader2, Plus, ChevronRight, ChevronDown, ArrowDown,
-  Clock, CornerDownLeft, FolderSearch, ListChecks, type LucideIcon,
+  Clock, CornerDownLeft, FolderSearch, ListChecks, MessageSquareQuote, type LucideIcon,
 } from 'lucide-react';
 import ExamplePrompt from './ExamplePrompt';
 import LeftOffCards from './LeftOffCards';
@@ -1091,6 +1091,65 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     updateNote: updateAnnotationNote,
   } = useAnnotations(sessionId);
   const [annotationsOpen, setAnnotationsOpen] = useState(false);
+
+  // The composer's inline capsules (2026-10-28): the picked skill and the
+  // staged annotations sit at the start of the input's first line, and the
+  // typed text flows after them. The textarea stays a plain textarea (IME,
+  // paste, undo and every key handler depend on it): the capsule row is
+  // positioned over its top-left corner and the textarea's FIRST line is
+  // indented by the row's measured width (`text-indent` only ever indents the
+  // first line). The row carries its own trailing gap, so indent == width.
+  const hasCapsule = pickedSkill !== null || annotations.length > 0;
+  const capsuleRowRef = useRef<HTMLDivElement>(null);
+  const [capsuleWidth, setCapsuleWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = capsuleRowRef.current;
+    if (!hasCapsule || !el) {
+      setCapsuleWidth(0);
+      return;
+    }
+    const measure = () => setCapsuleWidth(Math.ceil(el.getBoundingClientRect().width));
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasCapsule, pickedSkill, annotations.length]);
+  // The annotation list opens as a popover anchored to its capsule; a click
+  // outside it or Esc closes it.
+  const annotationPopoverRef = useRef<HTMLDivElement>(null);
+  // Anchored to the capsule, but never past the viewport: on a phone the
+  // capsule sits mid-input and the list is wider than what is left to its
+  // right, so it slides left just enough to stay 12px inside the screen.
+  const annotationListBoxRef = useRef<HTMLDivElement>(null);
+  const [popoverShift, setPopoverShift] = useState(0);
+  useLayoutEffect(() => {
+    const el = annotationListBoxRef.current;
+    if (!annotationsOpen || !el) {
+      setPopoverShift(0);
+      return;
+    }
+    const anchorLeft = el.parentElement?.getBoundingClientRect().left ?? 0;
+    const width = el.getBoundingClientRect().width;
+    const overflow = anchorLeft + width - (window.innerWidth - 12);
+    setPopoverShift(overflow > 0 ? Math.min(overflow, Math.max(0, anchorLeft - 12)) : 0);
+  }, [annotationsOpen]);
+  useEffect(() => {
+    if (!annotationsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const root = annotationPopoverRef.current;
+      if (root && !e.composedPath().includes(root)) setAnnotationsOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setAnnotationsOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [annotationsOpen]);
   const [dragCounter, setDragCounter] = useState(0);
   // Stop-button optimistic state. Set true synchronously on click so the
   // input row immediately shows a loading affordance; cleared when
@@ -3576,11 +3635,51 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // Spec 078 §5.4 — the annotation chip. Collapsed it is just the count;
   // expanded it lists each quote with an editable note and a remove control,
   // so a note typed in a hurry on the panel can be fixed before the message
-  // goes. Hoisted out of the composer card because it has to render in BOTH
-  // composer states: while the queue owns the chat the card is replaced by
-  // ComposerDisabledPrompt, and a strip that lived inside the card left
-  // annotations staged with nothing on screen to show for them (2026-09-05:
-  // "when i do the browser annotation, where did it go?").
+  // goes. It renders in BOTH composer states: in the composer it is an inline
+  // capsule at the start of the input (its list a popover); while the queue
+  // owns the chat the card is replaced by ComposerDisabledPrompt, so it falls
+  // back to a strip above the notice — otherwise annotations would be staged
+  // with nothing on screen to show for them (2026-09-05: "when i do the
+  // browser annotation, where did it go?").
+  const annotationList = (
+    <ul
+      className="flex flex-col gap-1 max-h-[140px] overflow-y-auto"
+      data-testid="annotation-list"
+    >
+      {annotations.map((a) => (
+        <li key={a.n} className="flex items-center gap-2">
+          <span className="font-mono text-[11px] text-secondary shrink-0">[{a.n}]</span>
+          <span
+            className="text-[11px] text-secondary truncate max-w-[40%]"
+            title={annotationSummary(a, chromeTr)}
+          >
+            {annotationSummary(a, chromeTr)}
+          </span>
+          <input
+            value={a.note}
+            onChange={(e) => updateAnnotationNote(a.n, e.target.value)}
+            placeholder={t('panel.annotation.note')}
+            aria-label={`${t('panel.annotation.note')} [${a.n}]`}
+            className="flex-1 min-w-0 text-[11px] bg-transparent border border-border rounded px-1.5 py-0.5 text-primary outline-none focus:border-accent"
+          />
+          <button
+            type="button"
+            onClick={() => removeAnnotation(a.n)}
+            aria-label={`${t('panel.annotation.remove')} [${a.n}]`}
+            className="shrink-0 text-secondary hover:text-primary text-xs leading-none px-1"
+          >
+            ×
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+
+  const annotationCount =
+    annotations.length === 1
+      ? t('composer.annotations.one')
+      : t('composer.annotations.other', { n: annotations.length });
+
   const annotationStrip = annotations.length > 0 && (
     <div className="flex flex-col gap-1" data-testid="annotation-strip">
       <button
@@ -3590,43 +3689,71 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         data-testid="annotation-chip"
         className="self-start inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-secondary hover:text-primary transition-colors"
       >
-        {annotations.length === 1
-          ? t('composer.annotations.one')
-          : t('composer.annotations.other', { n: annotations.length })}
+        {annotationCount}
         {annotationsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
       </button>
-      {annotationsOpen && (
-        <ul
-          className="flex flex-col gap-1 max-h-[140px] overflow-y-auto"
-          data-testid="annotation-list"
-        >
-          {annotations.map((a) => (
-            <li key={a.n} className="flex items-center gap-2">
-              <span className="font-mono text-[11px] text-secondary shrink-0">[{a.n}]</span>
-              <span
-                className="text-[11px] text-secondary truncate max-w-[40%]"
-                title={annotationSummary(a, chromeTr)}
-              >
-                {annotationSummary(a, chromeTr)}
-              </span>
-              <input
-                value={a.note}
-                onChange={(e) => updateAnnotationNote(a.n, e.target.value)}
-                placeholder={t('panel.annotation.note')}
-                aria-label={`${t('panel.annotation.note')} [${a.n}]`}
-                className="flex-1 min-w-0 text-[11px] bg-transparent border border-border rounded px-1.5 py-0.5 text-primary outline-none focus:border-accent"
-              />
-              <button
-                type="button"
-                onClick={() => removeAnnotation(a.n)}
-                aria-label={`${t('panel.annotation.remove')} [${a.n}]`}
-                className="shrink-0 text-secondary hover:text-primary text-xs leading-none px-1"
-              >
-                ×
-              </button>
-            </li>
-          ))}
-        </ul>
+      {annotationsOpen && annotationList}
+    </div>
+  );
+
+  // The composer's capsule row: skill first, then the annotation capsule
+  // (its list opens as a popover above it). Positioned over the textarea's
+  // first line; see `capsuleWidth`.
+  const capsuleRow = hasCapsule && (
+    <div
+      ref={capsuleRowRef}
+      data-testid="composer-capsules"
+      // The row covers the start of the input's first line: a tap on a
+      // capsule's body (not its × or the annotation toggle) goes to the
+      // input, as a tap on that spot always did.
+      onMouseDown={(e) => {
+        if ((e.target as HTMLElement).closest('button')) return;
+        e.preventDefault();
+        textareaRef.current?.focus();
+      }}
+      className="absolute left-0 top-0 z-10 flex max-w-[75%] items-center gap-1 pr-1.5 h-[1.625em] text-[13px] max-md:text-base"
+    >
+      {pickedSkill && (
+        <SkillChip
+          inline
+          name={pickedSkill.name}
+          title={pickedSkill.description || pickedSkill.name}
+          onRemove={() => setPickedSkillState(null)}
+          data-testid="composer-skill-chip"
+        />
+      )}
+      {annotations.length > 0 && (
+        <div ref={annotationPopoverRef} className="relative min-w-0 flex">
+          <button
+            type="button"
+            onClick={() => setAnnotationsOpen((open) => !open)}
+            aria-expanded={annotationsOpen}
+            aria-haspopup="dialog"
+            aria-label={annotationCount}
+            title={annotationCount}
+            data-testid="annotation-chip"
+            className="inline-flex min-w-0 items-center gap-0.5 rounded-full border border-border bg-card pl-1.5 pr-1 h-[18px] text-[11px] leading-none text-secondary hover:text-primary transition-colors whitespace-nowrap"
+          >
+            <MessageSquareQuote size={11} aria-hidden="true" className="shrink-0" />
+            {/* The words where there is room; on a phone (173px of input) the
+                count alone, so the skill capsule keeps its name. */}
+            <span className="truncate max-md:hidden">{annotationCount}</span>
+            <span className="md:hidden">{annotations.length}</span>
+            {annotationsOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          </button>
+          {annotationsOpen && (
+            <div
+              ref={annotationListBoxRef}
+              role="dialog"
+              aria-label={annotationCount}
+              data-testid="annotation-popover"
+              style={popoverShift ? { transform: `translateX(-${popoverShift}px)` } : undefined}
+              className="absolute bottom-full left-0 mb-2 z-50 w-[min(26rem,calc(100vw-3rem))] rounded-[10px] border border-border bg-elevated p-2 text-[13px] shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)]"
+            >
+              {annotationList}
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
@@ -4395,20 +4522,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               ))}
             </div>
           )}
-          {annotationStrip}
-          {(attachments.length > 0 || pickedSkill) && (
+          {attachments.length > 0 && (
             <div
               className="flex flex-wrap gap-2 max-h-[100px] overflow-y-auto"
               data-testid="chip-strip"
             >
-              {pickedSkill && (
-                <SkillChip
-                  name={pickedSkill.name}
-                  title={pickedSkill.description || pickedSkill.name}
-                  onRemove={() => setPickedSkillState(null)}
-                  data-testid="composer-skill-chip"
-                />
-              )}
               {attachments.map((a) => (
                 <AttachmentChip
                   key={a.id}
@@ -4476,6 +4594,8 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             >
               <Plus size={18} />
             </button>
+            <div className="relative flex flex-1 min-w-0" data-testid="composer-input">
+            {capsuleRow}
             <textarea
               ref={textareaRef}
               value={inputText}
@@ -4485,13 +4605,20 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               onBlur={() => adjustTextareaHeight()}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={pinnedTarget
-                ? t('chat.composer.placeholderPinned', { agent: pinnedTarget })
-                : t('chat.composer.placeholder')}
+              // No placeholder under a capsule: the capsule already says what
+              // the message is about, and the hint would sit behind it.
+              placeholder={hasCapsule
+                ? ''
+                : pinnedTarget
+                  ? t('chat.composer.placeholderPinned', { agent: pinnedTarget })
+                  : t('chat.composer.placeholder')}
               rows={1}
               disabled={isCancelling}
-              className="flex-1 resize-none text-[13px] max-md:text-base bg-transparent focus:outline-none leading-relaxed disabled:opacity-50"
+              // First line only: the text starts after the capsule row.
+              style={capsuleWidth > 0 ? { textIndent: `${capsuleWidth}px` } : undefined}
+              className="flex-1 w-full resize-none text-[13px] max-md:text-base bg-transparent focus:outline-none leading-relaxed disabled:opacity-50"
             />
+            </div>
             {(agentStatus === 'running' || agentStatus === 'waiting') ? (
               <>
                 <button

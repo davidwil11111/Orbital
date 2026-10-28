@@ -655,43 +655,27 @@ describe('SessionSidebar — filter and automation groups', () => {
   it('an empty filter says so instead of showing a blank list', async () => {
     const user = userEvent.setup();
     resetMocks();
-    // Only automation runs: Chats is the filter that can come up empty.
-    mockSessions = [daily('run-1', '2026-09-10T00:00:00Z')];
+    mockSessions = [makeSession({ session_id: 'a', session_uuid: 'ua', name: 'Chat' })];
     render(<SessionSidebar projectId="p1" />);
-    await user.click(screen.getByTestId('session-filter-chats'));
-    expect(screen.getByTestId('session-empty')).toHaveTextContent('No chats yet');
+    await user.click(screen.getByTestId('session-filter-automations'));
+    expect(screen.getByTestId('session-empty')).toHaveTextContent('No automation runs yet');
   });
 
-  // Spec 137 polish: nothing to tell apart → no filter (the prototype's column).
-  it('a project with no automation session shows no filter, and lists everything', () => {
+  // The original segmented control (restored 2026-10-28): always rendered,
+  // boxed on a track, 16px sides in line with the "Sessions N" header.
+  it('the filter is always the boxed segmented control, even with no automation session', () => {
     resetMocks();
-    localStorage.setItem('orbital:sessionSidebar.filter', 'automations'); // remembered from another project
-    mockSessions = [
-      makeSession({ session_id: 'a', session_uuid: 'ua', name: 'Chat A' }),
-      makeSession({ session_id: 'b', session_uuid: 'ub', name: 'Chat B' }),
-    ];
-    render(<SessionSidebar projectId="p1" />);
-    expect(screen.queryByRole('tablist')).toBeNull();
-    expect(screen.queryByTestId('session-filter-all')).toBeNull();
-    expect(ids()).toEqual(['session-list-item-a', 'session-list-item-b']);
-    expect(screen.getByTestId('session-active-count').textContent).toBe('2');
-  });
-
-  it('with automation sessions the filter is plain text tabs: no boxed track, the chosen one primary + medium', async () => {
-    const user = userEvent.setup();
-    resetMocks();
-    mockSessions = mixed();
+    mockSessions = [makeSession({ session_id: 'a', session_uuid: 'ua', name: 'Chat' })];
     render(<SessionSidebar projectId="p1" />);
     const tablist = screen.getByRole('tablist', { name: 'Filter sessions' });
-    expect(tablist.className).not.toMatch(/\bborder\b|bg-nav|rounded-lg/);
+    for (const c of ['rounded-lg', 'border', 'bg-nav', 'p-0.5']) expect(tablist.className).toContain(c);
+    expect(tablist.parentElement?.className).toContain('px-4');
+    expect(screen.getByTestId('session-sidebar-header').className).toContain('px-4');
     const all = screen.getByTestId('session-filter-all');
     expect(all).toHaveAttribute('aria-selected', 'true');
-    expect(all.className).toContain('text-primary');
-    expect(all.className).toContain('font-medium');
-    expect(all.className).not.toMatch(/bg-/);
-    await user.click(screen.getByTestId('session-filter-chats'));
-    expect(screen.getByTestId('session-filter-chats').className).toContain('font-medium');
-    expect(screen.getByTestId('session-filter-all').className).toContain('text-secondary');
+    expect(all.className).toContain('bg-segment-on');
+    expect(screen.getByTestId('session-filter-chats')).toBeInTheDocument();
+    expect(screen.getByTestId('session-filter-automations')).toBeInTheDocument();
   });
 
   it('the header reads "Sessions 6": sentence case, the count without parentheses', () => {

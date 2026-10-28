@@ -11,9 +11,8 @@
  * card read as a second panel and clashed with the pinned project list's
  * square corner).
  *
- * Header: "Sessions" + the count for the active filter, then — only when
- *   the project has at least one automation session — an All | Chats |
- *   Automations filter as plain text tabs (remembered per device).
+ * Header: "Sessions" + the count for the active filter, then the All | Chats |
+ *   Automations segmented control, always shown (remembered per device).
  * Body: pinned rows first (spec 067), then everything else most recent first.
  *   Sessions a schedule, a file watch or the queue fired are folded into ONE
  *   row per automation, sitting where its latest run was (see
@@ -183,7 +182,7 @@ export function SessionSidebar({
     [sessions],
   );
 
-  const [chosenFilter, setFilter] = useState<SessionFilter>(readFilter);
+  const [filter, setFilter] = useState<SessionFilter>(readFilter);
   const chooseFilter = useCallback((next: SessionFilter) => {
     setFilter(next);
     try {
@@ -196,15 +195,6 @@ export function SessionSidebar({
   // Pinned rows (any kind — a pin is the user saying "keep this at the top"),
   // then the rest in the order above, with each automation's runs folded into
   // one group node.
-  // Spec 137 polish: the All | Chats | Automations filter only exists when
-  // there is something to tell apart — a project with no automation session
-  // shows no filter at all, and lists everything (a remembered filter from
-  // another project must not hide this one's chats).
-  const hasAutomations = useMemo(
-    () => buildSessionList(sortedSessions, 'all').counts.automations > 0,
-    [sortedSessions],
-  );
-  const filter: SessionFilter = hasAutomations ? chosenFilter : 'all';
   const { pinned, nodes, counts } = useMemo(
     () => buildSessionList(sortedSessions, filter),
     [sortedSessions, filter],
@@ -385,9 +375,7 @@ export function SessionSidebar({
       className="flex flex-col flex-1 min-h-0"
     >
       {/* Header: "Sessions 5" — sentence case, the count beside it in
-          secondary. Then, only when there are automation sessions to tell
-          apart from chats, the filter as plain text tabs (no boxed control:
-          in the column it read as a second toolbar). */}
+          secondary. */}
       <div
         className="flex items-baseline gap-1.5 px-4 pt-3 pb-1 shrink-0 text-xs"
         data-testid="session-sidebar-header"
@@ -398,11 +386,15 @@ export function SessionSidebar({
         </span>
       </div>
 
-      {hasAutomations && (
+      {/* All | Chats | Automations — a segmented control on a track, the same
+          pattern as the Tasks page's Queue | Automations switch. Always shown
+          (the user's call, 2026-10-28: the original control, not text tabs
+          that come and go). 16px sides, in line with the header above. */}
+      <div className="px-4 pb-1.5 shrink-0">
         <div
           role="tablist"
           aria-label={t('sessionSidebar.filter.label')}
-          className="flex items-center gap-3 px-4 pb-1.5 shrink-0"
+          className="flex gap-0.5 rounded-lg border border-border bg-nav p-0.5"
         >
           {FILTERS.map((f) => {
             const active = filter === f.key;
@@ -414,8 +406,10 @@ export function SessionSidebar({
                 aria-selected={active}
                 data-testid={`session-filter-${f.key}`}
                 onClick={() => chooseFilter(f.key)}
-                className={`whitespace-nowrap py-0.5 text-[11px] transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded-sm ${
-                  active ? 'font-medium text-primary' : 'text-secondary hover:text-primary'
+                className={`flex-auto whitespace-nowrap text-[11px] font-medium px-1.5 py-1 rounded-md transition-colors duration-150 ${
+                  active
+                    ? 'bg-segment-on text-segment-on-text shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
+                    : 'text-secondary hover:text-primary'
                 }`}
               >
                 {t(f.labelKey)}
@@ -423,7 +417,7 @@ export function SessionSidebar({
             );
           })}
         </div>
-      )}
+      </div>
 
       {/* Session list: pinned, then the rest most-recent first, one row per automation */}
       <div
