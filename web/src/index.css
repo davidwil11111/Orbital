@@ -133,20 +133,16 @@
   --text-2xs--letter-spacing: 0.015em;
 
   /* ------------------------------------------------------------------ depth
-     Edge shading, so the zones read as stacked layers rather than as regions
-     that merely abut. Two roles, matching the two-zone rule:
-
-       panel  a RAISED surface casting onto what's behind it — used at the
-              shell -> project boundary, so the project lifts off the shell
-       well   a RECESSED region, shaded inward at its own edges — used on the
-              session inset, so it reads as carved INTO the project rather
-              than as another panel sitting beside it
+     Edge shading, so the shell and the project read as stacked layers rather
+     than as regions that merely abut: `panel` is a RAISED surface casting onto
+     what's behind it, used at the shell -> project boundary so the project
+     lifts off the shell. (Spec 137's folder shell retired the inward `well`
+     the session inset wore: the session list is now part of the project
+     column, a tint and nothing else.)
 
      Kept deliberately faint: this should register as depth, not as a drop
      shadow you can point at. */
   --shadow-panel: -1px 0 12px -4px rgb(0 0 0 / 0.10);
-  --shadow-well: inset 7px 0 8px -8px rgb(0 0 0 / 0.13),
-    inset -7px 0 8px -8px rgb(0 0 0 / 0.09);
 
   --text-xs--letter-spacing: 0.005em;
   --text-sm--letter-spacing: 0em;
@@ -242,8 +238,6 @@
 
   /* Light-mode shadows (black at 10–13%) vanish against a dark canvas. */
   --shadow-panel: -1px 0 14px -4px rgb(0 0 0 / 0.5);
-  --shadow-well: inset 7px 0 8px -8px rgb(0 0 0 / 0.45),
-    inset -7px 0 8px -8px rgb(0 0 0 / 0.35);
 }
 
 /* Self-hosted fonts (woff2, latin subset). Bundled under web/public/fonts so
@@ -351,6 +345,20 @@ body {
 
 :root[data-chrome="mac-inline"] .titlebar-band-canvas {
   background-color: var(--color-background);
+}
+
+/* Spec 137 (the folder shell): on desktop and narrow windows the project is a
+   tinted column at the left edge of <main> (260px, 220 below the dock
+   threshold — ProjectDetail picks the same split in JS). The band above it
+   takes the column's tint so the column runs to the top of the window like
+   the nav, instead of starting under a white strip. */
+:root[data-chrome="mac-inline"] .titlebar-band-card:has(.project-column) {
+  background-image: linear-gradient(to right, var(--color-sidebar) 260px, transparent 260px);
+}
+@media (max-width: 1199px) {
+  :root[data-chrome="mac-inline"] .titlebar-band-card:has(.project-column) {
+    background-image: linear-gradient(to right, var(--color-sidebar) 220px, transparent 220px);
+  }
 }
 
 /* ------------------------------------------------- native control suppression
@@ -596,6 +604,10 @@ body {
    `vt-project-body` so they swap in sequence — old out, then new up — rather
    than cross-dissolving two screens of text into each other; naming them also
    keeps the rest of the app (the root group) still.
+   The fold happens only where a header exists to fold: the phone and global
+   settings. On desktop and narrow windows (spec 137, the folder shell) the
+   project column stays put and carries no names, so only the right area
+   (`vt-project-body`) swaps — old out, new up.
    Where the API is missing the switch stays instant; reduced motion skips it
    in JS. */
 .vt-project-header { view-transition-name: project-header; }

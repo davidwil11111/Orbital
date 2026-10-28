@@ -248,12 +248,25 @@ describe('ProjectDetail routing (spec 137: pages, no tabs)', () => {
     });
   });
 
-  it('Back from Tasks returns to the chat home', () => {
-    const setRoute = renderAt({ ...baseRoute, page: 'tasks', sessionId: 'sess-abc' });
-    fireEvent.click(screen.getByTestId('tasks-back-button'));
-    const produced = setRoute.mock.calls[0][0] as Extract<Route, { name: 'project' }>;
-    expect(produced).toMatchObject({ name: 'project', projectId: 'proj-42', sessionId: 'sess-abc' });
-    expect(produced.page).toBeUndefined();
+  // Spec 137 item 10: Back exists on the phone only — desktop and narrow
+  // windows go back through the project column (a session row).
+  it('Back from Tasks (phone) returns to the chat home', () => {
+    Object.defineProperty(window, 'innerWidth', { value: 390, configurable: true, writable: true });
+    try {
+      const setRoute = renderAt({ ...baseRoute, page: 'tasks', sessionId: 'sess-abc' });
+      fireEvent.click(screen.getByTestId('tasks-back-button'));
+      const produced = setRoute.mock.calls[0][0] as Extract<Route, { name: 'project' }>;
+      expect(produced).toMatchObject({ name: 'project', projectId: 'proj-42', sessionId: 'sess-abc' });
+      expect(produced.page).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: 1024, configurable: true, writable: true });
+    }
+  });
+
+  it('desktop pages have no Back: the column is the way home', () => {
+    renderAt({ ...baseRoute, page: 'tasks', sessionId: 'sess-abc' });
+    expect(screen.queryByTestId('tasks-back-button')).toBeNull();
+    expect(screen.getByTestId('project-column')).toBeInTheDocument();
   });
 
   it('renders no tab bar on any page', () => {

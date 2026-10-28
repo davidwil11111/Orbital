@@ -2,18 +2,34 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import ProjectDetail from './ProjectDetail';
-import type { Project, Trigger } from '../types';
+import type { Project, SessionListEntry, Trigger } from '../types';
 import type { Route } from '../route';
 import { __resetPanelState, usePanelState } from '../hooks/usePanelState';
 import { renderHook } from '@testing-library/react';
 
-// ProjectDetail now calls useSessions and useQueue (both need WebSocketProvider).
-// Mock them to avoid the provider requirement in these unit tests.
+// The project column lists the sessions (useSessions) and ProjectDetail reads
+// the queue (useQueue); both need a WebSocketProvider. Mock them to avoid the
+// provider requirement in these unit tests. The session list is mutable so
+// the column tests can put rows in it.
+const sessionsMock = vi.hoisted(() => ({ sessions: [] as SessionListEntry[] }));
 vi.mock('../hooks/useSessions', () => ({
-  useSessions: () => ({ sessions: [], loading: false, error: null, refresh: vi.fn() }),
+  useSessions: () => ({
+    sessions: sessionsMock.sessions,
+    loading: false,
+    error: null,
+    refresh: vi.fn(),
+    renameSession: vi.fn(),
+    pinSession: vi.fn(),
+    deleteSession: vi.fn(),
+  }),
+}));
+// "+ new session" in the column mints through useAgent.
+const mintMock = vi.hoisted(() => ({ newSession: vi.fn(async () => ({ status: 'ok', session_id: 'sess-new' })) }));
+vi.mock('../hooks/useAgent', () => ({
+  useAgent: () => ({ newSession: mintMock.newSession }),
 }));
 // A mutable queue snapshot, so the status-line tests can put work in it.
 const queueMock = vi.hoisted(() => ({ snapshot: null as null | { items: Array<{ state: string }> } }));
@@ -85,8 +101,30 @@ function makeTrigger(over: Partial<Trigger> = {}): Trigger {
 
 afterEach(() => {
   queueMock.snapshot = null;
+  sessionsMock.sessions = [];
   __resetPanelState();
+  setViewportWidth(1024);
 });
+
+/** usePanelDockable / usePanelMobile read window.innerWidth. jsdom's 1024 is a
+ * narrow desktop window: the column layout without a docked panel. */
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, 'innerWidth', {
+    value: width,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function session(id: string): SessionListEntry {
+  return {
+    session_id: id,
+    status: 'idle',
+    session_uuid: `uuid-${id}`,
+    last_terminal_event: null,
+    last_activity_at: '2026-10-28T09:00:00Z',
+  };
+}
 
 function renderProjectDetail(
   routeOverride?: Partial<Extract<Route, { name: 'project' }>>,
@@ -181,7 +219,61 @@ describe('ProjectDetail — no tab bar, one page at a time', () => {
     expect(screen.getByTestId('chat-children')).toBeInTheDocument();
   });
 
-  it('a page swaps the header for the toolbar and renders the page, not the chat children', () => {
+  it('a page replaces the chat in the right area; the column stays', () => {
+    render(
+      <ProjectDetail
+        project={mockProject}
+        agentStatus="idle"
+        route={{ ...baseRoute, page: 'settings' }}
+        setRoute={vi.fn()}
+        pageContent={{ settings: <div data-testid="settings-body" /> }}
+      >
+        <div data-testid="chat-children" />
+      </ProjectDetail>,
+    );
+    const main = screen.getByTestId('project-main');
+    expect(within(main).getByTestId('settings-body')).toBeInTheDocument();
+    expect(screen.queryByTestId('chat-children')).toBeNull();
+    // The column is still the project: name, gear, status line, sessions.
+    const column = screen.getByTestId('project-column');
+    expect(within(column).getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
+    expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();
+    expect(within(column).getByTestId('trigger-summary')).toBeInTheDocument();
+    expect(within(column).getByTestId('session-sidebar')).toBeInTheDocument();
+    // The page carries only its title: no project crumb (the column names it).
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Settings');
+    expect(screen.getByTestId('settings-modal-title').textContent).toBe('Settings');
+  });
+
+  it('Pricing nests under Settings: crumb Settings / Pricing, the parent a link', () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'pricing' }, setRoute);
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Settings/Pricing table');
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Location' })).getByRole('button', { name: 'Settings' }));
+    expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'settings' }));
+  });
+});
+
+// Spec 137 item 10: the column is the navigation on desktop and narrow
+// windows, so pages have no Back there. The phone has no column and keeps
+// Back + `Project / Page` (item 11).
+describe('ProjectDetail — Back exists on the phone only', () => {
+  it.each([1440, 1000])('no Back on the Tasks, Settings and Pricing pages at %ipx', (width) => {
+    setViewportWidth(width);
+    for (const [page, back] of [
+      ['tasks', 'tasks-back-button'],
+      ['settings', 'settings-back-button'],
+      ['pricing', 'pricing-back-button'],
+    ] as const) {
+      const { unmount } = renderProjectDetail({ page });
+      expect(screen.queryByTestId(back)).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
+      unmount();
+    }
+  });
+
+  it('phone: a page is full-screen with Back + `Project / Page`, the header folded away', () => {
+    setViewportWidth(390);
     render(
       <ProjectDetail
         project={mockProject}
@@ -195,13 +287,14 @@ describe('ProjectDetail — no tab bar, one page at a time', () => {
     );
     expect(screen.getByTestId('settings-body')).toBeInTheDocument();
     expect(screen.queryByTestId('chat-children')).toBeNull();
+    expect(screen.queryByTestId('project-column')).toBeNull();
     expect(screen.queryByRole('button', { name: /project settings/i })).toBeNull();
-    const crumbs = screen.getByRole('navigation', { name: 'Location' });
-    expect(crumbs.textContent).toBe('Alpha Project/Settings');
-    expect(screen.getByTestId('settings-modal-title').textContent).toBe('Settings');
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Alpha Project/Settings');
+    expect(screen.getByTestId('settings-back-button')).toBeInTheDocument();
   });
 
-  it('Back from Settings returns to chat with the session kept', () => {
+  it('phone: Back from Settings returns to chat with the session kept', () => {
+    setViewportWidth(390);
     const setRoute = vi.fn();
     renderProjectDetail({ page: 'settings', settingsAnchor: 'budget' }, setRoute);
     fireEvent.click(screen.getByTestId('settings-back-button'));
@@ -210,14 +303,16 @@ describe('ProjectDetail — no tab bar, one page at a time', () => {
     );
   });
 
-  it('the project crumb is a link home', () => {
+  it('phone: the project crumb is a link home', () => {
+    setViewportWidth(390);
     const setRoute = vi.fn();
     renderProjectDetail({ page: 'tasks' }, setRoute);
     fireEvent.click(screen.getByRole('button', { name: 'Alpha Project' }));
     expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: undefined }));
   });
 
-  it('Pricing nests under Settings: crumb Project / Settings / Pricing, Back goes up one level to Budget', () => {
+  it('phone: Pricing nests under Settings: Project / Settings / Pricing, Back goes up one level to Budget', () => {
+    setViewportWidth(390);
     const setRoute = vi.fn();
     renderProjectDetail({ page: 'pricing' }, setRoute);
     expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe(
@@ -234,10 +329,15 @@ describe('ProjectDetail — no tab bar, one page at a time', () => {
 });
 
 describe('ProjectDetail — Tasks page', () => {
-  it('is a page with its own crumb: Project / Tasks', () => {
+  it('is a page titled Tasks (Project / Tasks on the phone)', () => {
+    const { unmount } = renderProjectDetail({ page: 'tasks' });
+    expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Tasks');
+    expect(screen.getByTestId('tasks-title').textContent).toBe('Tasks');
+    unmount();
+
+    setViewportWidth(390);
     renderProjectDetail({ page: 'tasks' });
     expect(screen.getByRole('navigation', { name: 'Location' }).textContent).toBe('Alpha Project/Tasks');
-    expect(screen.getByTestId('tasks-title').textContent).toBe('Tasks');
   });
 
   it('shows the Queue│Automations switch only on the Tasks page', () => {
@@ -370,7 +470,21 @@ describe('ProjectDetail — the status line', () => {
     expect(setRoute).toHaveBeenCalledWith(expect.objectContaining({ page: 'tasks', queuePane: 'automations' }));
   });
 
-  it('is not on a page — the toolbar replaces the whole header', () => {
+  it('stays in the column on a page, and shows as the chosen row while Tasks is open', () => {
+    const { unmount } = renderProjectDetail();
+    expect(screen.getByTestId('trigger-summary')).not.toHaveAttribute('aria-current');
+    unmount();
+
+    const tasks = renderProjectDetail({ page: 'tasks' });
+    expect(screen.getByTestId('trigger-summary')).toHaveAttribute('aria-current', 'page');
+    tasks.unmount();
+
+    renderProjectDetail({ page: 'settings' });
+    expect(screen.getByTestId('trigger-summary')).not.toHaveAttribute('aria-current');
+  });
+
+  it('phone: not on a page — the toolbar replaces the whole header', () => {
+    setViewportWidth(390);
     renderProjectDetail({ page: 'tasks' });
     expect(screen.queryByTestId('trigger-summary')).toBeNull();
   });
@@ -466,14 +580,6 @@ describe('ProjectDetail — calendar lens tab visibility', () => {
 // else — Queue, Files, settings, mobile, narrow windows — the overlay stays.
 // ---------------------------------------------------------------------------
 
-function setViewportWidth(width: number) {
-  Object.defineProperty(window, 'innerWidth', {
-    value: width,
-    configurable: true,
-    writable: true,
-  });
-}
-
 describe('ProjectDetail — overlay drawer vs. the docked panel', () => {
   afterEach(() => setViewportWidth(1024));
 
@@ -535,17 +641,204 @@ describe('ProjectDetail — the narrow-window panel button', () => {
     expect(screen.getByTestId('panel-open-button')).toBeInTheDocument();
   });
 
-  it('the docked panel maximized hides the project header (the main area is the panel)', () => {
+  it('narrow: the button sits in the column\'s name row, beside the gear', () => {
+    setViewportWidth(1000);
+    renderProjectDetail();
+    const column = screen.getByTestId('project-column');
+    expect(within(column).getByTestId('panel-open-button')).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 137 items 8–13 — the folder shell: the project is the left column, the
+// right area is what was opened from it.
+// ---------------------------------------------------------------------------
+
+describe('ProjectDetail — the project column (desktop, narrow)', () => {
+  it('holds the header content; the chat area renders no header and no status line', () => {
+    setViewportWidth(1440);
+    render(
+      <ProjectDetail project={mockProject} agentStatus="idle" route={baseRoute} setRoute={vi.fn()}>
+        <div data-testid="chat-children" />
+      </ProjectDetail>,
+    );
+    const column = screen.getByTestId('project-column');
+    expect(within(column).getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
+    expect(within(column).getByText('Idle')).toBeInTheDocument();
+    expect(within(column).getByTestId('project-credential-chip').textContent).toBe('claude-3-5-sonnet');
+    expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();
+    expect(within(column).getByTestId('trigger-summary')).toBeInTheDocument();
+    expect(within(column).getByTestId('session-sidebar')).toBeInTheDocument();
+    expect(within(column).getByTestId('session-new-button')).toBeInTheDocument();
+    // Order, top to bottom: name, state, status line, sessions.
+    const order = [
+      within(column).getByRole('heading', { level: 1 }),
+      within(column).getByTestId('project-state-row'),
+      within(column).getByTestId('trigger-summary'),
+      within(column).getByTestId('session-sidebar'),
+    ];
+    for (let i = 1; i < order.length; i++) {
+      expect(order[i - 1].compareDocumentPosition(order[i]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+
+    const main = screen.getByTestId('project-main');
+    expect(within(main).getByTestId('chat-children')).toBeInTheDocument();
+    expect(within(main).queryByRole('heading')).toBeNull();
+    expect(within(main).queryByTestId('trigger-summary')).toBeNull();
+    expect(within(main).queryByRole('button', { name: /project settings/i })).toBeNull();
+  });
+
+  it('keeps the tour anchors on the column (spec 138)', () => {
+    setViewportWidth(1000);
+    renderProjectDetail();
+    const column = screen.getByTestId('project-column');
+    for (const id of ['project-header', 'project-settings', 'status-line', 'panel-button']) {
+      expect(column.querySelector(`[data-tour="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it('is 260px beside a docked panel and 220px on a narrow window, tinted, with no border', () => {
+    setViewportWidth(1440);
+    const wide = renderProjectDetail();
+    const column = screen.getByTestId('project-column');
+    expect(column.style.width).toBe('260px');
+    expect(column.className).toContain('bg-sidebar');
+    expect(column.className).not.toMatch(/\bborder/);
+    wide.unmount();
+
+    setViewportWidth(1000);
+    renderProjectDetail();
+    expect(screen.getByTestId('project-column').style.width).toBe('220px');
+  });
+
+  it('draws no lines across the window: no header border, no banded status line', () => {
+    setViewportWidth(1440);
+    const { container } = renderProjectDetail();
+    expect(screen.getByTestId('trigger-summary').parentElement?.className ?? '').not.toContain('border-y');
+    expect(screen.getByTestId('session-sidebar').className).not.toMatch(/\bborder|shadow-well/);
+    // Nothing folds on desktop: the header→toolbar View Transition is the phone's.
+    expect(container.querySelector('.vt-project-header')).toBeNull();
+    expect(container.querySelector('.vt-project-title')).toBeNull();
+    // The right area swaps as one.
+    expect(screen.getByTestId('project-main').className).toContain('vt-project-body');
+  });
+
+  it('a page keeps the column free of View Transition names too', () => {
+    setViewportWidth(1440);
+    const { container } = renderProjectDetail({ page: 'pricing' });
+    expect(container.querySelector('.vt-project-header')).toBeNull();
+    expect(container.querySelector('.vt-project-title')).toBeNull();
+    expect(container.querySelector('.vt-settings-back')).toBeNull();
+  });
+
+  it('phone keeps the compact header + banded status line and the View Transition names', () => {
+    setViewportWidth(390);
+    const { container } = renderProjectDetail();
+    expect(screen.queryByTestId('project-column')).toBeNull();
+    expect(container.querySelector('.vt-project-header')).not.toBeNull();
+    expect(screen.getByTestId('trigger-summary').parentElement?.className).toContain('border-y');
+    expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('Alpha Project');
+  });
+
+  it('the gear shows as chosen on Settings and on a page under it, not elsewhere', () => {
+    for (const [page, chosen] of [
+      [undefined, false],
+      ['tasks', false],
+      ['settings', true],
+      ['pricing', true],
+    ] as const) {
+      const { unmount } = renderProjectDetail({ page });
+      const gear = screen.getByRole('button', { name: /project settings/i });
+      if (chosen) expect(gear).toHaveAttribute('aria-current', 'page');
+      else expect(gear).not.toHaveAttribute('aria-current');
+      unmount();
+    }
+  });
+
+  it('the session you came from keeps a faint "was here" mark while a page is open', () => {
+    sessionsMock.sessions = [session('sess-xyz'), session('sess-other')];
+    const chat = renderProjectDetail();
+    const row = screen.getByTestId('session-list-item-sess-xyz');
+    expect(row).toHaveAttribute('aria-selected', 'true');
+    expect(row).not.toHaveAttribute('data-was-here');
+    chat.unmount();
+
+    renderProjectDetail({ page: 'tasks' });
+    const was = screen.getByTestId('session-list-item-sess-xyz');
+    expect(was).toHaveAttribute('aria-selected', 'false');
+    expect(was).toHaveAttribute('data-was-here', 'true');
+    expect(within(was).getByTestId('session-name').className).toContain('text-secondary');
+    expect(screen.getByTestId('session-list-item-sess-other')).not.toHaveAttribute('data-was-here');
+  });
+
+  it('clicking any session from a page returns to the chat on that session', () => {
+    sessionsMock.sessions = [session('sess-xyz'), session('sess-other')];
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'settings' }, setRoute);
+    for (const id of ['sess-xyz', 'sess-other']) {
+      setRoute.mockClear();
+      fireEvent.click(screen.getByTestId(`session-list-item-${id}`));
+      const updater = setRoute.mock.calls[0][0] as (prev: Route) => Route;
+      expect(updater({ ...baseRoute, page: 'settings' })).toMatchObject({ sessionId: id, page: undefined });
+    }
+  });
+
+  it('"New session" in the column mints one and opens it in the chat', async () => {
+    const setRoute = vi.fn();
+    renderProjectDetail({ page: 'tasks' }, setRoute);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('session-new-button'));
+    });
+    expect(mintMock.newSession).toHaveBeenCalledWith('proj-42');
+    const updater = setRoute.mock.calls[setRoute.mock.calls.length - 1][0] as (prev: Route) => Route;
+    expect(updater({ ...baseRoute, page: 'tasks' })).toMatchObject({ sessionId: 'sess-new', page: undefined });
+  });
+});
+
+// Spec 137 item 12: maximized Files fills the right area while the column
+// stays, and opening anything from the column needs the right area back.
+describe('ProjectDetail — maximize and the column', () => {
+  function maximized() {
     setViewportWidth(1440);
     const panel = renderHook(() => usePanelState('proj-42', 'sess-xyz'));
     act(() => {
       panel.result.current.expand();
       panel.result.current.maximize();
     });
+    return panel;
+  }
+
+  it('the column stays visible while the panel is maximized', () => {
+    maximized();
     renderProjectDetail();
-    expect(screen.queryByRole('button', { name: /project settings/i })).toBeNull();
-    expect(screen.queryByTestId('trigger-summary')).toBeNull();
-    act(() => panel.result.current.restore());
-    expect(screen.getByRole('button', { name: /project settings/i })).toBeInTheDocument();
+    const column = screen.getByTestId('project-column');
+    expect(column.className).not.toMatch(/(^|\s)hidden(\s|$)/);
+    expect(within(column).getByRole('button', { name: /project settings/i })).toBeInTheDocument();
+    expect(within(column).getByTestId('trigger-summary')).toBeInTheDocument();
+  });
+
+  it('opening a session while maximized restores the panel to its docked width', () => {
+    sessionsMock.sessions = [session('sess-xyz'), session('sess-other')];
+    const panel = maximized();
+    renderProjectDetail();
+    act(() => {
+      fireEvent.click(screen.getByTestId('session-list-item-sess-other'));
+    });
+    expect(panel.result.current.maximized).toBe(false);
+    expect(panel.result.current.expanded).toBe(true);
+  });
+
+  it('the status line and the gear restore it too', () => {
+    for (const open of [
+      () => fireEvent.click(screen.getByTestId('trigger-summary')),
+      () => fireEvent.click(screen.getByRole('button', { name: /project settings/i })),
+    ]) {
+      const panel = maximized();
+      const { unmount } = renderProjectDetail();
+      act(open);
+      expect(panel.result.current.maximized).toBe(false);
+      unmount();
+      __resetPanelState();
+    }
   });
 });

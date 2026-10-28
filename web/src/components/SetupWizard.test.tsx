@@ -342,7 +342,7 @@ describe('SetupWizard — Agents step', () => {
     mockApi({ apiKeySet: false });
     render(<SetupWizard onComplete={vi.fn()} />);
     await waitFor(() => expect(screen.getByTestId('wizard-not-found')).toBeTruthy());
-    expect(screen.getByText('Not found on this computer')).toBeTruthy();
+    expect(screen.getByText('Local Agents Not Found?')).toBeTruthy();
     expect(screen.queryByTestId('sub-agent-not-detected-kimi-code')).toBeNull();
     fireEvent.click(screen.getByTestId('wizard-locate-chip-kimi-code'));
     expect(screen.getByTestId('sub-agent-not-detected-kimi-code')).toBeTruthy();

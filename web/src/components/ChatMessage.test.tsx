@@ -161,7 +161,7 @@ describe('ChatMessage — flat avatar-log layout (Design §5)', () => {
     expect(avatar?.getAttribute('data-variant')).toBe('agent');
     expect(avatar?.querySelector('img')?.getAttribute('src')).toBe('/icon-192.png');
 
-    expect(screen.getByText('agent')).toBeInTheDocument();
+    expect(screen.getByText('Agent')).toBeInTheDocument();
     expect(screen.getByText('agent reply here')).toBeInTheDocument();
 
     // No bubble background/border box wrapping the content.
@@ -209,17 +209,17 @@ describe('ChatMessage — configured agent name', () => {
   it('Test 1: a management message shows the configured agent_name', () => {
     render(<ChatMessage message={agentMsg('mgmt reply')} agentName="Research Bot" />);
     expect(screen.getByText('Research Bot')).toBeInTheDocument();
-    expect(screen.queryByText('agent')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agent')).not.toBeInTheDocument();
   });
 
   it('Test 2: a management message with empty agent_name falls back to "agent"', () => {
     render(<ChatMessage message={agentMsg('mgmt reply')} agentName="" />);
-    expect(screen.getByText('agent')).toBeInTheDocument();
+    expect(screen.getByText('Agent')).toBeInTheDocument();
   });
 
   it('Test 2b: a whitespace-only agent_name also falls back to "agent"', () => {
     render(<ChatMessage message={agentMsg('mgmt reply')} agentName="   " />);
-    expect(screen.getByText('agent')).toBeInTheDocument();
+    expect(screen.getByText('Agent')).toBeInTheDocument();
   });
 
   it('Test 3: a sub-agent message shows its handle regardless of agentName', () => {

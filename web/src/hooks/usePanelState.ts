@@ -26,9 +26,11 @@ export interface PanelState {
   view: PanelView;
   file: string | null;
   /**
-   * Spec 137 — the panel fills the main area (docked: the session column and
-   * chat hide; overlay: the full width right of the strip/list). Maximized
-   * Files is the old Files tab: tree on the left, the file on the right.
+   * Spec 137 — the panel fills the right area (docked: the chat hides and the
+   * project column stays; overlay: the full width right of the column).
+   * Maximized Files is the old Files tab: tree on the left, the file on the
+   * right. Opening anything from the project column restores it
+   * (`restoreMaximized`).
    */
   maximized: boolean;
   /** Spec 137 — below the dock threshold the panel opens as an overlay / bottom sheet. */
@@ -245,6 +247,25 @@ function subscribeToWindowWidth(onChange: () => void) {
   if (typeof window === 'undefined') return () => {};
   window.addEventListener('resize', onChange);
   return () => window.removeEventListener('resize', onChange);
+}
+
+/**
+ * Spec 137 item 12 — opening anything from the project column (a session, the
+ * status line, the gear) needs the right area, so every maximized panel of the
+ * project returns to its docked width. Project-wide rather than per session:
+ * a session row opens ANOTHER session, whose panel may have been left
+ * maximized too, and maximize is never persisted anyway (item 7).
+ */
+export function restoreMaximized(projectId: string): void {
+  const prefix = `${projectId}:`;
+  let changed = false;
+  for (const [key, state] of store) {
+    if (key.startsWith(prefix) && state.maximized) {
+      store.set(key, { ...state, maximized: false });
+      changed = true;
+    }
+  }
+  if (changed) listeners.forEach((l) => l());
 }
 
 /** Test helper: wipe every session's panel state. */

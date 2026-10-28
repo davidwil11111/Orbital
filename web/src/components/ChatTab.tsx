@@ -3,15 +3,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
- * ChatTab — the Chat-tab 2-column layout (V1 Phase 1B).
+ * ChatTab — the project's chat home: the conversation for the ACTIVE session
+ * and, beside it, the workspace panel (spec 078).
  *
- *   [ SessionSidebar 260px ][ ChatView 1fr ]
+ *   [ ChatView 1fr ][ panel | handle ]
  *
- * The Chat tab is session-aware: the LEFT column lists the project's sessions
- * (SessionSidebar) and the RIGHT column renders the conversation for the
- * ACTIVE session. Selecting a session is a route change — it sets
- * `route.sessionId` (the source of truth for the active session) and the
- * sidebar persists it via useSession.
+ * Spec 137 (the folder shell): the session list moved out of here into the
+ * project column ProjectDetail draws, because that column stays on screen
+ * while a page (Tasks, Settings) replaces the chat. Selecting a session is
+ * still a route change — `route.sessionId` is the source of truth — made
+ * through `useSessionNav`, which the column and ChatView's session links share.
  *
  * Active-session resolution (§2 of the T5 brief):
  *   route.sessionId is the source of truth. When undefined (project just
@@ -42,11 +43,10 @@ import type {
 import type { Route } from '../route';
 import { useSessions } from '../hooks/useSessions';
 import { useSession } from '../hooks/useSession';
-import { useAgent } from '../hooks/useAgent';
+import { useSessionNav } from '../hooks/useSessionNav';
 import { useFiles } from '../hooks/useFiles';
 import { useChatHistory } from '../hooks/useChatHistory';
 import { useSessionMessages } from '../utils/sessionMessagesStore';
-import { markFreshSession } from '../utils/freshSession';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAnnotations } from '../hooks/useAnnotations';
 import { usePanelDockable, usePanelMobile, usePanelState } from '../hooks/usePanelState';
@@ -58,7 +58,6 @@ import {
   touchedFiles,
   viewForEvent,
 } from '../utils/panelSelectors';
-import { SessionSidebar } from './SessionSidebar';
 import ChatView from './ChatView';
 import ScopeChip from './ScopeChip';
 import FilePreviewDrawer from './FilePreviewDrawer';
@@ -148,7 +147,7 @@ export default function ChatTab({
   const projectId = project.project_id;
   const { sessions } = useSessions(projectId);
   const { activeSessionId, setActiveSessionId } = useSession(projectId);
-  const { newSession } = useAgent();
+  const { selectSession } = useSessionNav(projectId, setRoute);
 
   const routeSessionId = route.sessionId;
 
@@ -182,9 +181,9 @@ export default function ChatTab({
   // bottom sheet is already the whole screen.
   const canMaximize = docked || !mobile;
   const maximized = panelOpen && canMaximize && panelMaximized;
-  // The docked panel maximized takes the whole row: the session column and
-  // the conversation hide (CSS only — the chat stays mounted, composer
-  // draft and stream intact).
+  // The docked panel maximized takes the whole right area: the conversation
+  // hides (CSS only — the chat stays mounted, composer draft and stream
+  // intact). The project column beside it stays (spec 137 item 12).
   const panelFillsRow = docked && maximized;
   const { annotating, setAnnotating, annotations, add: addAnnotation } =
     useAnnotations(routeSessionId);
@@ -409,34 +408,6 @@ export default function ChatTab({
     }
   }, [routeSessionId, sessions, activeSessionId, projectId, setRoute, setActiveSessionId]);
 
-  // Selecting a session in the sidebar is a route change. SessionSidebar is
-  // controlled (it does NOT persist internally), so ChatTab — the single
-  // source of truth — both updates route.sessionId AND persists the selection.
-  function handleSessionSelect(sessionId: string) {
-    setRoute((prev) =>
-      prev.name === 'project' && prev.projectId === projectId
-        ? { ...prev, sessionId }
-        : prev,
-    );
-    setActiveSessionId(sessionId);
-  }
-
-  // After a session is deleted: if it was the one being viewed, navigate to the
-  // most recent remaining session, else to a blank state (sessionId undefined,
-  // which lets the resolution effect pick a default or render the empty state).
-  // The sidebar passes the already-pruned remaining list (sorted most-recent
-  // first), so [0] is the most recent.
-  function handleSessionDeleted(deletedId: string, remaining: SessionListEntry[]) {
-    if (routeSessionId !== deletedId) return; // a non-viewed row was deleted
-    const nextId = remaining[0]?.session_id;
-    setRoute((prev) =>
-      prev.name === 'project' && prev.projectId === projectId
-        ? { ...prev, sessionId: nextId }
-        : prev,
-    );
-    setActiveSessionId(nextId ?? null);
-  }
-
   // Workbench card-tap doorway (spec 2026-07-24 §5.3): route.draft is a
   // one-shot composer prefill. ChatView applies it once and calls this back
   // so the consumed copy is cleared from the route — otherwise it would
@@ -447,45 +418,6 @@ export default function ChatTab({
         ? { ...prev, draft: undefined, draftSkill: undefined }
         : prev,
     );
-  }
-
-  // "+ new session": mint a genuinely BLANK session on the backend and
-  // navigate to it. We must NOT clear route.sessionId to undefined — that
-  // would let the resolution effect re-open the most-recent existing session
-  // (the bug). Instead we POST /new-session with NO session_id (fresh-create),
-  // read the minted `session_id` from the response, and set it on the route.
-  //
-  // Because the minted id is DEFINED, the resolution effect above early-returns
-  // (`if (routeSessionId !== undefined) return;`) and cannot clobber it. The
-  // fresh session has no messages and is not yet in the `sessions` list (it
-  // materializes server-side only on first inject); ChatView tolerates an
-  // unknown id and renders a blank composer.
-  //
-  // This is a click handler — fire-and-forget the async mint; do not block the
-  // UI. Log on failure (minimal error handling).
-  function handleNewSession() {
-    void newSession(projectId)
-      .then((result) => {
-        const newId = result.session_id;
-        if (!newId) {
-          console.error('newSession returned no session_id', result);
-          return;
-        }
-        // Spec 107 FE-1: tell ChatView's load effect this id was minted here
-        // and has no history yet — BEFORE the route flips, so the effect skips
-        // the /chat fetch (and its skeleton) for a session that cannot exist
-        // on disk until the first message.
-        markFreshSession(projectId, newId);
-        setRoute((prev) =>
-          prev.name === 'project' && prev.projectId === projectId
-            ? { ...prev, sessionId: newId }
-            : prev,
-        );
-        setActiveSessionId(newId);
-      })
-      .catch((err) => {
-        console.error('Failed to create a new session', err);
-      });
   }
 
   // The panel's chrome and body, shared by the docked column and the
@@ -556,15 +488,6 @@ export default function ChatTab({
 
   return (
     <div className="flex h-full min-h-0" data-testid="chat-tab">
-      <div className={`shrink-0 max-md:hidden ${panelFillsRow ? 'hidden' : ''}`} data-testid="chat-tab-sessions">
-        <SessionSidebar
-          projectId={projectId}
-          selectedSessionId={routeSessionId}
-          onSessionSelect={handleSessionSelect}
-          onNewSession={handleNewSession}
-          onSessionDeleted={handleSessionDeleted}
-        />
-      </div>
       <div
         data-testid="chat-tab-conversation"
         className={`flex-1 min-w-0 min-h-0 flex flex-col bg-card ${
@@ -595,13 +518,14 @@ export default function ChatTab({
             initialSkill={route.draftSkill}
             onDraftConsumed={handleDraftConsumed}
             onRefreshProject={onRefreshProject}
-            onOpenSession={handleSessionSelect}
+            onOpenSession={selectSession}
           />
         </div>
       </div>
-      {/* Spec 078 §5.1 — the third column: the panel when expanded, the 20px
+      {/* Spec 078 §5.1 — beside the chat: the panel when expanded, the 20px
           edge handle when collapsed. Only above the push threshold. Spec
-          137: maximized, it takes the whole row. */}
+          137: a full-height sibling with a left edge only; maximized, it
+          takes the whole right area (the project column stays). */}
       {docked &&
         (panelExpanded ? (
           <FilePreviewDrawer

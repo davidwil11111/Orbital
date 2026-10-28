@@ -29,7 +29,6 @@ import type {
 import type { Route } from '../route';
 import { __resetPanelState } from '../hooks/usePanelState';
 import { __resetAnnotationsStore } from '../hooks/useAnnotations';
-import { consumeFreshSession } from '../utils/freshSession';
 
 afterEach(() => cleanup());
 
@@ -150,7 +149,8 @@ vi.mock('./panel/BrowserView', () => ({
 // the real heavy components (which need API / WS / etc.)
 // ---------------------------------------------------------------------------
 
-// Capture the last props passed to each stub.
+// Capture the last props passed to each stub. SessionSidebar is stubbed only
+// to prove ChatTab no longer renders it (spec 137: it is the project column's).
 let lastSessionSidebarProps: Record<string, unknown> = {};
 let lastChatViewProps: Record<string, unknown> = {};
 
@@ -394,7 +394,6 @@ describe('ChatTab — route.sessionId already set: no override', () => {
       );
     });
 
-    expect(lastSessionSidebarProps.selectedSessionId).toBe('sess-x');
     expect(lastChatViewProps.sessionId).toBe('sess-x');
   });
 });
@@ -434,29 +433,31 @@ describe('ChatTab — persisted session gone: fallback to most-recent existing',
   });
 });
 
-describe('ChatTab — controlled sidebar handoff (onSessionSelect)', () => {
+// Spec 137 (the folder shell): the session list moved into the project
+// column (ProjectDetail), which stays while a page fills the right area. The
+// chat only opens other sessions through ChatView's links, with the same
+// navigation the column uses (hooks/useSessionNav).
+describe('ChatTab — the session list lives in the project column, not here', () => {
   beforeEach(() => resetMocks());
 
-  it('passes selectedSessionId (= route.sessionId) to SessionSidebar', async () => {
+  it('renders no session list of its own', async () => {
     mockSessions = [makeSession({ session_id: 'sess-ctrl' })];
-    const route = makeRoute({ sessionId: 'sess-ctrl' });
-
     await act(async () => {
       render(
         <ChatTab
           project={PROJECT}
           agentStatus="idle"
           agents={[]}
-          route={route}
+          route={makeRoute({ sessionId: 'sess-ctrl' })}
           setRoute={vi.fn()}
         />,
       );
     });
-
-    expect(lastSessionSidebarProps.selectedSessionId).toBe('sess-ctrl');
+    expect(lastSessionSidebarProps).toEqual({});
+    expect(screen.queryByTestId('chat-tab-sessions')).toBeNull();
   });
 
-  it('invoking SessionSidebar onSessionSelect calls setRoute with the picked session and setActiveSessionId', async () => {
+  it('ChatView opening another session sets the route to it (back on chat) and persists it', async () => {
     mockSessions = [
       makeSession({ session_id: 'sess-a' }),
       makeSession({ session_id: 'sess-b' }),
@@ -476,19 +477,13 @@ describe('ChatTab — controlled sidebar handoff (onSessionSelect)', () => {
       );
     });
 
-    // Simulate user picking 'sess-b' in the sidebar
-    const onSessionSelect = lastSessionSidebarProps.onSessionSelect as (id: string) => void;
     act(() => {
-      onSessionSelect('sess-b');
+      (lastChatViewProps.onOpenSession as (id: string) => void)('sess-b');
     });
 
-    // setRoute must have been called with an updater that resolves to sessionId: 'sess-b'
     expect(setRoute).toHaveBeenCalled();
     const updater = setRoute.mock.calls[0][0] as (prev: Route) => Route;
-    const updated = updater(route);
-    expect(updated).toMatchObject({ name: 'project', projectId: 'proj-1', sessionId: 'sess-b' });
-
-    // setActiveSessionId must also have been called with the picked id
+    expect(updater(route)).toMatchObject({ name: 'project', projectId: 'proj-1', sessionId: 'sess-b', page: undefined });
     expect(mockSetActiveSessionId).toHaveBeenCalledWith('sess-b');
   });
 });
@@ -594,113 +589,18 @@ describe('ChatTab — empty project (no sessions)', () => {
     // No route override should be called — nothing to resolve to
     expect(setRoute).not.toHaveBeenCalled();
 
-    // Children receive undefined sessionId
-    expect(lastSessionSidebarProps.selectedSessionId).toBeUndefined();
+    // ChatView receives undefined sessionId
     expect(lastChatViewProps.sessionId).toBeUndefined();
   });
 });
 
 // ---------------------------------------------------------------------------
-// Task C — "+ new session" mints a FRESH blank session (not re-resolve old)
+// Task C — a freshly minted session is not in the list yet. ("+ new session"
+// itself moved to the project column; its tests are in useSessionNav.test.ts.)
 // ---------------------------------------------------------------------------
 
-describe('ChatTab — "+ new session" creates a genuinely blank session', () => {
+describe('ChatTab — a minted session not yet in the list', () => {
   beforeEach(() => resetMocks());
-
-  it('mints a fresh session id via newSession and navigates to it (not the most-recent existing)', async () => {
-    // There is an existing, most-recently-active session. The OLD buggy
-    // behaviour cleared route.sessionId to undefined, which re-resolved to
-    // this existing session. The fix must navigate to the minted id instead.
-    mockSessions = [
-      makeSession({ session_id: 'sess-old', last_activity_at: '2026-06-01T00:00:00Z' }),
-    ];
-    mockActiveSessionId = 'sess-old';
-
-    const setRoute = vi.fn();
-    const route = makeRoute({ sessionId: 'sess-old' });
-
-    await act(async () => {
-      render(
-        <ChatTab
-          project={PROJECT}
-          agentStatus="idle"
-          agents={[]}
-          route={route}
-          setRoute={setRoute}
-        />,
-      );
-    });
-
-    // The resolution effect must NOT have fired (route.sessionId already set).
-    setRoute.mockClear();
-
-    // User clicks "+ new session".
-    const onNewSession = lastSessionSidebarProps.onNewSession as () => void;
-    await act(async () => {
-      onNewSession();
-      // allow the awaited newSession() promise + state update to flush
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // newSession was called with NO explicit session id (fresh-create).
-    expect(mockNewSession).toHaveBeenCalledTimes(1);
-    expect(mockNewSession).toHaveBeenCalledWith('proj-1');
-
-    // setRoute navigates to the MINTED id, not the old/most-recent one.
-    expect(setRoute).toHaveBeenCalled();
-    const updater = setRoute.mock.calls[setRoute.mock.calls.length - 1][0] as (prev: Route) => Route;
-    const updated = updater(route);
-    expect(updated).toMatchObject({
-      name: 'project',
-      projectId: 'proj-1',
-      sessionId: 'sess_minted_new',
-    });
-    expect(updated.name === 'project' && updated.sessionId).not.toBe('sess-old');
-  });
-
-  it('marks the minted id as fresh BEFORE navigating to it (spec 107 FE-1)', async () => {
-    // ChatView's load effect runs as soon as the route flips to the minted id.
-    // The mark must already be there at that moment, or the pane fetches
-    // /chat for an id it knows is empty and shows a skeleton while the backend
-    // scans every session log for a session that cannot exist.
-    mockSessions = [
-      makeSession({ session_id: 'sess-old', last_activity_at: '2026-06-01T00:00:00Z' }),
-    ];
-    mockActiveSessionId = 'sess-old';
-
-    let freshAtSetRoute: boolean | null = null;
-    const setRoute = vi.fn(() => {
-      // Consuming here proves the mark preceded the navigation.
-      freshAtSetRoute = consumeFreshSession('proj-1', 'sess_minted_new');
-    });
-    const route = makeRoute({ sessionId: 'sess-old' });
-
-    await act(async () => {
-      render(
-        <ChatTab
-          project={PROJECT}
-          agentStatus="idle"
-          agents={[]}
-          route={route}
-          setRoute={setRoute}
-        />,
-      );
-    });
-    setRoute.mockClear();
-
-    const onNewSession = lastSessionSidebarProps.onNewSession as () => void;
-    await act(async () => {
-      onNewSession();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(setRoute).toHaveBeenCalled();
-    expect(freshAtSetRoute).toBe(true);
-    // Consumed once: nothing lingers for a later visit to the same id.
-    expect(consumeFreshSession('proj-1', 'sess_minted_new')).toBe(false);
-  });
 
   it('tolerates a route.sessionId that is not in the sessions list (blank session, no re-resolve)', async () => {
     // After minting, the new id is DEFINED but not yet in `sessions` (it
@@ -728,8 +628,7 @@ describe('ChatTab — "+ new session" creates a genuinely blank session', () => 
 
     // No clobbering back to an existing session.
     expect(setRoute).not.toHaveBeenCalled();
-    // Children receive the fresh id even though it isn't in `sessions`.
-    expect(lastSessionSidebarProps.selectedSessionId).toBe('sess_minted_new');
+    // ChatView receives the fresh id even though it isn't in `sessions`.
     expect(lastChatViewProps.sessionId).toBe('sess_minted_new');
   });
 });
@@ -823,8 +722,9 @@ describe('ChatTab — panel column vs. overlay (push threshold)', () => {
 
     expect(screen.getByTestId('workspace-panel-column')).toBeInTheDocument();
     expect(screen.queryByTestId('panel-handle')).toBeNull();
-    // The session column and the chat column are still there — three columns.
-    expect(lastSessionSidebarProps.selectedSessionId).toBe('sess-x');
+    // The chat is still there beside it (the project column is
+    // ProjectDetail's, to the left of both).
+    expect(screen.getByTestId('chat-tab-conversation').className).not.toMatch(/(^|\s)hidden(\s|$)/);
     expect(lastChatViewProps.sessionId).toBe('sess-x');
     expect(screen.getByRole('tab', { name: 'Files' })).toBeInTheDocument();
   });
@@ -1312,17 +1212,15 @@ describe('ChatTab — maximize (docked)', () => {
     return view;
   }
 
-  it('docked → maximized hides the session column and the chat; Restore brings back the docked width', async () => {
+  it('docked → maximized hides the chat and fills the right area; Restore brings back the docked width', async () => {
     const view = await openDocked();
-    const sessions = view.container.querySelector('[data-testid="chat-tab-sessions"]') as HTMLElement;
     const chat = view.container.querySelector('[data-testid="chat-tab-conversation"]') as HTMLElement;
-    expect(sessions.className).not.toMatch(/(^|\s)hidden(\s|$)/);
+    expect(chat.className).not.toMatch(/(^|\s)hidden(\s|$)/);
 
     await act(async () => {
       fireEvent.click(screen.getByTestId('panel-maximize'));
     });
     expect(screen.getByTestId('workspace-panel-column')).toHaveAttribute('data-maximized', 'true');
-    expect(sessions.className).toMatch(/(^|\s)hidden(\s|$)/);
     expect(chat.className).toMatch(/(^|\s)hidden(\s|$)/);
     // Maximized Files is the old Files tab: the tree + preview explorer.
     expect(screen.getByTestId('file-explorer')).toBeInTheDocument();
