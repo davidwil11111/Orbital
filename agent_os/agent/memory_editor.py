@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from agent_os.agent import memory_entries as _mem
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -112,12 +113,14 @@ def _marker_path(orbital_dir: str) -> str:
 
 
 def read_marker(orbital_dir: str) -> dict:
-    try:
-        with open(_marker_path(orbital_dir), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    text = read_text_lenient(_marker_path(orbital_dir))
+    if text is None:
         return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _parse_iso(value) -> datetime | None:

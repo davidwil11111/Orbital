@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from agent_os.agent import state_blocks, user_flags
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -1727,11 +1728,7 @@ def memory_key_for_path(resolved_path: str, workspace: str) -> str | None:
 
 
 def _read(path: str) -> str | None:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        return None
+    return read_text_lenient(path)
 
 
 def _atomic_write(path: str, text: str) -> None:

@@ -46,6 +46,7 @@ import os
 from datetime import datetime, timezone
 
 from agent_os.agent import blob_store
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -308,20 +309,16 @@ def read_archive_manifest(session) -> list[dict]:
     """
     path = os.path.join(_tool_results_dir(session), ARCHIVE_MANIFEST)
     entries: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(entry, dict) and entry.get("call_id") and entry.get("sha256"):
-                    entries.append(entry)
-    except OSError:
-        pass
+    for line in (read_text_lenient(path) or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("call_id") and entry.get("sha256"):
+            entries.append(entry)
     return entries
 
 

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 
 from agent_os.agent import memory_entries as _mem
+from agent_os.utils.text_io import read_text_lenient, read_text_lenient_detail
 
 logger = logging.getLogger(__name__)
 
@@ -427,11 +428,36 @@ class WorkspaceFileManager:
         if file_key not in FILE_NAMES:
             raise ValueError(f"Unknown file_key: {file_key!r}. Must be one of {list(FILE_NAMES)}")
         filepath = self._file_path(file_key)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return f.read()
-        except OSError:
+        res = read_text_lenient_detail(filepath)
+        if res is None:
             return None
+        text, fallbacks = res
+        if fallbacks:
+            self._heal_to_utf8(filepath, text)
+        return text
+
+    @staticmethod
+    def _heal_to_utf8(filepath: str, text: str) -> None:
+        """Spec 141 B: rewrite an Orbital-owned Layer-1 file that needed the
+        lenient fallback (e.g. a GBK tail from a Windows shell append) as
+        UTF-8, so the next read takes the fast path. Same atomic tmp+replace
+        as ``write``, but verbatim — no ``prepare`` normalisation, the bytes
+        change only in encoding. Only ``orbital/<FILE_NAMES>`` reach here;
+        user-owned files are never rewritten. Best effort: a failed heal
+        must not fail the read."""
+        tmp_path = filepath + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            _atomic_replace(tmp_path, filepath)
+            _record_daemon_write(filepath)
+            logger.info("re-encoded %s as UTF-8", filepath)
+        except OSError:
+            logger.warning("could not re-encode %s as UTF-8", filepath, exc_info=True)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     def prepare(self, file_key: str, content: str, *, today: str | None = None) -> tuple[str, list[str]]:
         """What ``write`` would put on disk for ``file_key``, without writing.
@@ -507,12 +533,7 @@ class WorkspaceFileManager:
             raise ValueError(f"Unknown file_key: {file_key!r}. Must be one of {list(FILE_NAMES)}")
         self.ensure_dir()
         filepath = self._file_path(file_key)
-        existing = ""
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                existing = f.read()
-        except OSError:
-            pass
+        existing = read_text_lenient(filepath) or ""
         tmp_path = filepath + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(existing + content)

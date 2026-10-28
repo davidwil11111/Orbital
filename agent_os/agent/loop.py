@@ -34,6 +34,7 @@ from agent_os.agent.providers.types import (
     ErrorCategory,
 )
 from agent_os.agent.tools.base import ToolResult
+from agent_os.utils.text_io import read_text_lenient
 from agent_os.agent.tool_result_filters import dispatch_prefilter
 from agent_os.agent.tool_result_lifecycle import (
     archive_and_supersede_tool_results,
@@ -208,11 +209,7 @@ def classify_written_path(workspace: str, path) -> str | None:
 
 
 def _read_memory_file(workspace: str, name: str) -> str | None:
-    try:
-        with open(os.path.join(workspace, "orbital", name), "r", encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        return None
+    return read_text_lenient(os.path.join(workspace, "orbital", name))
 
 
 def _last_line(text: str | None) -> str:
@@ -2262,10 +2259,9 @@ class AgentLoop:
             return
         try:
             path = os.path.join(workspace, "orbital", "PROJECT_STATE.md")
-            with open(path, "r", encoding="utf-8") as fh:
-                ids = {b.id for b in _blocks.parse(fh.read())[1] if b.id}
-        except OSError:
-            ids = set()
+            text = read_text_lenient(path)
+            ids = ({b.id for b in _blocks.parse(text)[1] if b.id}
+                   if text is not None else set())
         except Exception:  # noqa: BLE001 — a parse bug must not break a turn
             logger.warning("seen-set binding failed", exc_info=True)
             return

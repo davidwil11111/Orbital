@@ -26,7 +26,15 @@ const KEY_BY_CODE: Record<string, StringKey> = {
   model_not_found: 'agentError.model_not_found',
   provider_unreachable: 'agentError.provider_unreachable',
   provider_error: 'agentError.provider_error',
+  // Spec 141: an Orbital-side crash, not a provider failure.
+  internal_error: 'agentError.internal_error',
 };
+
+/** Codes that are Orbital's own failure: the fix is not in Settings, so the
+ * notice offers Send feedback instead of Open settings (spec 141). */
+export function isInternalError(code: string | undefined): boolean {
+  return code === 'internal_error';
+}
 
 /** i18n key for a classifier code; unknown codes fall back to the generic. */
 export function providerErrorKey(code: string | undefined): StringKey {

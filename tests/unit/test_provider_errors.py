@@ -67,10 +67,49 @@ def test_classify_real_openai_connection_error_as_unreachable():
     assert code == "provider_unreachable"
 
 
-def test_classify_unknown_exception_as_provider_error():
+def test_classify_unknown_exception_as_internal_error():
+    # Spec 141 §1 C: an exception that did not come from the LLM call path is
+    # Orbital's own failure, not the provider's.
     code, msg = classify_llm_error(RuntimeError("boom"))
-    assert code == "provider_error"
+    assert code == "internal_error"
     assert "boom" in msg
+
+
+def test_classify_unicode_decode_error_as_internal_error():
+    exc = UnicodeDecodeError("utf-8", b"\xb4", 0, 1, "invalid start byte")
+    code, msg = classify_llm_error(exc)
+    assert code == "internal_error"
+    # The detail names the exception class (it feeds the Send feedback
+    # context: "<exception class>: <message>").
+    assert msg.startswith("UnicodeDecodeError: ")
+    assert "can't decode byte 0xb4" in msg
+
+
+def test_classify_real_openai_status_500_as_provider_error():
+    req = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    exc = openai.InternalServerError(
+        "upstream exploded", response=httpx.Response(500, request=req), body=None,
+    )
+    code, _ = classify_llm_error(exc)
+    assert code == "provider_error"
+
+
+def test_classify_httpx_error_without_status_as_provider_error():
+    code, _ = classify_llm_error(httpx.ReadError("stream broke"))
+    assert code == "provider_error"
+
+
+def test_classify_provider_layer_errors_keep_provider_codes():
+    from agent_os.agent.providers.types import ContextOverflowError, LLMError
+
+    assert classify_llm_error(LLMError("Request timed out"))[0] == "provider_error"
+    assert classify_llm_error(LLMError("bad key", status_code=401))[0] == "invalid_api_key"
+    assert classify_llm_error(ContextOverflowError("too long"))[0] == "provider_error"
+
+
+def test_classify_provider_config_error_unchanged():
+    code, msg = classify_llm_error(ProviderConfigError("missing_card", "gone"))
+    assert (code, msg) == ("missing_card", "gone")
 
 
 def _make_manager():

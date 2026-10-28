@@ -20,6 +20,7 @@ import time
 from datetime import date
 
 from agent_os.utils.file_lock import FileLockError, session_lock
+from agent_os.utils.text_io import read_text_lenient
 
 from .base import Tool, ToolResult
 
@@ -125,11 +126,7 @@ class RememberAboutUserTool(Tool):
         # Dedup and the caps are checked under the lock so concurrent appends
         # can neither interleave nor double-file the same fact.
         try:
-            try:
-                with open(self._path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except OSError:
-                content = ""
+            content = read_text_lenient(self._path) or ""
 
             if any(_fact_of_line(line) == fact
                    for line in content.splitlines() if line.strip()):

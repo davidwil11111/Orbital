@@ -70,6 +70,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 
 from agent_os.agent import user_flags
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -533,27 +534,26 @@ def _session_user_texts(sessions_dir: str, stem: str) -> list[str]:
     if not _SESSION_STEM_RE.match(stem):
         return []
     texts: list[str] = []
-    try:
-        with open(os.path.join(sessions_dir, stem + ".jsonl"), encoding="utf-8") as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(row, dict) or row.get("role") != "user":
-                    continue
-                if row.get("source") not in (None, "user"):
-                    continue
-                content = row.get("content")
-                if isinstance(content, list):
-                    content = " ".join(
-                        b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                if isinstance(content, str) and content:
-                    texts.append(_norm(content))
-    except OSError:
+    raw = read_text_lenient(os.path.join(sessions_dir, stem + ".jsonl"))
+    if raw is None:
         return []
+    for line in raw.split("\n"):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("role") != "user":
+            continue
+        if row.get("source") not in (None, "user"):
+            continue
+        content = row.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if isinstance(content, str) and content:
+            texts.append(_norm(content))
     return texts
 
 
