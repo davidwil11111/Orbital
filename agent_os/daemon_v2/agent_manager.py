@@ -867,6 +867,11 @@ class AgentManager:
         def _session_header_for(provider_key: str) -> str | None:
             return self._provider_registry.get_provider_data(provider_key).get("session_header")
 
+        # Registry ``session_scope`` (spec 140): "project" lets a trigger loop
+        # route by project instead of by session.
+        def _session_scope_for(provider_key: str) -> str | None:
+            return self._provider_registry.get_provider_data(provider_key).get("session_scope")
+
         # Per-model endpoint override (registry ``sdk``/``base_url``). An
         # aggregator serves different models over different wire protocols
         # under one key — OpenCode Go puts minimax-m3 on Anthropic /messages
@@ -884,6 +889,7 @@ class AgentManager:
             provider=config.provider,
             extra_headers=_headers_for(config.provider),
             session_header=_session_header_for(config.provider),
+            session_scope=_session_scope_for(config.provider),
         )
 
         fallback_providers = []
@@ -901,7 +907,8 @@ class AgentManager:
                             reasoning=fb_info.reasoning,
                             provider=getattr(fb, 'provider', 'custom'),
                             extra_headers=_headers_for(getattr(fb, 'provider', 'custom')),
-                            session_header=_session_header_for(getattr(fb, 'provider', 'custom')))
+                            session_header=_session_header_for(getattr(fb, 'provider', 'custom')),
+                            session_scope=_session_scope_for(getattr(fb, 'provider', 'custom')))
             )
 
         if config.utility_model:
@@ -914,6 +921,7 @@ class AgentManager:
                 provider=config.provider,
                 extra_headers=_headers_for(config.provider),
                 session_header=_session_header_for(config.provider),
+                session_scope=_session_scope_for(config.provider),
             )
         else:
             utility_provider = provider
@@ -943,6 +951,8 @@ class AgentManager:
                 af.provider).get("extra_headers"),
             session_header=self._provider_registry.get_provider_data(
                 af.provider).get("session_header"),
+            session_scope=self._provider_registry.get_provider_data(
+                af.provider).get("session_scope"),
         )
 
     @staticmethod
@@ -1578,6 +1588,10 @@ class AgentManager:
             memory_record_enabled=not is_memory,
             tool_guard=_memory_editor.memory_tool_guard(config.workspace) if is_memory else None,
             tool_call_cap=_memory_editor.EDITOR_MAX_CALLS if is_memory else None,
+            # Spec 140: a trigger-started manager session routes by project on
+            # a project-scoped provider (OpenCode Go), so repeat fires land on
+            # the warm upstream. Chat/memory sessions keep the session uuid.
+            routing_project_id=project_id if (trigger_source and not is_memory) else None,
         )
         if is_memory:
             loop._cache_session_id = cache_session_id
