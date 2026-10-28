@@ -27,7 +27,7 @@ import { FIELD_MULTILINE } from './fieldStyles';
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
 export interface DiagnosticsContext {
-  kind: 'login_failed' | 'dispatch_failed' | 'general';
+  kind: 'login_failed' | 'dispatch_failed' | 'agent_error' | 'general';
   agent?: string;
   detail?: string;
 }
@@ -127,6 +127,8 @@ export function SendFeedbackDialog({
     contextLine = t('feedback.context.login_failed', { agent: context.agent ?? '' });
   } else if (context?.kind === 'dispatch_failed') {
     contextLine = t('feedback.context.dispatch_failed', { agent: context.agent ?? '' });
+  } else if (context?.kind === 'agent_error') {
+    contextLine = t('feedback.context.agent_error');
   }
 
   const sent = send.status === 'sent';

@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from agent_os.utils.text_io import read_text_lenient
+
 logger = logging.getLogger(__name__)
 
 RETRACTIONS_FILENAME = "retractions.md"
@@ -111,10 +113,8 @@ def add_retraction(orbital_dir: Path | str, r: Retraction) -> None:
 def list_retractions(orbital_dir: Path | str) -> list[Retraction]:
     """Return every retraction ever recorded, oldest first. `[]` if no file."""
     path = _path(orbital_dir)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except OSError:
+    content = read_text_lenient(str(path))
+    if content is None:
         return []
     out: list[Retraction] = []
     for line in content.split("\n"):

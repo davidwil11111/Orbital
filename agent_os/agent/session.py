@@ -11,6 +11,7 @@ persisted to a JSONL file. Provides sliding window over recent messages.
 from __future__ import annotations
 
 import html
+import io
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from agent_os.agent import blob_store
 from agent_os.agent.token_utils import estimate_message_tokens
 from agent_os.utils.file_lock import session_lock
+from agent_os.utils.text_io import read_text_lenient, read_text_lenient_raising
 
 logger = logging.getLogger(__name__)
 
@@ -433,7 +435,7 @@ class Session:
         with session._file_lock:
             skipped = 0
             stored_name: str | None = None
-            with open(filepath, "r", encoding="utf-8") as f:
+            with io.StringIO(read_text_lenient_raising(filepath)) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -870,11 +872,10 @@ class Session:
         """
         with self._lock:
             with self._file_lock:
-                try:
-                    with open(self._filepath, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                except OSError:
+                text = read_text_lenient(self._filepath)
+                if text is None:
                     return
+                lines = io.StringIO(text).readlines()
 
                 changed = False
                 for idx, raw in enumerate(lines):
@@ -1047,7 +1048,7 @@ class Session:
         if not pending or not os.path.exists(self._filepath):
             return []
         full: list[dict] = []
-        with open(self._filepath, "r", encoding="utf-8") as f:
+        with io.StringIO(read_text_lenient_raising(self._filepath)) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -1163,20 +1164,16 @@ class Session:
         lines: list[str] = []
         if self._pending_meta is not None:
             lines.append(json.dumps(self._pending_meta, ensure_ascii=False) + "\n")
-        try:
-            with open(self._filepath, "r", encoding="utf-8") as fh:
-                for raw in fh:
-                    raw_s = raw.strip()
-                    if not raw_s:
-                        continue
-                    try:
-                        rec = json.loads(raw_s)
-                    except json.JSONDecodeError:
-                        continue
-                    if rec.get("role") == "meta":
-                        lines.append(raw_s + "\n")
-        except OSError:
-            pass
+        for raw in (read_text_lenient(self._filepath) or "").split("\n"):
+            raw_s = raw.strip()
+            if not raw_s:
+                continue
+            try:
+                rec = json.loads(raw_s)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("role") == "meta":
+                lines.append(raw_s + "\n")
         return lines
 
     # ------------------------------------------------------------------

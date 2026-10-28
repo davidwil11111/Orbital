@@ -315,3 +315,63 @@ def test_write_invalid_key(ws):
 def test_no_cold_resume_builder(ws):
     """build_cold_resume_context was removed with the cold-resume row (2026-10-20)."""
     assert not hasattr(ws, "build_cold_resume_context")
+
+
+# ---------------------------------------------------------------------------
+# Spec 141 §1 A + B — a GBK tail must not brick reads; Orbital's own memory
+# files self-heal to UTF-8 after one read.
+# ---------------------------------------------------------------------------
+
+_141_HEAD = "# Project State\n" + "状态：进行中 — all good so far.\n" * 60
+_141_TAIL = "大量中文\n"
+
+
+@pytest.fixture
+def _windows_cp936(monkeypatch):
+    from agent_os.utils import text_io
+    text_io._reset_warned_for_tests()
+    monkeypatch.setattr(text_io, "_is_windows", lambda: True)
+    monkeypatch.setattr(text_io, "_preferred_encoding", lambda: "cp936")
+    yield
+    text_io._reset_warned_for_tests()
+
+
+def _write_mixed(path):
+    head = _141_HEAD.encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(head + _141_TAIL.encode("gbk"))
+
+
+def test_read_mixed_gbk_tail_decodes_both_halves_and_heals(ws, ws_dir, _windows_cp936):
+    os.makedirs(ws_dir, exist_ok=True)
+    path = os.path.join(ws_dir, "PROJECT_STATE.md")
+    _write_mixed(path)
+
+    text = ws.read("state")
+
+    assert text == _141_HEAD + _141_TAIL
+    # B: the file on disk is valid UTF-8 afterwards, with the same text.
+    with open(path, "rb") as f:
+        assert f.read().decode("utf-8") == _141_HEAD + _141_TAIL
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_read_heal_happens_once_then_fast_path(ws, ws_dir, _windows_cp936, caplog):
+    os.makedirs(ws_dir, exist_ok=True)
+    path = os.path.join(ws_dir, "DECISIONS.md")
+    _write_mixed(path)
+    with caplog.at_level(logging.WARNING, logger="agent_os.utils.text_io"):
+        first = ws.read("decisions")
+        second = ws.read("decisions")
+    assert first == second == _141_HEAD + _141_TAIL
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_read_utf8_file_is_not_rewritten(ws, ws_dir):
+    os.makedirs(ws_dir, exist_ok=True)
+    path = os.path.join(ws_dir, "LESSONS.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("1. lesson\n")
+    before = os.stat(path).st_mtime_ns
+    assert ws.read("lessons") == "1. lesson\n"
+    assert os.stat(path).st_mtime_ns == before

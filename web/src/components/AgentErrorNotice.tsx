@@ -13,11 +13,17 @@
  * The headline is the translated, actionable message for the classifier
  * `code`; the raw backend `message` is shown untranslated as secondary detail
  * (dynamic provider strings are not UI chrome — see i18n rules).
+ *
+ * Spec 141: `internal_error` is Orbital's own crash, so there is nothing to
+ * fix in Settings — the notice offers Send feedback (the spec-113 dialog,
+ * prefilled with the raw detail) instead of Open settings.
  */
 
+import { useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { useT } from '../i18n/useT';
-import { providerErrorKey } from '../utils/providerError';
+import { isInternalError, providerErrorKey } from '../utils/providerError';
+import { SendFeedbackDialog } from './SendFeedback';
 
 export interface AgentErrorNoticeProps {
   /** Stable classifier code (missing_api_key, invalid_api_key, …). */
@@ -36,6 +42,8 @@ export default function AgentErrorNotice({
   onDismiss,
 }: AgentErrorNoticeProps) {
   const t = useT();
+  const internal = isInternalError(code);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
   return (
     <div
       data-testid="agent-error-notice"
@@ -53,14 +61,25 @@ export default function AgentErrorNotice({
         </div>
       </div>
       <div className="mt-3 flex gap-2">
-        <button
-          type="button"
-          data-testid="agent-error-notice-settings"
-          onClick={onOpenSettings}
-          className="shrink-0 px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide bg-accent text-white hover:bg-accent/85 transition-colors duration-150"
-        >
-          {t('agentError.openSettings')}
-        </button>
+        {internal ? (
+          <button
+            type="button"
+            data-testid="agent-error-notice-feedback"
+            onClick={() => setFeedbackOpen(true)}
+            className="shrink-0 px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide bg-accent text-white hover:bg-accent/85 transition-colors duration-150"
+          >
+            {t('feedback.button')}
+          </button>
+        ) : (
+          <button
+            type="button"
+            data-testid="agent-error-notice-settings"
+            onClick={onOpenSettings}
+            className="shrink-0 px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide bg-accent text-white hover:bg-accent/85 transition-colors duration-150"
+          >
+            {t('agentError.openSettings')}
+          </button>
+        )}
         <button
           type="button"
           data-testid="agent-error-notice-dismiss"
@@ -70,6 +89,12 @@ export default function AgentErrorNotice({
           {t('agentError.dismiss')}
         </button>
       </div>
+      {feedbackOpen && (
+        <SendFeedbackDialog
+          context={{ kind: 'agent_error', ...(message ? { detail: message } : {}) }}
+          onClose={() => setFeedbackOpen(false)}
+        />
+      )}
     </div>
   );
 }

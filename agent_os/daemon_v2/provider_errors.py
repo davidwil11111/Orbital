@@ -17,8 +17,26 @@ Codes are part of the HTTP/WS contract with the frontend — keep them stable:
   invalid_api_key      provider rejected the key (401/403)
   model_not_found      provider returned 404 for the model/endpoint
   provider_unreachable network-level failure reaching base_url
-  provider_error       anything else (raw message passed through)
+  provider_error       any other failure from the LLM call path (raw message
+                       passed through)
+  internal_error       an exception that did NOT come from the LLM call path —
+                       Orbital's own bug (e.g. a file it could not read). The
+                       UI must not send the user to provider settings for it.
 """
+
+# Modules whose exceptions are, by construction, failures of the LLM call
+# path: the provider SDKs, their HTTP transport, and Orbital's own provider
+# layer (which wraps SDK errors in LLMError / ContextOverflowError — a timeout
+# LLMError carries ``status_code=None``).
+_LLM_PATH_MODULES = ("openai", "anthropic", "httpx", "httpcore",
+                     "agent_os.agent.providers")
+
+
+def _from_llm_call_path(exc: BaseException) -> bool:
+    if hasattr(exc, "status_code"):
+        return True
+    module = type(exc).__module__ or ""
+    return any(module == m or module.startswith(m + ".") for m in _LLM_PATH_MODULES)
 
 
 class ProviderConfigError(Exception):
@@ -38,9 +56,17 @@ def classify_llm_error(exc: BaseException) -> tuple[str, str]:
     isinstance-based so it covers both the openai and anthropic SDK error
     hierarchies (and any wrapper that preserves ``status_code``) without
     importing either.
+
+    Spec 141 §1 C: only exceptions from the LLM call path keep the provider
+    codes; everything else is ``internal_error`` (the old fallthrough
+    labelled e.g. a ``UnicodeDecodeError`` reading a memory file as a
+    provider failure and sent the user to settings).
     """
     if isinstance(exc, ProviderConfigError):
         return exc.code, exc.message
+
+    if not _from_llm_call_path(exc):
+        return "internal_error", f"{type(exc).__name__}: {exc}"
 
     status = getattr(exc, "status_code", None)
     if status in (401, 403):

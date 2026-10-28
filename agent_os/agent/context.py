@@ -23,6 +23,7 @@ from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agent.prompt_builder import PromptContext
 from agent_os.agent.token_utils import estimate_message_tokens
 from agent_os.agent.workspace_files import WorkspaceFileManager
+from agent_os.utils.text_io import read_text_lenient, read_text_lenient_raising
 
 
 # Layer 1 workspace file keys (matching WorkspaceFileManager.FILE_NAMES)
@@ -385,15 +386,14 @@ class ContextManager:
 
         # Read all messages from the most recent prior session
         messages = []
-        with open(most_recent_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    messages.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+        for line in read_text_lenient_raising(most_recent_path).split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                messages.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
 
         if not messages:
             return
@@ -1030,9 +1030,9 @@ class ContextManager:
         parts = []
         for filename in files:
             filepath = os.path.join(instructions_dir, filename)
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    parts.append(f.read())
-            except OSError:
-                pass
+            # User-dropped files — the likeliest to be GBK (spec 141). Read
+            # leniently, never rewritten.
+            text = read_text_lenient(filepath)
+            if text is not None:
+                parts.append(text)
         return "\n\n".join(parts) if parts else None

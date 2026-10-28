@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agent.token_utils import estimate_message_tokens
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -300,11 +301,7 @@ def inject_reorientation(workspace: str, session) -> None:
 
 def _safe_read(filepath: str, max_chars: int = 3000) -> str:
     """Read a file up to max_chars. Return empty string on any error."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return f.read(max_chars)
-    except (OSError, IOError):
-        return ""
+    return read_text_lenient(filepath, limit=max_chars) or ""
 
 
 def _format_messages_for_summary(messages: list[dict]) -> str:

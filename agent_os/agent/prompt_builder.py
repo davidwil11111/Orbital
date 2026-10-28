@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from agent_os.agent.skills import SkillLoader
+from agent_os.utils.text_io import read_text_lenient
 
 
 # ---------------------------------------------------------------------------
@@ -1044,11 +1045,9 @@ class PromptBuilder:
     @staticmethod
     def _read_truncated(filepath: str) -> str | None:
         """Read a file, truncating at _BOOTSTRAP_TRUNCATE chars. Returns None if missing."""
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read(_BOOTSTRAP_TRUNCATE + 1)
-            if len(content) > _BOOTSTRAP_TRUNCATE:
-                content = content[:_BOOTSTRAP_TRUNCATE] + "\n... [truncated]"
-            return content if content.strip() else None
-        except OSError:
+        content = read_text_lenient(filepath, limit=_BOOTSTRAP_TRUNCATE + 1)
+        if content is None:
             return None
+        if len(content) > _BOOTSTRAP_TRUNCATE:
+            content = content[:_BOOTSTRAP_TRUNCATE] + "\n... [truncated]"
+        return content if content.strip() else None
