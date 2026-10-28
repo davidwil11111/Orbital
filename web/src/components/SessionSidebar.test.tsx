@@ -1011,7 +1011,7 @@ describe('SessionSidebar — in the project column', () => {
     rerender(<SessionSidebar projectId="proj-1" selectedSessionId="sess-a" pageOpen />);
     expect(row()).toHaveAttribute('aria-selected', 'false');
     expect(row()).toHaveAttribute('data-was-here', 'true');
-    expect(row().getAttribute('style') ?? '').not.toContain('--color-selected');
+    expect(row().getAttribute('style') ?? '').not.toContain('session-selected');
     const name = within(row()).getByTestId('session-name');
     expect(name.className).toContain('text-secondary');
     expect(name.className).toContain('font-normal');
@@ -1027,26 +1027,30 @@ describe('SessionSidebar — in the project column', () => {
     expect(onSelect).toHaveBeenCalledWith('sess-a');
   });
 
-  // Spec 137 round 3: the session group is one soft surface on the column.
-  it('is one soft surface — white, rounded, the standard shadow, inset 8px — with no width, border or tint of its own', () => {
+  it('owns no width, border or inset shadow — the column does', () => {
     resetMocks();
     render(<SessionSidebar projectId="proj-1" />);
     const el = screen.getByTestId('session-sidebar');
     expect(el.getAttribute('style')).toBeNull();
-    for (const c of ['bg-card', 'rounded-[10px]', 'mx-2', 'mt-2']) expect(el.className).toContain(c);
-    expect(el.className).toContain('shadow-[0_1px_2px');
     expect(el.className).not.toMatch(/\bborder|shadow-well|bg-sidebar/);
-    // Header, list and New session all sit on it.
-    expect(el.contains(screen.getByTestId('session-sidebar-header'))).toBe(true);
-    expect(el.contains(screen.getByTestId('session-new-button'))).toBe(true);
   });
 
-  it('the selected row on the surface is a tint with no shadow', () => {
+  // Spec 137 round 4 ("status card only"): the status line is the column's
+  // single white card; the session group sits on the column tint.
+  it('sits on the column tint: no card, shadow, rounding or inset of its own', () => {
+    resetMocks();
+    render(<SessionSidebar projectId="proj-1" />);
+    const el = screen.getByTestId('session-sidebar');
+    expect(el.className).not.toMatch(/bg-card|shadow|rounded|\bmx-|\bmt-/);
+  });
+
+  it('the selected row is the raised card row it is on the tint', () => {
     resetMocks();
     mockSessions = [makeSession({ session_id: 'sess-a', session_uuid: 'ua' })];
     render(<SessionSidebar projectId="proj-1" selectedSessionId="sess-a" />);
     const row = screen.getByTestId('session-list-item-sess-a');
-    expect(row.style.background).toBe('var(--color-selected)');
-    expect(row.style.boxShadow).toBe('');
+    expect(row.style.background).toBe('var(--color-session-selected)');
+    expect(row.style.boxShadow).not.toBe('');
   });
 });
+
