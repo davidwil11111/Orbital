@@ -29,6 +29,8 @@ Two constraints worth stating because they are not visible from the code:
 import logging
 import os
 
+from agent_os.utils.text_io import read_text_lenient
+
 logger = logging.getLogger(__name__)
 
 AGENT_MD_FILENAME = "AGENTS.md"
@@ -376,15 +378,13 @@ def reseed_project_agent_md(project_store, project_id: str) -> dict:
         )
         return {"status": "seeded", "path": dest}
 
-    try:
-        with open(dest, "r", encoding="utf-8", newline="") as f:
-            existing = f.read()
-    except OSError:
+    # Lenient (spec 141): a user-edited AGENTS.md saved in GBK must not raise
+    # out of the reseed. It is user-owned, so it is only compared, never
+    # re-encoded. The reader already normalizes line endings (a CRLF checkout
+    # of an otherwise-unedited seed still counts as unedited); writes stay "\n".
+    normalized = read_text_lenient(dest)
+    if normalized is None:
         return {"status": "read_failed", "path": dest}
-
-    # Normalize line endings for the comparison only (a CRLF checkout of an
-    # otherwise-unedited seed still counts as unedited); writes stay "\n".
-    normalized = existing.replace("\r\n", "\n")
     if normalized == current:
         return {"status": "unchanged", "path": dest}
 

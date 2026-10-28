@@ -27,6 +27,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from agent_os.daemon_v2.credential_store import ENV_CARD_ID, CardKeyStore
+from agent_os.utils.text_io import read_text_lenient
 
 logger = logging.getLogger(__name__)
 
@@ -708,12 +709,10 @@ class SettingsStore:
 
         # Read user preferences file content
         prefs_path = data.get("user_preferences_path")
+        # User-owned files: read leniently (spec 141 — a GBK file must not
+        # 500 the settings page), never rewritten.
         if prefs_path and os.path.exists(prefs_path):
-            try:
-                with open(prefs_path, "r", encoding="utf-8") as f:
-                    data["user_preferences_content"] = f.read()
-            except OSError:
-                data["user_preferences_content"] = ""
+            data["user_preferences_content"] = read_text_lenient(prefs_path) or ""
         else:
             data["user_preferences_content"] = ""
 
@@ -724,11 +723,7 @@ class SettingsStore:
         memory_path = data.get("user_memory_path") or os.path.join(
             os.path.expanduser("~"), "orbital", "user_memory.md")
         if os.path.exists(memory_path):
-            try:
-                with open(memory_path, "r", encoding="utf-8") as f:
-                    data["user_memory_content"] = f.read()
-            except OSError:
-                data["user_memory_content"] = ""
+            data["user_memory_content"] = read_text_lenient(memory_path) or ""
         else:
             data["user_memory_content"] = ""
 
