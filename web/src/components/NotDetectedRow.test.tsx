@@ -64,7 +64,7 @@ describe('NotDetectedRow (the locate card)', () => {
     render(<NotDetectedRow slug="codex" name="Codex" />);
     expect(row()).toHaveTextContent('Codex');
     expect(row()).toHaveTextContent('Not detected');
-    expect(row()).toHaveTextContent('Copy this into Codex and paste its answer below.');
+    expect(row()).toHaveTextContent('Copy a prompt into Codex and paste its answer below.');
     expect(row()).not.toHaveTextContent('zprofile');
     expect(row()).not.toHaveTextContent('Refresh');
     expect(answerBox().placeholder).toBe('Paste the answer here');
@@ -79,7 +79,7 @@ describe('NotDetectedRow (the locate card)', () => {
       />,
     );
     expect(row()).toHaveTextContent('Or point Orbital at a Codex you installed yourself.');
-    expect(row()).not.toHaveTextContent('Copy this into Codex and paste its answer below.');
+    expect(row()).not.toHaveTextContent('Copy a prompt into Codex and paste its answer below.');
     // The prompt is still on offer: the copy button stays.
     expect(screen.getByTestId('sub-agent-locate-copy-codex')).toBeInTheDocument();
   });
@@ -202,7 +202,7 @@ describe('NotDetectedRow (the locate card)', () => {
       </LocaleProvider>,
     );
     expect(row()).toHaveTextContent('未检测到');
-    expect(row()).toHaveTextContent('复制到 Codex 里运行，把它的回答粘贴到下面。');
+    expect(row()).toHaveTextContent('将提示词复制给 Codex，把它的回答粘贴到下面。');
     expect(row()).toHaveTextContent('你选择的文件已不存在：/x/codex');
     expect(answerBox().placeholder).toBe('把回答粘贴到这里');
     expect(testBtn()).toHaveTextContent('测试');

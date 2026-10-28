@@ -162,7 +162,7 @@ describe('SubAgentSettings', () => {
     const row = screen.getByTestId('sub-agent-not-detected-gemini-cli');
     expect(row).toHaveTextContent('Gemini CLI');
     expect(row).toHaveTextContent('Not detected');
-    expect(row).toHaveTextContent('Copy this into Gemini CLI and paste its answer below.');
+    expect(row).toHaveTextContent('Copy a prompt into Gemini CLI and paste its answer below.');
     expect(within(row).queryByRole('combobox')).not.toBeInTheDocument();
     expect(within(row).queryByText('Login')).not.toBeInTheDocument();
     expect(within(row).getByTestId('sub-agent-locate-answer-gemini-cli')).toBeInTheDocument();
@@ -931,7 +931,7 @@ describe('SubAgentSettings — Orbital-managed install', () => {
     expect(row).toHaveTextContent(
       'Or point Orbital at a DeepSeek Harness you installed yourself: paste the launcher path (or the YAML an agent returns for it) below.',
     );
-    expect(row).not.toHaveTextContent('Copy this into DeepSeek Harness');
+    expect(row).not.toHaveTextContent('Copy a prompt into DeepSeek Harness');
     expect(within(row).getByTestId('sub-agent-locate-answer-dsh')).toBeInTheDocument();
   });
 

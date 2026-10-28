@@ -1174,7 +1174,7 @@ export const STRINGS = {
   "subAgentCard.locate.found": { en: "Found {name} {version} at {path}", zh: "在 {path} 找到了 {name} {version}" },
   "subAgentCard.locate.foundNoVersion": { en: "Found {name} at {path} (no version check for this agent)", zh: "在 {path} 找到了 {name}（该 Agent 没有版本检查）" },
   "subAgentCard.locate.gone": { en: "The file you chose is gone: {path}", zh: "你选择的文件已不存在：{path}" },
-  "subAgentCard.locate.hint": { en: "Copy a prompt into {name} and paste its answer below.", zh: "将提示词复制给 {name} ，把它的回答粘贴到下面。" },
+  "subAgentCard.locate.hint": { en: "Copy a prompt into {name} and paste its answer below.", zh: "将提示词复制给 {name}，把它的回答粘贴到下面。" },
   "subAgentCard.locate.orbitalInstallFallback": { en: "Or point Orbital at a {name} you installed yourself: paste the launcher path (or the YAML an agent returns for it) below.", zh: "也可以指向你自己安装的 {name}：把启动程序路径（或任一 Agent 返回的 YAML）粘贴到下面。" },
   "subAgentCard.locate.placeholder": { en: "Paste the answer here", zh: "把回答粘贴到这里" },
   "subAgentCard.locate.save": { en: "Save", zh: "保存" },

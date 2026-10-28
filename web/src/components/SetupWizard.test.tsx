@@ -346,7 +346,7 @@ describe('SetupWizard — Agents step', () => {
     expect(screen.queryByTestId('sub-agent-not-detected-kimi-code')).toBeNull();
     fireEvent.click(screen.getByTestId('wizard-locate-chip-kimi-code'));
     expect(screen.getByTestId('sub-agent-not-detected-kimi-code')).toBeTruthy();
-    expect(screen.getByText('Copy this into Kimi Code and paste its answer below.')).toBeTruthy();
+    expect(screen.getByText('Copy a prompt into Kimi Code and paste its answer below.')).toBeTruthy();
   });
 });
 
