@@ -637,12 +637,16 @@ class TestTriggerManager:
 
 
 # ===========================================================================
-# PromptBuilder Trigger Context
+# PromptBuilder: no trigger section (spec 140 R2)
 # ===========================================================================
 
 class TestPromptBuilderTriggerContext:
+    """The trigger context moved out of the system prompt into the trigger's
+    first user message (trigger_manager.TRIGGER_RUN_NOTE), so a triggered
+    run shares the chat sessions' cached prefix. Byte-identity across all
+    three parts is pinned in tests/unit/test_trigger_context_140.py."""
 
-    def test_trigger_context_included_when_trigger_source_set(self):
+    def test_no_trigger_section_when_trigger_source_set(self):
         from agent_os.agent.prompt_builder import PromptBuilder, PromptContext, Autonomy
         builder = PromptBuilder()
         ctx = PromptContext(
@@ -657,9 +661,8 @@ class TestPromptBuilderTriggerContext:
             trigger_name="Morning PDF summary",
         )
         _, semi_stable, _ = builder.build(ctx)
-        assert "Trigger Context" in semi_stable
-        assert "Morning PDF summary" in semi_stable
-        assert "schedule" in semi_stable
+        assert "Trigger Context" not in semi_stable
+        assert "Morning PDF summary" not in semi_stable
 
     def test_trigger_context_absent_when_no_trigger(self):
         from agent_os.agent.prompt_builder import PromptBuilder, PromptContext, Autonomy

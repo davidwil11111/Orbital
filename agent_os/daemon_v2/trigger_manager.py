@@ -25,6 +25,21 @@ from watchdog.observers import Observer
 
 logger = logging.getLogger(__name__)
 
+# Spec 140 R2: what the system prompt's old "## Trigger Context" section told
+# the management agent, now the last paragraph of a triggered run's first user
+# message, so the system prompt stays byte-identical to a chat session's and
+# the provider's cached prefix is shared. It goes AFTER the task: the
+# "[Triggered by …]" first line, the "Changed files:" paragraph and the task
+# keep their positions for the readers that parse them (session.py names,
+# onboarding/text_clean.py, web/src/lib/sessionLabel.ts). Workers get the
+# message without it: they have no trigger tools.
+TRIGGER_RUN_NOTE = (
+    "[This run was started unattended by the trigger above; the task is the "
+    "message above. Carry it out according to your project goals and autonomy "
+    "settings. If asked to change scheduled tasks, use create_trigger, "
+    "list_triggers, update_trigger or delete_trigger.]"
+)
+
 
 def generate_trigger_id() -> str:
     """Generate a unique trigger ID."""
@@ -745,7 +760,7 @@ class TriggerManager:
             else:
                 await self._agent_manager.start_agent(
                     project_id, config,
-                    initial_message=initial_message,
+                    initial_message=f"{initial_message}\n\n{TRIGGER_RUN_NOTE}",
                     trigger_source=trigger_type,
                     trigger_name=trigger_name,
                 )
