@@ -351,8 +351,10 @@ def test_read_mixed_gbk_tail_decodes_both_halves_and_heals(ws, ws_dir, _windows_
 
     assert text == _141_HEAD + _141_TAIL
     # B: the file on disk is valid UTF-8 afterwards, with the same text.
+    # Line endings follow ``write`` (text-mode ``open``: CRLF on Windows).
     with open(path, "rb") as f:
-        assert f.read().decode("utf-8") == _141_HEAD + _141_TAIL
+        healed = f.read().decode("utf-8").replace("\r\n", "\n")
+    assert healed == _141_HEAD + _141_TAIL
     assert not os.path.exists(path + ".tmp")
 
 
