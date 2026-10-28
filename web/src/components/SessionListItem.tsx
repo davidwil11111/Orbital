@@ -210,9 +210,11 @@ function SessionListItemBase({
       }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      // The list sits on a white surface (spec 137 round 3), so the selected
-      // row is a tint, not a raised card: `--color-selected`, no shadow.
-      style={selected ? { background: 'var(--color-selected)' } : undefined}
+      style={
+        selected
+          ? { background: 'var(--color-session-selected)', boxShadow: '0 1px 2px rgba(0,0,0,0.04)' }
+          : undefined
+      }
       className={[
         'relative flex items-center gap-1.5 px-2.5 py-[7px] rounded-md cursor-pointer select-none transition-colors',
         selected ? 'font-medium text-selected-text' : 'hover:bg-card-hover',

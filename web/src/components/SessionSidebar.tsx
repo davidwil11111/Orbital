@@ -4,11 +4,12 @@
 
 /**
  * SessionSidebar — the session half of the project column (spec 137, the
- * folder shell: name, state, status line, then this). One soft surface (round
- * 3): header, filter, list and New session sit on a white rounded card inset
- * 8px from the column's edges, so the group reads as one thing on the tinted
- * column without a line. It fills whatever height the column gives it; the
- * column owns the width.
+ * folder shell: name, state, status line, then this). It fills whatever room
+ * the column gives it; the column owns the width, the tint and the absence of
+ * any border. It sits directly on the column tint: the status line above it is
+ * the column's ONE white card (spec 137 round 4 — a full-height white session
+ * card read as a second panel and clashed with the pinned project list's
+ * square corner).
  *
  * Header: "Sessions" + the count for the active filter, then — only when
  *   the project has at least one automation session — an All | Chats |
@@ -381,14 +382,14 @@ export function SessionSidebar({
     <section
       data-testid="session-sidebar"
       aria-label={t('sessionSidebar.header')}
-      className="mx-2 mt-2 flex flex-col flex-1 min-h-0 rounded-[10px] bg-card shadow-[0_1px_2px_rgb(0_0_0/0.06)]"
+      className="flex flex-col flex-1 min-h-0"
     >
       {/* Header: "Sessions 5" — sentence case, the count beside it in
           secondary. Then, only when there are automation sessions to tell
           apart from chats, the filter as plain text tabs (no boxed control:
           in the column it read as a second toolbar). */}
       <div
-        className="flex items-baseline gap-1.5 px-3 pt-3 pb-1 shrink-0 text-xs"
+        className="flex items-baseline gap-1.5 px-4 pt-3 pb-1 shrink-0 text-xs"
         data-testid="session-sidebar-header"
       >
         <span className="font-semibold text-secondary">{t('sessionSidebar.header')}</span>
@@ -401,7 +402,7 @@ export function SessionSidebar({
         <div
           role="tablist"
           aria-label={t('sessionSidebar.filter.label')}
-          className="flex items-center gap-3 px-3 pb-1.5 shrink-0"
+          className="flex items-center gap-3 px-4 pb-1.5 shrink-0"
         >
           {FILTERS.map((f) => {
             const active = filter === f.key;
@@ -426,7 +427,7 @@ export function SessionSidebar({
 
       {/* Session list: pinned, then the rest most-recent first, one row per automation */}
       <div
-        className="flex-1 overflow-y-auto px-1.5 pt-0.5 pb-1.5 flex flex-col gap-0.5"
+        className="flex-1 overflow-y-auto px-1.5 py-1 flex flex-col gap-0.5"
         data-testid="session-list"
       >
         {loading && sortedSessions.length === 0 && (
@@ -468,7 +469,7 @@ export function SessionSidebar({
       </div>
 
       {/* New session button */}
-      <div className="shrink-0 px-2 pb-3.5 pt-2.5">
+      <div className="shrink-0 px-4 pb-3.5 pt-2">
         <button
           type="button"
           data-testid="session-new-button"
