@@ -60,6 +60,8 @@ export default function TasksStatusLine({
   const offCount = triggers.filter((tr) => !tr.enabled).length;
   const busy = running + queued > 0;
   const empty = !busy && triggers.length === 0;
+  const pane: TasksPane = busy ? 'queue' : 'automations';
+  const state = empty ? 'empty' : busy ? 'busy' : 'automations';
 
   const dot = (
     <span className="text-muted" aria-hidden="true">
@@ -67,90 +69,106 @@ export default function TasksStatusLine({
     </span>
   );
 
-  let content: React.ReactNode;
-  if (empty) {
-    const [before, after = ''] = t('statusLine.teach', { command: COMMAND_SLOT }).split(COMMAND_SLOT);
-    const teach = (
-      <span className={`min-w-0 text-muted ${row ? '' : 'truncate'}`} data-testid="status-line-teach">
-        {before}
-        <kbd className="mx-0.5 rounded border border-border px-1 font-mono text-[11px] text-secondary">/automate</kbd>
-        {after}
-      </span>
-    );
-    // In the column the sentence wraps onto a second line (zh runs longer
-    // than 260px); icon and text stay one unit so the clock heads the first
-    // line instead of sitting on a line of its own.
-    content = row ? (
-      <span className="flex flex-1 min-w-0 items-start gap-2">
-        <Clock size={13} aria-hidden="true" className="mt-px shrink-0 text-muted" />
-        {teach}
-      </span>
-    ) : (
-      <>
-        <Clock size={13} aria-hidden="true" className="shrink-0 text-muted" />
-        {teach}
-      </>
-    );
-  } else {
-    const parts: React.ReactNode[] = [];
-    if (running > 0) {
-      parts.push(
-        <span key="running" className="flex items-center gap-1.5 shrink-0">
-          <Play size={11} aria-hidden="true" className="shrink-0 text-success" fill="currentColor" />
-          <span className="text-primary">{t('statusLine.running', { n: running })}</span>
-        </span>,
-      );
-    }
-    if (queued > 0) {
-      parts.push(
-        <span key="queued" className="shrink-0 text-primary">
-          {t('statusLine.queued', { n: queued })}
-        </span>,
-      );
-    }
-    if (triggers.length > 0) {
-      parts.push(
-        <span key="automations" className="flex items-center gap-1.5 shrink-0">
-          <Clock size={13} aria-hidden="true" className="shrink-0 text-muted" />
-          <span className="text-primary">
-            {t(triggers.length === 1 ? 'statusLine.automations.one' : 'statusLine.automations.other', {
-              n: triggers.length,
-            })}
-          </span>
-          {offCount > 0 && <span className="text-muted">{t('trigger.summary.off', { n: offCount })}</span>}
-        </span>,
-      );
-    }
-    content = parts.flatMap((part, i) => (i === 0 ? [part] : [<span key={`dot-${i}`}>{dot}</span>, part]));
+  // The facts, in order, as translated text — rendered as spans below and
+  // joined for the column row's `title` (the row truncates; the tooltip
+  // carries everything).
+  const facts: { key: string; text: string; icon?: 'play' | 'clock'; off?: string }[] = [];
+  if (running > 0) facts.push({ key: 'running', text: t('statusLine.running', { n: running }), icon: 'play' });
+  if (queued > 0) facts.push({ key: 'queued', text: t('statusLine.queued', { n: queued }) });
+  if (triggers.length > 0) {
+    facts.push({
+      key: 'automations',
+      text: t(triggers.length === 1 ? 'statusLine.automations.one' : 'statusLine.automations.other', {
+        n: triggers.length,
+      }),
+      icon: 'clock',
+      off: offCount > 0 ? t('trigger.summary.off', { n: offCount }) : undefined,
+    });
   }
 
-  const pane: TasksPane = busy ? 'queue' : 'automations';
-  const state = empty ? 'empty' : busy ? 'busy' : 'automations';
+  const factNodes = facts.flatMap((f, i) => {
+    const node = (
+      <span key={f.key} className="flex items-center gap-1.5 shrink-0">
+        {f.icon === 'play' && <Play size={11} aria-hidden="true" className="shrink-0 text-success" fill="currentColor" />}
+        {f.icon === 'clock' && <Clock size={13} aria-hidden="true" className="shrink-0 text-muted" />}
+        <span className="text-primary">{f.text}</span>
+        {f.off && <span className="text-muted">{f.off}</span>}
+      </span>
+    );
+    return i === 0 ? [node] : [<span key={`dot-${i}`}>{dot}</span>, node];
+  });
+
+  // The teaching text splits around the `/automate` token so the token can be
+  // styled as a key. The phone's full-width band keeps the one sentence; the
+  // column (260px, 220 narrow) says it as a two-line item instead — a title
+  // and a hint, like a session row — so nothing wraps or ends in an ellipsis.
+  const [before, after = ''] = t(row ? 'statusLine.teach.hint' : 'statusLine.teach', {
+    command: COMMAND_SLOT,
+  }).split(COMMAND_SLOT);
+  const keyToken = (extra: string) => (
+    <kbd className={`mx-0.5 rounded border border-border px-1 text-secondary ${extra}`}>/automate</kbd>
+  );
 
   if (row) {
-    // The column is 260px (220 narrow): the facts wrap rather than truncate,
-    // and the trailing "Tasks" word gives way to the chevron alone — the row
-    // is a row in a list of places, like the sessions under it.
+    // The facts: ONE line, then the chevron; anything that does not fit ends
+    // in an ellipsis and the facts are the tooltip. Nothing scheduled: two
+    // deliberate lines (title, then the /automate hint under it). No fill at
+    // rest — a quiet row among rows; raised only while Tasks is open.
+    const title = empty
+      ? `${t('statusLine.teach.title')} · ${before}/automate${after}`
+      : facts.map((f) => (f.off ? `${f.text} ${f.off}` : f.text)).join(' · ');
     return (
       <button
         type="button"
         onClick={() => onOpen(pane)}
         aria-current={selected ? 'page' : undefined}
-        title={t('projectDetail.tab.queue')}
+        title={title}
         data-testid="trigger-summary"
         data-tour="status-line"
         data-state={state}
-        className={`mx-2 mt-1.5 mb-1 flex min-w-0 items-center gap-2 rounded-lg px-2 py-[7px] text-left text-xs text-secondary transition-[background-color,box-shadow] duration-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
-          selected
-            ? 'bg-card shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
-            : 'hover:bg-card hover:shadow-[0_1px_2px_rgb(0_0_0/0.06)]'
-        }`}
+        className={`mx-2 mt-1.5 mb-1 flex min-w-0 gap-2 rounded-lg px-2 py-[7px] text-left text-xs text-secondary whitespace-nowrap transition-[background-color,box-shadow] duration-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
+          empty ? 'items-start' : 'items-center'
+        } ${selected ? 'bg-card shadow-[0_1px_2px_rgb(0_0_0/0.06)]' : 'hover:bg-card-hover'}`}
       >
-        <span className="flex flex-1 min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">{content}</span>
-        <ChevronRight size={13} aria-hidden="true" className="shrink-0 text-muted" />
+        {empty ? (
+          <>
+            <Clock size={13} aria-hidden="true" className="mt-px shrink-0 text-muted" />
+            <span className="flex min-w-0 flex-1 flex-col gap-0.5" data-testid="status-line-teach">
+              <span className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 text-secondary" data-testid="status-line-teach-title">
+                  {t('statusLine.teach.title')}
+                </span>
+                <ChevronRight size={13} aria-hidden="true" className="shrink-0 text-muted" />
+              </span>
+              <span className="text-[11px] text-muted" data-testid="status-line-teach-hint">
+                {before}
+                {keyToken('font-sans text-[10px]')}
+                {after}
+              </span>
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">{factNodes}</span>
+            <ChevronRight size={13} aria-hidden="true" className="shrink-0 text-muted" />
+          </>
+        )}
       </button>
     );
   }
+
+  const content = empty ? (
+    <>
+      <Clock size={13} aria-hidden="true" className="shrink-0 text-muted" />
+      <span className="min-w-0 truncate text-muted" data-testid="status-line-teach">
+        {before}
+        {keyToken('font-mono text-[11px]')}
+        {after}
+      </span>
+    </>
+  ) : (
+    factNodes
+  );
 
   return (
     <div className="border-y border-border">

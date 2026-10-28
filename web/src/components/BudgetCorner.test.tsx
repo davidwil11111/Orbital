@@ -154,4 +154,33 @@ describe('BudgetCorner', () => {
     );
     expect(screen.getByTestId('budget-corner').textContent).toContain('¥8.00');
   });
+
+  // Spec 137 polish: in the project column the spend reads as words.
+  it('plain (the project column): sans 12px, no monospace; header form unchanged', () => {
+    mockUseCost.mockReturnValue({ cost: costOf(0.84), loading: false, error: null, refresh: vi.fn() });
+    const { unmount } = render(
+      <BudgetCorner project={project()} pauseReason={null} onOpenBudgetSettings={vi.fn()} plain />,
+    );
+    const corner = screen.getByTestId('budget-corner');
+    expect(corner.className).toContain('text-xs');
+    expect(corner.className).not.toContain('font-mono');
+    unmount();
+    render(<BudgetCorner project={project()} pauseReason={null} onOpenBudgetSettings={vi.fn()} />);
+    expect(screen.getByTestId('budget-corner').className).toContain('font-mono');
+  });
+
+  it('plain exhausted: the short label, the long one as the tooltip', () => {
+    mockUseCost.mockReturnValue({ cost: costOf(11), loading: false, error: null, refresh: vi.fn() });
+    render(
+      <BudgetCorner
+        project={project({ budget_limit_usd: 10 })}
+        pauseReason={null}
+        onOpenBudgetSettings={vi.fn()}
+        plain
+      />,
+    );
+    const corner = screen.getByTestId('budget-corner');
+    expect(corner.textContent).toBe('Budget paused');
+    expect(corner.querySelector('[title]')).toHaveAttribute('title', 'Budget paused · raise limit to resume');
+  });
 });
