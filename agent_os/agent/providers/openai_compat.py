@@ -582,7 +582,8 @@ class LLMProvider:
     def __init__(self, model: str, api_key: str, base_url: str | None = None, sdk: str = "openai",
                  max_output: int = 16384, capabilities=None, reasoning=None,
                  provider: str = "unknown", extra_headers: dict | None = None,
-                 session_header: str | None = None):
+                 session_header: str | None = None,
+                 session_scope: str | None = None):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
@@ -606,6 +607,13 @@ class LLMProvider:
         self.session_header = session_header or None
         self._session_id_getter = None
         self._instance_session_id = uuid.uuid4().hex
+        # Registry ``session_scope`` (spec 140). ``"project"``: a loop that
+        # binds a routing project (trigger-started manager sessions) sends
+        # one stable ``project:<id>`` value instead of its session uuid, so
+        # every fire lands on the same upstream and its warm prompt cache.
+        # Absent/unknown: per-conversation, as before.
+        self.session_scope = session_scope or None
+        self._routing_project_key: str | None = None
         # Spec 112 A4: who this client serves, stamped on every
         # ``[CACHE_AUDIT]`` line. The Memory session (spec 124 §3.7) sets
         # ``"memory"`` on its own client; everything else is ``main``.
@@ -633,8 +641,19 @@ class LLMProvider:
         the id of the session it is actually serving."""
         self._session_id_getter = getter
 
+    def bind_routing_project(self, project_id: str | None) -> None:
+        """Route this client's requests by project (``project:<id>``) when the
+        registry scopes the header per project. A no-op for every other
+        provider; ``None`` unbinds. The loop calls this only when it has a
+        routing project, so a loop without one (a fan-out worker sharing the
+        parent's client) never clears the parent's choice."""
+        self._routing_project_key = f"project:{project_id}" if project_id else None
+
     def request_session_id(self) -> str:
-        """The conversation id the next request's ``session_header`` carries."""
+        """The conversation id the next request's ``session_header`` carries
+        (the project key for a project-scoped provider bound to a project)."""
+        if self.session_scope == "project" and self._routing_project_key:
+            return self._routing_project_key
         if self._session_id_getter is not None:
             try:
                 sid = self._session_id_getter()

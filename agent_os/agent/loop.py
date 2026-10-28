@@ -335,6 +335,7 @@ class AgentLoop:
         memory_record_enabled: bool = True,
         tool_guard=None,
         tool_call_cap: int | None = None,
+        routing_project_id: str | None = None,
     ):
         self._session = session
         self._provider = provider
@@ -351,6 +352,10 @@ class AgentLoop:
         # lazily, only after a 401/403 proves the project key dead, so
         # transient-rotation semantics stay byte-identical until then.
         self._auth_fallback_provider = auth_fallback_provider
+        # Spec 140: set for trigger-started manager sessions only. Fixed for
+        # the life of this loop (later messages and hot resumes keep it); a
+        # project-scoped provider then routes by project, not by session.
+        self._routing_project_id = routing_project_id or None
         self.bind_session_headers()
         self._max_iterations = max_iterations
         # PURE token safety-net cap (NOT budget-derived). Budget Piece 2 cut the
@@ -959,13 +964,21 @@ class AgentLoop:
     def bind_session_headers(self) -> None:
         """Point every provider this loop owns at its live session id.
         Called from __init__ and again whenever the manager rebuilds the
-        provider set on a hot resume (the new clients start unbound)."""
+        provider set on a hot resume (the new clients start unbound).
+        A trigger loop also binds its routing project (spec 140); a loop
+        without one never touches it, so a worker sharing its parent's
+        client cannot clear the parent's project key."""
         providers = [self._provider, self._utility_provider,
                      self._auth_fallback_provider, *self._fallback_providers]
+        project_id = getattr(self, "_routing_project_id", None)
         for prov in providers:
             bind = getattr(prov, "bind_session_id", None)
             if callable(bind):
                 bind(self._current_session_id)
+            if project_id:
+                bind_project = getattr(prov, "bind_routing_project", None)
+                if callable(bind_project):
+                    bind_project(project_id)
 
     async def _stream_response(self, context, tool_schemas) -> LLMResponse:
         """Stream LLM response from the primary provider.
