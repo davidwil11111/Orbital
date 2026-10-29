@@ -48,10 +48,12 @@ const BADGE_LABEL_KEY: Record<SubAgentInfo['status'], 'subAgentBar.working' | 's
   idle: 'subAgentBar.idle',
 };
 
-const BADGE_CLASS: Record<SubAgentInfo['status'], string> = {
-  running: 'bg-blue-500/15 text-blue-400 border-blue-500/40 animate-pulse',
-  'background-running': 'bg-amber-500/15 text-amber-400 border-amber-500/40',
-  idle: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30',
+/** The dot before the status word: the agent's own colour, pulsing, while
+ *  its turn runs; amber for work alive after the turn; grey when idle. */
+const DOT_CLASS: Record<SubAgentInfo['status'], string> = {
+  running: 'bg-[var(--agent-color)] animate-pulse',
+  'background-running': 'bg-warning',
+  idle: 'bg-border',
 };
 
 export default function SubAgentStatusBar({ projectId, sessionId, live }: Props) {
@@ -90,26 +92,30 @@ export default function SubAgentStatusBar({ projectId, sessionId, live }: Props)
 
   if (agents.length === 0 && !lastStop) return null;
 
+  // A line of the session heading, not a bar of its own (spec 137 follow-up,
+  // C4 of the heading options): while a worker runs, the agents sit under
+  // the session title as flat tiles, and the messages scroll under a fade
+  // below this line instead of the heading's (`.sub-agent-line` in
+  // index.css). Same horizontal inset as the title and the messages.
   return (
     <div
       data-testid="sub-agent-status-bar"
-      className="flex items-center gap-2 overflow-x-auto px-3 py-1.5 border-b border-zinc-800 bg-zinc-900/60 text-xs"
+      className="sub-agent-line relative z-10 shrink-0 flex items-center gap-2 overflow-x-auto px-4 pt-2 pb-2.5 md:px-7 md:pt-0.5 bg-card text-xs"
     >
       {agents.map((a) => (
         <div
           key={a.handle}
           data-testid={`sub-agent-chip-${a.handle}`}
-          // Dark mode tints each chip with the agent's brand colour (palette
-          // 1a), so Claude Code and Codex are told apart before reading.
           style={{ '--agent-color': agentTint(a.handle) } as CSSProperties}
-          className="flex items-center gap-1.5 shrink-0 rounded-full border border-zinc-700 bg-zinc-800/80 pl-2 pr-1 py-0.5 dark:border-transparent dark:bg-[color-mix(in_srgb,var(--agent-color)_16%,transparent)]"
+          className="flex items-center gap-1.5 shrink-0 rounded-md bg-background dark:bg-elevated pl-2 pr-1 py-0.5 text-primary"
         >
-          <span className="text-zinc-300 max-w-[96px] truncate dark:text-[color-mix(in_srgb,var(--agent-color)_45%,white)]">{a.display_name}</span>
+          <span className="max-w-[96px] truncate">{a.display_name}</span>
           <span
             data-testid={`sub-agent-badge-${a.handle}`}
             data-status={a.status}
-            className={`rounded-full border px-1.5 py-px text-2xs leading-4 ${BADGE_CLASS[a.status]}`}
+            className="inline-flex items-center gap-1.5 text-2xs leading-4 text-secondary"
           >
+            <span aria-hidden="true" className={`inline-block w-[7px] h-[7px] rounded-full ${DOT_CLASS[a.status]}`} />
             {t(BADGE_LABEL_KEY[a.status])}
           </span>
           {a.status !== 'idle' && (
@@ -119,7 +125,7 @@ export default function SubAgentStatusBar({ projectId, sessionId, live }: Props)
               aria-label={t('subAgentBar.stopTitle', { name: a.display_name })}
               disabled={stopping === a.handle}
               onClick={() => setConfirming(a)}
-              className="grid place-items-center h-5 w-5 rounded-full text-red-400 hover:bg-red-500/20 disabled:opacity-40"
+              className="grid place-items-center h-5 w-5 rounded text-[9px] text-secondary hover:text-error-text hover:bg-error-surface disabled:opacity-40"
             >
               ■
             </button>
@@ -128,7 +134,7 @@ export default function SubAgentStatusBar({ projectId, sessionId, live }: Props)
       ))}
 
       {lastStop && (
-        <span data-testid="sub-agent-stop-result" className="text-zinc-400 shrink-0">
+        <span data-testid="sub-agent-stop-result" className="text-secondary shrink-0">
           {t('subAgentBar.stopped', { handle: lastStop.handle })}
           {lastStop.background_terminated.length > 0 &&
             t('subAgentBar.bgTerminated', { n: lastStop.background_terminated.length })}
@@ -138,42 +144,42 @@ export default function SubAgentStatusBar({ projectId, sessionId, live }: Props)
       {confirming && (
         <div
           data-testid="sub-agent-stop-confirm"
-          className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4"
+          className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4"
           onClick={() => setConfirming(null)}
         >
           <div
-            className="w-full max-w-sm rounded-lg border border-zinc-700 bg-zinc-900 p-4 text-sm text-zinc-200"
+            className="w-full max-w-sm rounded-lg border border-border bg-elevated p-4 text-sm text-primary shadow-[0_10px_28px_rgba(24,24,27,0.10),0_2px_6px_rgba(24,24,27,0.05)]"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="font-medium mb-2">{t('subAgentBar.confirm.title', { name: confirming.display_name })}</div>
-            <p className="text-zinc-400 mb-2">
+            <p className="text-secondary mb-2">
               {confirming.status === 'running'
                 ? t('subAgentBar.confirm.running')
                 : t('subAgentBar.confirm.background')}
             </p>
             {confirming.status === 'background-running' &&
               confirming.background_commands.length > 0 && (
-              <ul className="mb-2 max-h-24 overflow-y-auto rounded bg-zinc-800/80 p-2 font-mono text-[11px] text-amber-300">
+              <ul className="mb-2 max-h-24 overflow-y-auto rounded bg-background p-2 font-mono text-[11px] text-warning-text">
                 {confirming.background_commands.map((c, i) => (
                   <li key={i} className="truncate">{c}</li>
                 ))}
               </ul>
             )}
-            <p data-testid="sub-agent-stop-warning" className="text-[11px] text-zinc-500 mb-3">
+            <p data-testid="sub-agent-stop-warning" className="text-[11px] text-secondary mb-3">
               {t('subAgentBar.confirm.warning')}
             </p>
             <div className="flex justify-end gap-2">
               <button
                 data-testid="sub-agent-stop-cancel"
                 onClick={() => setConfirming(null)}
-                className="rounded px-3 py-1.5 text-zinc-300 hover:bg-zinc-800"
+                className="rounded px-3 py-1.5 text-secondary hover:bg-card-hover"
               >
                 {t('subAgentBar.confirm.cancel')}
               </button>
               <button
                 data-testid="sub-agent-stop-confirm-button"
                 onClick={() => doStop(confirming)}
-                className="rounded bg-red-600 px-3 py-1.5 text-white hover:bg-red-500"
+                className="rounded bg-error px-3 py-1.5 text-white hover:opacity-90"
               >
                 {t('subAgentBar.confirm.stop')}
               </button>

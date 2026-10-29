@@ -619,7 +619,11 @@ body {
    a 16px fade below it. Written as a plain gradient on purpose — Tailwind v4's
    `bg-linear-to-b … to-transparent` interpolates in oklab, and WebKit (the
    packaged app's WKWebView, Safari) renders that as a dark grey band. */
-.session-heading::after {
+/* The fade the messages scroll under: below the session heading, or below
+   the sub-agent line when workers are running (that line paints over the
+   heading's fade, so only one shows). */
+.session-heading::after,
+.sub-agent-line::after {
   content: '';
   position: absolute;
   left: 0;

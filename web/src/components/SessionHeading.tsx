@@ -37,7 +37,8 @@ interface SessionHeadingProps {
  * fade below the heading (`.session-heading` in index.css — a plain sRGB
  * gradient; Tailwind's oklab gradient to `transparent` paints a dark band in
  * WebKit, which is what the packaged app renders in), so the boundary is the
- * heading itself.
+ * heading itself. While workers run, SubAgentStatusBar adds a line of agent
+ * tiles under the title and carries the fade instead (`.sub-agent-line`).
  *
  * The phone keeps its project header and never mounts this.
  */
